@@ -1,19 +1,28 @@
-# Aura 语言使用手册 (v0.4)
+# Aura 语言使用手册 v0.4
 
-## 1. 简介
+## 关于 `io` 与 `path` 的重要说明
 
-Aura 是一门静态类型、编译型的系统编程语言，目标是在保持高性能的同时，提供现代、简洁的语法和强大的类型推断。它采用结构化并发、结构类型系统以及显式异常处理，让你编写安全且易维护的程序。
+- **`Io` 是能力类型**：程序入口 `main(io: Io)` 接收的 `io` 是运行时能力令牌，封装所有 I/O 副作用（文件读写、终端输出等）。任何需要副作用的函数必须显式接收 `io: Io`。
+- **`path` 是内置模块**：通过 `import "path"` 导入，提供纯函数式的路径操作（拼接、解析、文件名提取等）。所有 `path` 函数均无副作用，无需能力令牌，可在任何地方使用。
+- **两者分离**：`path` 负责路径计算（数据），`Io` 负责实际的文件系统访问（效果）。这种设计让副作用完全受控，同时路径操作可自由组合。
 
-一个最小的 Aura 程序：
+---
 
+## 1. 你好，Aura
+
+Aura 是一门静态类型、编译型语言，旨在提供现代、安全的编程体验。其核心特色包括：
+- 全静态类型，函数类型必须显式标注，变量类型通常可推断。
+- 结构类型系统、接口自动实现。
+- 结构化并发，无 `async` 关键字。
+- 显式异常处理，错误路径清晰。
+- 能力对象控制副作用。
+
+一个最小程序：
 ```aura
 fun main(io: Io) throws {
     io.println("Hello, Aura!")
 }
 ```
-
-- `main` 是程序入口，接收一个 `Io` 能力对象用于输入输出。
-- 所有可能抛出异常的函数必须标注 `throws`，`main` 也不例外。
 
 ---
 
@@ -30,210 +39,162 @@ fun main(io: Io) throws {
 ```
 
 ### 2.2 标识符与关键字
-标识符以字母或下划线开头，后可跟字母、数字、下划线。  
-保留关键字：`fun, let, const, throws, throw, try, catch, match, if, else, for, while, loop, break, continue, spawn, sync, return, import, type, interface, true, false, None, impl`
+标识符以字母或下划线开头，后可跟字母、数字、下划线，区分大小写。  
+关键字：`fun, let, const, throws, throw, try, catch, match, if, else, for, while, loop, break, continue, spawn, sync, return, import, type, interface, true, false, None, impl, as`
 
 ### 2.3 字面量
 ```aura
-42               // 整数
-0xFF             // 十六进制
-3.14             // 浮点数
-"hello"          // 字符串
-true, false      // 布尔
-None             // 空值（用于联合类型）
-[1, 2, 3]        // 列表
-{ id = 1, name = "Aura" }   // 记录（无构造函数时）
+42                  // 整数
+0xFF                // 十六进制
+3.14                // 浮点数
+"hello"             // 字符串（转义：\n \t \\ \"）
+true, false         // 布尔
+None                // 空值（用于联合类型）
+[1, 2, 3]           // 列表
+{ x = 1, y = 2 }    // 记录（无构造函数时可用）
 ```
+
+### 2.4 运算符优先级（由高到低）
+1. 一元 `-` `not`
+2. `*` `/` `%`
+3. `+` `-`
+4. `<` `<=` `>` `>=`
+5. `==` `!=`
+6. `and`
+7. `or`
+8. 错误传播后缀：`!`
+9. 管道（预留）：`|>`
 
 ---
 
 ## 3. 类型系统
 
-### 3.1 基础类型
-基本类型全部小写：`int`, `float`, `bool`, `string`。
+### 3.1 基础类型（小写）
+`int`, `float`, `bool`, `string`
 
-### 3.2 记录类型
-记录是堆分配的引用类型，结构匹配（结构类型）。  
-定义类型别名：
+### 3.2 复合类型
+
+**记录类型**  
+结构类型，堆分配引用类型，形状相等即相容。
 ```aura
 type Point = { x: int, y: int }
 ```
-
-创建记录值（无自定义构造函数时）：
+创建实例（无构造函数时）：
 ```aura
-let p: Point = { x = 3, y = 4 }   // 带字段名
-let q: Point = { 3, 4 }           // 按字段顺序，上下文确定类型
+let p: Point = { x = 3, y = 4 }
+let q: Point = { 3, 4 }          // 按字段顺序
 ```
 
-### 3.3 联合类型
-使用 `|` 组合多个类型：
+**联合类型**  
+`Type1 | Type2 | ...`，用于表示可选值或多态值。
 ```aura
 type MaybeInt = int | None
 type Result = string | Error
 ```
 
-### 3.4 列表类型
+**列表类型**  
+`[int]`, `[string]` 等，元素类型需一致。
 ```aura
-let numbers: [int] = [1, 2, 3]
-let names: [string] = ["a", "b"]
+let nums: [int] = [1, 2, 3]
 ```
 
-### 3.5 接口类型
-接口名可直接作为类型使用，表示任何实现了该接口的值。详见第6节。
+**接口类型**  
+接口名直接用作类型，表示任何实现了该接口的值（见第6节）。
 
-### 3.6 泛型类型
-在类型别名中使用 `<T>` 标记类型变量：
+**泛型**  
+使用 `<T>` 标记类型变量，作用域为所在定义（函数或类型别名）。
 ```aura
-type Pair = { first: <A>, second: <B> }   // 泛型记录
-type Option = <T> | None                  // 泛型联合类型（如果将来支持）
+type Pair = { first: <A>, second: <B> }
+fun id(x: <T>) -> T { return x }
 ```
-> 注意：目前语法规范中，泛型联合类型直接在类型别名里写 `<T> | None` 尚未定义，但可以后续扩展。现阶段泛型主要用于函数和泛型记录。
+
+### 3.3 类型别名
+```aura
+type User = { id: int, name: string }
+type Pair = { first: <A>, second: <B> }
+type MaybeFloat = float | None
+```
+类型别名中类型变量必须写为 `<Name>`。
 
 ---
 
 ## 4. 变量与常量
 
-变量使用 `let` 声明（可变），常量使用 `const` 声明（不可变绑定）。  
-类型注解是可选的，编译器会根据初始化表达式推断。
-
+- `let` 声明可变变量，可省略类型。
+- `const` 声明不可变绑定（绑定不可改，但引用类型字段可改）。
 ```aura
-let x = 10                  // 推断为 int
-const pi = 3.14159          // 推断为 float
-let name: string = "Aura"   // 显式类型
-x = 20                      // 允许，let 可变
-// pi = 3.0                 // 错误！const 不可重新赋值
+let x = 10               // 推断为 int
+const pi = 3.14          // 推断为 float
+let name: string = "Aura"
+x = 20                   // 允许
+// pi = 3.0              // 错误
 ```
 
-对于引用类型（如记录），`const` 只阻止变量指向其他对象，但不冻结对象内部字段：
+对于记录：
 ```aura
 const p = Point{x=1, y=2}
-p.x = 5   // 允许，修改字段
-// p = Point{x=3, y=4}   // 错误，const 绑定不可变
+p.x = 5                  // 允许，修改字段
+// p = Point{x=3, y=4}   // 错误，绑定不可改
 ```
 
 ---
 
 ## 5. 函数
 
-函数定义要求**所有参数和返回类型必须显式标注**，无一例外。
+**所有函数参数及返回类型必须显式标注**。
 
 ### 5.1 基本函数
 ```aura
 fun add(a: int, b: int) -> int {
     return a + b
 }
-
-fun greet(name: string) -> string {
-    return "Hello, " + name
-}
 ```
 
-### 5.2 可能抛出异常的函数
-调用可能失败的操作或使用 `throw` 的函数必须标注 `throws`。
+### 5.2 异常标记 `throws`
+可能抛出异常的函数必须标注 `throws`。
 ```aura
 fun divide(a: int, b: int) throws -> float {
     if b == 0 {
-        throw { kind = "division_by_zero", message = "cannot divide by zero" }
+        throw { kind = "div_zero", message = "cannot divide by zero" }
     }
     return a / b
 }
 ```
-
-在 `throws` 函数内部，可使用 `!` 操作符显式传播异常（可选）：
+`throws` 函数内可使用 `!` 后缀显式传播异常（可选，相当于默认传播）：
 ```aura
-fun loadConfig(io: Io) throws -> string {
-    let data = io.readFile("config.txt")!   // 若失败，立即向上抛出
+fun load(io: Io) throws -> string {
+    let data = io.read_file("config.txt")!   // 失败则立即向上抛出
     return data
 }
 ```
-`!` 的效果等价于直接调用（异常自动传播），仅作为视觉标记。
 
 ### 5.3 泛型函数
-使用 `<T>` 在参数或返回类型中引入类型变量。同一函数内相同 `<T>` 表示相同类型。
+用 `<T>` 标记类型变量。
 ```aura
-fun id(x: <T>) -> T {
-    return x
-}
-
 fun max(a: <T>, b: <T>) -> T {
-    if a.compare(b) > 0 {   // 隐式要求 T 实现 compare 方法
+    if a.compare(b) > 0 {   // 隐式要求 T 有 compare 方法
         return a
     }
     return b
 }
-```
 
-调用泛型函数时，编译器自动推断类型变量：
-```aura
-let x = id(10)         // x: int
-let m = max(3, 5)      // m: int
-```
-
-### 5.4 多泛型参数
-```aura
 fun zip(a: <A>, b: <B>) -> Pair {
     return Pair(a, b)
 }
 ```
-（`Pair` 是之前定义的泛型记录）
 
 ---
 
 ## 6. 方法与接口
 
-### 6.1 方法定义
-方法使用显式接收者语法定义，接收者放在括号内，函数名后是普通参数：
+### 6.1 方法定义（显式接收者）
 ```aura
 fun (self Point) length() -> float {
     return sqrt(self.x * self.x + self.y * self.y)
 }
 ```
 
-调用：
-```aura
-let p = Point{x=3, y=4}
-let len = p.length()   // 5.0
-```
-
-### 6.2 接口定义
-接口声明了方法签名，不包含实现：
-```aura
-interface Greetable {
-    greet() -> string
-}
-```
-
-任何类型只要拥有 `greet() -> string` 方法，就自动实现 `Greetable`（结构类型）。  
-你也可以在方法定义时显式标记 `impl` 来请求编译期检查：
-```aura
-fun (self User impl Greetable) greet() -> string {
-    return "Hello, I'm " + self.name
-}
-```
-
-### 6.3 使用接口类型
-接口名可以作为类型使用，接受任何实现了该接口的值。
-```aura
-fun welcome(g: Greetable, io: Io) {
-    io.println(g.greet())
-}
-```
-
-### 6.4 方法的多态
-方法同样支持泛型：
-```aura
-fun (self Pair) swap() -> Pair {
-    return Pair(self.second, self.first)
-}
-```
-这里的 `Pair` 会根据调用者的具体类型自动实例化。
-
----
-
-## 7. 构造函数
-
-记录类型可以定义构造函数，用于自定义初始化逻辑。构造函数名与类型名相同，接收者 `self` 代表新分配的对象。
-
+### 6.2 构造函数
 ```aura
 type User = { id: int, name: string }
 
@@ -242,20 +203,34 @@ fun (self User) User(id: int, name: string) {
     self.name = name
 }
 ```
+定义构造函数后，只能用构造函数创建实例，不能使用记录字面量。
 
-定义了构造函数后，只能通过构造函数创建实例，不能再使用记录字面量：
+### 6.3 接口
 ```aura
-let u = User(1, "Alice")   // 正确
-// let v: User = { id=2, name="Bob" }   // 错误，已有构造函数
+interface Greetable {
+    greet() -> string
+}
+```
+任何类型拥有同名同签名方法即自动实现接口（结构类型）。  
+可选择用 `impl` 让编译器验证：
+```aura
+fun (self User impl Greetable) greet() -> string {
+    return "Hello, " + self.name
+}
 ```
 
-如果类型没有自定义构造函数，则可以使用记录字面量初始化。
+接口可作为类型使用：
+```aura
+fun welcome(g: Greetable, io: Io) {
+    io.println(g.greet())
+}
+```
 
 ---
 
-## 8. 控制流
+## 7. 控制流
 
-### 8.1 条件语句
+### 7.1 条件
 ```aura
 if score >= 90 {
     io.println("A")
@@ -265,59 +240,59 @@ if score >= 90 {
     io.println("C")
 }
 ```
-条件必须是 `bool` 类型。
 
-### 8.2 循环
-**while** 循环：
+### 7.2 循环
 ```aura
+// while
 let i = 0
 while i < 5 {
     io.println(i)
     i = i + 1
 }
-```
 
-**无限循环** `loop`：
-```aura
-let counter = 0
+// 无限循环
 loop {
-    if counter >= 10 {
-        break
-    }
-    counter = counter + 1
+    if done { break }
 }
-```
 
-**for-in** 遍历迭代器：
-```aura
-let numbers = [1, 2, 3]
-for n in numbers {
+// for-in
+let nums = [1, 2, 3]
+for n in nums {
     io.println(n)
 }
 ```
-迭代要求类型实现对应的迭代协议（内置列表、字符串等已支持）。
+内置列表、字符串等已实现迭代协议。
 
 ---
 
-## 9. 模式匹配
+## 8. 模式匹配
 
-`match` 表达式用于处理联合类型的值，编译器强制穷尽所有情况。
+`match` 用于联合类型，强制穷尽所有分支。
 
 语法：
 ```aura
-match expression {
+match expr {
     TypePattern => body,
     Constant    => body,
     _           => body
 }
 ```
 
-### 9.1 匹配联合类型
+### 8.1 匹配联合类型
+```aura
+fun describe(val: int | string | None) -> string {
+    match val {
+        int n    => return "integer: " + n,
+        string s => return "string: " + s,
+        None     => return "none"
+    }
+}
+```
+
+### 8.2 `T | None` 示例
 ```aura
 fun safeDivide(a: int, b: int) -> int | None {
-    if b == 0 {
-        return None
-    }
+    if b == 0 { return None }
     return a / b
 }
 
@@ -326,256 +301,219 @@ match safeDivide(10, 2) {
     None       => io.println("Division by zero")
 }
 ```
-- `int result` 是类型模式，匹配时绑定到 `result`。
-- `None` 是常量模式。
-- 通配符 `_` 匹配剩余情况，但这里已经穷尽，可以不写。
-
-### 9.2 多类型联合
-```aura
-type Value = int | string | None
-
-fun describe(v: Value) -> string {
-    match v {
-        int n    => return "integer: " + n,
-        string s => return "string: " + s,
-        None     => return "nothing"
-    }
-}
-```
 
 ---
 
-## 10. 错误处理
+## 9. 错误处理
 
-### 10.1 抛出异常
-使用 `throw` 表达式创建一个错误对象。错误对象是内置 `Error` 记录，可包含任意自定义字段。
+### 9.1 抛出异常
 ```aura
 throw { kind = "io_error", message = "file not found", path = "/tmp/x" }
 ```
+异常对象是内建 `Error` 记录，可附加自定义字段，编译器自动注入堆栈与变量快照。
 
-### 10.2 捕获异常
+### 9.2 捕获异常
 ```aura
 try {
-    let content = io.readFile("data.txt")!   // 可能抛出 IO 异常
-    io.println(content)
+    let data = io.read_file("data.txt")!
 } catch (e) {
-    io.println("Failed: " + e.message)
-    // e.kind 也可用
+    io.println("Error: " + e.message)
 }
 ```
-- 在 `try` 块内捕获异常后，当前函数不需要再声明 `throws`（除非还有其他未捕获异常）。
-
-### 10.3 传播操作符 `!`
-在 `throws` 函数内，可在调用可能失败的方法后加 `!`，语义为“如果抛出异常，立即向上传播”。这不是必需的，但有助于标记异常路径。
-```aura
-fun process(io: Io) throws {
-    let data = io.readFile("input.txt")!   // 传播异常
-    let parsed = parseData(data)!          // 若 parseData 是 throws 函数
-    io.println(parsed)
-}
-```
+捕获后当前函数无需再声明 `throws`（除非有其他未捕获异常）。
 
 ---
 
-## 11. 并发
+## 10. 并发
 
-Aura 采用**结构化并发**模型，所有函数默认可暂停（无 `async` 关键字）。使用 `sync` 块管理并发任务，`spawn` 启动轻量级任务。
+**结构化并发**，所有函数默认可暂停，无 `async` 关键字。
 
-### 11.1 基本并发
+### 10.1 基本使用
 ```aura
-fun main(io: Io) throws {
-    sync {
-        spawn { io.println("Task A") }   // 并行执行
-        spawn { io.println("Task B") }
-        // 这里也可以写同步代码
-    }
-    io.println("All tasks done")
+sync {
+    spawn { io.println("Task A") }
+    spawn { io.println("Task B") }
+    // 此处可写同步代码
 }
+// 所有 spawn 任务完成后才继续
 ```
-- `sync` 块会等待所有直接 `spawn` 的子任务完成（或抛出异常）后才离开。
-- 如果任何子任务抛出异常，`sync` 会等待其他任务结束，然后抛出一个聚合异常。
-
-### 11.2 并发任务有返回值
-（注：当前规范中未明确定义 `spawn` 的返回值用法，但可以预期通过句柄或通道获取，这里暂用输出演示）
-
-在实际开发中，你可以通过共享的数据结构（如线程安全队列）传递结果，但要注意同步。
+若子任务抛异常，`sync` 等待所有任务终止后抛出聚合异常。
 
 ---
 
-## 12. 模块与能力对象
+## 11. 模块、导入与能力对象
 
-### 12.1 模块导入
-一个 `.aura` 文件就是一个模块。使用 `import` 导入其他文件中的公开定义。
+### 11.1 模块导入
+一个 `.aura` 文件即一个模块。导入使用 `import` 语句：
 ```aura
-// 在 main.aura 中
 import "utils/helpers.aura"
-
-fun main(io: Io) throws {
-    let result = helpers.compute(5)   // 假设 helpers.aura 定义了 compute 函数
-    io.println(result)
-}
+import "math.aura" as m
 ```
 
-### 12.2 能力对象
-副作用（如 I/O）必须通过能力对象显式传递，不能直接调用全局函数。程序入口 `main` 默认接收一个 `Io` 对象。
+### 11.2 导入路径表达式（编译期）
+`import` 支持编译期路径计算，仅可使用 `const` 和 `path` 内置模块的纯函数：
+```aura
+import "path"
+const BASE = path.new("plugins")
+import path.join(BASE, "auth.aura")           // 导入 plugins/auth.aura
+import path.join(BASE, "db", "postgres.aura") as pg
+```
+模块名默认为最终文件名（去 `.aura`），可用 `as` 别名。
+
+### 11.3 能力对象 `Io`
+`main` 函数接收 `io: Io`。所有 I/O 操作必须通过 `io` 调用：
 ```aura
 fun main(io: Io) throws {
-    io.println("Enter your name:")
+    io.println("Enter name:")
     let name = io.readln()!
     io.println("Hello, " + name)
 }
 ```
-`Io` 提供的主要方法（预览）：
-- `io.println(msg: string)` – 打印一行
-- `io.readln() throws -> string` – 读取一行输入
-- `io.readFile(path: string) throws -> string` – 读取文件内容
-- `io.writeFile(path: string, content: string) throws` – 写入文件
-- `io.fileExists(path: string) -> bool` – 检查文件是否存在
 
-自定义能力对象也可以类似地定义和使用，只需将对象传入需要副作用的函数即可。这有利于测试和沙箱化。
-
-> **关于 `io: Io` 的重要说明**  
-> `Io` 是 Aura 运行时内置的**能力类型**，并不是通过 `import` 导入的库。  
-> `main(io: Io)` 接收的 `io` 是一个**运行时能力令牌**：它封装了所有 I/O 副作用原语（如读写文件、输出到终端、路径操作等），并且必须在需要副作用的函数间显式传递。  
-> 这意味着：任何执行 I/O 操作的函数，其签名中都会出现 `io: Io`，从而让副作用始终可见、可控、可模拟。
-
-
-### 12.3 Io 与路径操作（预览）
-
-未来 `Io` 对象将集成类似 Python `pathlib` 的路径抽象，提供跨平台的文件系统路径操作方法，例如：
-
-```aura
-// 计划中的 API 预览
-let p = io.Path("data/config.toml")      // 创建路径对象
-let parent = p.parent()                  // 获取父路径
-let full = io.cwd().join(p)             // 当前目录与相对路径拼接
-```
-
-这些路径对象同样可通过 `io` 传递，使得文件操作更加安全和一致。
-
-### 12.4 动态导入与路径（预览）
-
-`import` 语句未来可接受 `io` 提供的路径变量，从而支持模块的动态发现与加载：
-
-```aura
-// 计划中的语法（当前未实现）
-let modPath = io.Path("plugins/my_plugin.aura")
-import modPath   // 基于 io 的路径导入模块
-modPath.myFunction()
-```
-
-这将方便插件化架构和用户自定义库路径，同时保持能力对象控制副作用的原则。
-
-以上仅作为功能路标，具体实现将在后续版本中确定。
+### 11.4 `path` 内置模块
+`path` 提供纯函数路径操作，无副作用。通过 `import "path"` 使用。
 
 ---
 
-## 13. 完整示例
+## 12. `Io` 能力对象 API
 
-下面是一个利用多种特性的示例程序：
+以下方法均需通过 `io` 实例调用，且可能抛出异常（标记 `throws`）。
+
+| 方法签名 | 说明 |
+|----------|------|
+| `io.println(value: string)` | 输出一行文本（自动换行） |
+| `io.readln() throws -> string` | 读取一行标准输入 |
+| `io.read_file(path: Path) throws -> string` | 读取文件内容 |
+| `io.write_file(path: Path, content: string) throws` | 写入文件（覆盖） |
+| `io.file_exists(path: Path) -> bool` | 检查文件或目录是否存在 |
+| `io.mkdir(path: Path) throws` | 创建目录 |
+| `io.remove(path: Path) throws` | 删除文件或空目录 |
+| `io.list_dir(path: Path) throws -> [Path]` | 列出目录内容 |
+| `io.cwd() -> Path` | 获取当前工作目录 |
+
+> `Path` 类型来自 `path` 模块。
+
+---
+
+## 13. `path` 内置模块 API
+
+通过 `import "path"` 导入，以下为模块顶层函数及 `Path` 类型的方法。
+
+### 13.1 创建与拼接
+| 函数 | 说明 |
+|------|------|
+| `path.new(s: string) -> Path` | 从字符串创建路径 |
+| `path.join(parts: Path, ...) -> Path` | 拼接多个路径（可接受 Path 与 string） |
+| `path.cwd() -> Path`（注：需能力？这里实现为纯函数可能有争议，暂不列入；建议用 io.cwd 获取运行时工作目录） | — |
+
+### 13.2 `Path` 方法
+| 方法签名 | 说明 |
+|----------|------|
+| `p.parent() -> Path` | 返回父目录路径 |
+| `p.file_name() -> string` | 返回文件名（含扩展名） |
+| `p.extension() -> string` | 返回扩展名（含 `.`），无则返回 `""` |
+| `p.is_absolute() -> bool` | 是否为绝对路径 |
+| `p.to_string() -> string` | 转为字符串表示 |
+
+`Path` 是内建结构类型，字段不公开，只能通过上述方法访问。
+
+示例：
+```aura
+import "path"
+let p = path.join(path.new("/home/aura"), "docs", "readme.md")
+let name = p.file_name()      // "readme.md"
+let parent = p.parent()       // Path("/home/aura/docs")
+```
+
+---
+
+## 14. 完整示例
 
 ```aura
-// 定义能力对象接口（示例，非必须）
-// Io 已内建，用户无需定义，此处仅示意其概念
+import "path"
 
-// 定义记录类型
 type User = { id: int, name: string }
 
-// 定义一个接口
 interface Stringer {
     to_string() -> string
 }
 
-// 构造函数
 fun (self User) User(id: int, name: string) {
     self.id = id
     self.name = name
 }
 
-// 为 User 实现 Stringer 接口
 fun (self User impl Stringer) to_string() -> string {
     return "User(" + self.id + ", " + self.name + ")"
 }
 
-// 泛型记录
 type Pair = { first: <A>, second: <B> }
 
-// 泛型函数：交换 Pair 的字段
 fun zip(a: <A>, b: <B>) -> Pair {
     return Pair(a, b)
 }
 
-// 可能抛出异常的函数：解析 JSON 并返回 User
 fun parseUser(json: string) throws -> User {
-    // 模拟解析逻辑
+    // 假设 parseJson 为底层解析函数
     if json == "" {
         throw { kind = "parse_error", message = "empty json" }
     }
-    // 假设存在底层解析函数
     let obj = parseJson(json)!
     return User(obj.id, obj.name)
 }
 
-// 从文件加载用户
 fun loadUser(id: int, io: Io) throws -> User {
-    let filename = "user_" + id + ".json"
-    let data = io.readFile(filename)!
+    let filename = path.join(path.new("users"), id + ".json")
+    let data = io.read_file(filename)!
     return parseUser(data)!
 }
 
-// 安全获取用户（返回联合类型）
-fun getUserSafe(id: int, io: Io) throws -> User | None {
-    if io.fileExists("user_" + id + ".json") {
-        return loadUser(id, io)!
-    }
-    return None
-}
-
-// 主函数
 fun main(io: Io) throws {
-    // 使用泛型函数创建 Pair
-    let p = zip(42, "hello")
-    io.println("Pair: (" + p.first + ", " + p.second + ")")
+    // 路径演示
+    let p = path.join(path.new("config"), "app.toml")
+    io.println("Config path: " + p.to_string())
 
-    // 检查用户是否存在并打印
+    // 泛型示例
+    let pair = zip(42, "hello")
+    io.println("Pair: (" + pair.first + ", " + pair.second + ")")
+
+    // 并发加载用户
     let ids = [1, 2, 3]
     sync {
         for id in ids {
             spawn {
-                match getUserSafe(id, io) {
-                    User u => io.println(u.to_string()),
-                    None   => io.println("User " + id + " not found")
+                try {
+                    let user = loadUser(id, io)!
+                    io.println(user.to_string())
+                } catch (e) {
+                    io.println("Failed to load user " + id + ": " + e.message)
                 }
             }
         }
     }
 
-    // 异常处理示例
-    try {
-        let test = loadUser(999, io)!
-        io.println(test.to_string())
-    } catch (e) {
-        io.println("Failed to load user: " + e.message)
-    }
-
-    io.println("All tasks completed")
+    io.println("Done.")
 }
 ```
 
 ---
 
-## 14. 速查表
+## 15. 速查表
 
 | 特性 | 规则 |
 |------|------|
 | 变量 | `let` 可变，`const` 不可变绑定 |
 | 函数 | 所有参数和返回类型必须显式标注 |
-| 异常 | 可能抛出异常的函数必须标注 `throws` |
-| 传播符 `!` | 可选，在 `throws` 函数内显式标记传播点 |
-| 联合类型 | `T1 \| T2`；使用 `match` 穷尽匹配 |
-| 方法 | `fun (recv Type) name(...)` |
+| 异常 | `throws` 标记可能抛出异常的函数 |
+| 传播符 `!` | 可选，显式传播异常（仅视觉标记） |
+| 联合类型 | `T1 \| T2`；`match` 穷尽匹配 |
+| 方法 | `fun (self Type) name(...)` |
 | 接口 | 结构类型，自动实现；可用 `impl` 做编译检查 |
-| 泛型 | 使用 `<T>` 标记类型变量；函数和类型别名中均需显式写出 |
+| 泛型 | 类型位置用 `<T>` 标记类型变量，记录泛型同样需加 `<>` |
 | 构造函数 | `fun (self T) T(...)` 可选；无则可用记录字面量 |
-| 并发 | `sync` 块管理结构化并发，`spawn` 启动任务 |
-| 能力 | I/O 等副作用通过能力对象传递 |
+| 并发 | `sync` 结构化并发，`spawn` 启动任务 |
+| 能力对象 | I/O 副作用通过 `io: Io` 显式传递 |
+| `path` 模块 | 纯路径操作，`import "path"` |
+| 导入路径表达式 | `import path.join(...)` 编译期求值 |
+
+此手册涵盖了 Aura v0.4 的所有核心特性与标准 API，可作为开发与编译器实现的参考基线。

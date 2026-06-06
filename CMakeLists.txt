@@ -27,6 +27,18 @@ set(AURA_SOURCES
     src/Parser/StmtParser.cpp
     src/Parser/ExprParser.cpp
     src/Parser/TypeParser.cpp
+    src/Sema/SemType.cpp
+    src/Sema/SymbolTable.cpp
+    src/Sema/SemAnalyzer.cpp
+    src/Sema/Checker/DeclChecker.cpp
+    src/Sema/Checker/StmtChecker.cpp
+    src/Sema/Checker/ExprInfer.cpp
+    src/CodeGen/CodeGen.cpp
+    src/CodeGen/TypeMap.cpp
+    src/CodeGen/DeclGen.cpp
+    src/CodeGen/StmtGen.cpp
+    src/CodeGen/ExprGen.cpp
+    src/CodeGen/CoroDecide.cpp
 )
 
 set(AURA_HEADERS
@@ -39,6 +51,11 @@ set(AURA_HEADERS
     src/AST/Expr.h
     src/AST/Stmt.h
     src/AST/Type.h
+    src/Sema/SemType.h
+    src/Sema/Symbol.h
+    src/Sema/SymbolTable.h
+    src/Sema/SemAnalyzer.h
+    src/CodeGen/CodeGen.h
 )
 
 add_executable(Aura ${AURA_SOURCES} ${AURA_HEADERS})

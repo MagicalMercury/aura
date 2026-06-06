@@ -16,46 +16,74 @@ namespace Aura {
 struct IntLiteral : ASTNode {
     int64_t value = 0;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<IntLiteral>();
+        n->value = value; n->line = line; n->col = col;
+        return n;
+    }
 };
 
 struct FloatLiteral : ASTNode {
     double value = 0.0;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<FloatLiteral>();
+        n->value = value; n->line = line; n->col = col;
+        return n;
+    }
 };
 
 struct StringLiteral : ASTNode {
     std::string value;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<StringLiteral>();
+        n->value = value; n->line = line; n->col = col;
+        return n;
+    }
 };
 
 struct BoolLiteral : ASTNode {
     bool value = false;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<BoolLiteral>();
+        n->value = value; n->line = line; n->col = col;
+        return n;
+    }
 };
 
 struct NoneLiteral : ASTNode {
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<NoneLiteral>();
+        n->line = line; n->col = col;
+        return n;
+    }
 };
 
 struct Identifier : ASTNode {
     std::string name;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<Identifier>();
+        n->name = name; n->line = line; n->col = col;
+        return n;
+    }
 };
 
-// 列表字面量 [expr, ...]
 struct ListExpr : ASTNode {
     std::vector<std::unique_ptr<ASTNode>> elements;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ListExpr>();
+        for (auto& e : elements)
+            n->elements.push_back(e ? e->clone() : nullptr);
+        n->line = line; n->col = col;
+        return n;
+    }
 };
 
-// 记录字面量字段
 struct RecordField {
     std::string name;
     std::unique_ptr<ASTNode> value;
@@ -64,72 +92,123 @@ struct RecordField {
 struct RecordExpr : ASTNode {
     std::vector<RecordField> fields;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<RecordExpr>();
+        for (auto& f : fields) {
+            RecordField rf;
+            rf.name = f.name;
+            rf.value = f.value ? f.value->clone() : nullptr;
+            n->fields.push_back(std::move(rf));
+        }
+        n->line = line; n->col = col;
+        return n;
+    }
 };
 
-// 二元表达式
 struct BinaryExpr : ASTNode {
     std::string op;
     std::unique_ptr<ASTNode> left;
     std::unique_ptr<ASTNode> right;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<BinaryExpr>();
+        n->op = op;
+        n->left  = left  ? left->clone()  : nullptr;
+        n->right = right ? right->clone() : nullptr;
+        n->line = line; n->col = col;
+        return n;
+    }
 };
 
-// 一元表达式（- / not）
 struct UnaryExpr : ASTNode {
     std::string op;
     std::unique_ptr<ASTNode> operand;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<UnaryExpr>();
+        n->op = op;
+        n->operand = operand ? operand->clone() : nullptr;
+        n->line = line; n->col = col;
+        return n;
+    }
 };
 
-// 函数调用 callee(args)
 struct CallExpr : ASTNode {
     std::unique_ptr<ASTNode> callee;
     std::vector<std::unique_ptr<ASTNode>> args;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<CallExpr>();
+        n->callee = callee ? callee->clone() : nullptr;
+        for (auto& a : args) n->args.push_back(a ? a->clone() : nullptr);
+        n->line = line; n->col = col;
+        return n;
+    }
 };
 
-// 方法调用 obj.method(args)
 struct MethodCallExpr : ASTNode {
     std::unique_ptr<ASTNode> object;
     std::string method;
     std::vector<std::unique_ptr<ASTNode>> args;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<MethodCallExpr>();
+        n->object = object ? object->clone() : nullptr;
+        n->method = method;
+        for (auto& a : args) n->args.push_back(a ? a->clone() : nullptr);
+        n->line = line; n->col = col;
+        return n;
+    }
 };
 
-// 成员访问 obj.field
 struct MemberAccessExpr : ASTNode {
     std::unique_ptr<ASTNode> object;
     std::string member;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<MemberAccessExpr>();
+        n->object = object ? object->clone() : nullptr;
+        n->member = member;
+        n->line = line; n->col = col;
+        return n;
+    }
 };
 
-// 赋值 target = value
 struct AssignExpr : ASTNode {
     std::unique_ptr<ASTNode> target;
     std::unique_ptr<ASTNode> value;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<AssignExpr>();
+        n->target = target ? target->clone() : nullptr;
+        n->value  = value  ? value->clone()  : nullptr;
+        n->line = line; n->col = col;
+        return n;
+    }
 };
 
-// 错误传播 expr!
 struct ErrorPropagationExpr : ASTNode {
     std::unique_ptr<ASTNode> expr;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ErrorPropagationExpr>();
+        n->expr = expr ? expr->clone() : nullptr;
+        n->line = line; n->col = col;
+        return n;
+    }
 };
 
-// 管道 expr |> expr
 struct PipeExpr : ASTNode {
     std::unique_ptr<ASTNode> left;
     std::unique_ptr<ASTNode> right;
     void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<PipeExpr>();
+        n->left  = left  ? left->clone()  : nullptr;
+        n->right = right ? right->clone() : nullptr;
+        n->line = line; n->col = col;
+        return n;
+    }
 };
 
 } // namespace Aura

@@ -39,6 +39,7 @@ private:
     Token scanString();
 
     Token makeToken(TokType type);
+    Token makeToken(TokType type, const std::string& lexeme);
     Token makeError(const std::string& msg);
 
     SourcePos currentPos() const { return curPos_; }

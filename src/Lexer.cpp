@@ -53,47 +53,47 @@ Token Lexer::scanOne() {
         return scanString();
     }
 
-    // 运算符与分隔符
+    // 运算符与分隔符 — lexeme 始终包含实际字符
     switch (c) {
-    case '+': return makeToken(TokType::Plus);
-    case '*': return makeToken(TokType::Star);
-    case '%': return makeToken(TokType::Percent);
-    case '(': return makeToken(TokType::LParen);
-    case ')': return makeToken(TokType::RParen);
-    case '{': return makeToken(TokType::LBrace);
-    case '}': return makeToken(TokType::RBrace);
-    case '[': return makeToken(TokType::LBracket);
-    case ']': return makeToken(TokType::RBracket);
-    case ',': return makeToken(TokType::Comma);
-    case ';': return makeToken(TokType::Semicolon);
+    case '+': return makeToken(TokType::Plus,    "+");
+    case '*': return makeToken(TokType::Star,    "*");
+    case '%': return makeToken(TokType::Percent, "%");
+    case '(': return makeToken(TokType::LParen,  "(");
+    case ')': return makeToken(TokType::RParen,  ")");
+    case '{': return makeToken(TokType::LBrace,  "{");
+    case '}': return makeToken(TokType::RBrace,  "}");
+    case '[': return makeToken(TokType::LBracket,"[");
+    case ']': return makeToken(TokType::RBracket,"]");
+    case ',': return makeToken(TokType::Comma,   ",");
+    case ';': return makeToken(TokType::Semicolon, ";");
 
     case '=':
-        if (peek() == '=') { advance(); return makeToken(TokType::EqEq); }
-        if (peek() == '>') { advance(); return makeToken(TokType::FatArrow); }
-        return makeToken(TokType::Assign);
+        if (peek() == '=') { advance(); return makeToken(TokType::EqEq,     "=="); }
+        if (peek() == '>') { advance(); return makeToken(TokType::FatArrow, "=>"); }
+        return makeToken(TokType::Assign, "=");
 
     case '!':
-        if (peek() == '=') { advance(); return makeToken(TokType::NotEq); }
-        return makeToken(TokType::Bang);
+        if (peek() == '=') { advance(); return makeToken(TokType::NotEq, "!="); }
+        return makeToken(TokType::Bang, "!");
 
     case '<':
-        if (peek() == '=') { advance(); return makeToken(TokType::LessEq); }
-        return makeToken(TokType::Less);
+        if (peek() == '=') { advance(); return makeToken(TokType::LessEq, "<="); }
+        return makeToken(TokType::Less, "<");
 
     case '>':
-        if (peek() == '=') { advance(); return makeToken(TokType::GreaterEq); }
-        return makeToken(TokType::Greater);
+        if (peek() == '=') { advance(); return makeToken(TokType::GreaterEq, ">="); }
+        return makeToken(TokType::Greater, ">");
 
     case '|':
-        if (peek() == '>') { advance(); return makeToken(TokType::Pipe); }
-        return makeToken(TokType::Bar);
+        if (peek() == '>') { advance(); return makeToken(TokType::Pipe, "|>"); }
+        return makeToken(TokType::Bar, "|");
 
     case '-':
-        if (peek() == '>') { advance(); return makeToken(TokType::Arrow); }
-        return makeToken(TokType::Minus);
+        if (peek() == '>') { advance(); return makeToken(TokType::Arrow, "->"); }
+        return makeToken(TokType::Minus, "-");
 
     case '/':
-        return makeToken(TokType::Slash);
+        return makeToken(TokType::Slash, "/");
 
     case '.':
         if (std::isdigit(static_cast<unsigned char>(peek()))) {
@@ -101,13 +101,13 @@ Token Lexer::scanOne() {
             --curPos_.col;
             return scanNumber();
         }
-        return makeToken(TokType::Dot);
+        return makeToken(TokType::Dot, ".");
 
     case ':':
-        return makeToken(TokType::Colon);
+        return makeToken(TokType::Colon, ":");
 
     default:
-        return makeError(std::string("unexpected character '") + c + "'");
+        return makeError(std::string("unexpected character '") + std::string(1, c) + "'");
     }
 }
 
@@ -282,6 +282,10 @@ bool Lexer::atEnd() const {
 
 Token Lexer::makeToken(TokType type) {
     return Token{type, "", 0, 0};
+}
+
+Token Lexer::makeToken(TokType type, const std::string& lexeme) {
+    return Token{type, lexeme, 0, 0};
 }
 
 Token Lexer::makeError(const std::string& msg) {
