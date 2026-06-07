@@ -17,6 +17,7 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -O2 -g -DN
 add_library(aura_rt STATIC
     types.cpp
     gc.cpp
+    task.cpp
     builtin/io.cpp
 )
 

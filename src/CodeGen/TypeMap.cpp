@@ -30,15 +30,28 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
     if (auto* n = dynamic_cast<const NamedType*>(&type)) {
         std::string base = mapNamedType(n->name);
         if (!n->typeArgs.empty()) {
-            // 如果 base 是 "User*"，去掉 * 后加 typeArgs，再加 *
-            if (base.size() > 1 && base.back() == '*') {
-                base.pop_back();
-                base += "<";
-                for (size_t i = 0; i < n->typeArgs.size(); ++i) {
-                    if (i > 0) base += ", ";
-                    base += n->typeArgs[i] ? mapType(*n->typeArgs[i]) : "???";
-                }
-                base += ">*";
+            bool hadStar = base.size() > 1 && base.back() == '*';
+            if (hadStar) base.pop_back();
+            base += "<";
+            for (size_t i = 0; i < n->typeArgs.size(); ++i) {
+                if (i > 0) base += ", ";
+                base += n->typeArgs[i] ? mapType(*n->typeArgs[i]) : "???";
+            }
+            base += ">";
+            if (hadStar) base += "*";
+        }
+        // 命名空间前缀：math.Pair → math::Pair
+        if (!n->namespacePrefix.empty()) {
+            std::string prefix;
+            for (auto& ns : n->namespacePrefix)
+                prefix += ns + "::";
+            // 跨模块类型都是堆指针，若 base 不是以 * 结尾则追加
+            if (!base.empty() && base.back() != '*')
+                base += "*";
+            if (base.find("aura_rt::") == 0) {
+                base.insert(std::string("aura_rt::").size(), prefix);
+            } else {
+                base = prefix + base;
             }
         }
         return base;

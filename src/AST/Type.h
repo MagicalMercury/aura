@@ -12,12 +12,14 @@ namespace Aura {
 struct TypeExpr : ASTNode { };
 
 struct NamedType : TypeExpr {
-    std::string name;
-    std::vector<std::unique_ptr<TypeExpr>> typeArgs; // 泛型实例化参数，如 Stack<T>
+    std::string name;                                      // 最终类型名（如 "Pair"）
+    std::vector<std::string> namespacePrefix;              // 命名空间前缀（如 ["math"] → math::Pair）
+    std::vector<std::unique_ptr<TypeExpr>> typeArgs;       // 泛型实例化参数，如 Stack<T>
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<NamedType>();
         n->name = name;
+        n->namespacePrefix = namespacePrefix;
         for (auto& a : typeArgs)
             n->typeArgs.emplace_back(a ? std::unique_ptr<TypeExpr>(static_cast<TypeExpr*>(a->clone().release())) : nullptr);
         n->line = line; n->col = col;

@@ -37,10 +37,22 @@ struct PendingMethod {
 // ============================================================
 struct CompileUnit {
     std::string moduleName;    // 文件名（去 .aura）
+    std::string nsName;        // C++ 命名空间（如 aura_mod_math_utils，空 = 无命名空间包裹）
     std::string header;        // 头文件内容（类型定义、接口类、函数声明）
     std::string impl;          // 实现文件内容（函数体、_desc 实例）
     std::string footer;        // 主入口 int main(...)
     bool        hasMain = false;
+};
+
+// ============================================================
+// ImportInfo — 一条 import 信息（供 CodeGen 生成 #include + 别名）
+// ============================================================
+struct CodeGenImport {
+    std::string path;       // 导入路径（用于 #include 解析）
+    std::string alias;      // as 别名（空 = 无别名）
+    std::string modName;    // 模块名（用作命名空间别名键，如 "math_utils"）
+    bool        isBuiltin;  // 内置模块
+    std::string nsName;     // 目标命名空间
 };
 
 // ============================================================
@@ -75,9 +87,13 @@ public:
     CodeGenerator();
 
     // -- 主入口 --
-    // 生成一个或多个编译单元（.aura → .cpp/.h）
+    // 生成一个编译单元（.aura → .cpp/.h）
+    // imports: 该模块的 import 列表（用于生成 #include 和命名空间别名）
+    // nsName:  该模块自己的 C++ 命名空间（空 = 不包裹命名空间）
     [[nodiscard]] CompileUnit generate(const Program& program,
-                                        const std::string& moduleName = "main");
+                                        const std::string& moduleName = "main",
+                                        const std::vector<CodeGenImport>& imports = {},
+                                        const std::string& nsName = "");
 
     // -- 协程判定入口 --
     [[nodiscard]] CoroDecision decideCoro(const FunDecl& decl);
@@ -175,7 +191,7 @@ private:
     void genFunctionEpilogue(std::ostream& cpp, const FunDecl& decl);
 
     // --- 主入口 (§5) ---
-    void genMainEntry(std::ostream& cpp, const FunDecl& mainDecl);
+    void genMainEntry(std::ostream& cpp, const FunDecl& mainDecl, const std::string& nsName = "");
 
     // ============================================================
     // 语句输出
@@ -297,6 +313,13 @@ private:
 
     // 字符串类型变量名集合（用于 genBinaryExpr 检测 string + T 拼接）
     std::set<std::string> stringVarNames_;
+
+    // 导入的命名空间名集合（路径名 + 别名，用于 genMethodCall 判断是否用 ::）
+    std::set<std::string> importNsNames_;
+
+    // let/const 声明中类型标注的显式模板参数（如 math.Pair<float, bool> → {"float", "bool"}）
+    // genLetStmt 设置，genMethodCall 的 ns-ctor 路径消费后清空
+    std::vector<std::string> expectedTemplateArgs_;
 
     // 错误列表
     std::vector<std::string> errors_;

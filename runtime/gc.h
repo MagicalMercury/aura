@@ -224,7 +224,7 @@ GcRootHandle<T>::~GcRootHandle() {
 } // namespace aura_rt
 
 // ============================================================
-// Array<T> 方法实现（必须在 gc_alloc / GcHeap 完整定义之后）
+// Array<T> 模板方法实现（必须放头文件 — 用户会实例化各种 T）
 // ============================================================
 namespace aura_rt {
 
@@ -251,38 +251,20 @@ void Array<T>::push(const T& value) {
 }
 
 // ============================================================
-// 字符串工具实现（需要 gc_alloc / GcHeap 完整定义）
+// 字符串工具声明（实现在 types.cpp，链接 libaura_rt.a）
 // ============================================================
-inline GcString* make_string(const char* s)   { return GcString::make(s); }
-inline GcString* make_string(const std::string& s) { return GcString::make(s); }
-
-inline GcString* string_concat(GcString* a, GcString* b) {
-    if (!a || !b) return a ? a : b;
-    int32_t total = a->length + b->length;
-    auto* result = gc_alloc<GcString>(&GcString::_desc);
-    result->length = total;
-    result->data   = static_cast<char*>(GcHeap::instance().allocRaw(total + 1));
-    std::memcpy(result->data, a->data, a->length);
-    std::memcpy(result->data + a->length, b->data, b->length);
-    result->data[total] = '\0';
-    return result;
-}
-
-inline GcString* int_to_string(int32_t val) {
-    char buf[32];
-    int len = snprintf(buf, sizeof(buf), "%d", val);
-    return GcString::make(buf, static_cast<size_t>(len));
-}
-inline GcString* float_to_string(double val) {
-    char buf[64];
-    int len = snprintf(buf, sizeof(buf), "%.6g", val);
-    return GcString::make(buf, static_cast<size_t>(len));
-}
-
-inline GcString* concat(GcString* a, GcString* b)  { return string_concat(a, b); }
-inline GcString* concat(GcString* a, int32_t b)    { return string_concat(a, int_to_string(b)); }
-inline GcString* concat(int32_t a,    GcString* b) { return string_concat(int_to_string(a), b); }
-inline GcString* concat(GcString* a, double b)     { return string_concat(a, float_to_string(b)); }
-inline GcString* concat(double a,     GcString* b) { return string_concat(float_to_string(a), b); }
+GcString* make_string(const char* s);
+GcString* make_string(const std::string& s);
+GcString* string_concat(GcString* a, GcString* b);
+GcString* int_to_string(int32_t val);
+GcString* float_to_string(double val);
+GcString* concat(GcString* a, GcString* b);
+GcString* concat(GcString* a, int32_t b);
+GcString* concat(int32_t a,    GcString* b);
+GcString* concat(GcString* a, double b);
+GcString* concat(double a,     GcString* b);
+GcString* bool_to_string(bool val);
+GcString* concat(GcString* a, bool b);
+GcString* concat(bool a,        GcString* b);
 
 } // namespace aura_rt

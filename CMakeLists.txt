@@ -44,6 +44,7 @@ set(AURA_SOURCES
     src/CodeGen/StmtGen.cpp
     src/CodeGen/ExprGen.cpp
     src/CodeGen/CoroDecide.cpp
+    src/Module/ModuleManager.cpp
 )
 
 set(AURA_HEADERS
@@ -61,6 +62,7 @@ set(AURA_HEADERS
     src/Sema/SymbolTable.h
     src/Sema/SemAnalyzer.h
     src/CodeGen/CodeGen.h
+    src/Module/ModuleManager.h
 )
 
 add_executable(aurac ${AURA_SOURCES} ${AURA_HEADERS})

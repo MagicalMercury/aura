@@ -362,11 +362,15 @@ struct InterfaceDecl : Decl {
 };
 
 struct ImportDecl : Decl {
-    std::string path;
+    std::string path;       // 导入路径（用户模块用文件路径，内置模块用标识符名）
+    std::string alias;      // import ... as 别名（空 = 无别名）
+    bool        isBuiltin = false; // true = 内置模块/外部包（无引号），false = 用户模块
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<ImportDecl>();
         n->path = path;
+        n->alias = alias;
+        n->isBuiltin = isBuiltin;
         n->line = line; n->col = col;
         return n;
     }

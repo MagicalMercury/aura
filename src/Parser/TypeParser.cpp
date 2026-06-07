@@ -71,12 +71,20 @@ std::unique_ptr<TypeExpr> Parser::parsePrimaryType() {
 
     // 命名类型，可能是函数类型: Type -> RetType throws?
     // 也可能是泛型实例化: Name<T> 或 Name<A, B>
+    // 也可能是命名空间限定: ns.Name<T>
     // None 也是合法的类型名
     if (check(TokType::Identifier) || check(TokType::None)) {
         auto& tok = advance();
         auto n = std::make_unique<NamedType>();
         setNodePos(n.get(), tok);
         n->name = tok.lexeme;
+
+        // 解析命名空间前缀: a.b.c.Name → prefix = [a, b, c], name = Name
+        while (match(TokType::Dot)) {
+            auto& nextTok = consume(TokType::Identifier, "expected identifier after '.' in type name");
+            n->namespacePrefix.push_back(n->name);
+            n->name = nextTok.lexeme;
+        }
 
         // 泛型实例化参数: Name<T> 或 Name<A, B>
         if (match(TokType::Less)) {

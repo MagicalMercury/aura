@@ -18,35 +18,45 @@
 
 #include <filesystem>
 #include <string>
-#include <string_view>
-#include <vector>
+
+#include "../types.h"
 
 namespace aura_rt {
 
 // ============================================================
-// Path — 跨平台路径类型
+// Path — 跨平台路径类型（值类型，非 GC）
+// 所有返回字符串的方法返回 GcString*，与 Aura 类型系统一致
 // ============================================================
 class Path {
 public:
     Path() = default;
     explicit Path(std::filesystem::path p) : path_(std::move(p)) {}
 
-    // --- 方法（README §13.2）---
+    // --- 方法 ---
 
     // parent() → Path — 返回父目录路径
     Path parent() const { return Path(path_.parent_path()); }
 
     // file_name() → string — 返回文件名（含扩展名）
-    std::string file_name() const { return path_.filename().string(); }
+    GcString* file_name() const {
+        auto s = path_.filename().string();
+        return GcString::make(s.data(), s.size());
+    }
 
     // extension() → string — 返回扩展名（含 .），无则 ""
-    std::string extension() const { return path_.extension().string(); }
+    GcString* extension() const {
+        auto s = path_.extension().string();
+        return GcString::make(s.data(), s.size());
+    }
 
     // is_absolute() → bool — 是否为绝对路径
     bool is_absolute() const { return path_.is_absolute(); }
 
     // to_string() → string — 转为字符串表示
-    std::string to_string() const { return path_.string(); }
+    GcString* to_string() const {
+        auto s = path_.string();
+        return GcString::make(s.data(), s.size());
+    }
 
     // --- 运算符 ---
     bool operator==(const Path& other) const { return path_ == other.path_; }
@@ -58,6 +68,9 @@ public:
     // join 操作符（Path / Path 拼接）
     Path operator/(const Path& other) const { return Path(path_ / other.path_); }
     Path operator/(const std::string& segment) const { return Path(path_ / segment); }
+
+    // GcString* 适配声明（实现在类外）
+    Path operator/(GcString* gcs) const;
 
 private:
     std::filesystem::path path_;
@@ -90,6 +103,30 @@ Path join(const Path& first, const std::string& second, Rest&&... rest) {
     return join(first / second, std::forward<Rest>(rest)...);
 }
 
+// ============================================================
+// GcString* 适配 — 让 Aura 生成的代码直接传 GcString* 给 path 函数
+// ============================================================
+
+// new(gcs: GcString*) → Path
+inline Path new_(GcString* gcs) {
+    if (gcs && gcs->data) return Path(std::filesystem::path(std::string(gcs->data, gcs->length)));
+    return Path();
+}
+
+// join overloads with GcString*
+inline Path join(const Path& first, GcString* second) {
+    return first / Path(std::filesystem::path(std::string(second ? second->data : "", second ? second->length : 0)));
+}
+
+template <typename... Rest>
+Path join(const Path& first, GcString* second, Rest&&... rest) {
+    auto p = Path(std::filesystem::path(std::string(second ? second->data : "", second ? second->length : 0)));
+    return join(first / p, std::forward<Rest>(rest)...);
+}
+
 } // namespace path
+
+// Path::operator/ 也支持 GcString*
+inline Path Path::operator/(GcString* gcs) const { return Path(path_ / std::string(gcs ? gcs->data : "", static_cast<size_t>(gcs ? gcs->length : 0))); }
 
 } // namespace aura_rt

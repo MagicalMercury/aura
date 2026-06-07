@@ -1,4 +1,5 @@
 #include "CodeGen.h"
+#include <cctype>
 #include <sstream>
 
 namespace Aura {
@@ -225,9 +226,11 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
 
     std::string calleeExpr = isCtor ? (calleeName + "_ctor") : genExpr(*e.callee, isCoroutine);
 
-    // 泛型构造函数：传递当前函数的模板参数（如 fillAndPrint<E> 中 Stack() → Stack_ctor<E>()）
+    // 泛型构造函数模板参数：
+    // 零参构造函数（如 Stack()）需要 currentTParams_ 推断类型
+    // 有参构造函数让 CTAD 从参数推导（如 Pair(p.second, p.first) → Pair_ctor(B, A)）
     std::string targs;
-    if (isCtor && !currentTParams_.empty()) {
+    if (isCtor && e.args.empty() && !currentTParams_.empty()) {
         targs = "<";
         for (size_t i = 0; i < currentTParams_.size(); ++i) {
             if (i > 0) targs += ", ";
@@ -277,16 +280,47 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
     bool needAwait = isIoCall && isCoroutine;
     std::string prefix = needAwait ? "co_await " : "";
 
-    // 判断对象是值类型（用 . ）还是指针类型（用 -> ）
-    bool isPointer = true;
+    // 判断是命名空间限定下的构造调用：math.Pair(...) → math::Pair_ctor(...)
+    // 检查条件：对象是导入的命名空间 + (方法名是本地注册的堆类型 或 以大写开头(跨模块类型))
+    bool isNsCtor = false;
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
-        if (valueTypeVarNames_.count(id->name)) {
-            isPointer = false;
+        if (importNsNames_.count(id->name)) {
+            if (registeredTypes_.count(e.method) && registeredTypes_[e.method]) {
+                isNsCtor = true;
+            } else if (!e.method.empty() && std::isupper(static_cast<unsigned char>(e.method[0]))) {
+                // 跨模块类型：导入命名空间下的 PascalCase 调用视为构造函数
+                isNsCtor = true;
+            }
         }
     }
 
-    std::string access = isPointer ? "->" : ".";
-    oss << prefix << obj << access << safeName(e.method) << "(";
+    if (isNsCtor) {
+        oss << prefix << obj << "::" << safeName(e.method) << "_ctor";
+        if (!expectedTemplateArgs_.empty()) {
+            oss << "<";
+            for (size_t i = 0; i < expectedTemplateArgs_.size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << expectedTemplateArgs_[i];
+            }
+            oss << ">";
+        }
+        oss << "(";
+    } else {
+        // 判断对象是值类型（用 . ）还是指针类型（用 -> ）还是命名空间（用 ::）
+        std::string access;
+        if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+            if (importNsNames_.count(id->name)) {
+                access = "::";
+            } else if (valueTypeVarNames_.count(id->name)) {
+                access = ".";
+            } else {
+                access = "->";
+            }
+        } else {
+            access = "->";
+        }
+        oss << prefix << obj << access << safeName(e.method) << "(";
+    }
     for (size_t i = 0; i < e.args.size(); ++i) {
         if (i > 0) oss << ", ";
         oss << genExpr(*e.args[i], isCoroutine);

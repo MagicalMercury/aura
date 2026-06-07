@@ -69,7 +69,8 @@ void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
     h << "\n  static const aura_rt::TypeDescriptor _desc;\n";
     h << "};\n\n";
 
-    genTypeDescriptor(cpp, name, tparams, ptrFields);
+    // 模板类型的 _desc 必须在头文件中实例化（跨模块链接需要）
+    genTypeDescriptor(tparams.empty() ? cpp : h, name, tparams, ptrFields);
 }
 
 // ============================================================
@@ -123,9 +124,14 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
         }
     }
 
-    cpp << tprefix << sig << " {\n";
-    if (decl.body) genBlock(cpp, *decl.body, isCoro);
-    cpp << "}\n\n";
+    // 模板函数：体放入头文件（跨模块可见）
+    std::ostream& out = tparams.empty()
+        ? static_cast<std::ostream&>(cpp)
+        : static_cast<std::ostream&>(h);
+
+    out << tprefix << sig << " {\n";
+    if (decl.body) genBlock(out, *decl.body, isCoro);
+    out << "}\n\n";
     valueTypeVarNames_.clear();
     stringVarNames_.clear();
 }
@@ -136,18 +142,7 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
     std::ostringstream sig;
 
     std::string retType = decl.returnType ? mapType(*decl.returnType) : "void";
-    if (!tparams.empty() && decl.returnType) {
-        if (auto* nt = dynamic_cast<const NamedType*>(decl.returnType.get())) {
-            if (isHeapType(nt->name)) {
-                retType = nt->name + "<";
-                for (size_t i = 0; i < tparams.size(); ++i) {
-                    if (i > 0) retType += ", ";
-                    retType += tparams[i];
-                }
-                retType += ">*";
-            }
-        }
-    }
+    (void)tparams; // mapType 已正确解析 typeArgs 顺序（含泛型参数名）
 
     sig << (isCoro ? "aura_rt::task<" + retType + ">" : retType);
     std::string fn = safeName(decl.name);
@@ -162,7 +157,7 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
     return sig.str();
 }
 
-void CodeGenerator::genMethodDecl(std::ostream& /*h*/, std::ostream& cpp,
+void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
                                    const MethodDecl& decl) {
     if (decl.isConstructor) {
         genConstructor(cpp, decl);
@@ -208,11 +203,16 @@ void CodeGenerator::genMethodDecl(std::ostream& /*h*/, std::ostream& cpp,
     }
     sig += ")";
 
-    cpp << tprefix << sig << " {\n";
+    // 模板方法：体放入头文件（跨模块可见）
+    std::ostream& out = tparams.empty()
+        ? static_cast<std::ostream&>(cpp)
+        : static_cast<std::ostream&>(h);
+
+    out << tprefix << sig << " {\n";
     currentReceiverName_ = decl.receiverName;
-    if (decl.body) genBlock(cpp, *decl.body, isCoro);
+    if (decl.body) genBlock(out, *decl.body, isCoro);
     currentReceiverName_.clear();
-    cpp << "}\n\n";
+    out << "}\n\n";
     valueTypeVarNames_.clear();
     stringVarNames_.clear();
 }
@@ -249,13 +249,18 @@ void CodeGenerator::genConstructor(std::ostream& cpp, const MethodDecl& decl) {
     }
 
     std::string sig = constructorSignature(decl, tparams);
-    cpp << tprefix << sig << " {\n";
-    cpp << "  " << fullType << "* " << safeName(decl.receiverName) << " = aura_rt::gc_alloc<"
+
+    // 模板构造函数：体放入头文件（跨模块可见）
+    std::ostream& out = tparams.empty()
+        ? static_cast<std::ostream&>(cpp)
+        : *headerStream_;
+
+    out << tprefix << sig << " {\n";
+    out << "  " << fullType << "* " << safeName(decl.receiverName) << " = aura_rt::gc_alloc<"
         << fullType << ">(&" << fullType << "::_desc);\n";
-    // 构造函数翻译为自由函数，不设置 currentReceiverName_（不是 C++ 成员函数）
-    if (decl.body) genBlock(cpp, *decl.body, false);
-    cpp << "  return " << safeName(decl.receiverName) << ";\n";
-    cpp << "}\n\n";
+    if (decl.body) genBlock(out, *decl.body, false);
+    out << "  return " << safeName(decl.receiverName) << ";\n";
+    out << "}\n\n";
     valueTypeVarNames_.clear();
     stringVarNames_.clear();
     currentTParams_.clear();
@@ -287,13 +292,18 @@ std::string CodeGenerator::constructorSignature(const MethodDecl& decl,
 // 主入口（plan §5）
 // ============================================================
 
-void CodeGenerator::genMainEntry(std::ostream& cpp, const FunDecl& mainDecl) {
+void CodeGenerator::genMainEntry(std::ostream& cpp, const FunDecl& mainDecl,
+                                    const std::string& nsName) {
     cpp << "\n// ============================================================\n";
     cpp << "// Aura 程序入口\n";
     cpp << "// ============================================================\n";
     cpp << "int main(int /*argc*/, char** /*argv*/) {\n";
     cpp << "  aura_rt::Io io;\n";
-    cpp << "  auto t = ::aura_main(io);\n";
+    if (nsName.empty()) {
+        cpp << "  auto t = ::aura_main(io);\n";
+    } else {
+        cpp << "  auto t = " << nsName << "::aura_main(io);\n";
+    }
     cpp << "  aura_rt::run_event_loop(t);\n";
     cpp << "  return 0;\n";
     cpp << "}\n";
@@ -312,6 +322,10 @@ void CodeGenerator::collectTParams(const TypeExpr& type, std::set<std::string>& 
     if (auto* n = dynamic_cast<const NamedType*>(&type)) {
         for (auto& a : n->typeArgs)
             if (a) collectTParams(*a, out);
+        // 无 typeArgs + 非注册类型 → 是泛型参数（如 Pair<A,B> 中的 A/B）
+        if (n->typeArgs.empty() && !registeredTypes_.count(n->name)
+            && !interfaceNames_.count(n->name))
+            out.insert(n->name);
         return;
     }
     if (auto* l = dynamic_cast<const ListType*>(&type)) {

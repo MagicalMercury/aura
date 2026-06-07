@@ -60,8 +60,23 @@ void CodeGenerator::genStmt(std::ostream& cpp, const Stmt& stmt,
 void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     std::string type = decl.type
         ? mapType(*decl.type) : "auto";
+
+    // 提取类型标注中的模板参数（如 math.Pair<float, bool>），供 genMethodCall 用于跨模块构造
+    expectedTemplateArgs_.clear();
+    if (decl.type) {
+        if (auto* nt = dynamic_cast<const NamedType*>(decl.type.get())) {
+            if (!nt->typeArgs.empty()) {
+                for (auto& ta : nt->typeArgs)
+                    expectedTemplateArgs_.push_back(mapType(*ta));
+            }
+        }
+    }
+
     std::string init = decl.initializer
         ? genExpr(*decl.initializer, currentFunctionIsCoroutine_) : "";
+
+    expectedTemplateArgs_.clear();
+
     writeLine(cpp, type + " " + safeName(decl.name) +
               (init.empty() ? ";" : " = " + init + ";"));
 
@@ -71,13 +86,40 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
          init.find("aura_rt::concat") != std::string::npos)) {
         stringVarNames_.insert(safeName(decl.name));
     }
+
+    // 跟踪值类型变量（如 Path，用 . 而非 ->）
+    if (!init.empty() && (
+        init.find("path::") != std::string::npos ||
+        init.find("Path(") != std::string::npos)) {
+        valueTypeVarNames_.insert(safeName(decl.name));
+    }
+    if (decl.type) {
+        if (auto* nt = dynamic_cast<const NamedType*>(decl.type.get())) {
+            if (nt->name == "Path" || (!nt->namespacePrefix.empty() && nt->namespacePrefix[0] == "path"))
+                valueTypeVarNames_.insert(safeName(decl.name));
+        }
+    }
 }
 
 void CodeGenerator::genConstStmt(std::ostream& cpp, const ConstDecl& decl) {
     std::string type = decl.type
         ? mapType(*decl.type) : "auto";
+
+    expectedTemplateArgs_.clear();
+    if (decl.type) {
+        if (auto* nt = dynamic_cast<const NamedType*>(decl.type.get())) {
+            if (!nt->typeArgs.empty()) {
+                for (auto& ta : nt->typeArgs)
+                    expectedTemplateArgs_.push_back(mapType(*ta));
+            }
+        }
+    }
+
     std::string init = decl.initializer
         ? genExpr(*decl.initializer, currentFunctionIsCoroutine_) : "";
+
+    expectedTemplateArgs_.clear();
+
     writeLine(cpp, "const " + type + " " + safeName(decl.name) +
               (init.empty() ? ";" : " = " + init + ";"));
 }

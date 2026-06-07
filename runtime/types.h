@@ -229,26 +229,16 @@ struct Array : GcObject {
 };
 
 // ============================================================
-// 便捷工厂（声明；实现在 gc.h 末尾，需要 gc_alloc / GcHeap 完整定义）
+// 便捷工厂 & 字符串工具声明（实现在 types.cpp）
 // ============================================================
 GcString* make_string(const char* s);
 GcString* make_string(const std::string& s);
 
-// 字符串值比较
+// 字符串值比较（内联，简单）
 inline bool string_eq(GcString* a, GcString* b) {
     if (a == b) return true;
     if (!a || !b) return false;
     return *a == *b;
 }
-
-// 字符串拼接（声明；实现需要 gc_alloc）
-GcString* string_concat(GcString* a, GcString* b);
-GcString* int_to_string(int32_t val);
-GcString* float_to_string(double val);
-GcString* concat(GcString* a, GcString* b);
-GcString* concat(GcString* a, int32_t b);
-GcString* concat(int32_t a,    GcString* b);
-GcString* concat(GcString* a, double b);
-GcString* concat(double a,     GcString* b);
 
 } // namespace aura_rt

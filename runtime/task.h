@@ -11,11 +11,10 @@
 // run_event_loop ─ 驱动主协程直至完成
 //
 // 依赖：types.h (GcString, Error 等)
-//       gc.h（run_event_loop 需要 gc_register_stack_roots）
+//       gc.h 仅 task.cpp 需要（run_event_loop 实现中注册 GC 栈根）
 // ============================================================
 
 #include "types.h"
-#include "gc.h"
 
 #include <concepts>
 #include <coroutine>
@@ -181,18 +180,6 @@ inline task<void> when_all(std::vector<task<void>> tasks) {
 // 迭代驱动协程，每次恢复后处理待执行的回调。
 // 初版：单线程、无 I/O 复用，仅用于驱动纯计算协程。
 // ============================================================
-inline void run_event_loop(task<void>& mainTask) {
-    auto handle = mainTask.handle();
-    if (!handle) return;
-
-    // 将协程帧注册为 GC 保守栈根，使 GC 能发现帧内的 GC 对象
-    void* framePtr = handle.address();
-    static constexpr size_t kConservativeFrameSize = 4096;
-    gc_register_stack_roots(framePtr, static_cast<char*>(framePtr) + kConservativeFrameSize);
-
-    handle.resume();
-
-    gc_unregister_stack_roots(framePtr, static_cast<char*>(framePtr) + kConservativeFrameSize);
-}
+void run_event_loop(task<void>& mainTask);
 
 } // namespace aura_rt

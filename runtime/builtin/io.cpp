@@ -51,7 +51,7 @@ task<GcString*> Io::read_file(const Path& path) {
     std::ifstream file(path.native(), std::ios::binary);
     if (!file.is_open()) {
         throw Error(make_string("io_error"),
-                    make_string("cannot open file: " + path.to_string()));
+                    make_string("cannot open file: " + path.native().string()));
         co_return nullptr;
     }
     std::ostringstream oss;
@@ -64,13 +64,13 @@ task<void> Io::write_file(const Path& path, const std::string& content) {
     std::ofstream file(path.native(), std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
         throw Error(make_string("io_error"),
-                    make_string("cannot write file: " + path.to_string()));
+                    make_string("cannot write file: " + path.native().string()));
         co_return;
     }
     file.write(content.data(), static_cast<std::streamsize>(content.size()));
     if (!file) {
         throw Error(make_string("io_error"),
-                    make_string("write failed: " + path.to_string()));
+                    make_string("write failed: " + path.native().string()));
     }
     file.close();
     co_return;
@@ -89,7 +89,7 @@ task<void> Io::mkdir(const Path& path) {
     std::filesystem::create_directories(path.native(), ec);
     if (ec) {
         throw Error(make_string("io_error"),
-                    make_string("cannot create directory: " + path.to_string() + " - " + ec.message()));
+                    make_string("cannot create directory: " + path.native().string() + " - " + ec.message()));
     }
     co_return;
 }
@@ -103,7 +103,7 @@ task<void> Io::remove(const Path& path) {
     }
     if (ec) {
         throw Error(make_string("io_error"),
-                    make_string("cannot remove: " + path.to_string() + " - " + ec.message()));
+                    make_string("cannot remove: " + path.native().string() + " - " + ec.message()));
     }
     co_return;
 }
@@ -114,7 +114,7 @@ task<Array<Path>*> Io::list_dir(const Path& path) {
     for (auto& entry : std::filesystem::directory_iterator(path.native(), ec)) {
         if (ec) {
             throw Error(make_string("io_error"),
-                        make_string("cannot list directory: " + path.to_string() + " - " + ec.message()));
+                        make_string("cannot list directory: " + path.native().string() + " - " + ec.message()));
             co_return nullptr;
         }
         entries.push_back(Path(entry.path()));

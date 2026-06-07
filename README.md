@@ -361,24 +361,41 @@ sync {
 ## 11. 模块、导入与能力对象
 
 ### 11.1 模块导入
-一个 `.aura` 文件即一个模块。导入使用 `import` 语句：
+
+一个 `.aura` 文件即一个模块。导入分为两类：
+
+- **用户模块**：使用带引号的路径字符串，指向项目内的 `.aura` 文件。
+- **内置模块 / 外部包**：直接使用模块名（标识符），不用引号。
+
 ```aura
+// 导入用户模块
 import "utils/helpers.aura"
 import "math.aura" as m
+
+// 导入内置模块（如 path）
+import path
+import path as p          // 可起别名
 ```
 
 ### 11.2 导入路径表达式（编译期）
-`import` 支持编译期路径计算，仅可使用 `const` 和 `path` 内置模块的纯函数：
+
+对于用户模块，`import` 支持在字符串中使用**编译期路径计算**。此时可使用内置 `path` 模块提供的纯函数，表达式必须在编译期可求值。
+
 ```aura
-import "path"
+import path               // 导入内置 path 模块，无需引号
 const BASE = path.new("plugins")
-import path.join(BASE, "auth.aura")           // 导入 plugins/auth.aura
-import path.join(BASE, "db", "postgres.aura") as pg
+
+// 在 import 中使用路径表达式，结果必须是字符串
+import path.join(BASE, "auth.aura")              // 导入 plugins/auth.aura
+import path.join(BASE, "db", "postgres.aura") as pg  // 导入并起别名
 ```
-模块名默认为最终文件名（去 `.aura`），可用 `as` 别名。
+
+> 注意：路径表达式中的 `path` 函数必须在编译期可计算，因此只能用 `const` 值和纯函数。模块名默认为最终文件名（去 `.aura`），可用 `as` 自定义别名。
 
 ### 11.3 能力对象 `Io`
+
 `main` 函数接收 `io: Io`。所有 I/O 操作必须通过 `io` 调用：
+
 ```aura
 fun main(io: Io) throws {
     io.println("Enter name:")
@@ -388,7 +405,35 @@ fun main(io: Io) throws {
 ```
 
 ### 11.4 `path` 内置模块
-`path` 提供纯函数路径操作，无副作用。通过 `import "path"` 使用。
+
+`path` 是内置模块，提供纯函数路径操作，无副作用。导入方式为 `import path`（无引号）。以下为模块顶层函数及 `Path` 类型的方法。
+
+#### 创建与拼接
+
+| 函数 | 说明 |
+|------|------|
+| `path.new(s: string) -> Path` | 从字符串创建路径 |
+| `path.join(parts: Path, ...) -> Path` | 拼接多个路径（可接受 `Path` 或 `string`） |
+
+#### `Path` 方法
+
+| 方法签名 | 说明 |
+|----------|------|
+| `p.parent() -> Path` | 返回父目录路径 |
+| `p.file_name() -> string` | 返回文件名（含扩展名） |
+| `p.extension() -> string` | 返回扩展名（含 `.`），无则返回 `""` |
+| `p.is_absolute() -> bool` | 是否为绝对路径 |
+| `p.to_string() -> string` | 转为字符串表示 |
+
+`Path` 是内建结构类型，字段不公开，只能通过上述方法访问。
+
+**示例**
+```aura
+import path
+let p = path.join(path.new("/home/aura"), "docs", "readme.md")
+let name = p.file_name()      // "readme.md"
+let parent = p.parent()       // Path("/home/aura/docs")
+```
 
 ---
 

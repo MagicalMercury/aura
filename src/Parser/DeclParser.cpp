@@ -180,11 +180,32 @@ std::unique_ptr<ImportDecl> Parser::parseImportDecl() {
     auto decl = std::make_unique<ImportDecl>();
     setNodePos(decl.get(), tok);
 
-    auto& strTok = consume(TokType::StringLiteral, "expected string literal after 'import'");
-    if (auto* s = std::get_if<std::string>(&strTok.literal)) {
-        decl->path = *s;
+    if (check(TokType::StringLiteral)) {
+        // import "path/to/module.aura"  或  import "path" as alias
+        auto& strTok = consume(TokType::StringLiteral, "expected string literal after 'import'");
+        if (auto* s = std::get_if<std::string>(&strTok.literal)) {
+            decl->path = *s;
+        } else {
+            decl->path = strTok.lexeme;
+        }
+        decl->isBuiltin = false;
+    } else if (check(TokType::Identifier)) {
+        // import path 或 import json as j  (内置模块/外部包)
+        decl->path = advance().lexeme;
+        decl->isBuiltin = true;
     } else {
-        decl->path = strTok.lexeme;
+        error("expected string literal or identifier after 'import'");
+        return decl;
+    }
+
+    // 可选的 as 别名
+    if (check(TokType::Identifier) && peek().lexeme == "as") {
+        advance(); // skip "as"
+        if (check(TokType::Identifier)) {
+            decl->alias = advance().lexeme;
+        } else {
+            error("expected identifier after 'as'");
+        }
     }
 
     match(TokType::Semicolon);

@@ -1,4 +1,5 @@
 #include "CodeGen.h"
+#include <filesystem>
 #include <sstream>
 
 namespace Aura {
@@ -18,16 +19,61 @@ CodeGenerator::CodeGenerator() {
 }
 
 CompileUnit CodeGenerator::generate(const Program& program,
-                                     const std::string& moduleName) {
+                                     const std::string& moduleName,
+                                     const std::vector<CodeGenImport>& imports,
+                                     const std::string& nsName) {
     CompileUnit unit;
     unit.moduleName = moduleName;
+    unit.nsName     = nsName;
 
     std::ostringstream header, impl;
     headerStream_ = &header;
     implStream_   = &impl;
 
     // 公共头
-    header << "#include \"aura_rt.h\"\n\n";
+    header << "#include \"aura_rt.h\"\n";
+
+    // 生成 import 对应的 #include（头文件中包含依赖模块的 .h）
+     for (auto& imp : imports) {
+         if (imp.isBuiltin) {
+             // 内置模块已通过 aura_rt.h 引入，此处生成注释说明
+             header << "// using builtin: " << imp.path << "\n";
+         } else {
+            // 用户模块：相对路径 #include
+            std::string depStem = std::filesystem::path(imp.path).stem().string();
+            header << "#include \"" << depStem << ".aura.h\"\n";
+        }
+    }
+    header << "\n";
+
+    // 生成翻译单元级别的命名空间别名
+     // 有 alias 时只生成别名，屏蔽原名
+     for (auto& imp : imports) {
+         bool hasAlias = !imp.alias.empty() && imp.alias != imp.modName;
+         if (!hasAlias) {
+             // 无别名：用模块名
+             if (imp.isBuiltin) {
+                 impl << "namespace " << imp.modName
+                      << " = aura_rt::" << imp.path << ";\n";
+             } else {
+                 impl << "namespace " << imp.modName << " = " << imp.nsName << ";\n";
+             }
+             importNsNames_.insert(imp.modName);
+         }
+         if (!imp.alias.empty()) {
+             // 有别名：生成别名（别名 ≠ 原名时）
+             impl << "namespace " << imp.alias
+                  << " = " << (imp.isBuiltin ? std::string("aura_rt::") + imp.path : imp.nsName) << ";\n";
+             importNsNames_.insert(imp.alias);
+         }
+     }
+     if (!imports.empty()) impl << "\n";
+
+    // 打开命名空间（若有）— header 和 impl 都需要
+    if (!nsName.empty()) {
+        header << "namespace " << nsName << " {\n\n";
+        impl << "namespace " << nsName << " {\n\n";
+    }
 
     // 第一遍：注册所有类型名和接口名
     for (auto& d : program.decls) {
@@ -81,12 +127,20 @@ CompileUnit CodeGenerator::generate(const Program& program,
         genDecl(header, impl, *d, unit);
     }
 
-    // 检测 main 函数并生成入口
+    // 关闭命名空间（若有）
+    if (!nsName.empty()) {
+        header << "} // namespace " << nsName << "\n";
+        impl << "} // namespace " << nsName << "\n";
+    }
+
+    // 检测 main 函数并生成入口（必须在命名空间之外）
     for (auto& d : program.decls) {
         if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
             if (f->name == "main") {
                 unit.hasMain = true;
-                genMainEntry(impl, *f);
+                std::ostringstream footerStream;
+                genMainEntry(footerStream, *f, nsName);
+                unit.footer = footerStream.str();
                 break;
             }
         }

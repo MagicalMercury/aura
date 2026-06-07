@@ -23,15 +23,22 @@ void printPattern(std::ostream& os, int indent, const Pattern* pat) {
 
 void NamedType::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "NamedType: " << name;
+    if (!namespacePrefix.empty()) {
+        os << "NamedType: ";
+        for (size_t i = 0; i < namespacePrefix.size(); ++i) {
+            if (i > 0) os << "::";
+            os << namespacePrefix[i];
+        }
+        os << "::" << name;
+    } else {
+        os << "NamedType: " << name;
+    }
     if (!typeArgs.empty()) {
         os << "<";
         for (size_t i = 0; i < typeArgs.size(); ++i) {
             if (i > 0) os << ", ";
-            if (auto* n = dynamic_cast<const NamedType*>(typeArgs[i].get()))
-                os << n->name;
-            else if (auto* g = dynamic_cast<const GenericTypeRef*>(typeArgs[i].get()))
-                os << "<" << g->name << ">";
+            if (typeArgs[i]) typeArgs[i]->print(os, indent + 2);
+            else os << "???";
         }
         os << ">";
     }
@@ -462,7 +469,10 @@ void InterfaceDecl::print(std::ostream& os, int indent) const {
 
 void ImportDecl::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "ImportDecl: " << path << '\n';
+    os << "ImportDecl: " << (isBuiltin ? "<builtin>" : "\"") << path
+       << (isBuiltin ? "" : "\"");
+    if (!alias.empty()) os << " as " << alias;
+    os << '\n';
 }
 
 void MethodDecl::print(std::ostream& os, int indent) const {
