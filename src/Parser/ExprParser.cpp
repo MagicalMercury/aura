@@ -204,6 +204,13 @@ std::unique_ptr<ASTNode> Parser::parseCall() {
                 ma->member = memberTok.lexeme;
                 expr = std::move(ma);
             }
+        } else if (match(TokType::LBracket)) {
+            auto idx = std::make_unique<IndexExpr>();
+            setNodePos(idx.get(), peek());
+            idx->object = std::move(expr);
+            idx->index  = parseExpr();
+            consume(TokType::RBracket, "expected ']' after index expression");
+            expr = std::move(idx);
         } else {
             break;
         }
@@ -213,22 +220,17 @@ std::unique_ptr<ASTNode> Parser::parseCall() {
 }
 
 std::unique_ptr<ASTNode> Parser::parsePrimary() {
-    if (check(TokType::IntLiteral)) {
-        auto& tok = advance();
-        auto n = std::make_unique<IntLiteral>();
-        setNodePos(n.get(), tok);
-        if (auto* v = std::get_if<int64_t>(&tok.literal)) n->value = *v;
-        return n;
+#define PARSE_LITERAL(tok, CppType, AuraType)        \
+    if (check(tok)) {                                 \
+        auto& tokRef = advance();                     \
+        auto n = std::make_unique<CppType>();         \
+        setNodePos(n.get(), tokRef);                  \
+        if (auto* v = std::get_if<AuraType>(&tokRef.literal)) n->value = *v; \
+        return n;                                     \
     }
 
-    if (check(TokType::FloatLiteral)) {
-        auto& tok = advance();
-        auto n = std::make_unique<FloatLiteral>();
-        setNodePos(n.get(), tok);
-        if (auto* v = std::get_if<double>(&tok.literal)) n->value = *v;
-        return n;
-    }
-
+    PARSE_LITERAL(TokType::IntLiteral,    IntLiteral,    int64_t)
+    PARSE_LITERAL(TokType::FloatLiteral,  FloatLiteral,  double)
     if (check(TokType::StringLiteral)) {
         auto& tok = advance();
         auto n = std::make_unique<StringLiteral>();
@@ -237,6 +239,8 @@ std::unique_ptr<ASTNode> Parser::parsePrimary() {
         else n->value = tok.lexeme;
         return n;
     }
+
+#undef PARSE_LITERAL
 
     if (match(TokType::True)) {
         auto n = std::make_unique<BoolLiteral>();

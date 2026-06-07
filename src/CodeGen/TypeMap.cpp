@@ -27,8 +27,22 @@ bool CodeGenerator::isHeapType(const std::string& auraName) const {
 // ============================================================
 
 std::string CodeGenerator::mapType(const TypeExpr& type) {
-    if (auto* n = dynamic_cast<const NamedType*>(&type))
-        return mapNamedType(n->name);
+    if (auto* n = dynamic_cast<const NamedType*>(&type)) {
+        std::string base = mapNamedType(n->name);
+        if (!n->typeArgs.empty()) {
+            // 如果 base 是 "User*"，去掉 * 后加 typeArgs，再加 *
+            if (base.size() > 1 && base.back() == '*') {
+                base.pop_back();
+                base += "<";
+                for (size_t i = 0; i < n->typeArgs.size(); ++i) {
+                    if (i > 0) base += ", ";
+                    base += n->typeArgs[i] ? mapType(*n->typeArgs[i]) : "???";
+                }
+                base += ">*";
+            }
+        }
+        return base;
+    }
     if (auto* g = dynamic_cast<const GenericTypeRef*>(&type))
         return mapGenericRef(*g);
     if (auto* l = dynamic_cast<const ListType*>(&type)) {
@@ -153,7 +167,7 @@ void CodeGenerator::genTypeDescriptor(std::ostream& cpp,
         cpp << "const aura_rt::TypeDescriptor " << fullName
             << "::_desc = { sizeof(" << fullName << "), "
             << ptrFieldNames.size() << ", _"
-            << structName << "_ptrs };\n";
+            << structName << "_ptrs" << tparamsStr << " };\n";
     }
 }
 

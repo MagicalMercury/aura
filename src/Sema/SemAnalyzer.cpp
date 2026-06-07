@@ -61,6 +61,13 @@ std::unique_ptr<SemType> SemAnalyzer::resolveNamedType(const std::string& name) 
         return t;
     }
 
+    // 泛型参数引用（如裸 T，由 resolveType 上下文提供）
+    if (sym && sym->kind == SymKind::GenericParam) {
+        auto t = std::make_unique<GenericSemType>();
+        t->name = name;
+        return t;
+    }
+
     // 未找到：返回 Error 类型（后续阶段会报错）
     return ErrorSemType::make();
 }
@@ -79,6 +86,14 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
         for (auto& v : u->variants) {
             if (v && isAssignable(*v, source))
                 return true;
+        }
+        return false;
+    }
+
+    // 列表类型：元素类型兼容即兼容
+    if (auto* lt = dynamic_cast<const ListSemType*>(&target)) {
+        if (auto* ls = dynamic_cast<const ListSemType*>(&source)) {
+            return isAssignable(*lt->elementType, *ls->elementType);
         }
         return false;
     }

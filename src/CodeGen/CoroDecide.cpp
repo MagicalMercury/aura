@@ -149,6 +149,10 @@ bool CodeGenerator::scanExprForCoroutine(const ASTNode& expr) {
             if (f.value && scanExprForCoroutine(*f.value)) return true;
         return false;
     }
+    if (auto* e = dynamic_cast<const IndexExpr*>(&expr)) {
+        return (e->object && scanExprForCoroutine(*e->object)) ||
+               (e->index  && scanExprForCoroutine(*e->index));
+    }
     return false;
 }
 

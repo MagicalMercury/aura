@@ -321,11 +321,13 @@ struct ConstDecl : Decl {
 
 struct TypeDecl : Decl {
     std::string name;
+    std::vector<std::string> typeParams; // 泛型参数名（如 <T> 或 <A, B>）
     std::unique_ptr<TypeExpr> type;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<TypeDecl>();
         n->name = name;
+        n->typeParams = typeParams;
         if (type) n->type.reset(static_cast<TypeExpr*>(type->clone().release()));
         n->line = line; n->col = col;
         return n;
@@ -373,6 +375,7 @@ struct ImportDecl : Decl {
 struct MethodDecl : Decl {
     std::string receiverName;
     std::string receiverType;
+    std::vector<std::string> receiverTypeArgs; // 接收者泛型参数（如 Stack<T> 中的 T）
     std::string implInterface;
     std::string name;
     bool isConstructor = false;
@@ -385,6 +388,7 @@ struct MethodDecl : Decl {
         auto n = std::make_unique<MethodDecl>();
         n->receiverName  = receiverName;
         n->receiverType  = receiverType;
+        n->receiverTypeArgs = receiverTypeArgs;
         n->implInterface = implInterface;
         n->name          = name;
         n->isConstructor = isConstructor;

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <variant>
 
 namespace aura_rt {
@@ -67,11 +68,26 @@ inline constexpr NoneType None{};
 //
 // GC 扫描时，从对象基址出发，根据 ptrFieldOffsets 找到所有
 // 指向其他 GC 对象的指针字段，递归标记。
+//
+// arrayPtrFields — 数组指针字段（如 Array<GcString*>::elements）。
+// 每个数组指针字段描述一个指针字段，该字段指向一块 GC 指针数组，
+// 数组长度由 lengthOffset 指定的字段给出。
 // ============================================================
+
+// 数组指针字段描述符（如 Array<GcString*>::elements）
+struct ArrayPtrField {
+    size_t ptrOffset;     // 指针字段在对象内的偏移
+    size_t lengthOffset;  // 长度字段在对象内的偏移（如 Array::length）
+};
+
 struct TypeDescriptor {
     size_t        size;             // 对象总大小（字节）
-    size_t        ptrFieldCount;    // 指针字段数量
-    const size_t* ptrFieldOffsets;  // 指针字段在对象内的偏移数组
+    size_t        ptrFieldCount;    // 普通指针字段数量
+    const size_t* ptrFieldOffsets;  // 普通指针字段偏移数组
+
+    // 分代 GC 扩展
+    size_t              arrayPtrFieldCount = 0;  // 数组指针字段数量
+    const ArrayPtrField* arrayPtrFields = nullptr; // 数组指针字段描述符
 };
 
 // ============================================================
@@ -93,6 +109,9 @@ struct GcObject {
 
     // GC 内部链表指针（空闲链表 / 标记队列 / 终结队列）
     GcObject* next  = nullptr;
+
+    // 分代 GC：0 = 新生代（young），1 = 老年代（old）
+    uint8_t  generation = 0;
 };
 
 // ============================================================
@@ -161,10 +180,10 @@ struct Error : GcObject {
 //
 // plan §4.1: "[T] 映射为 aura_rt::Array<T>*"
 //
-// 元素缓冲区在 GC 堆外分配（使用 new T[]），
-// 因此 elements 指针不注册在 TypeDescriptor 中。
-// 对于 T 为指针类型（如 Array<GcString*>）的情况，
-// 需要额外的写屏障来处理指针赋值（由代码生成器插入）。
+// 对象和元素缓冲区均通过 GcHeap 分配（bump allocator），
+// 不经过 CRT 堆，避免进程退出时的 debug heap 校验延迟。
+// 对于 T 为指针类型（如 Array<GcString*>），TypeDescriptor 中的
+// arrayPtrFields 会告诉 GC 如何扫描 elements 缓冲区中的 GC 指针。
 // ============================================================
 template <typename T>
 struct Array : GcObject {
@@ -172,37 +191,31 @@ struct Array : GcObject {
     int32_t capacity = 0;
     T*      elements = nullptr;
 
-    // 每个特化返回各自的 static 描述符
-    //
-    // Array<T> 的 GC 策略：
-    //   - T 是值类型（如 Path）→ ptrFieldCount = 0
-    //   - T 是 GC 指针（如 GcString*）→ ptrFieldCount = 1（elements 字段的偏移）
-    //
-    // 代码生成器在实例化 Array<GcObject派生类> 时会生成真正的 _desc。
-    // 此默认实现针对值类型 T。
     static const TypeDescriptor& desc() {
-        static const TypeDescriptor d = { sizeof(Array<T>), 0, nullptr };
-        return d;
+        if constexpr (std::is_pointer_v<T>) {
+            // elements 指向 GC 指针数组，需 GC 扫描
+            static const ArrayPtrField arrFields[] = {
+                { offsetof(Array<T>, elements), offsetof(Array<T>, length) }
+            };
+            static const TypeDescriptor d = {
+                sizeof(Array<T>),
+                0,          // 无普通指针字段（elements 由数组指针字段处理）
+                nullptr,
+                1,          // 一个数组指针字段
+                arrFields
+            };
+            return d;
+        } else {
+            // 非指针元素（如 Array<int32_t>），无 GC 指针
+            static const TypeDescriptor d = { sizeof(Array<T>), 0, nullptr };
+            return d;
+        }
     }
 
-    static Array<T>* make(int32_t initialCapacity = 4) {
-        auto* arr = new Array<T>();
-        arr->capacity = initialCapacity;
-        arr->length   = 0;
-        arr->elements = new T[initialCapacity];
-        return arr;
-    }
-    void push(const T& value) {
-        if (length >= capacity) {
-            int32_t newCap = capacity * 2;
-            auto*   newBuf = new T[newCap];
-            for (int32_t i = 0; i < length; ++i) newBuf[i] = elements[i];
-            delete[] elements;
-            elements = newBuf;
-            capacity = newCap;
-        }
-        elements[length++] = value;
-    }
+    // make / push 实现在 gc.h 末尾（需要 gc_alloc / GcHeap 完整定义）
+    static Array<T>* make(int32_t initialCapacity = 4);
+    void push(const T& value);
+
     T& operator[](int32_t idx)       { return elements[idx]; }
     const T& operator[](int32_t idx) const { return elements[idx]; }
 
@@ -211,45 +224,31 @@ struct Array : GcObject {
     const T* begin() const { return elements; }
     T* end() { return elements + length; }
     const T* end() const { return elements + length; }
+
+    int32_t len() const { return length; }
 };
 
 // ============================================================
-// 便捷工厂
+// 便捷工厂（声明；实现在 gc.h 末尾，需要 gc_alloc / GcHeap 完整定义）
 // ============================================================
-inline GcString* make_string(const char* s)   { return GcString::make(s); }
-inline GcString* make_string(const std::string& s) { return GcString::make(s); }
+GcString* make_string(const char* s);
+GcString* make_string(const std::string& s);
 
-// 字符串值比较（Aura 中 == / != 用于字符串时调用）
+// 字符串值比较
 inline bool string_eq(GcString* a, GcString* b) {
     if (a == b) return true;
     if (!a || !b) return false;
     return *a == *b;
 }
 
-// 字符串拼接辅助（代码生成器使用，Aura 中 string + T → string）
-inline GcString* string_concat(GcString* a, GcString* b) {
-    if (!a || !b) return a ? a : b;
-    std::string result(a->data, a->length);
-    result.append(b->data, b->length);
-    return GcString::make(result);
-}
-
-inline GcString* int_to_string(int32_t val) {
-    return GcString::make(std::to_string(val));
-}
-inline GcString* float_to_string(double val) {
-    // 避免尾部多余的 .000000
-    std::string s = std::to_string(val);
-    s.erase(s.find_last_not_of('0') + 1, std::string::npos);
-    if (!s.empty() && s.back() == '.') s.pop_back();
-    return GcString::make(s);
-}
-
-// 通用拼接重载 — 利用 C++ 重载决议自动选择正确的转换
-inline GcString* concat(GcString* a, GcString* b)  { return string_concat(a, b); }
-inline GcString* concat(GcString* a, int32_t b)    { return string_concat(a, int_to_string(b)); }
-inline GcString* concat(int32_t a,    GcString* b) { return string_concat(int_to_string(a), b); }
-inline GcString* concat(GcString* a, double b)     { return string_concat(a, float_to_string(b)); }
-inline GcString* concat(double a,     GcString* b) { return string_concat(float_to_string(a), b); }
+// 字符串拼接（声明；实现需要 gc_alloc）
+GcString* string_concat(GcString* a, GcString* b);
+GcString* int_to_string(int32_t val);
+GcString* float_to_string(double val);
+GcString* concat(GcString* a, GcString* b);
+GcString* concat(GcString* a, int32_t b);
+GcString* concat(int32_t a,    GcString* b);
+GcString* concat(GcString* a, double b);
+GcString* concat(double a,     GcString* b);
 
 } // namespace aura_rt

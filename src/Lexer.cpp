@@ -30,29 +30,26 @@ Token Lexer::scanOne() {
 
     // 标识符或关键字
     if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
-        --pos_; // 回退，让 scanIdentifierOrKeyword 处理
-        --curPos_.col;
+        --pos_; --curPos_.col; // 回退，让 scanIdentifierOrKeyword 处理
         return scanIdentifierOrKeyword();
     }
 
     // 数字
     if (std::isdigit(static_cast<unsigned char>(c))) {
-        --pos_;
-        --curPos_.col;
+        --pos_; --curPos_.col;
         return scanNumber();
     }
 
-    // 字符串
+    // 字符串 — advance 已消费 "，回退以保留起始位置
     if (c == '"') {
-        // advance 已消费了 "，需要回退以保留起始位置
-        // 但 scanString 不期望已消费引号，所以我们在这里处理
-        // 实际上当前 c 就是 '"'，词素从它开始
-        // 简化：字符串的起始位置就是 " 的位置（已由调用者保存）
-        --pos_;
-        --curPos_.col;
+        --pos_; --curPos_.col;
         return scanString();
     }
 
+    return scanOperatorOrDelimiter(c);
+}
+
+Token Lexer::scanOperatorOrDelimiter(char c) {
     // 运算符与分隔符 — lexeme 始终包含实际字符
     switch (c) {
     case '+': return makeToken(TokType::Plus,    "+");
@@ -97,8 +94,7 @@ Token Lexer::scanOne() {
 
     case '.':
         if (std::isdigit(static_cast<unsigned char>(peek()))) {
-            --pos_;
-            --curPos_.col;
+            --pos_; --curPos_.col;
             return scanNumber();
         }
         return makeToken(TokType::Dot, ".");

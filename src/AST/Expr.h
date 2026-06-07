@@ -174,6 +174,19 @@ struct MemberAccessExpr : ASTNode {
     }
 };
 
+struct IndexExpr : ASTNode {
+    std::unique_ptr<ASTNode> object;
+    std::unique_ptr<ASTNode> index;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<IndexExpr>();
+        n->object = object ? object->clone() : nullptr;
+        n->index  = index  ? index->clone()  : nullptr;
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
 struct AssignExpr : ASTNode {
     std::unique_ptr<ASTNode> target;
     std::unique_ptr<ASTNode> value;

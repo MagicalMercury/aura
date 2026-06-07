@@ -37,6 +37,7 @@ private:
     Token scanIdentifierOrKeyword();
     Token scanNumber();
     Token scanString();
+    Token scanOperatorOrDelimiter(char firstChar);
 
     Token makeToken(TokType type);
     Token makeToken(TokType type, const std::string& lexeme);

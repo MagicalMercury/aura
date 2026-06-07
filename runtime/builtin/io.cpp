@@ -120,12 +120,9 @@ task<Array<Path>*> Io::list_dir(const Path& path) {
         entries.push_back(Path(entry.path()));
     }
 
-    // 构造 Array<Path>
-    auto* arr = static_cast<Array<Path>*>(
-        GcHeap::instance().alloc(sizeof(Array<Path>), &Array<Path>::desc()));
-    arr->length   = static_cast<int32_t>(entries.size());
-    arr->capacity = arr->length;
-    arr->elements = new Path[entries.size()];
+    // 构造 Array<Path>，统一走 GC 分配
+    auto* arr = Array<Path>::make(static_cast<int32_t>(entries.size()));
+    arr->length = static_cast<int32_t>(entries.size());
     std::copy(entries.begin(), entries.end(), arr->elements);
     co_return arr;
 }

@@ -64,6 +64,13 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
         ? genExpr(*decl.initializer, currentFunctionIsCoroutine_) : "";
     writeLine(cpp, type + " " + safeName(decl.name) +
               (init.empty() ? ";" : " = " + init + ";"));
+
+    // 跟踪字符串变量（用于后续 string + T 拼接检测）
+    if (!init.empty() &&
+        (init.find("aura_rt::make_string") != std::string::npos ||
+         init.find("aura_rt::concat") != std::string::npos)) {
+        stringVarNames_.insert(safeName(decl.name));
+    }
 }
 
 void CodeGenerator::genConstStmt(std::ostream& cpp, const ConstDecl& decl) {
@@ -163,15 +170,7 @@ void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
                                      const TryCatchStmt& stmt,
                                      bool isCoroutine) {
     if (!isCoroutine || !stmt.tryBody || stmt.tryBody->stmts.empty()) {
-        // 非协程：直接生成 try/catch
-        cpp << indentStr() << "try {\n";
-        if (stmt.tryBody) genBlock(cpp, *stmt.tryBody, isCoroutine);
-        std::string cv = safeName(stmt.catchVar);
-        cpp << indentStr() << "} catch (aura_rt::Error& " << cv << ") {\n";
-        valueTypeVarNames_.insert(cv);
-        if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, false);
-        valueTypeVarNames_.erase(cv);
-        cpp << indentStr() << "}\n";
+        genTryCatchRaw(cpp, stmt, isCoroutine);
         return;
     }
 
@@ -184,31 +183,21 @@ void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
 
     auto& stmts = stmt.tryBody->stmts;
 
-    // 1. 找到 try 体中的第一个 LetDecl（setup 语句）
+    // 1. 找到 try 体中的第一个 LetDecl（含 initializer）
     const LetDecl* setupLet = nullptr;
     size_t letIdx = 0;
-    std::vector<size_t> preSetupIdxs;  // LetDecl 之前的语句索引
     for (size_t i = 0; i < stmts.size(); ++i) {
         if (auto* let = dynamic_cast<const LetDecl*>(stmts[i].get())) {
             if (let->initializer) { setupLet = let; letIdx = i; break; }
         }
-        preSetupIdxs.push_back(i);
     }
 
-    // 如果没有找到含 initializer 的 LetDecl，回退为原始 try/catch
     if (!setupLet) {
-        cpp << indentStr() << "try {\n";
-        if (stmt.tryBody) genBlock(cpp, *stmt.tryBody, isCoroutine);
-        std::string cv = safeName(stmt.catchVar);
-        cpp << indentStr() << "} catch (aura_rt::Error& " << cv << ") {\n";
-        valueTypeVarNames_.insert(cv);
-        if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, false);
-        valueTypeVarNames_.erase(cv);
-        cpp << indentStr() << "}\n";
+        genTryCatchRaw(cpp, stmt, isCoroutine);
         return;
     }
 
-    // 2. 推断结果类型（优先用显式注解，否则用 decltype）
+    // 2. 推断结果类型
     std::string initExpr = genExpr(*setupLet->initializer, false);
     std::string resultType = setupLet->type
         ? mapType(*setupLet->type)
@@ -234,7 +223,7 @@ void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
     indentLevel_--;
     writeLine(cpp, "}();");
 
-    // 4. 错误分支 → catch body
+    // 4. 错误分支
     cpp << indentStr() << "if (std::holds_alternative<aura_rt::Error>(_try)) {\n";
     indentLevel_++;
     writeLine(cpp, "auto& " + cv + " = std::get<aura_rt::Error>(_try);");
@@ -245,7 +234,7 @@ void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
     cpp << indentStr() << "} else {\n";
     indentLevel_++;
 
-    // 5. 成功分支：绑定变量 + 执行 continuation 语句
+    // 5. 成功分支
     writeLine(cpp, "auto " + varName + " = std::get<" + resultType + ">(_try);");
     for (size_t i = letIdx + 1; i < stmts.size(); ++i) {
         if (stmts[i]) genStmt(cpp, *stmts[i], isCoroutine);
@@ -254,6 +243,19 @@ void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
     indentLevel_--;
     cpp << indentStr() << "}\n";
     indentLevel_--;
+    cpp << indentStr() << "}\n";
+}
+
+void CodeGenerator::genTryCatchRaw(std::ostream& cpp,
+                                    const TryCatchStmt& stmt,
+                                    bool isCoroutine) {
+    cpp << indentStr() << "try {\n";
+    if (stmt.tryBody) genBlock(cpp, *stmt.tryBody, isCoroutine);
+    std::string cv = safeName(stmt.catchVar);
+    cpp << indentStr() << "} catch (aura_rt::Error& " << cv << ") {\n";
+    valueTypeVarNames_.insert(cv);
+    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, false);
+    valueTypeVarNames_.erase(cv);
     cpp << indentStr() << "}\n";
 }
 
@@ -266,6 +268,7 @@ void CodeGenerator::genSyncStmt(std::ostream& cpp, const SyncStmt& stmt,
     cpp << indentStr() << "{\n";
     cpp << indentStr() << "    std::vector<aura_rt::task<void>> _tasks;\n";
     if (stmt.body) genBlock(cpp, *stmt.body, true);
+    cpp << indentStr() << "    aura_rt::gc_safepoint();\n";
     cpp << indentStr() << "    co_await aura_rt::when_all(std::move(_tasks));\n";
     cpp << indentStr() << "}\n";
 }
@@ -463,6 +466,10 @@ void CodeGenerator::collectIdRefsExpr(const ASTNode& expr, std::set<std::string>
     }
     else if (auto* ma = dynamic_cast<const MemberAccessExpr*>(&expr))
         { collectIdRefsExpr(*ma->object, out); }
+    else if (auto* idx = dynamic_cast<const IndexExpr*>(&expr)) {
+        collectIdRefsExpr(*idx->object, out);
+        collectIdRefsExpr(*idx->index, out);
+    }
     else if (auto* as = dynamic_cast<const AssignExpr*>(&expr)) {
         collectIdRefsExpr(*as->target, out);
         collectIdRefsExpr(*as->value, out);

@@ -23,7 +23,19 @@ void printPattern(std::ostream& os, int indent, const Pattern* pat) {
 
 void NamedType::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "NamedType: " << name << '\n';
+    os << "NamedType: " << name;
+    if (!typeArgs.empty()) {
+        os << "<";
+        for (size_t i = 0; i < typeArgs.size(); ++i) {
+            if (i > 0) os << ", ";
+            if (auto* n = dynamic_cast<const NamedType*>(typeArgs[i].get()))
+                os << n->name;
+            else if (auto* g = dynamic_cast<const GenericTypeRef*>(typeArgs[i].get()))
+                os << "<" << g->name << ">";
+        }
+        os << ">";
+    }
+    os << '\n';
 }
 
 void ListType::print(std::ostream& os, int indent) const {
@@ -165,6 +177,15 @@ void MemberAccessExpr::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << "MemberAccessExpr: ." << member << '\n';
     if (object) object->print(os, indent + 1);
+}
+
+void IndexExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "IndexExpr" << '\n';
+    if (object) object->print(os, indent + 1);
+    printIndent(os, indent + 1);
+    os << "index:" << '\n';
+    if (index) index->print(os, indent + 2);
 }
 
 void AssignExpr::print(std::ostream& os, int indent) const {
@@ -405,7 +426,16 @@ void ConstDecl::print(std::ostream& os, int indent) const {
 
 void TypeDecl::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "TypeDecl: " << name << '\n';
+    os << "TypeDecl: " << name;
+    if (!typeParams.empty()) {
+        os << "<";
+        for (size_t i = 0; i < typeParams.size(); ++i) {
+            if (i > 0) os << ", ";
+            os << typeParams[i];
+        }
+        os << ">";
+    }
+    os << '\n';
     if (type) type->print(os, indent + 1);
 }
 
@@ -440,6 +470,14 @@ void MethodDecl::print(std::ostream& os, int indent) const {
     os << (isConstructor ? "Constructor: " : "MethodDecl: ") << name << '\n';
     printIndent(os, indent + 1);
     os << "receiver: (" << receiverName << " " << receiverType;
+    if (!receiverTypeArgs.empty()) {
+        os << "<";
+        for (size_t i = 0; i < receiverTypeArgs.size(); ++i) {
+            if (i > 0) os << ", ";
+            os << receiverTypeArgs[i];
+        }
+        os << ">";
+    }
     if (!implInterface.empty()) os << " impl " << implInterface;
     os << ")" << '\n';
     if (!params.empty()) {

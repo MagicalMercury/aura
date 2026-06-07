@@ -93,6 +93,7 @@ private:
     [[nodiscard]] std::unique_ptr<SemType> inferCall(const CallExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferMethodCall(const MethodCallExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferMemberAccess(const MemberAccessExpr& e);
+    [[nodiscard]] std::unique_ptr<SemType> inferIndexExpr(const IndexExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferAssign(const AssignExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferErrorPropagation(const ErrorPropagationExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferPipe(const PipeExpr& e);

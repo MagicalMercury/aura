@@ -13,10 +13,14 @@ struct TypeExpr : ASTNode { };
 
 struct NamedType : TypeExpr {
     std::string name;
+    std::vector<std::unique_ptr<TypeExpr>> typeArgs; // 泛型实例化参数，如 Stack<T>
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<NamedType>();
-        n->name = name; n->line = line; n->col = col;
+        n->name = name;
+        for (auto& a : typeArgs)
+            n->typeArgs.emplace_back(a ? std::unique_ptr<TypeExpr>(static_cast<TypeExpr*>(a->clone().release())) : nullptr);
+        n->line = line; n->col = col;
         return n;
     }
 };

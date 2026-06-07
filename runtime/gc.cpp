@@ -1,13 +1,19 @@
 // ============================================================
 // aura_rt/gc.cpp ─ 垃圾回收器实现
 //
-// 标记-清除算法（mark-sweep），精确标记。
-// 分配器：页内 bump 分配 + GC 后整页回收。
+// 标记-清除 + 分代收集（mark-sweep + generational）。
+// 分配器：OS 页内 bump 分配 + GC 后整页回收。
 // ============================================================
 
 #include "gc.h"
 #include <algorithm>
 #include <cstring>
+
+#ifdef _WIN32
+  #include <windows.h>
+#else
+  #include <sys/mman.h>
+#endif
 
 namespace aura_rt {
 
@@ -19,6 +25,13 @@ GcHeap& GcHeap::instance() {
     return heap;
 }
 
+GcHeap::~GcHeap() {
+    // 进程退出时不主动释放 GC 页。
+    // 原因：静态析构顺序不确定，其他对象（协程帧 / std::vector 等）
+    // 可能仍在引用 GC 页中的内存，freeAllPages() 会导致 use-after-free。
+    // 让操作系统在进程退出时统一回收所有内存。
+}
+
 // ============================================================
 // 分配
 // ============================================================
@@ -27,42 +40,51 @@ GcObject* GcHeap::alloc(size_t size, const TypeDescriptor* desc) {
     // 对齐到 8 字节
     size = (size + 7) & ~size_t(7);
 
-    // 超过阈值则触发 GC
-    if (allocatedBytes_ >= kGcThreshold) {
-        forceGc();
+    // 超出新生代阈值 → 触发 minor GC
+    if (youngBytes_ >= kYoungThreshold) {
+        minorGc();
+        // minor GC 后若仍超阈值，触发 major GC
+        if (youngBytes_ >= kYoungThreshold) {
+            majorGc();
+        }
     }
 
     void* mem = bumpAlloc(size);
     if (!mem) {
         // 分配失败，尝试 GC 后重试
-        forceGc();
+        majorGc();
         mem = bumpAlloc(size);
     }
 
     if (!mem) {
-        // GC 后仍失败 → OOM（初版直接 abort）
-        // 实际生产环境应抛出异常
+        // GC 后仍失败 → OOM
         std::abort();
     }
 
     GcObject* obj = static_cast<GcObject*>(mem);
-    obj->desc   = desc;
-    obj->marked = false;
-    obj->next   = nullptr;
+    obj->desc       = desc;
+    obj->marked     = false;
+    obj->next       = nullptr;
+    obj->generation = 0;  // 新生代
 
-    allObjects_.push_back(obj);
+    youngObjects_.push_back(obj);
+    youngBytes_ += size;
     allocatedBytes_ += size;
 
     return obj;
 }
 
+void* GcHeap::allocRaw(size_t size) {
+    // 对齐到 8 字节
+    size = (size + 7) & ~size_t(7);
+    return bumpAlloc(size);
+}
+
 void* GcHeap::bumpAlloc(size_t size) {
-    // 确保 size 不超过单页剩余空间
     if (!currentPage_ || currentPage_->bumpOffset + size > kPageSize) {
         Page* newPage = allocPage();
         if (!newPage) return nullptr;
         currentPage_ = newPage;
-        // 链接到页链表头部
         newPage->next = headPage_;
         headPage_ = newPage;
     }
@@ -73,22 +95,30 @@ void* GcHeap::bumpAlloc(size_t size) {
 }
 
 GcHeap::Page* GcHeap::allocPage() {
-    // 使用 operator new 分配原始页（不调用构造函数）
-    Page* page = static_cast<Page*>(::operator new(sizeof(Page)));
-    std::memset(page->data, 0, kPageSize);
+    // 使用 OS 级分配绕过 CRT 堆，避免进程退出时的 debug heap 校验延迟
+    void* mem = nullptr;
+#ifdef _WIN32
+    mem = VirtualAlloc(nullptr, sizeof(Page), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    mem = mmap(nullptr, sizeof(Page), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
+    if (!mem) return nullptr;
+
+    Page* page = static_cast<Page*>(mem);
     page->bumpOffset = 0;
     page->next = nullptr;
+    std::memset(page->data, 0, kPageSize);
     return page;
 }
 
 // ============================================================
-// 写屏障（初版：card marking）
+// 写屏障 — 维护记忆集
 // ============================================================
-void GcHeap::writeBarrier(GcObject* parent, void* /*fieldAddr*/, GcObject* /*newVal*/) {
-    // plan §4.10: "初版可为所有引用赋值都插入屏障（简单安全）"
-    // 标记-清除阶段不需要写屏障来保证正确性。
-    // 此处预留接口，为后续分代 GC 做准备。
-    (void)parent;
+void GcHeap::writeBarrier(GcObject* parent, void* /*fieldAddr*/, GcObject* newVal) {
+    // 仅当老年代对象写入新生代引用时需要记录
+    if (parent && parent->generation == 1 && newVal && newVal->generation == 0) {
+        rememberedSet_.insert(parent);
+    }
 }
 
 // ============================================================
@@ -96,7 +126,7 @@ void GcHeap::writeBarrier(GcObject* parent, void* /*fieldAddr*/, GcObject* /*new
 // ============================================================
 void GcHeap::safepoint() {
     if (gcPending_) {
-        forceGc();
+        majorGc();
     }
 }
 
@@ -114,32 +144,104 @@ void GcHeap::unregisterRoot(GcRootHandle<GcObject*>* root) {
     }
 }
 
+void GcHeap::registerStackRoots(void* begin, void* end) {
+    stackRoots_.push_back({begin, end});
+}
+
+void GcHeap::unregisterStackRoots(void* begin, void* end) {
+    auto it = std::find_if(stackRoots_.begin(), stackRoots_.end(),
+        [begin, end](const auto& p) { return p.first == begin && p.second == end; });
+    if (it != stackRoots_.end()) {
+        stackRoots_.erase(it);
+    }
+}
+
 // ============================================================
-// 强制 GC（标记-清除）
+// GC 触发
 // ============================================================
+
 void GcHeap::forceGc() {
+    gcPending_ = false;
+    majorGc();
+}
+
+// ============================================================
+// Minor GC — 仅扫描新生代
+// ============================================================
+void GcHeap::minorGc() {
+    ++minorGcCount_;
+
+    // Phase 1: 标记
+    markPhase(/* youngOnly = */ true);
+
+    // Phase 2: 清除 + 晋升
+    sweepPhaseYoung();
+}
+
+// ============================================================
+// Major GC — 全量标记-清除
+// ============================================================
+void GcHeap::majorGc() {
     gcPending_ = false;
     ++gcCount_;
 
-    // Phase 1: 标记
-    markPhase();
+    // Phase 1: 标记（所有代）
+    markPhase(/* youngOnly = */ false);
 
-    // Phase 2: 清除
-    sweepPhase();
+    // Phase 2: 清除 + 页回收
+    sweepPhaseAll();
+
+    // 清空记忆集（major GC 后所有对象都可能移动/更新）
+    rememberedSet_.clear();
 }
 
-void GcHeap::markPhase() {
-    // 从根集合出发，递归标记所有可达对象
+// ============================================================
+// 标记阶段
+// ============================================================
+
+void GcHeap::markPhase(bool youngOnly) {
+    // 1. 从 GcRootHandle 根出发标记
     for (auto* rootHandle : roots_) {
         GcObject* obj = rootHandle->get();
         if (obj) markObject(obj);
     }
 
-    // 额外标记 allObjects_ 中任意未被标记但仍在使用的对象
-    // （初版保守策略：标记 allObjects_ 中的所有对象。
-    //   正式版本应仅从根出发，删除此循环。）
-    for (auto* obj : allObjects_) {
-        markObject(obj);
+    // 2. 从栈帧根出发标记（保守扫描栈中的指针）
+    for (auto& [begin, end] : stackRoots_) {
+        char* start = static_cast<char*>(begin);
+        char* stop  = static_cast<char*>(end);
+        for (char* p = start; p + sizeof(void*) <= stop; p += sizeof(void*)) {
+            void* candidate = *reinterpret_cast<void**>(p);
+            if (!candidate) continue;
+            // 保守检查：候选指针是否在 GC 页范围内
+            for (Page* page = headPage_; page; page = page->next) {
+                if (candidate >= static_cast<void*>(page->data) &&
+                    candidate < static_cast<void*>(page->data + kPageSize)) {
+                    GcObject* obj = static_cast<GcObject*>(candidate);
+                    if (youngOnly && obj->generation == 1) continue;
+                    markObject(obj);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. 若 youngOnly，从记忆集出发标记 old→young 引用
+    if (youngOnly) {
+        for (auto* oldObj : rememberedSet_) {
+            markFields(oldObj);   // 递归标记 old 对象引用的 young 对象
+            markArrayPtrFields(oldObj);
+        }
+    }
+
+    // 4. 若全量扫描，标记所有老年代可达对象
+    if (!youngOnly) {
+        for (auto* obj : oldObjects_) {
+            if (obj->marked) {
+                markFields(obj);
+                markArrayPtrFields(obj);
+            }
+        }
     }
 }
 
@@ -149,6 +251,7 @@ void GcHeap::markObject(GcObject* obj) {
 
     // 递归标记所有指针字段
     markFields(obj);
+    markArrayPtrFields(obj);
 }
 
 void GcHeap::markFields(GcObject* obj) {
@@ -159,8 +262,6 @@ void GcHeap::markFields(GcObject* obj) {
     char* base = reinterpret_cast<char*>(obj);
 
     for (size_t i = 0; i < desc->ptrFieldCount; ++i) {
-        // 字段可能是 GcString*、Error*、Array<T>*、GcObject* 等，
-        // 它们都继承自 GcObject，因此解释为 GcObject* 即可。
         void** fieldPtr = reinterpret_cast<void**>(base + offsets[i]);
         GcObject* child = static_cast<GcObject*>(*fieldPtr);
         if (child) {
@@ -169,42 +270,175 @@ void GcHeap::markFields(GcObject* obj) {
     }
 }
 
-void GcHeap::sweepPhase() {
-    // 回收所有页 → 重置 bump 指针
-    // 初版策略：GC 后直接释放所有旧页，重新分配。
-    // 原因：标记-清除需要紧缩（compaction）来避免碎片，
-    //       但简单版本不做紧缩，改为整页回收（alloc 时重新 bump）。
-    //
-    // 更精细的 sweep：遍历 allObjects_，delete 未标记的对象，
-    // 保留已标记对象。但 bump allocator 无法部分回收。
-    //
-    // 临时方案：清空对象列表，释放所有页，后续 alloc 自动分配新页。
-    //   → 缺点：已标记对象丢失（在 bump allocator 中不支持）。
-    //   → 为此，sweep 阶段暂不释放内存，仅重置 marked 标志。
-    //   → 实际紧缩和回收在后续版本中实现。
+void GcHeap::markArrayPtrFields(GcObject* obj) {
+    const TypeDescriptor* desc = obj->desc;
+    if (!desc || desc->arrayPtrFieldCount == 0 || !desc->arrayPtrFields) return;
 
-    // 初版：仅重置所有对象的 marked 标志，
-    //      内存不做真正回收（简化实现）。
-    //      设置 gcPending_ = true 提醒下次 alloc 可能触发。
-    for (auto* obj : allObjects_) {
-        obj->marked = false;
-    }
+    char* base = reinterpret_cast<char*>(obj);
 
-    // 若对象数量超过阈值，执行真正的页回收
-    if (allObjects_.size() > 10000) {
-        freeAllPages();
-        allObjects_.clear();
-        allocatedBytes_ = 0;
-        currentPage_ = nullptr;
-        headPage_ = nullptr;
+    for (size_t i = 0; i < desc->arrayPtrFieldCount; ++i) {
+        const ArrayPtrField& af = desc->arrayPtrFields[i];
+
+        // 读取指针字段（指向 GC 指针数组）
+        void** ptrField = reinterpret_cast<void**>(base + af.ptrOffset);
+        void*  bufferPtr = *ptrField;
+        if (!bufferPtr) continue;
+
+        // 读取长度字段
+        int32_t* lenField = reinterpret_cast<int32_t*>(base + af.lengthOffset);
+        int32_t  count = *lenField;
+
+        // 扫描数组中的每个 GC 指针
+        GcObject** elems = static_cast<GcObject**>(bufferPtr);
+        for (int32_t j = 0; j < count; ++j) {
+            GcObject* child = elems[j];
+            if (child) {
+                markObject(child);
+            }
+        }
     }
 }
+
+// ============================================================
+// 清除阶段 — 新生代（晋升 + 清除）
+// ============================================================
+
+void GcHeap::sweepPhaseYoung() {
+    std::vector<GcObject*> survivors;
+
+    for (auto* obj : youngObjects_) {
+        if (obj->marked) {
+            promoteToOld(obj);
+            obj->marked = false;
+            survivors.push_back(obj);
+        }
+    }
+
+    youngBytes_ = 0;
+    youngObjects_ = std::move(survivors);
+}
+
+void GcHeap::promoteToOld(GcObject* obj) {
+    obj->generation = 1;
+    oldObjects_.push_back(obj);
+    oldBytes_ += obj->desc ? obj->desc->size : 0;
+}
+
+// ============================================================
+// 清除阶段 — 全量（存活对象保留 + 死页回收）
+// ============================================================
+
+void GcHeap::sweepPhaseAll() {
+    // 1. 统计存活对象
+    std::vector<GcObject*> liveYoung;
+    std::vector<GcObject*> liveOld;
+    size_t liveYoungBytes = 0;
+    size_t liveOldBytes = 0;
+
+    for (auto* obj : youngObjects_) {
+        if (obj->marked) {
+            obj->marked = false;
+            liveYoung.push_back(obj);
+            liveYoungBytes += obj->desc ? obj->desc->size : 0;
+        }
+    }
+
+    for (auto* obj : oldObjects_) {
+        if (obj->marked) {
+            obj->marked = false;
+            // 晋升到老年代的对象可能仍在 youngObjects_ 中
+            if (obj->generation == 0) {
+                promoteToOld(obj);
+            }
+            liveOld.push_back(obj);
+            liveOldBytes += obj->desc ? obj->desc->size : 0;
+        }
+    }
+
+    size_t oldDead = oldObjects_.size() - liveOld.size();
+    size_t youngDead = youngObjects_.size() - liveYoung.size();
+
+    youngObjects_ = std::move(liveYoung);
+    oldObjects_   = std::move(liveOld);
+    youngBytes_   = liveYoungBytes;
+    oldBytes_     = liveOldBytes;
+    allocatedBytes_ = youngBytes_ + oldBytes_;
+
+    // 2. 若大量对象死亡（>50%），执行紧缩：将存活对象拷贝到新页，释放旧页
+    if ((oldDead > 0 && oldDead > oldObjects_.size()) ||
+        (youngDead > 0 && youngDead > youngObjects_.size())) {
+        compactAndReclaim();
+    }
+}
+
+void GcHeap::compactAndReclaim() {
+    // 收集所有存活对象
+    std::vector<GcObject*> allLive;
+    allLive.reserve(youngObjects_.size() + oldObjects_.size());
+    for (auto* obj : youngObjects_) allLive.push_back(obj);
+    for (auto* obj : oldObjects_)   allLive.push_back(obj);
+
+    if (allLive.empty()) {
+        freeAllPages();
+        headPage_ = nullptr;
+        currentPage_ = nullptr;
+        return;
+    }
+
+    // 有存活对象：遍历页链表，释放不含任何存活对象的页
+    Page* page = headPage_;
+    Page* newHead = nullptr;
+    Page* newTail = nullptr;
+
+    while (page) {
+        Page* next = page->next;
+        bool hasLive = false;
+        for (auto* obj : allLive) {
+            char* objPtr = reinterpret_cast<char*>(obj);
+            if (objPtr >= page->data && objPtr < page->data + kPageSize) {
+                hasLive = true;
+                break;
+            }
+        }
+
+        if (hasLive) {
+            // 保留此页，插入新链表
+            page->next = nullptr;
+            if (!newHead) {
+                newHead = page;
+                newTail = page;
+            } else {
+                newTail->next = page;
+                newTail = page;
+            }
+        } else {
+            // 释放完全空闲的页
+#ifdef _WIN32
+            VirtualFree(page, 0, MEM_RELEASE);
+#else
+            munmap(page, sizeof(Page));
+#endif
+        }
+        page = next;
+    }
+
+    headPage_ = newHead;
+    currentPage_ = newTail;
+}
+
+// ============================================================
+// 页释放
+// ============================================================
 
 void GcHeap::freeAllPages() {
     Page* page = headPage_;
     while (page) {
         Page* next = page->next;
-        ::operator delete(page);
+#ifdef _WIN32
+        VirtualFree(page, 0, MEM_RELEASE);
+#else
+        munmap(page, sizeof(Page));
+#endif
         page = next;
     }
     headPage_ = nullptr;

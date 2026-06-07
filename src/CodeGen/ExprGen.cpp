@@ -34,6 +34,8 @@ std::string CodeGenerator::genExpr(const ASTNode& expr, bool isCoroutine) {
         return genMethodCall(*e, isCoroutine);
     if (auto* e = dynamic_cast<const MemberAccessExpr*>(&expr))
         return genMemberAccess(*e);
+    if (auto* e = dynamic_cast<const IndexExpr*>(&expr))
+        return genIndexExpr(*e, isCoroutine);
     if (auto* e = dynamic_cast<const AssignExpr*>(&expr))
         return genAssignExpr(*e, isCoroutine);
     if (auto* e = dynamic_cast<const ErrorPropagationExpr*>(&expr))
@@ -80,6 +82,10 @@ std::string CodeGenerator::genIdentifier(const Identifier& e) {
 
 std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
     if (e.elements.empty()) {
+        // 泛型上下文中的空列表：用第一个模板参数生成 Array<T>::make(0)
+        if (!currentTParams_.empty()) {
+            return "aura_rt::Array<" + currentTParams_[0] + ">::make(0)";
+        }
         return "/* empty list - element type unknown */ nullptr";
     }
 
@@ -153,6 +159,11 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
                        || right.find(".to_string") != std::string::npos
                        || right.find("aura_rt::concat") != std::string::npos
                        || right.find("aura_rt::string_concat") != std::string::npos;
+
+        // 也检测已知字符串类型变量
+        if (!leftIsStr && stringVarNames_.count(left)) leftIsStr = true;
+        if (!rightIsStr && stringVarNames_.count(right)) rightIsStr = true;
+
         if (leftIsStr || rightIsStr) {
             return "aura_rt::concat(" + left + ", " + right + ")";
         }
@@ -214,6 +225,17 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
 
     std::string calleeExpr = isCtor ? (calleeName + "_ctor") : genExpr(*e.callee, isCoroutine);
 
+    // 泛型构造函数：传递当前函数的模板参数（如 fillAndPrint<E> 中 Stack() → Stack_ctor<E>()）
+    std::string targs;
+    if (isCtor && !currentTParams_.empty()) {
+        targs = "<";
+        for (size_t i = 0; i < currentTParams_.size(); ++i) {
+            if (i > 0) targs += ", ";
+            targs += currentTParams_[i];
+        }
+        targs += ">";
+    }
+
     bool needAwait = false;
     if (isCoroutine && !isCtor) {
         needAwait = coroutineFunctions_.count(calleeExpr) > 0;
@@ -221,7 +243,7 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
 
     std::string prefix = needAwait ? "co_await " : "";
     std::ostringstream oss;
-    oss << prefix << calleeExpr << "(";
+    oss << prefix << calleeExpr << targs << "(";
     for (size_t i = 0; i < e.args.size(); ++i) {
         if (i > 0) oss << ", ";
         oss << genExpr(*e.args[i], isCoroutine);
@@ -285,6 +307,12 @@ std::string CodeGenerator::genMemberAccess(const MemberAccessExpr& e) {
     return obj + access + safeName(e.member);
 }
 
+std::string CodeGenerator::genIndexExpr(const IndexExpr& e, bool isCoroutine) {
+    std::string obj   = genExpr(*e.object, false);
+    std::string idx   = genExpr(*e.index, isCoroutine);
+    return "(*" + obj + ")[" + idx + "]";
+}
+
 // ============================================================
 // 赋值
 // ============================================================
@@ -292,6 +320,21 @@ std::string CodeGenerator::genMemberAccess(const MemberAccessExpr& e) {
 std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) {
     std::string target = genExpr(*e.target, isCoroutine);
     std::string value  = genExpr(*e.value, isCoroutine);
+
+    // 如果目标变量是字符串类型且值使用了 concat，更新追踪
+    if (stringVarNames_.count(target)) {
+        if (value.find("aura_rt::concat") == std::string::npos &&
+            value.find("aura_rt::make_string") == std::string::npos) {
+            // 不再从 make_string/concat 赋值 — 移除字符串追踪
+            // (但保守起见保留 — 可能是 string + int 产生的 concat 还没替换)
+        }
+    }
+    // 如果值包含 concat，标记目标为字符串变量
+    if (value.find("aura_rt::concat") != std::string::npos ||
+        value.find("aura_rt::make_string") != std::string::npos) {
+        stringVarNames_.insert(target);
+    }
+
     return target + " = " + value;
 }
 

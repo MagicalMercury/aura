@@ -91,6 +91,15 @@ std::unique_ptr<TypeDecl> Parser::parseTypeDecl() {
     auto& nameTok = consume(TokType::Identifier, "expected type name after 'type'");
     decl->name = nameTok.lexeme;
 
+    // 泛型参数：type Name<T> 或 type Name<A, B>
+    if (match(TokType::Less)) {
+        do {
+            auto& tp = consume(TokType::Identifier, "expected type parameter name");
+            decl->typeParams.push_back(tp.lexeme);
+        } while (match(TokType::Comma));
+        consume(TokType::Greater, "expected '>' after type parameters");
+    }
+
     consume(TokType::Assign, "expected '=' in type declaration");
     decl->type = parseType();
     match(TokType::Semicolon);
@@ -125,6 +134,15 @@ std::unique_ptr<MethodDecl> Parser::parseMethodDecl() {
     decl->receiverName = recvName.lexeme;
     auto& recvType = consume(TokType::Identifier, "expected receiver type");
     decl->receiverType = recvType.lexeme;
+
+    // 泛型接收者类型参数：fun (self Stack<T>) 中的 <T>
+    if (match(TokType::Less)) {
+        do {
+            auto& tp = consume(TokType::Identifier, "expected type parameter in receiver");
+            decl->receiverTypeArgs.push_back(tp.lexeme);
+        } while (match(TokType::Comma));
+        consume(TokType::Greater, "expected '>' after receiver type arguments");
+    }
 
     if (match(TokType::Impl)) {
         auto& implTok = consume(TokType::Identifier, "expected interface name after 'impl'");

@@ -11,10 +11,13 @@ void CodeGenerator::genTypeDecl(std::ostream& h, std::ostream& cpp,
                                  const TypeDecl& decl) {
     if (!decl.type) return;
     if (auto* rec = dynamic_cast<const RecordType*>(decl.type.get())) {
-        std::vector<std::string> tparams;
-        for (auto& f : rec->fields) {
-            if (f.type && dynamic_cast<const GenericTypeRef*>(f.type.get())) {
-                tparams.push_back(dynamic_cast<const GenericTypeRef*>(f.type.get())->name);
+        // 优先使用 TypeDecl 显式声明的泛型参数，否则从字段中扫描 GenericTypeRef
+        std::vector<std::string> tparams = decl.typeParams;
+        if (tparams.empty()) {
+            for (auto& f : rec->fields) {
+                if (f.type && dynamic_cast<const GenericTypeRef*>(f.type.get())) {
+                    tparams.push_back(dynamic_cast<const GenericTypeRef*>(f.type.get())->name);
+                }
             }
         }
         genRecordStruct(h, cpp, decl.name, *rec, tparams);
@@ -43,10 +46,11 @@ void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
     for (auto& f : body.fields) {
         std::string cppType = f.type ? mapType(*f.type) : "???";
         h << "  " << cppType << " " << safeName(f.name) << ";\n";
-        if (auto* nt = dynamic_cast<const NamedType*>(f.type.get())) {
-            auto it = registeredTypes_.find(nt->name);
-            if (it != registeredTypes_.end() && it->second)
-                ptrFields.push_back(safeName(f.name));
+
+        // 检测 GC 指针字段：任何映射后以 * 结尾的 C++ 类型都是堆对象指针
+        // 包括 NamedType（如 User*）、ListType（如 Array<T>*）、GcString* 等
+        if (!cppType.empty() && cppType.back() == '*') {
+            ptrFields.push_back(safeName(f.name));
         }
     }
 
@@ -93,11 +97,8 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     bool isCoro = coroutineFunctions_.count(decl.name);
     currentFunctionIsCoroutine_ = isCoro;
 
-    std::vector<std::string> tparams;
-    for (auto& p : decl.params) {
-        if (p.type && dynamic_cast<const GenericTypeRef*>(p.type.get()))
-            tparams.push_back(dynamic_cast<const GenericTypeRef*>(p.type.get())->name);
-    }
+    std::vector<std::string> tparams = collectFunTParams(decl);
+    currentTParams_ = tparams;
 
     std::string tprefix;
     if (!tparams.empty()) {
@@ -113,6 +114,7 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     h << tprefix << sig << ";\n";
 
     valueTypeVarNames_.clear();
+    stringVarNames_.clear();
     for (auto& p : decl.params) {
         if (p.type && dynamic_cast<const NamedType*>(p.type.get())) {
             auto* nt = dynamic_cast<const NamedType*>(p.type.get());
@@ -125,6 +127,7 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     if (decl.body) genBlock(cpp, *decl.body, isCoro);
     cpp << "}\n\n";
     valueTypeVarNames_.clear();
+    stringVarNames_.clear();
 }
 
 std::string CodeGenerator::funSignature(const FunDecl& decl,
@@ -169,11 +172,35 @@ void CodeGenerator::genMethodDecl(std::ostream& /*h*/, std::ostream& cpp,
     bool isCoro = coroutineFunctions_.count(decl.name);
     currentFunctionIsCoroutine_ = isCoro;
 
+    std::vector<std::string> tparams = collectMethodTParams(decl);
+    currentTParams_ = tparams;
+
+    std::string tprefix;
+    if (!tparams.empty()) {
+        tprefix = "template<";
+        for (size_t i = 0; i < tparams.size(); ++i) {
+            if (i > 0) tprefix += ", ";
+            tprefix += "typename " + tparams[i];
+        }
+        tprefix += ">\n";
+    }
+
+    // 构建带模板参数的接收者类型名
+    std::string recvFullType = decl.receiverType;
+    if (!tparams.empty()) {
+        recvFullType += "<";
+        for (size_t i = 0; i < tparams.size(); ++i) {
+            if (i > 0) recvFullType += ", ";
+            recvFullType += tparams[i];
+        }
+        recvFullType += ">";
+    }
+
     valueTypeVarNames_.clear();
-    // receiverName (self) is a pointer, not a value type
+    stringVarNames_.clear();
 
     std::string retType = decl.returnType ? mapType(*decl.returnType) : "void";
-    std::string sig = retType + " " + decl.receiverType + "::" + safeName(decl.name) + "(";
+    std::string sig = retType + " " + recvFullType + "::" + safeName(decl.name) + "(";
     for (size_t i = 0; i < decl.params.size(); ++i) {
         if (i > 0) sig += ", ";
         sig += (decl.params[i].type ? mapType(*decl.params[i].type) : "auto")
@@ -181,12 +208,13 @@ void CodeGenerator::genMethodDecl(std::ostream& /*h*/, std::ostream& cpp,
     }
     sig += ")";
 
-    cpp << sig << " {\n";
+    cpp << tprefix << sig << " {\n";
     currentReceiverName_ = decl.receiverName;
     if (decl.body) genBlock(cpp, *decl.body, isCoro);
     currentReceiverName_.clear();
     cpp << "}\n\n";
     valueTypeVarNames_.clear();
+    stringVarNames_.clear();
 }
 
 // ============================================================
@@ -194,12 +222,9 @@ void CodeGenerator::genMethodDecl(std::ostream& /*h*/, std::ostream& cpp,
 // ============================================================
 
 void CodeGenerator::genConstructor(std::ostream& cpp, const MethodDecl& decl) {
-    // 提取泛型类型参数（从参数类型中检测 GenericTypeRef）
-    std::vector<std::string> tparams;
-    for (auto& p : decl.params) {
-        if (p.type && dynamic_cast<const GenericTypeRef*>(p.type.get()))
-            tparams.push_back(dynamic_cast<const GenericTypeRef*>(p.type.get())->name);
-    }
+    // 提取泛型类型参数（统一用 collectMethodTParams）
+    std::vector<std::string> tparams = collectMethodTParams(decl);
+    currentTParams_ = tparams;
 
     // 构建模板前缀
     std::string tprefix;
@@ -231,6 +256,9 @@ void CodeGenerator::genConstructor(std::ostream& cpp, const MethodDecl& decl) {
     if (decl.body) genBlock(cpp, *decl.body, false);
     cpp << "  return " << safeName(decl.receiverName) << ";\n";
     cpp << "}\n\n";
+    valueTypeVarNames_.clear();
+    stringVarNames_.clear();
+    currentTParams_.clear();
 }
 
 std::string CodeGenerator::constructorSignature(const MethodDecl& decl,
@@ -270,6 +298,62 @@ void CodeGenerator::genMainEntry(std::ostream& cpp, const FunDecl& mainDecl) {
     cpp << "  return 0;\n";
     cpp << "}\n";
     (void)mainDecl;
+}
+
+// ============================================================
+// 泛型模板参数收集
+// ============================================================
+
+void CodeGenerator::collectTParams(const TypeExpr& type, std::set<std::string>& out) const {
+    if (auto* g = dynamic_cast<const GenericTypeRef*>(&type)) {
+        out.insert(g->name);
+        return;
+    }
+    if (auto* n = dynamic_cast<const NamedType*>(&type)) {
+        for (auto& a : n->typeArgs)
+            if (a) collectTParams(*a, out);
+        return;
+    }
+    if (auto* l = dynamic_cast<const ListType*>(&type)) {
+        if (l->elementType) collectTParams(*l->elementType, out);
+        return;
+    }
+    if (auto* r = dynamic_cast<const RecordType*>(&type)) {
+        for (auto& f : r->fields)
+            if (f.type) collectTParams(*f.type, out);
+        return;
+    }
+    if (auto* u = dynamic_cast<const UnionType*>(&type)) {
+        for (auto& v : u->types)
+            if (v) collectTParams(*v, out);
+        return;
+    }
+    if (auto* fn = dynamic_cast<const FunctionType*>(&type)) {
+        for (auto& p : fn->paramTypes)
+            if (p) collectTParams(*p, out);
+        if (fn->returnType) collectTParams(*fn->returnType, out);
+        return;
+    }
+}
+
+std::vector<std::string> CodeGenerator::collectFunTParams(const FunDecl& decl) const {
+    std::set<std::string> names;
+    for (auto& p : decl.params)
+        if (p.type) collectTParams(*p.type, names);
+    if (decl.returnType) collectTParams(*decl.returnType, names);
+    return {names.begin(), names.end()};
+}
+
+std::vector<std::string> CodeGenerator::collectMethodTParams(const MethodDecl& decl) const {
+    std::set<std::string> names;
+    // 优先从 receiverTypeArgs（如 Stack<T> 中的 T）
+    for (auto& ta : decl.receiverTypeArgs)
+        names.insert(ta);
+    // 从参数类型中收集
+    for (auto& p : decl.params)
+        if (p.type) collectTParams(*p.type, names);
+    if (decl.returnType) collectTParams(*decl.returnType, names);
+    return {names.begin(), names.end()};
 }
 
 } // namespace Aura

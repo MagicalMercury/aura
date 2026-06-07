@@ -17,8 +17,18 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         Symbol sym;
         sym.kind = SymKind::TypeAlias;
         sym.name = t->name;
+
+        // 注册类型泛型参数（如 type Stack<T> 中的 T）
+        for (auto& tp : t->typeParams) {
+            Symbol tpSym;
+            tpSym.kind = SymKind::GenericParam;
+            tpSym.name = tp;
+            symtab_.defineGlobal(std::move(tpSym));
+        }
+
         if (t->type) sym.type = resolveType(*t->type);
         else sym.type = ErrorSemType::make();
+
         symtab_.defineGlobal(std::move(sym));
         return;
     }
@@ -155,6 +165,13 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
         if (p.type) registerGenericParams(*p.type);
     }
     if (decl.returnType) registerGenericParams(*decl.returnType);
+    // 注册接收者泛型参数
+    for (auto& ta : decl.receiverTypeArgs) {
+        Symbol tpSym;
+        tpSym.kind = SymKind::GenericParam;
+        tpSym.name = ta;
+        symtab_.define(std::move(tpSym));
+    }
     {
         Symbol sym;
         sym.kind = SymKind::Parameter;
@@ -177,6 +194,10 @@ void SemAnalyzer::registerGenericParams(const TypeExpr& type) {
         sym.kind = SymKind::GenericParam;
         sym.name = g->name;
         symtab_.define(std::move(sym));
+    }
+    if (auto* n = dynamic_cast<const NamedType*>(&type)) {
+        for (auto& a : n->typeArgs)
+            if (a) registerGenericParams(*a);
     }
     if (auto* l = dynamic_cast<const ListType*>(&type)) {
         if (l->elementType) registerGenericParams(*l->elementType);

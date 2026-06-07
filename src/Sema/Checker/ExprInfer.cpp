@@ -21,6 +21,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferExpr(const ASTNode& expr) {
     if (auto* e = dynamic_cast<const CallExpr*>(&expr))            return inferCall(*e);
     if (auto* e = dynamic_cast<const MethodCallExpr*>(&expr))      return inferMethodCall(*e);
     if (auto* e = dynamic_cast<const MemberAccessExpr*>(&expr))    return inferMemberAccess(*e);
+    if (auto* e = dynamic_cast<const IndexExpr*>(&expr))           return inferIndexExpr(*e);
     if (auto* e = dynamic_cast<const AssignExpr*>(&expr))          return inferAssign(*e);
     if (auto* e = dynamic_cast<const ErrorPropagationExpr*>(&expr))return inferErrorPropagation(*e);
     if (auto* e = dynamic_cast<const PipeExpr*>(&expr))            return inferPipe(*e);
@@ -176,6 +177,15 @@ std::unique_ptr<SemType> SemAnalyzer::inferMemberAccess(const MemberAccessExpr& 
         return ErrorSemType::make();
     }
     // 接口类型或其他：允许成员访问（编译时无法确定）
+    return ErrorSemType::make();
+}
+
+std::unique_ptr<SemType> SemAnalyzer::inferIndexExpr(const IndexExpr& e) {
+    auto objType = inferExpr(*e.object);
+    if (auto* list = dynamic_cast<const ListSemType*>(objType.get())) {
+        return list->elementType ? list->elementType->clone() : ErrorSemType::make();
+    }
+    // 泛型或其他：编译时无法确定元素类型
     return ErrorSemType::make();
 }
 

@@ -99,6 +99,16 @@ private:
     void collectDeclared(const Stmt& stmt, std::set<std::string>& out) const;
 
     // ============================================================
+    // 泛型模板参数收集
+    // ============================================================
+
+    // 递归扫描类型表达式，收集所有泛型引用名（GenericTypeRef + NamedType.typeArgs）
+    void collectTParams(const TypeExpr& type, std::set<std::string>& out) const;
+    // 从函数声明中收集模板参数（params + returnType + receiverTypeArgs）
+    [[nodiscard]] std::vector<std::string> collectFunTParams(const FunDecl& decl) const;
+    [[nodiscard]] std::vector<std::string> collectMethodTParams(const MethodDecl& decl) const;
+
+    // ============================================================
     // 类型映射
     // ============================================================
 
@@ -184,6 +194,9 @@ private:
     void genContinueStmt(std::ostream& cpp);
     void genTryCatchStmt(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
     void genSyncStmt(std::ostream& cpp, const SyncStmt& stmt, bool isCoroutine);
+
+    // 原始 try/catch（非协程模式回退，被 genTryCatchStmt 复用）
+    void genTryCatchRaw(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
     void genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt, bool isCoroutine);
     void genMatchStmt(std::ostream& cpp, const MatchStmt& stmt, bool isCoroutine);
     void genExprStmt(std::ostream& cpp, const ExprStmt& stmt, bool isCoroutine);
@@ -206,6 +219,7 @@ private:
     [[nodiscard]] std::string genCallExpr(const CallExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genMethodCall(const MethodCallExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genMemberAccess(const MemberAccessExpr& e);
+    [[nodiscard]] std::string genIndexExpr(const IndexExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genAssignExpr(const AssignExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genErrorPropagation(const ErrorPropagationExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genPipeExpr(const PipeExpr& e, bool isCoroutine);
@@ -277,6 +291,12 @@ private:
 
     // 当前正在生成的函数的协程状态
     bool currentFunctionIsCoroutine_ = false;
+
+    // 当前函数的模板参数列表（用于调用泛型构造函数时传递类型参数）
+    std::vector<std::string> currentTParams_;
+
+    // 字符串类型变量名集合（用于 genBinaryExpr 检测 string + T 拼接）
+    std::set<std::string> stringVarNames_;
 
     // 错误列表
     std::vector<std::string> errors_;

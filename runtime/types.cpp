@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "types.h"
+#include "gc.h"   // 需要 gc_alloc / allocRaw
 #include <cstring>
 
 namespace aura_rt {
@@ -34,18 +35,17 @@ const TypeDescriptor Error::_desc = {
 };
 
 // ============================================================
-// GcString 工厂实现
+// GcString 工厂实现（plan §6: 使用 gc_alloc 分配对象）
 // ============================================================
 GcString* GcString::make(const char* s) {
     return make(s, std::strlen(s));
 }
 
 GcString* GcString::make(const char* s, size_t len) {
-    // 使用 gc_alloc（gc.h），所以此实现必须放在 gc.h 之后
-    // 简易回退：operator new
-    auto* str = new GcString();
+    // 使用 GC 页分配：GcString* 走 bump allocator，data 走 allocRaw
+    auto* str = gc_alloc<GcString>(&GcString::_desc);
     str->length = static_cast<int32_t>(len);
-    str->data   = new char[len + 1];
+    str->data   = static_cast<char*>(GcHeap::instance().allocRaw(len + 1));
     std::memcpy(str->data, s, len);
     str->data[len] = '\0';
     return str;

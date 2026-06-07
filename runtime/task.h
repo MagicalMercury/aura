@@ -11,10 +11,11 @@
 // run_event_loop ─ 驱动主协程直至完成
 //
 // 依赖：types.h (GcString, Error 等)
-//       不依赖 gc.h（协程帧由 gc_alloc 分配，但 task.h 本身不调用 GC）
+//       gc.h（run_event_loop 需要 gc_register_stack_roots）
 // ============================================================
 
 #include "types.h"
+#include "gc.h"
 
 #include <concepts>
 #include <coroutine>
@@ -46,8 +47,8 @@ struct task_promise_base {
     struct final_awaiter : std::suspend_always {
         std::coroutine_handle<> continuation;
         final_awaiter(std::coroutine_handle<> h) : continuation(h) {}
-        auto await_suspend(std::coroutine_handle<>) noexcept {
-            return continuation;
+        void await_suspend(std::coroutine_handle<>) noexcept {
+            if (continuation) continuation.resume();
         }
     };
 
@@ -181,13 +182,17 @@ inline task<void> when_all(std::vector<task<void>> tasks) {
 // 初版：单线程、无 I/O 复用，仅用于驱动纯计算协程。
 // ============================================================
 inline void run_event_loop(task<void>& mainTask) {
-    // 从初始挂起点恢复
     auto handle = mainTask.handle();
     if (!handle) return;
 
-    // 启动主协程。C++20 对称传输会自动将控制权在协程链中传递，
-    // 主协程完成时 resume() 自然返回，无需 busy loop。
+    // 将协程帧注册为 GC 保守栈根，使 GC 能发现帧内的 GC 对象
+    void* framePtr = handle.address();
+    static constexpr size_t kConservativeFrameSize = 4096;
+    gc_register_stack_roots(framePtr, static_cast<char*>(framePtr) + kConservativeFrameSize);
+
     handle.resume();
+
+    gc_unregister_stack_roots(framePtr, static_cast<char*>(framePtr) + kConservativeFrameSize);
 }
 
 } // namespace aura_rt

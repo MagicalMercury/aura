@@ -1,4 +1,4 @@
-# Aura 语言使用手册 v0.4
+# Aura 语言使用手册 v0.5
 
 ## 关于 `io` 与 `path` 的重要说明
 
@@ -102,19 +102,23 @@ let nums: [int] = [1, 2, 3]
 接口名直接用作类型，表示任何实现了该接口的值（见第6节）。
 
 **泛型**  
-使用 `<T>` 标记类型变量，作用域为所在定义（函数或类型别名）。
+类型别名和函数均可使用泛型。类型别名定义时在名称后加 `<T>` 声明类型参数，字段内直接使用该参数名。  
+函数签名中，在参数类型处使用 `<T>` 引入类型变量，返回类型中直接使用已引入的变量名，不必再加尖括号。
 ```aura
-type Pair = { first: <A>, second: <B> }
-fun id(x: <T>) -> T { return x }
+type Pair<A, B> = { first: A, second: B }
+fun zip(a: <A>, b: <B>) -> Pair<A, B> {
+    return Pair(a, b)
+}
 ```
+多个泛型参数用逗号分隔：`<A, B>`。类型变量名习惯首字母大写，但非强制。
 
 ### 3.3 类型别名
 ```aura
 type User = { id: int, name: string }
-type Pair = { first: <A>, second: <B> }
+type Stack<T> = { items: [T], top: int }
 type MaybeFloat = float | None
 ```
-类型别名中类型变量必须写为 `<Name>`。
+类型别名中泛型参数必须紧跟在类型名后的 `< >` 中，字段内直接使用参数名，无需额外尖括号。
 
 ---
 
@@ -169,7 +173,7 @@ fun load(io: Io) throws -> string {
 ```
 
 ### 5.3 泛型函数
-用 `<T>` 标记类型变量。
+在参数类型中用 `<T>` 引入类型变量，返回类型直接使用该变量名。
 ```aura
 fun max(a: <T>, b: <T>) -> T {
     if a.compare(b) > 0 {   // 隐式要求 T 有 compare 方法
@@ -178,7 +182,7 @@ fun max(a: <T>, b: <T>) -> T {
     return b
 }
 
-fun zip(a: <A>, b: <B>) -> Pair {
+fun zip(a: <A>, b: <B>) -> Pair<A, B> {
     return Pair(a, b)
 }
 ```
@@ -204,6 +208,16 @@ fun (self User) User(id: int, name: string) {
 }
 ```
 定义构造函数后，只能用构造函数创建实例，不能使用记录字面量。
+
+泛型类型的构造函数示例：
+```aura
+type Stack<T> = { items: [T], top: int }
+
+fun (self Stack<T>) Stack() {
+    self.items = []
+    self.top = -1
+}
+```
 
 ### 6.3 接口
 ```aura
@@ -339,6 +353,9 @@ sync {
 ```
 若子任务抛异常，`sync` 等待所有任务终止后抛出聚合异常。
 
+### 10.2 协程透明性
+程序员无需关心函数是否为协程，编译器自动判定。调用 I/O 或可能挂起的操作时，当前函数即成为协程，所有异步细节在生成的代码中处理。
+
 ---
 
 ## 11. 模块、导入与能力对象
@@ -404,7 +421,6 @@ fun main(io: Io) throws {
 |------|------|
 | `path.new(s: string) -> Path` | 从字符串创建路径 |
 | `path.join(parts: Path, ...) -> Path` | 拼接多个路径（可接受 Path 与 string） |
-| `path.cwd() -> Path`（注：需能力？这里实现为纯函数可能有争议，暂不列入；建议用 io.cwd 获取运行时工作目录） | — |
 
 ### 13.2 `Path` 方法
 | 方法签名 | 说明 |
@@ -447,14 +463,36 @@ fun (self User impl Stringer) to_string() -> string {
     return "User(" + self.id + ", " + self.name + ")"
 }
 
-type Pair = { first: <A>, second: <B> }
+// 泛型记录 Pair
+type Pair<A, B> = { first: A, second: B }
 
-fun zip(a: <A>, b: <B>) -> Pair {
+fun zip(a: <A>, b: <B>) -> Pair<A, B> {
     return Pair(a, b)
 }
 
+// 泛型容器 Stack
+type Stack<T> = { items: [T], top: int }
+
+fun (self Stack<T>) Stack() {
+    self.items = []
+    self.top = -1
+}
+
+fun push(s: Stack<T>, value: T) {
+    s.items[s.top + 1] = value
+    s.top = s.top + 1
+}
+
+fun pop(s: Stack<T>) throws -> T {
+    if s.top < 0 {
+        throw { kind = "empty_stack", message = "cannot pop from empty stack" }
+    }
+    let val = s.items[s.top]
+    s.top = s.top - 1
+    return val
+}
+
 fun parseUser(json: string) throws -> User {
-    // 假设 parseJson 为底层解析函数
     if json == "" {
         throw { kind = "parse_error", message = "empty json" }
     }
@@ -473,9 +511,15 @@ fun main(io: Io) throws {
     let p = path.join(path.new("config"), "app.toml")
     io.println("Config path: " + p.to_string())
 
-    // 泛型示例
+    // 泛型示例：Pair
     let pair = zip(42, "hello")
     io.println("Pair: (" + pair.first + ", " + pair.second + ")")
+
+    // 泛型示例：Stack
+    let stack = Stack()
+    push(stack, 10)
+    push(stack, 20)
+    io.println("Stack top: " + pop(stack)!)   // 20
 
     // 并发加载用户
     let ids = [1, 2, 3]
@@ -509,11 +553,12 @@ fun main(io: Io) throws {
 | 联合类型 | `T1 \| T2`；`match` 穷尽匹配 |
 | 方法 | `fun (self Type) name(...)` |
 | 接口 | 结构类型，自动实现；可用 `impl` 做编译检查 |
-| 泛型 | 类型位置用 `<T>` 标记类型变量，记录泛型同样需加 `<>` |
+| 泛型类型定义 | `type Name<T> = { ... }`，字段内直接用 `T` |
+| 泛型函数 | 参数类型中用 `<T>` 引入，返回类型直接用变量名 |
 | 构造函数 | `fun (self T) T(...)` 可选；无则可用记录字面量 |
 | 并发 | `sync` 结构化并发，`spawn` 启动任务 |
 | 能力对象 | I/O 副作用通过 `io: Io` 显式传递 |
 | `path` 模块 | 纯路径操作，`import "path"` |
 | 导入路径表达式 | `import path.join(...)` 编译期求值 |
 
-此手册涵盖了 Aura v0.4 的所有核心特性与标准 API，可作为开发与编译器实现的参考基线。
+此手册涵盖 Aura v0.5 的所有核心特性与标准 API，可作为开发与编译器实现的参考基线。

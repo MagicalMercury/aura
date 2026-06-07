@@ -70,12 +70,21 @@ std::unique_ptr<TypeExpr> Parser::parsePrimaryType() {
     }
 
     // 命名类型，可能是函数类型: Type -> RetType throws?
+    // 也可能是泛型实例化: Name<T> 或 Name<A, B>
     // None 也是合法的类型名
     if (check(TokType::Identifier) || check(TokType::None)) {
         auto& tok = advance();
         auto n = std::make_unique<NamedType>();
         setNodePos(n.get(), tok);
         n->name = tok.lexeme;
+
+        // 泛型实例化参数: Name<T> 或 Name<A, B>
+        if (match(TokType::Less)) {
+            do {
+                n->typeArgs.push_back(parseType());
+            } while (match(TokType::Comma));
+            consume(TokType::Greater, "expected '>' after type arguments");
+        }
 
         if (match(TokType::Arrow)) {
             auto ft = std::make_unique<FunctionType>();

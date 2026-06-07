@@ -6,6 +6,11 @@ set(CMAKE_CXX_COMPILER "C:/msys64/ucrt64/bin/g++.exe")
 
 project(Aura)
 
+# 默认 Debug 编译
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
@@ -58,6 +63,6 @@ set(AURA_HEADERS
     src/CodeGen/CodeGen.h
 )
 
-add_executable(Aura ${AURA_SOURCES} ${AURA_HEADERS})
+add_executable(aurac ${AURA_SOURCES} ${AURA_HEADERS})
 
-target_include_directories(Aura PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(aurac PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
