@@ -220,6 +220,11 @@ std::unique_ptr<ASTNode> Parser::parseCall() {
 }
 
 std::unique_ptr<ASTNode> Parser::parsePrimary() {
+    // 闭包表达式: fun (params) -> Ret { body }
+    if (check(TokType::Fun)) {
+        return parseFunExpr();
+    }
+
 #define PARSE_LITERAL(tok, CppType, AuraType)        \
     if (check(tok)) {                                 \
         auto& tokRef = advance();                     \
@@ -310,6 +315,30 @@ std::unique_ptr<ASTNode> Parser::parsePrimary() {
 
     error("expected expression");
     return nullptr;
+}
+
+// ============================================================
+// 闭包表达式: fun (params) throws? -> Ret? { body }
+// ============================================================
+std::unique_ptr<ASTNode> Parser::parseFunExpr() {
+    auto tok = advance(); // fun
+    auto fe = std::make_unique<FunExpr>();
+    setNodePos(fe.get(), tok);
+
+    consume(TokType::LParen, "expected '(' after 'fun' in closure");
+    if (!check(TokType::RParen)) {
+        fe->params = parseParams();
+    }
+    consume(TokType::RParen, "expected ')' after closure parameters");
+
+    if (match(TokType::Throws)) fe->throws = true;
+
+    if (match(TokType::Arrow)) {
+        fe->returnType = parseType();
+    }
+
+    fe->body = parseBlock();
+    return fe;
 }
 
 } // namespace Aura

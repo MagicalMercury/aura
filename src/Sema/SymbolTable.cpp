@@ -21,14 +21,14 @@ bool Scope::define(Symbol sym) {
     return true;
 }
 
-Symbol* Scope::lookupLocal(const std::string& name) {
+Symbol* Scope::lookupLocal(const std::string& name) const {
     auto it = symbols_.find(name);
-    if (it != symbols_.end()) return &it->second;
+    if (it != symbols_.end()) return const_cast<Symbol*>(&it->second);
     return nullptr;
 }
 
-Symbol* Scope::lookup(const std::string& name) {
-    Scope* scope = this;
+Symbol* Scope::lookup(const std::string& name) const {
+    const Scope* scope = this;
     while (scope) {
         auto* sym = scope->lookupLocal(name);
         if (sym) return sym;
@@ -79,11 +79,11 @@ bool SymbolTable::defineGlobal(Symbol sym) {
     return false;
 }
 
-Symbol* SymbolTable::lookup(const std::string& name) {
+Symbol* SymbolTable::lookup(const std::string& name) const {
     return current_->lookup(name);
 }
 
-Symbol* SymbolTable::lookupGlobal(const std::string& name) {
+Symbol* SymbolTable::lookupGlobal(const std::string& name) const {
     for (auto& scope : scopes_) {
         if (scope->kind() == ScopeKind::Global) {
             return scope->lookupLocal(name);

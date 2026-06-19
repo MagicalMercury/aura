@@ -48,6 +48,7 @@ set(AURA_SOURCES
 )
 
 set(AURA_HEADERS
+    src/ASTWalker.h
     src/TokType.h
     src/Token.h
     src/Lexer.h

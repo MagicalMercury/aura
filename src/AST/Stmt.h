@@ -419,4 +419,29 @@ struct Program : ASTNode {
     }
 };
 
+// ============================================================
+// FunExpr ─ 闭包表达式 (fun (params) throws? -> Ret? { body })
+//
+// README §2.3, §5.4: 闭包字面量，作为表达式使用。
+// 定义于 Stmt.h（而非 Expr.h）以使用 Param / BlockStmt 的完整定义。
+// 继承 ASTNode（非 Stmt/Decl），因为它是表达式，可出现在任何表达式位置。
+// ============================================================
+struct FunExpr : ASTNode {
+    std::vector<Param> params;               // 参数列表（可为空；Phase 1 要求显式类型标注）
+    bool throws = false;                      // 是否可能抛出
+    std::unique_ptr<TypeExpr> returnType;     // 返回类型（可为空，由推断决定）
+    std::unique_ptr<BlockStmt> body;          // 函数体
+
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<FunExpr>();
+        for (auto& p : params) n->params.push_back(cloneParam(p));
+        n->throws = throws;
+        if (returnType) n->returnType.reset(static_cast<TypeExpr*>(returnType->clone().release()));
+        if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
 } // namespace Aura

@@ -1,8 +1,8 @@
 # Aura 编译器架构文档
 
-> 版本：v0.6
-> 日期：2026-06-07
-> 状态：多文件模块系统已实现，分代 GC 已就绪，import 端到端可工作
+> 版本：v0.7
+> 日期：2026-06-19
+> 状态：GcString 重构完成，Array 块链表就绪，CodeGen 闭包/递归/make_mapper 全场景通过
 
 ---
 
@@ -36,7 +36,7 @@
 | 语义分析 | `src/Sema/` (4 头文件 + 4 cpp) | ✅ 完成 |
 | 代码生成 | `src/CodeGen/` (1 头文件 + 6 cpp) | ✅ 完成（含命名空间包裹、跨模块模板体、构造调用） |
 | 模块系统 | `src/Module/` (2 文件) | ✅ 完成（递归加载、循环检测、拓扑分层、入口验证） |
-| 运行时库 | `runtime/` (7 头文件 + 4 cpp) | ✅ 完成（分代 GC + Path GcString* 适配 + bool_to_string） |
+| 运行时库 | `runtime/` (9 头文件 + 6 cpp) | ✅ 完成（GcString 重构、Array 块链表、扩展 API、错误工厂） |
 
 ---
 
@@ -69,12 +69,13 @@ d:\you\Aura\
 │   │   ├── SemType.{h,cpp}       # 语义类型层次（9 种子类）
 │   │   ├── Symbol.h              # 符号条目定义
 │   │   ├── SymbolTable.{h,cpp}   # 作用域 / 符号表
+│   │   ├── BuiltinMethods.h      # 内置方法映射表（string.len / [T].append 等）
 │   │   ├── SemAnalyzer.h         # SemAnalyzer 主头文件
 │   │   ├── SemAnalyzer.cpp       # 主流程 + 工具 + 调度
 │   │   └── Checker/
 │   │       ├── DeclChecker.cpp   # 声明注册（第 1 遍）
 │   │       ├── StmtChecker.cpp   # 语句检查
-│   │       └── ExprInfer.cpp     # 表达式类型推断 + match 穷尽
+│   │       └── ExprInfer.cpp     # 表达式类型推断 + match 穷尽 + string 拼接
 │   └── CodeGen/
 │       ├── CodeGen.h             # CodeGenerator 主头文件
 │       ├── CodeGen.cpp           # 主流程 + 命名空间包裹 + #include/别名生成
@@ -87,21 +88,34 @@ d:\you\Aura\
 ├── runtime/                      # 运行时库 (libaura_rt.a)
 │   ├── CMakeLists.txt            # 独立构建
 │   ├── aura_rt.h                 # 总头文件
-│   ├── types.{h,cpp}             # GcObject, GcString, Error, Array<T>, NoneType
-│   │                             #   TypeDescriptor (含 ArrayPtrField), GcObject.generation
-│   │                             #   bool_to_string, concat(bool,...)
+│   ├── types.{h,cpp}             # GcObject, Error, NoneType, TypeDescriptor
 │   ├── gc.{h,cpp}                # GcHeap 分代 GC（标记-清除 + 写屏障 + 记忆集）
-│   │                             #   registerStackRoots, compactAndReclaim
+│   │                             #   + OOM 错误缓存 + 老年代阈值检查
 │   ├── task.{h,cpp}              # task<T>, when_all, run_event_loop
-│   │                             #   final_awaiter 空 continuation 修复
 │   └── builtin/
+│       ├── string.{h,cpp}        # GcString 定义 + TypeDescriptor + make/from/concat
+│       │                         #   + ToString concept + operator+ 多重重载
+│       ├── array.h               # Array<T> 块链表实现（ArrayChunk + 迭代器 + 合并）
+│       ├── error.h               # 8 种内置错误工厂（Index/Type/Value/Key/IO/OOM...）
 │       ├── path.h                # Path + path 模块 (返回 GcString*，无 std::string)
 │       ├── io.h                  # Io 能力类声明
-│       └── io.cpp                # Io 实现 (println/readln/read_file/write_file/…)
-│
+│       └── io.cpp                # Io 实现 (println/readln/read_file/write_file/list_dir)
 ├── CMakeLists.txt                # 主构建 (aurac.exe)
 ├── README.md                     # 语言使用手册
-└── plan.md                       # 编译器实现计划书
+├── ARCHITECTURE.md               # 本文档
+├── change.md                     # Array 旧 API → 新 API 替换指南
+├── chunk_array_plan.md           # Array 块链表设计（ArrayChunk + maybeCompact）
+├── array_advise.md               # Array API 审查与改进建议（empty/size/clear...）
+├── coroutine_gc_review.md        # 协程 GC 根注册审查
+├── error.md                      # 运行时 Bug 追踪（全部已修复）
+├── Res.md                        # 项目总结 / TODO 总表
+├── plan/                         # 实现计划书
+│   ├── plan.md                   # 总计划
+│   ├── plan6.md                  # 分代 GC + 写屏障
+│   ├── plan11.md                 # 值方法调用（s.len() / arr.push(val)）
+│   ├── plan12.md                 # 闭包泛型 + 递归闭包 + make_mapper
+│   ├── plan13.md                 # GcString 重构（API 内聚 + operator+ + ToString）
+│   └── plan14.md                 # 分析器已知限制（递归泛型类型 + 闭包→接口匹配）
 ```
 
 ---
@@ -241,7 +255,10 @@ CoroDecide.cpp ── 协程判定  ──────────────�
 | 协程判定 | `CoroDecide.cpp` | 扫描 `io.*` 调用和协程函数调用 |
 | 字符串拼接 | `ExprGen.cpp` | `a + b` 检测字符串侧 → `concat(a, b)` |
 | bool 拼接 | `ExprGen.cpp` | `concat(str, true)` → `concat(str, bool_to_string(true))` |
+| 递归闭包 | `ExprGen.cpp` | `let f = fun(...) { ... f(...) }` → 加 `&` 引用捕获 |
+| 空列表修复 | `StmtGen.cpp` | `let x: [T] = []` 中 nullptr → `Array<T>::make(0)` |
 | `throw` 语句 | `StmtGen.cpp` | 记录字面量 → `Error(kind, message)` |
+| `push`→`append` | `ExprGen.cpp` | 列表字面量 `->push(` → `->append(` |
 | 值类型 `.` vs `->` | `ExprGen.cpp`/`StmtGen.cpp` | `Path`/`Io` 值类型跟踪 |
 | 命名空间 `::` | `ExprGen.cpp` | import 的模块/别名用 `::` 访问 |
 | 跨模块构造调用 | `ExprGen.cpp` | `math.Pair(a, b)` → `math::Pair_ctor<float, bool>(a, b)` |
@@ -251,13 +268,15 @@ CoroDecide.cpp ── 协程判定  ──────────────�
 | import 别名 | `CodeGen.cpp` | `namespace alias = target_ns;`，有别名时屏蔽原名 |
 | 中间文件清理 | `main.cpp` | 编译成功后删除 `.gen.cpp`/`.aura.h`（除非 `--cpp`） |
 
-### 4.3 已知待实现
+### 4.3 已知待实现 / 限制
 
-| 编号 | 问题 | 优先级 |
-|------|------|--------|
-| F1 | 接口类型擦除（当前输出注释） | 中 |
-| F2 | `match` 分支变量 lambda 捕获完整性 | 中 |
-| F3 | 编译期路径表达式（`import path.join(...)`）— 初版可延后 | 低 |
+| 编号 | 问题 | 优先级 | 计划 |
+|------|------|--------|------|
+| F1 | 接口类型擦除（当前输出占位） | 中 | plan14 |
+| F2 | `match` 分支变量 lambda 捕获完整性 | 中 | — |
+| F3 | 编译期路径表达式（`import path.join(...)`） | 低 | 延后 |
+| F4 | 递归泛型类型推断（`Tree<T> = {..., children: [Tree<T>]}`） | 高 | plan14 |
+| F5 | 闭包到接口的结构匹配（`fun(string) -> string` 作为 `interface` 参数） | 高 | plan14 |
 
 ---
 
@@ -267,9 +286,10 @@ CoroDecide.cpp ── 协程判定  ──────────────�
 
 ```
 GcObject (基类: desc, marked, next, generation)
-├── GcString    (length, data)      — 字符串
+├── GcString    (length, data)      — 字符串（定义在 builtin/string.h）
 ├── Error       (kind, message, extra) — 错误对象
-└── Array<T>    (length, capacity, elements) — 动态数组
+└── Array<T>    (块链表：head/tail+length+chunk_count) — 动态数组
+    └── ArrayChunk<T>  (used, capacity, next, prev, data @ this+1)
 
 值类型:
 │   NoneType    (单例 aura_rt::None)
@@ -281,21 +301,47 @@ GC 支持:
 │   GcHeap          — 分代 GC 单例 (mark-sweep + generational)
 │   GcRootHandle<T> — 根引用句柄（构造注册，析构注销）
 │   gc_alloc<T>()   — 模板分配器（→ youngObjects_）
-│   gc_safepoint()  — 安全点（检查 gcPending_）
+│   gc_safepoint()  — 安全点（检查 gcPending_ → minor/major GC）
 │   gc_write_barrier() — 写屏障（维护 rememberedSet_）
 │   gc_register_stack_roots() / gc_unregister_stack_roots()
 │                     — 协程帧保守栈根（run_event_loop 调用）
 │
-│   ArrayPtrField   — 数组指针字段描述符
-│                      用于 Array<GcString*>::elements 的 GC 扫描
+│   InlineArrayField — 内联数组字段描述符
+│                      用于 ArrayChunk<T*> 的 data 区 GC 扫描
 
-字符串工具 (types.cpp):
-│   make_string(s)   — GcString* 工厂
-│   string_concat(a,b) — 拼接
-│   int_to_string(i)  — int → GcString*
-│   float_to_string(d) — double → GcString*
-│   bool_to_string(b)  — bool → "true"/"false"
-│   concat(...)     — 15 个重载覆盖所有类型组合
+字符串工具 (builtin/string.h):
+│   GcString::make(s)   — 核心工厂（C 字符串 → GcString*）
+│   GcString::from(i/d/b)— 扩展工厂（int/double/bool → GcString*）
+│   GcString::concat(b) — 拼接（const GcString& → GcString*）
+│   operator+(a, b)     — 12 个重载（GcString&/int/double/bool + ToString）
+│   向后兼容: make_string/string_concat/int_to_string/concat
+│   string_eq(a, b)     — 字符串值比较
+
+错误工厂 (builtin/error.h):
+│   make_index_error       — IndexError
+│   make_type_error        — TypeError
+│   make_value_error       — ValueError
+│   make_key_error         — KeyError
+│   make_io_error          — IOError
+│   make_runtime_error     — RuntimeError
+│   make_not_implemented_error — NotImplementedError
+│   make_out_of_memory_error — OutOfMemoryError
+
+Array API (builtin/array.h):
+│   ArrayChunk<T>::make    — 创建 chunk（内联 data）
+│   ArrayChunk<T>::desc()  — TypeDescriptor（含 InlineArrayField）
+│   Array<T>::make(size)   — 预分配 chunk 链表
+│   append(v)             — 尾部追加（新建 chunk 如需要）
+│   pop() / pop(idx)      — 弹出（块内左移 + maybeCompact）
+│   insert(idx, v)        — 插入（块内右移 / 满块分裂）
+│   remove(idx)           — 别名 pop(idx)
+│   clear()               — 清零 used + 合并空块
+│   reserve(cap)          — 预分配 chunk
+│   operator[] / const operator[] — 随机访问（O(N/CAP)）
+│   len() / size() / empty() / capacity()
+│   front() / back()
+│   Iterator begin()/end()— 跨 chunk 迭代器
+│   EMPTY()               — 空 Array 单例
 ```
 
 ### 5.2 分代 GC 架构
@@ -312,32 +358,78 @@ youngBytes_ >= kYoungThreshold (256KB)?
      │        │    · GcRootHandle 根
      │        │    · stackRoots_ 保守扫描
      │        │    · rememberedSet_ 老→新引用
+     │        │    · OOM 错误缓存字符串始终标记
      │        └─ sweepPhaseYoung()     — 存活晋升 oldObjects_ (gen 1)
+     │           promoteToOld() 若 oldBytes_ >= kOldThreshold → gcPending_ = true
      │
   ┌──┴──┐
   │still│──► majorGc()
   └──┬──┘     ├─ markPhase(false)      — 全量扫描
      │        ├─ sweepPhaseAll()       — 存活保留
-     │        └─ compactAndReclaim()   — 死页回收
+     │        │   若 dead >= live (>=50% 死亡) → compactAndReclaim()
+     │        │   若 oldBytes_ >= kOldThreshold → gcPending_ = true
+     │        └─ 清空 rememberedSet_
+     │
+safepoint() — 安全点（协程恢复处插入）
+     │   gcPending_ = true 时触发:
+     │   youngBytes_ >= kYoungThreshold/2 → minorGc()
+     │   oldBytes_ >= kOldThreshold → majorGc()
 
 writeBarrier(parent(gen1), fieldAddr, newVal(gen0))
      └─► rememberedSet_.insert(parent)  — 老→新引用记录
+
+oomError_ 缓存:
+     instance() 构造时不初始化（避免 static init 递归）
+     tryAlloc() 首次调用时懒初始化 → make_string 此时 GcHeap 已就绪
+     oomInit_ 防止 ensureOomError → make_string → alloc → ensureOomError 回环
+     markPhase() 始终标记 oomError_.kind/message
 ```
 
-### 5.3 task.h 修复
+### 5.3 GcString 重构 (plan13)
+
+```
+旧设计（v0.6）:                       新设计（v0.7）:
+═══════════════                        ═══════════
+types.h   GcString 定义               types.h   struct GcString; 前向声明
+types.cpp GcString::_desc + make      builtin/string.h 完整定义 + 声明
+gc.h      9 个游离函数声明            builtin/string.h operator+ 重载
+          make_string / concat / ...              inline 向后兼容别名
+          int_to_string / float_to_string / ...   ToString concept<T>
+          bool_to_string                          string_eq
+types.cpp 15 个 concat 重载           builtin/string.cpp 实现集中
+                                       types.cpp/gc.h 旧代码注释
+```
+
+### 5.4 Array 块链表 (chunk_array_plan)
+
+
+设计摘要 — 完整文档见 `chunk_array_plan.md`：
+
+```
+Array<T> {
+    head → Chunk₀ ⇄ Chunk₁ ⇄ ... ⇄ Chunkₙ ← tail
+            │ data[8]  │ data[8]       │ data[8]
+}
+
+· 每块 8 元素，data 内联于对象体后（this + 1）
+· GC 通过 InlineArrayField 描述 data 区指针
+· pop 后 maybeCompact() 5 窗窗口合并稀疏块
+· 所有写屏障完整覆盖（c->next/prev/tail/head + 数据拷贝）
+```
+
+### 5.5 task.h
 
 ```cpp
-// final_awaiter — 空 continuation 不再对称传输到 null
 struct final_awaiter : std::suspend_always {
     std::coroutine_handle<> continuation;
     final_awaiter(std::coroutine_handle<> h) : continuation(h) {}
     void await_suspend(std::coroutine_handle<>) noexcept {
-        if (continuation) continuation.resume();  // 只在有等待者时恢复
+        if (continuation) continuation.resume();
     }
 };
 ```
 
-### 5.4 内置模块 API
+### 5.6 内置模块 API
 
 **`path` 模块** (纯函数，`import path`)
 
@@ -425,18 +517,26 @@ cmake --build build
 
 | 决策 | 说明 |
 |------|------|
-| 后端目标 C++20 | 利用协程、模板、variant |
+| 后端目标 C++20 | 利用协程、模板、variant、concepts |
 | 分代 GC | mark-sweep + generational（young/old + remembered set + 写屏障） |
 | 保守栈根 | `registerStackRoots` 扫描协程帧内存范围 |
-| 精确标记 | TypeDescriptor + ptrFieldOffsets + ArrayPtrField |
+| 精确标记 | TypeDescriptor + ptrFieldOffsets + InlineArrayField |
 | 模板体入 .h | 跨模块实例化必须可见 |
 | `as` 别名屏蔽原名 | 有 alias 时不生成原名别名 |
-| 函数着色消除 | 编译期扫描调用图自动判定 |
+| 函数着色消除 | 编译期扫描调用图自动判定（CoroDecide.cpp） |
 | 异常传播 | `throw { k=..., m=... }` → `throw aura_rt::Error(...)` |
 | 运行时独立库 | `runtime/` 独立编译为 `libaura_rt.a` |
 | 结构化并发 | `sync` + `spawn` → `when_all` |
 | Path 为值类型 | `std::filesystem::path` 包装，方法返回 `GcString*` |
 | 中间文件清理 | 编译成功后自动删除（除非显式 `--cpp`） |
+| GcString 重构 | 全部移入 builtin/string.h，types.h 只留前向声明 |
+| Array 块链表 | Chunk 内联 data + maybeCompact 5 窗合并（见 chunk_array_plan.md） |
+| OOM 缓存 | 懒初始化 Error(kind+message)，规避 static init 递归 + markPhase 保护 |
+| operator+ 值参 | `const GcString&` 而非 `GcString*`（C++ 要求至少一个类类型参数） |
+| 写屏障全覆 | append/insert/maybeCompact/reserve 所有跨代写入均调 gc_write_barrier |
+| 字符串拼接分析 | `inferBinaryExpr` 中 string + X → string，在算术之前判断 |
+| 递归闭包引用捕获 | `genFunExpr` 检测 `let f = fun(...) { ... f(...) }` 模式 → 加 `&` |
+| 空列表空指针修正 | `genLetStmt` 中检测 `nullptr` 初始化 → 用类型标注重写为 `Array<T>::make(0)` |
 
 ---
 
@@ -511,4 +611,32 @@ cmake --build build
 | `ListSemType` | 列表类型 |
 | `FuncSemType` | 函数类型 |
 | `InterfaceSemType` | 接口类型 |
-| `GenericSemType` | 泛型类型变量 |
+
+### BuiltinMethods — 内置方法映射表
+
+位于 `Sema/BuiltinMethods.h`，将 Aura 方法名映射到已知 C++ 运行时类型的方法签名，供语义分析器查找返回类型，避免将所有方法调用退回为 `ErrorSemType`。
+
+| 类型键 | 方法 | 参数 | 返回 | 说明 |
+|--------|------|:---:|------|------|
+| `string` | `len` | 0 | `Int` | 字符串长度 |
+| `[T]` | `append` | 1 | void | 尾部追加（原名 `push`） |
+| `[T]` | `pop` | 0 | 泛型 `T` | 弹出末尾 |
+| `[T]` | `pop` | 1 | 泛型 `T` | 弹出指定索引 |
+| `[T]` | `len` | 0 | `Int` | 元素数量 |
+| `[T]` | `size` | 0 | `Int` | 同 len（STL 兼容） |
+| `[T]` | `empty` | 0 | `Bool` | 判空 |
+| `[T]` | `remove` | 1 | 泛型 `T` | pop(idx) 别名 |
+| `[T]` | `insert` | 2 | void | 指定位置插入 |
+
+### ExprInfer 字符串拼接修复
+
+`inferBinaryExpr` 中字符串拼接判断从算术检查之后移到之前：
+
+```cpp
+// string + X / X + string 均可（runtime operator+ 有重载）
+if (op == "+" && (leftIsStr || rightIsStr))
+    return stringType();
+
+// 算术检查仅在非字符串拼接时生效
+if (op == "+" || op == "-" || ...) { ... }
+```

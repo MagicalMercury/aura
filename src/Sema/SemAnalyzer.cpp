@@ -1,4 +1,5 @@
 #include "SemAnalyzer.h"
+#include <algorithm>
 
 namespace Aura {
 
@@ -42,6 +43,13 @@ std::unique_ptr<SemType> SemAnalyzer::resolveNamedType(const std::string& name) 
     // 用户定义类型
     auto* sym = symtab_.lookup(name);
     if (sym && sym->kind == SymKind::TypeAlias) {
+        // 自引用检测：该类型正在解析中（如 Tree<T> = {..., children: [Tree<T>]}）
+        if (resolvingTypes_.count(name)) {
+            // 返回占位符类型，打破无限递归
+            auto g = std::make_unique<GenericSemType>();
+            g->name = name;
+            return g;
+        }
         return sym->type ? sym->type->clone() : ErrorSemType::make();
     }
 
@@ -81,6 +89,16 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
     if (dynamic_cast<const GenericSemType*>(&target))
         return true;
 
+    // 泛型参数作为 source：查类型别名获取实际类型再做兼容检查
+    // 处理递归类型引用（如 Tree<T> 内 children: [Tree<T>]，自引用产生 GenericSemType("Tree")）
+    if (auto* gs = dynamic_cast<const GenericSemType*>(&source)) {
+        auto* sym = symtab_.lookup(gs->name);
+        if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
+            return isAssignable(target, *sym->type);
+        }
+        return false;
+    }
+
     // 联合类型：source 匹配任一变体即为可赋值
     if (auto* u = dynamic_cast<const UnionSemType*>(&target)) {
         for (auto& v : u->variants) {
@@ -94,6 +112,53 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
     if (auto* lt = dynamic_cast<const ListSemType*>(&target)) {
         if (auto* ls = dynamic_cast<const ListSemType*>(&source)) {
             return isAssignable(*lt->elementType, *ls->elementType);
+        }
+        return false;
+    }
+
+    // 函数类型：逐参数检查（支持泛型参数）
+    if (auto* ft = dynamic_cast<const FuncSemType*>(&target)) {
+        if (auto* fs = dynamic_cast<const FuncSemType*>(&source)) {
+            if (ft->throws != fs->throws) return false;
+            if (ft->paramTypes.size() != fs->paramTypes.size()) return false;
+            for (size_t i = 0; i < ft->paramTypes.size(); ++i)
+                if (!isAssignable(*ft->paramTypes[i], *fs->paramTypes[i])) return false;
+            if (ft->returnType && fs->returnType)
+                return isAssignable(*ft->returnType, *fs->returnType);
+            return !ft->returnType && !fs->returnType;
+        }
+        return false;
+    }
+
+    // 接口类型：单方法接口可由函数类型（闭包）满足（结构类型系统的自动适配）
+    if (auto* iface = dynamic_cast<const InterfaceSemType*>(&target)) {
+        if (auto* func = dynamic_cast<const FuncSemType*>(&source)) {
+            if (iface->methods.size() == 1) {
+                auto& m = iface->methods[0];
+                if (m.throws != func->throws) return false;
+                if (m.paramTypes.size() != func->paramTypes.size()) return false;
+                for (size_t i = 0; i < m.paramTypes.size(); ++i)
+                    if (!isAssignable(*m.paramTypes[i], *func->paramTypes[i])) return false;
+                if (m.returnType && func->returnType)
+                    return isAssignable(*m.returnType, *func->returnType);
+                return !m.returnType && !func->returnType;
+            }
+            return false;
+        }
+        return false; // 非函数类型不能满足接口
+    }
+
+    // 记录类型：结构匹配，用 isAssignable 而非 equals（支持 ErrorSemType / GenericSemType 容错）
+    if (auto* rt = dynamic_cast<const RecordSemType*>(&target)) {
+        if (auto* rs = dynamic_cast<const RecordSemType*>(&source)) {
+            if (rt->fields.size() != rs->fields.size()) return false;
+            for (auto& tf : rt->fields) {
+                auto it = std::find_if(rs->fields.begin(), rs->fields.end(),
+                    [&](const RecordFieldSem& sf) { return sf.name == tf.name; });
+                if (it == rs->fields.end()) return false;
+                if (!isAssignable(*tf.type, *it->type)) return false;
+            }
+            return true;
         }
         return false;
     }

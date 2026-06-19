@@ -128,3 +128,100 @@ Parser 调用 `advance()`、`consume()`、`expect()` 等函数时，返回值（
 | **P2** | 注释补充（Lexer/Parser/AST） | 可读性 | 小 |
 | **P2** | CodeGen.h 拆分类 | 可维护性 | 大 |
 | **P3** | 命名风格统一 | 一致性 | 大 |
+
+---
+
+## 九、plan9.md 论断验证 & 修正
+
+以下是对上述优化分析的逐条独立验证结论（已对照源码核实）。
+
+### 9.1 `collectIdRefs` "嵌套 15 层" — 误判
+
+**实际代码**（[StmtGen.cpp L432-L488](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp)）：
+
+该函数是一个**扁平的 `if/else if` 链**，用 `dynamic_cast` 做类型分发。每个分支的嵌套深度 ≤ 2（`if` → `for`），不存在 15 层嵌套。Res.md 报告的「嵌套深度 15」是将 **Stmt 子类型数量**（约 15 种）误算为嵌套深度。
+
+`collectIdRefs`、`collectIdRefsExpr`、`collectDeclared`、`scanStmtForCoroutine`、`scanExprForCoroutine` 这 5 个函数使用了完全相同的 `dynamic_cast` 分发模式，代码重复是真实问题，但**嵌套深度不是问题**。
+
+**修正建议**：优先级从 P0 降为 P1，重构目标应聚焦"消除 5 个 Visitor 模式手工实现的重复"，而非"减少嵌套"。
+
+### 9.2 `scanOperatorOrDelimiter` "if-else 链" → "静态查找表" — 误判 & 坏建议
+
+**实际代码**（[Lexer.cpp L52-L108](file:///d:/you/Aura/src/Lexer.cpp)）：
+
+该函数使用的是 **`switch(c)` 语句**，不是 if-else 链。对单字符 Lexer token 扫描，`switch` 是 C/C++ 的标准最佳实践——编译器会生成高效跳转表。
+
+plan9.md 建议的 `std::unordered_map<std::string_view, TokenType>` 存在以下问题：
+- 每次 token 扫描涉及哈希计算 + 字符串构造 → **热点路径性能退化**
+- 多字符操作符（`==`, `!=`, `<=`, `>=`, `|>`, `->`）需要 peek 逻辑，无法用纯查找表替代
+- 代码可读性反而下降
+
+**判定**：`scanOperatorOrDelimiter` 的当前实现是正确的，无需修改。该项优化建议应**从 plan 中移除**。
+
+### 9.3 Parser 层 "100% 忽略错误" — 误判
+
+**实际代码**：
+
+- [Parser.cpp L56-L60](file:///d:/you/Aura/src/Parser/Parser.cpp)：`consume()` 内部调用 `error()`，将错误推入 `errors_` 向量
+- [Parser.cpp L71-L80](file:///d:/you/Aura/src/Parser/Parser.cpp)：`parse()` 入口有**错误恢复逻辑**（跳过非法 token 直到下一个声明关键字）
+- [StmtParser.cpp L44-L54](file:///d:/you/Aura/src/Parser/StmtParser.cpp)：`parseBlock()` 有**错误恢复逻辑**（跳过非法 token 直到下一个语句关键字或 `}`）
+- [main.cpp L101-L104](file:///d:/you/Aura/src/main.cpp)：调用方检查 `parser.errors()` 并报告
+
+Res.md 将"调用方未检查 `advance()`/`consume()` 返回值"等同于"错误被忽略"，这是误判。错误确实被**全局累积**而非通过返回值逐层传递——这是编译器前端的标准做法：全局错误列表 + panic mode 恢复。
+
+**判定**：Parser 的错误处理机制是完整的。该优化项应**降级或移除**。
+
+### 9.4 ExprParser "6 个重复函数" → `std::function` 表驱动 — 部分合理但过设计
+
+**实际代码**（[ExprParser.cpp](file:///d:/you/Aura/src/Parser/ExprParser.cpp)）：
+
+`parseOr`/`parseAnd` 使用 `while (match(TokType::Xx))` 模式，`parseEquality`/`parseComparison`/`parseAddSub`/`parseMulDiv` 使用 `while (check(A) || check(B) || ...)` 模式。两组的结构确实相似，但：
+- 每组调用不同的 `nextLevel` 函数 → 需要不同的参数
+- 每组创建不同 `op` 字符串 → 需要传入不同的标识符
+
+这是标准的 **Pratt 解析器**写法。`std::function` 方案会在热点路径引入虚函数调用开销。如果真要消除重复，C++ 模板（编译期展开）是更好的选择，但代码量减少有限。
+
+**判定**：该优化建议保守保留（降为 P2），但不应使用运行时多态。
+
+### 9.5 CodeGen.h "注释率 84.7% 说明设计文档和代码混在一起" — 非问题
+
+[CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) 的"注释"实际上是对类/方法/枚举的 Doxygen 风格文档注释。在头文件中用文档注释说明接口语义是**良好实践**，不是"屎山"。Res.md 的注释率算法将文档注释视为"代码中的注释"，才得出 84.7% 的异常数字。
+
+**判定**：此条应从优化项中移除。
+
+### 9.6 `compileMultiFile` 拆分 — 优先级过高
+
+该函数虽然 142 行，但有清晰的编号步骤（1-8）和分区注释。复杂度主要来自 `for (auto& layer : layers) { for (auto* mod : layer) { ... } }` 这个**固有的业务嵌套**——拓扑分层编译必须如此。拆分为 `compileAllModules()` + `linkModules()` + `cleanupArtifacts()` 会增加参数传递的复杂度。
+
+**判定**：从 P0 降为 P2，当前结构化程度已可接受。
+
+### 9.7 命名不一致 — 确认存在但系分层约定
+
+| 位置 | 风格 | 示例 |
+|------|------|------|
+| `src/` 编译器 | PascalCase | `genDecl`, `mapType`, `collectIdRefs` |
+| `runtime/gc.h` | camelCase | `writeBarrier`, `minorGc`, `safepoint` |
+| `runtime/gc.h` 对外 C API | snake_case | `gc_write_barrier`, `gc_safepoint` |
+
+三种风格并存。编译器内部统一 PascalCase（已基本一致），runtime C++ API 统一 camelCase，对外 C API 统一 snake_case，这其实是**有意设计的分层约定**而非无意的混用。
+
+**判定**：将优先级改为"确认分层命名约定，建议在 ARCHITECTURE.md 中显式记录命名规范"。
+
+---
+
+## 十、修正后的优先级排序
+
+| 优先级 | 优化项 | 影响 | 工作量 | 修正说明 |
+|--------|--------|------|--------|----------|
+| **P1** | 统一 AST 遍历框架（消除 5 个 dynamic_cast 链） | 可维护性 | 中 | 原 P0 `collectIdRefs`，嵌套 15 层系误判；真实问题是 5 处完全相同的模式 |
+| **P1** | `generate()` 拆分 | 可维护性 | 小 | 原 P0，降级；当前已有序但 132 行仍偏长 |
+| **P1** | ASTPrinter Visitor 化 | 可维护性 | 中 | 保持不变 |
+| **P2** | ExprParser Pratt 层模板化 | 可维护性 | 中 | 原 P1，降级；Pratt 解析器的重复是正常的，消除需谨慎 |
+| **P2** | `compileMultiFile` 拆分 | 可维护性 | 小 | 原 P0，降级；已有序且核心复杂度来自业务需要 |
+| **P2** | 注释补充（Lexer/Parser/AST） | 可读性 | 小 | 保持不变 |
+| **P2** | CodeGen.h 拆分类 | 可维护性 | 大 | 保持不变 |
+| **P3** | 命名规范文档化 | 一致性 | 小 | 原 P3，修正：不是"风格统一"而是"文档化现有约定" |
+| ~~移除~~ | ~~`scanOperatorOrDelimiter` 重写为查找表~~ | — | — | switch 已是正确实现 |
+| ~~移除~~ | ~~Parser 错误处理"修复"~~ | — | — | 错误处理机制完整，全局累积 + panic mode 系有意设计 |
+| ~~移除~~ | ~~CodeGen.h "注释率过高"~~ | — | — | 文档注释是良好实践 |
+

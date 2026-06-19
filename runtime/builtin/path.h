@@ -20,6 +20,7 @@
 #include <string>
 
 #include "../types.h"
+#include "string.h"
 
 namespace aura_rt {
 
@@ -109,24 +110,27 @@ Path join(const Path& first, const std::string& second, Rest&&... rest) {
 
 // new(gcs: GcString*) → Path
 inline Path new_(GcString* gcs) {
-    if (gcs && gcs->data) return Path(std::filesystem::path(std::string(gcs->data, gcs->length)));
+    if (gcs && gcs->length > 0)
+        return Path(std::filesystem::path(std::string(gcs->data(), gcs->length)));
     return Path();
 }
 
 // join overloads with GcString*
 inline Path join(const Path& first, GcString* second) {
-    return first / Path(std::filesystem::path(std::string(second ? second->data : "", second ? second->length : 0)));
+    return first / Path(std::filesystem::path(std::string(second ? second->data() : "", second ? static_cast<size_t>(second->length) : 0)));
 }
 
 template <typename... Rest>
 Path join(const Path& first, GcString* second, Rest&&... rest) {
-    auto p = Path(std::filesystem::path(std::string(second ? second->data : "", second ? second->length : 0)));
+    auto p = Path(std::filesystem::path(std::string(second ? second->data() : "", second ? static_cast<size_t>(second->length) : 0)));
     return join(first / p, std::forward<Rest>(rest)...);
 }
 
 } // namespace path
 
 // Path::operator/ 也支持 GcString*
-inline Path Path::operator/(GcString* gcs) const { return Path(path_ / std::string(gcs ? gcs->data : "", static_cast<size_t>(gcs ? gcs->length : 0))); }
+inline Path Path::operator/(GcString* gcs) const {
+    return Path(path_ / std::string(gcs ? gcs->data() : "", gcs ? static_cast<size_t>(gcs->length) : 0));
+}
 
 } // namespace aura_rt

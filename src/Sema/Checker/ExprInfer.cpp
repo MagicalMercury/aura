@@ -1,4 +1,5 @@
 #include "Sema/SemAnalyzer.h"
+#include "Sema/BuiltinMethods.h"
 #include <algorithm>
 
 namespace Aura {
@@ -25,6 +26,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferExpr(const ASTNode& expr) {
     if (auto* e = dynamic_cast<const AssignExpr*>(&expr))          return inferAssign(*e);
     if (auto* e = dynamic_cast<const ErrorPropagationExpr*>(&expr))return inferErrorPropagation(*e);
     if (auto* e = dynamic_cast<const PipeExpr*>(&expr))            return inferPipe(*e);
+    if (auto* e = dynamic_cast<const FunExpr*>(&expr))            return inferFunExpr(*e);
     return ErrorSemType::make();
 }
 
@@ -89,6 +91,15 @@ std::unique_ptr<SemType> SemAnalyzer::inferBinaryExpr(const BinaryExpr& e) {
     auto rt = inferExpr(*e.right);
     const std::string& op = e.op;
 
+    // 字符串拼接：string + 任意类型 → string（runtime 端有 operator+ 重载 / concat）
+    auto* ltPrim = dynamic_cast<PrimSemType*>(lt.get());
+    auto* rtPrim = dynamic_cast<PrimSemType*>(rt.get());
+    bool leftIsStr  = ltPrim && ltPrim->kind == PrimSemType::String;
+    bool rightIsStr = rtPrim && rtPrim->kind == PrimSemType::String;
+    if (op == "+" && (leftIsStr || rightIsStr)) {
+        return stringType();
+    }
+
     // 算术：int/float
     if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") {
         if (!isAssignable(*lt, *rt) && !isAssignable(*rt, *lt)) {
@@ -110,11 +121,6 @@ std::unique_ptr<SemType> SemAnalyzer::inferBinaryExpr(const BinaryExpr& e) {
         if (!isAssignable(*boolType(), *rt)) error(*e.right, "'" + op + "' requires bool, got " + rt->toString());
         return boolType();
     }
-    // 字符串拼接
-    if (op == "+" && dynamic_cast<PrimSemType*>(lt.get()) && dynamic_cast<const PrimSemType*>(lt.get())->kind == PrimSemType::String) {
-        return stringType();
-    }
-
     return lt->clone();
 }
 
@@ -132,37 +138,88 @@ std::unique_ptr<SemType> SemAnalyzer::inferUnaryExpr(const UnaryExpr& e) {
 std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
     auto* callee = dynamic_cast<const Identifier*>(e.callee.get());
     if (!callee) {
-        error(*e.callee, "only direct function calls are supported");
+        // 非标识符调用（如闭包调用）— 推断 callee 类型
+        auto calleeType = inferExpr(*e.callee);
+        if (auto* fst = dynamic_cast<const FuncSemType*>(calleeType.get())) {
+            // 暂不检查参数/返回值（跳过）
+            return fst->returnType ? fst->returnType->clone() : NoneSemType::make();
+        }
+        error(*e.callee, "callee is not a function type");
         return ErrorSemType::make();
     }
     auto* sym = symtab_.lookup(callee->name);
-    if (!sym || (sym->kind != SymKind::Function && sym->kind != SymKind::Method)) {
-        error(*e.callee, "undefined function '" + callee->name + "'");
+    if (!sym) {
+        error(*e.callee, "undefined identifier '" + callee->name + "'");
         return ErrorSemType::make();
     }
-    // 参数数量检查
-    if (e.args.size() != sym->params.size()) {
-        error(e, "function '" + callee->name + "' expects " + std::to_string(sym->params.size()) + " arguments, got " + std::to_string(e.args.size()));
+    // 函数、方法、函数类型变量（let 绑定闭包）、函数类型参数
+    if (sym->kind == SymKind::Function || sym->kind == SymKind::Method) {
+        // 参数数量检查
+        if (e.args.size() != sym->params.size()) {
+            error(e, "function '" + callee->name + "' expects " + std::to_string(sym->params.size()) + " arguments, got " + std::to_string(e.args.size()));
+        }
+        // 参数类型检查
+        for (size_t i = 0; i < e.args.size() && i < sym->params.size(); ++i) {
+            auto argTy = inferExpr(*e.args[i]);
+            if (sym->params[i].type && !isAssignable(*sym->params[i].type, *argTy)) {
+                error(*e.args[i], "argument type mismatch: expected '" + sym->params[i].type->toString() + "', got '" + argTy->toString() + "'");
+            }
+        }
+        return sym->type ? sym->type->clone() : ErrorSemType::make();
     }
-    // 参数类型检查
-    for (size_t i = 0; i < e.args.size() && i < sym->params.size(); ++i) {
-        auto argTy = inferExpr(*e.args[i]);
-        if (sym->params[i].type && !isAssignable(*sym->params[i].type, *argTy)) {
-            error(*e.args[i], "argument type mismatch: expected '" + sym->params[i].type->toString() + "', got '" + argTy->toString() + "'");
+    // Variable / Parameter 但类型是函数类型 → 可作为函数调用
+    if (sym->kind == SymKind::Variable || sym->kind == SymKind::Parameter) {
+        if (auto* fst = dynamic_cast<const FuncSemType*>(sym->type.get())) {
+            // 参数数量检查（从 FuncSemType 提取）
+            if (e.args.size() != fst->paramTypes.size()) {
+                error(e, "function expects " + std::to_string(fst->paramTypes.size()) + " arguments, got " + std::to_string(e.args.size()));
+            }
+            // 参数类型检查
+            for (size_t i = 0; i < e.args.size() && i < fst->paramTypes.size(); ++i) {
+                auto argTy = inferExpr(*e.args[i]);
+                if (fst->paramTypes[i] && !isAssignable(*fst->paramTypes[i], *argTy)) {
+                    error(*e.args[i], "argument type mismatch: expected '" + fst->paramTypes[i]->toString() + "', got '" + argTy->toString() + "'");
+                }
+            }
+            return fst->returnType ? fst->returnType->clone() : NoneSemType::make();
         }
     }
-    return sym->type ? sym->type->clone() : ErrorSemType::make();
+    error(*e.callee, "undefined function '" + callee->name + "'");
+    return ErrorSemType::make();
 }
 
 std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     auto objType = inferExpr(*e.object);
-    // 结构类型：查找接收者类型的方法
-    // 简化：通过字段访问检查
-    // 实际应查找 ReceiverType 注册的方法符号
-    // 暂时返回 Error，表示语义正确但不做深层次类型推导
-    // 检查：至少确保 object 有符号
-    // 对象的方法调用在运行时分派，这里仅做基本检查
-    return ErrorSemType::make(); // 后续完善
+
+    // 查 BuiltinMethods 表：若对象类型匹配已知 C++ 运行时类型，
+    // 返回表中注册的返回类型，让下游 CodeGen 生成正确调用。
+    std::string typeKey;
+    if (dynamic_cast<const PrimSemType*>(objType.get())) {
+        auto* p = static_cast<const PrimSemType*>(objType.get());
+        if (p->kind == PrimSemType::String) typeKey = "string";
+    } else if (dynamic_cast<const ListSemType*>(objType.get())) {
+        typeKey = "[T]";
+    }
+
+    if (!typeKey.empty()) {
+        if (auto* entry = BuiltinMethods::lookup(typeKey, e.method)) {
+            // 参数数量检查
+            if (entry->paramCount >= 0 && (int)e.args.size() != entry->paramCount) {
+                error(e, "method '" + std::string(e.method) + "' expects " +
+                      std::to_string(entry->paramCount) + " argument(s), got " +
+                      std::to_string(e.args.size()));
+            }
+            if (entry->returnsNone)
+                return NoneSemType::make();
+            if (!entry->isGeneric)
+                return std::make_unique<PrimSemType>(static_cast<PrimSemType::Kind>(entry->returnPrim));
+            // 泛型返回（如 pop → T）→ 委托给 C++ 编译器
+            return ErrorSemType::make();
+        }
+    }
+
+    // 不在表中 → 放行，由 C++ 编译器验证方法存在性
+    return ErrorSemType::make();
 }
 
 std::unique_ptr<SemType> SemAnalyzer::inferMemberAccess(const MemberAccessExpr& e) {
@@ -199,7 +256,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
 }
 
 std::unique_ptr<SemType> SemAnalyzer::inferErrorPropagation(const ErrorPropagationExpr& e) {
-    if (!currentFunctionThrows_) {
+    if (!currentFunctionThrows_ && insideTry_ == 0) {
         error(e, "'!' used in non-throwing function");
     }
     return inferExpr(*e.expr);
@@ -208,6 +265,61 @@ std::unique_ptr<SemType> SemAnalyzer::inferErrorPropagation(const ErrorPropagati
 std::unique_ptr<SemType> SemAnalyzer::inferPipe(const PipeExpr& e) {
     auto _ = inferExpr(*e.left);
     return inferExpr(*e.right);
+}
+
+// ============================================================
+// 闭包表达式类型推断
+// ============================================================
+
+std::unique_ptr<SemType> SemAnalyzer::inferFunExpr(const FunExpr& e) {
+    // 1. 构建参数类型列表
+    std::vector<std::unique_ptr<SemType>> paramTypes;
+    for (auto& p : e.params) {
+        if (p.type) {
+            paramTypes.push_back(resolveType(*p.type));
+        } else {
+            // Phase 1: 参数类型必须显式标注
+            error(e, "closure parameter '" + p.name + "' requires an explicit type annotation");
+            paramTypes.push_back(ErrorSemType::make());
+        }
+    }
+
+    // 2. 获取返回类型
+    std::unique_ptr<SemType> returnType;
+    if (e.returnType) {
+        returnType = resolveType(*e.returnType);
+    } else {
+        // 从函数体推断：暂简化 — 无 return 语句 → None
+        // Phase 1 先推断为 None，后续可扫描 return 语句
+        returnType = NoneSemType::make();
+    }
+
+    // 3. 推入新作用域并检查函数体
+    symtab_.enterScope(ScopeKind::Function);
+    for (auto& p : e.params) {
+        Symbol sym;
+        sym.kind = SymKind::Parameter;
+        sym.name = p.name;
+        sym.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
+        symtab_.define(std::move(sym));
+    }
+    if (e.body) {
+        auto prevRet = std::move(currentReturnType_);
+        auto prevThrows = currentFunctionThrows_;
+        currentReturnType_ = returnType->clone();
+        currentFunctionThrows_ = e.throws;
+        checkBlock(*e.body);
+        currentReturnType_ = std::move(prevRet);
+        currentFunctionThrows_ = prevThrows;
+    }
+    symtab_.exitScope();
+
+    // 4. 构造并返回 FuncSemType
+    auto fst = std::make_unique<FuncSemType>();
+    fst->paramTypes = std::move(paramTypes);
+    fst->returnType = std::move(returnType);
+    fst->throws = e.throws;
+    return fst;
 }
 
 // ============================================================

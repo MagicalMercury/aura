@@ -72,6 +72,9 @@ private:
     std::unique_ptr<ASTNode> parseCall();
     std::unique_ptr<ASTNode> parsePrimary();
 
+    // --- 解析闭包 ---
+    std::unique_ptr<ASTNode> parseFunExpr();
+
     // --- 解析类型 ---
     std::unique_ptr<TypeExpr> parseType();
     std::unique_ptr<TypeExpr> parseUnionType();

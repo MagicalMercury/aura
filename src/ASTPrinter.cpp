@@ -1,3 +1,7 @@
+// ============================================================
+// DEPRECATED — 不再使用。
+// 保留此文件仅用于历史参考，将在后续版本中移除。
+// ============================================================
 #include "ASTPrinter.h"
 #include <iostream>
 
@@ -522,6 +526,31 @@ void Program::print(std::ostream& os, int indent) const {
     for (auto& d : decls) {
         if (d) d->print(os, indent + 1);
     }
+}
+
+void FunExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "FunExpr";
+    if (throws) os << " throws";
+    os << '\n';
+    printIndent(os, indent + 1);
+    os << "params:" << '\n';
+    for (auto& p : params) {
+        printIndent(os, indent + 2);
+        os << p.name;
+        if (p.type) {
+            os << ": ";
+            p.type->print(os, indent + 2);
+        } else {
+            os << '\n';
+        }
+    }
+    if (returnType) {
+        printIndent(os, indent + 1);
+        os << "return:" << '\n';
+        printTypeNode(os, indent + 2, returnType.get());
+    }
+    if (body) body->print(os, indent + 1);
 }
 
 } // namespace Aura

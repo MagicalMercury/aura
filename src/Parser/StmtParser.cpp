@@ -33,6 +33,7 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
     }
     if (check(TokType::Let))      return parseLetDecl();
     if (check(TokType::Const))    return parseConstDecl();
+    if (check(TokType::Fun))      return parseFunDecl();
     if (check(TokType::LBrace))   return parseBlock();
     return parseExprStmt();
 }

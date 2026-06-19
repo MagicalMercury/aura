@@ -72,8 +72,24 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
         }
     }
 
-    std::string init = decl.initializer
-        ? genExpr(*decl.initializer, currentFunctionIsCoroutine_) : "";
+    std::string init;
+    if (decl.initializer) {
+        currentLetName_ = safeName(decl.name);
+        init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
+        currentLetName_.clear();
+    }
+
+    // 空列表 [] 在泛型闭包中 genListExpr 返回 nullptr → 用类型标注修正
+    if (init.find("nullptr") != std::string::npos && decl.type) {
+        std::string arrType = mapType(*decl.type);
+        // arrType 形如 "aura_rt::Array<X>*"，取元素类型 X 并生成 make(0)
+        if (arrType.find("aura_rt::Array<") == 0) {
+            size_t start = arrType.find("<") + 1;
+            size_t end = arrType.rfind(">");
+            std::string elem = arrType.substr(start, end - start);
+            init = "aura_rt::Array<" + elem + ">::make(0)";
+        }
+    }
 
     expectedTemplateArgs_.clear();
 
@@ -301,6 +317,8 @@ void CodeGenerator::genTryCatchRaw(std::ostream& cpp,
     cpp << indentStr() << "}\n";
 }
 
+// (IdRefCollector / DeclaredCollector 定义已移至 CodeGen.h)
+
 // ============================================================
 // sync / spawn（plan §4.9）
 // ============================================================
@@ -323,13 +341,15 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
 
     // 1. 收集 spawn 体中所有 Identifier 引用
     std::set<std::string> allRefs;
+    IdRefCollector idCol(allRefs);
     for (auto& s : stmt.body)
-        if (s) collectIdRefs(*s, allRefs);
+        if (s) idCol.collectStmt(*s);
 
     // 2. 收集 spawn 体内局部声明的变量
     std::set<std::string> declared;
+    DeclaredCollector declCol(declared);
     for (auto& s : stmt.body)
-        if (s) collectDeclared(*s, declared);
+        if (s) declCol.collectStmt(*s);
 
     // 3. 自由变量 = 引用 - 声明 - 内置 - 已知函数/类型
     std::set<std::string> builtins = {"io", "_tasks"};
@@ -423,137 +443,6 @@ void CodeGenerator::genExprStmt(std::ostream& cpp, const ExprStmt& stmt,
                                  bool isCoroutine) {
     if (stmt.expr)
         writeLine(cpp, genExpr(*stmt.expr, isCoroutine) + ";");
-}
-
-// ============================================================
-// spawn 变量捕获分析（plan3）
-// ============================================================
-
-void CodeGenerator::collectIdRefs(const Stmt& stmt, std::set<std::string>& out) const {
-    // Identifier
-    if (auto* id = dynamic_cast<const Identifier*>(&stmt))
-        { out.insert(id->name); return; }
-
-    // 递归到子节点
-    if (auto* b = dynamic_cast<const BlockStmt*>(&stmt))
-        { for (auto& s : b->stmts) if (s) collectIdRefs(*s, out); }
-    else if (auto* r = dynamic_cast<const ReturnStmt*>(&stmt))
-        { if (r->expr) collectIdRefsExpr(*r->expr, out); }
-    else if (auto* t = dynamic_cast<const ThrowStmt*>(&stmt))
-        { if (t->expr) collectIdRefsExpr(*t->expr, out); }
-    else if (auto* i = dynamic_cast<const IfStmt*>(&stmt)) {
-        if (i->condition) collectIdRefsExpr(*i->condition, out);
-        if (i->thenBranch) collectIdRefs(*i->thenBranch, out);
-        for (auto& ei : i->elseIfs) {
-            if (ei.condition) collectIdRefsExpr(*ei.condition, out);
-            if (ei.body) collectIdRefs(*ei.body, out);
-        }
-        if (i->elseBranch) collectIdRefs(*i->elseBranch, out);
-    }
-    else if (auto* w = dynamic_cast<const WhileStmt*>(&stmt)) {
-        if (w->condition) collectIdRefsExpr(*w->condition, out);
-        if (w->body) collectIdRefs(*w->body, out);
-    }
-    else if (auto* f = dynamic_cast<const ForStmt*>(&stmt)) {
-        if (f->iterable) collectIdRefsExpr(*f->iterable, out);
-        if (f->body) collectIdRefs(*f->body, out);
-    }
-    else if (auto* o = dynamic_cast<const LoopStmt*>(&stmt))
-        { if (o->body) collectIdRefs(*o->body, out); }
-    else if (auto* tc = dynamic_cast<const TryCatchStmt*>(&stmt)) {
-        if (tc->tryBody) collectIdRefs(*tc->tryBody, out);
-        if (tc->catchBody) collectIdRefs(*tc->catchBody, out);
-    }
-    else if (auto* s = dynamic_cast<const SyncStmt*>(&stmt))
-        { if (s->body) collectIdRefs(*s->body, out); }
-    else if (auto* sp = dynamic_cast<const SpawnStmt*>(&stmt))
-        { for (auto& sb : sp->body) if (sb) collectIdRefs(*sb, out); }
-    else if (auto* m = dynamic_cast<const MatchStmt*>(&stmt)) {
-        if (m->expr) collectIdRefsExpr(*m->expr, out);
-        for (auto& c : m->cases) {
-            if (c.body) {
-                if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get()))
-                    collectIdRefs(*cb, out);
-                else
-                    collectIdRefsExpr(*c.body, out);
-            }
-        }
-    }
-    else if (auto* e = dynamic_cast<const ExprStmt*>(&stmt))
-        { if (e->expr) collectIdRefsExpr(*e->expr, out); }
-    else if (auto* l = dynamic_cast<const LetDecl*>(&stmt))
-        { if (l->initializer) collectIdRefsExpr(*l->initializer, out); }
-    else if (auto* cn = dynamic_cast<const ConstDecl*>(&stmt))
-        { if (cn->initializer) collectIdRefsExpr(*cn->initializer, out); }
-}
-
-void CodeGenerator::collectIdRefsExpr(const ASTNode& expr, std::set<std::string>& out) const {
-    if (auto* id = dynamic_cast<const Identifier*>(&expr))
-        { out.insert(id->name); return; }
-
-    // 二元
-    if (auto* bin = dynamic_cast<const BinaryExpr*>(&expr)) {
-        collectIdRefsExpr(*bin->left, out);
-        collectIdRefsExpr(*bin->right, out);
-    }
-    else if (auto* un = dynamic_cast<const UnaryExpr*>(&expr))
-        { collectIdRefsExpr(*un->operand, out); }
-    else if (auto* call = dynamic_cast<const CallExpr*>(&expr)) {
-        collectIdRefsExpr(*call->callee, out);
-        for (auto& a : call->args) collectIdRefsExpr(*a, out);
-    }
-    else if (auto* mc = dynamic_cast<const MethodCallExpr*>(&expr)) {
-        collectIdRefsExpr(*mc->object, out);
-        for (auto& a : mc->args) collectIdRefsExpr(*a, out);
-    }
-    else if (auto* ma = dynamic_cast<const MemberAccessExpr*>(&expr))
-        { collectIdRefsExpr(*ma->object, out); }
-    else if (auto* idx = dynamic_cast<const IndexExpr*>(&expr)) {
-        collectIdRefsExpr(*idx->object, out);
-        collectIdRefsExpr(*idx->index, out);
-    }
-    else if (auto* as = dynamic_cast<const AssignExpr*>(&expr)) {
-        collectIdRefsExpr(*as->target, out);
-        collectIdRefsExpr(*as->value, out);
-    }
-    else if (auto* ep = dynamic_cast<const ErrorPropagationExpr*>(&expr))
-        { collectIdRefsExpr(*ep->expr, out); }
-    else if (auto* p = dynamic_cast<const PipeExpr*>(&expr)) {
-        collectIdRefsExpr(*p->left, out);
-        collectIdRefsExpr(*p->right, out);
-    }
-    else if (auto* rec = dynamic_cast<const RecordExpr*>(&expr))
-        { for (auto& f : rec->fields) if (f.value) collectIdRefsExpr(*f.value, out); }
-    else if (auto* list = dynamic_cast<const ListExpr*>(&expr))
-        { for (auto& e : list->elements) if (e) collectIdRefsExpr(*e, out); }
-    // 字面量无引用，跳过
-}
-
-void CodeGenerator::collectDeclared(const Stmt& stmt, std::set<std::string>& out) const {
-    if (auto* l = dynamic_cast<const LetDecl*>(&stmt))
-        { out.insert(l->name); }
-    else if (auto* c = dynamic_cast<const ConstDecl*>(&stmt))
-        { out.insert(c->name); }
-    else if (auto* f = dynamic_cast<const ForStmt*>(&stmt)) {
-        out.insert(f->itemName);
-        if (f->body) for (auto& s : f->body->stmts) if (s) collectDeclared(*s, out);
-    }
-    else if (auto* tc = dynamic_cast<const TryCatchStmt*>(&stmt)) {
-        out.insert(tc->catchVar);
-    }
-    else if (auto* m = dynamic_cast<const MatchStmt*>(&stmt)) {
-        for (auto& c : m->cases) {
-            if (auto* tp = dynamic_cast<const TypePattern*>(c.pattern.get()))
-                if (!tp->varName.empty()) out.insert(tp->varName);
-        }
-    }
-    else if (auto* b = dynamic_cast<const BlockStmt*>(&stmt))
-        { for (auto& s : b->stmts) if (s) collectDeclared(*s, out); }
-    else if (auto* s = dynamic_cast<const SyncStmt*>(&stmt))
-        { if (s->body) for (auto& sb : s->body->stmts) if (sb) collectDeclared(*sb, out); }
-    else if (auto* sp = dynamic_cast<const SpawnStmt*>(&stmt))
-        { for (auto& sb : sp->body) if (sb) collectDeclared(*sb, out); }
-    // if/while/loop/return/throw/expr 不声明变量
 }
 
 } // namespace Aura

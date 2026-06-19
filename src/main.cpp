@@ -21,7 +21,7 @@
 
 #include "Lexer.h"
 #include "Parser.h"
-#include "ASTPrinter.h"
+// #include "ASTPrinter.h"  // DEPRECATED
 #include "Sema/SemAnalyzer.h"
 #include "CodeGen/CodeGen.h"
 #include "Module/ModuleManager.h"
@@ -40,7 +40,7 @@
 // ============================================================
 struct CliOptions {
     std::string inputPath;       // 输入 .aura 文件
-    std::string astOutput;       // AST 输出路径
+    // std::string astOutput;       // AST 输出路径  // DEPRECATED
     std::string cppOutput;       // C++ 翻译输出路径（单文件=文件，多文件=目录）
     std::string outputDir;       // 输出目录（-o，多文件模式下是 .cpp/.h 输出目录）
     std::string exeOutput;       // exe 输出路径（多文件模式下由 -o 指定）
@@ -55,8 +55,8 @@ CliOptions parseArgs(const std::vector<std::string_view>& args) {
         std::string_view arg = args[i];
         if (arg == "-o" && i + 1 < args.size()) {
             opts.exeOutput = args[++i];
-        } else if (arg == "--ast" && i + 1 < args.size()) {
-            opts.astOutput = args[++i];
+        } else if (false /* DEPRECATED: --ast */ && arg == "--ast" && i + 1 < args.size()) {
+            // opts.astOutput = args[++i];  // DEPRECATED
         } else if (arg == "--cpp" && i + 1 < args.size()) {
             opts.cppOutput = args[++i];
         } else if (arg == "-S") {
@@ -114,6 +114,8 @@ int compileSingleFile(const CliOptions& opts) {
         return 1;
     }
 
+    // DEPRECATED: --ast 输出已移除
+    /*
     // AST 输出（仅 --ast）
     if (!opts.astOutput.empty()) {
         std::ostringstream astOut;
@@ -123,6 +125,7 @@ int compileSingleFile(const CliOptions& opts) {
             astPath = opts.outputDir + "/" + astPath;
         Aura::writeFile(astPath, astOut.str());
     }
+    */
 
     // C++ 代码生成
     Aura::CodeGenerator cg;

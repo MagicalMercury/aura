@@ -3,7 +3,9 @@
 // ============================================================
 
 #include "io.h"
+#include "array.h"
 #include "../gc.h"
+#include "string.h"
 
 #include <fstream>
 #include <iostream>
@@ -16,18 +18,18 @@ namespace aura_rt {
 // 终端 I/O
 // ============================================================
 
-task<void> Io::println(GcString* value) {
-    if (value && value->data) {
-        std::cout << std::string_view(value->data, value->length) << '\n';
+task<void> Io::println(GcString* value) const {
+    if (value && value->data()) {
+        std::cout << std::string_view(value->data(), value->length) << '\n';
     } else {
         std::cout << '\n';
     }
     co_return;
 }
 
-void Io::println_sync(GcString* value) {
-    if (value && value->data) {
-        std::cout << std::string_view(value->data, value->length) << '\n';
+void Io::println_sync(GcString* value) const {
+    if (value && value->data()) {
+        std::cout << std::string_view(value->data(), value->length) << '\n';
     } else {
         std::cout << '\n';
     }
@@ -121,9 +123,10 @@ task<Array<Path>*> Io::list_dir(const Path& path) {
     }
 
     // 构造 Array<Path>，统一走 GC 分配
-    auto* arr = Array<Path>::make(static_cast<int32_t>(entries.size()));
-    arr->length = static_cast<int32_t>(entries.size());
-    std::copy(entries.begin(), entries.end(), arr->elements);
+    auto* arr = Array<Path>::make(0);
+    for (auto& entry : entries) {
+        arr->append(entry);
+    }
     co_return arr;
 }
 

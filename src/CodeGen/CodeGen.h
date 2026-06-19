@@ -4,6 +4,7 @@
 #include "../AST/Expr.h"
 #include "../AST/Stmt.h"
 #include "../AST/Type.h"
+#include "../ASTWalker.h"
 #include "../Lexer.h"
 #include "../Token.h"
 #include <functional>
@@ -102,17 +103,88 @@ public:
     // -- 错误 --
     const std::vector<std::string>& errors() const { return errors_; }
 
+public:
+    // ============================================================
+    // AST 遍历 Visitor（基于 ASTWalker 模板）
+    // 供 genSpawnStmt / genFunExpr 等复用
+    // ============================================================
+
+    // IdRefCollector — 收集 Stmt/Expr 子树中所有 Identifier 引用名
+    class IdRefCollector {
+    public:
+        explicit IdRefCollector(std::set<std::string>& out) : out_(out) {}
+        bool collectStmt(const Stmt& stmt)  { return StmtWalker<IdRefCollector>::walk(stmt, *this); }
+        bool collectExpr(const ASTNode& e)  { return ExprWalker<IdRefCollector>::walk(e, *this); }
+        // --- Stmt visit ---
+        bool visit(const BlockStmt& n, IdRefCollector& self) { for (auto& s : n.stmts) if (s) self.collectStmt(*s); return false; }
+        bool visit(const ReturnStmt& n, IdRefCollector& self) { if (n.expr) self.collectExpr(*n.expr); return false; }
+        bool visit(const ThrowStmt& n, IdRefCollector& self)  { if (n.expr) self.collectExpr(*n.expr); return false; }
+        bool visit(const IfStmt& n, IdRefCollector& self) { if (n.condition) self.collectExpr(*n.condition); if (n.thenBranch) self.collectStmt(*n.thenBranch); for (auto& ei : n.elseIfs) { if (ei.condition) self.collectExpr(*ei.condition); if (ei.body) self.collectStmt(*ei.body); } if (n.elseBranch) self.collectStmt(*n.elseBranch); return false; }
+        bool visit(const WhileStmt& n, IdRefCollector& self) { if (n.condition) self.collectExpr(*n.condition); if (n.body) self.collectStmt(*n.body); return false; }
+        bool visit(const ForStmt& n, IdRefCollector& self)   { if (n.iterable) self.collectExpr(*n.iterable); if (n.body) self.collectStmt(*n.body); return false; }
+        bool visit(const LoopStmt& n, IdRefCollector& self)   { if (n.body) self.collectStmt(*n.body); return false; }
+        bool visit(const TryCatchStmt& n, IdRefCollector& self) { if (n.tryBody) self.collectStmt(*n.tryBody); if (n.catchBody) self.collectStmt(*n.catchBody); return false; }
+        bool visit(const SyncStmt& n, IdRefCollector& self)   { if (n.body) self.collectStmt(*n.body); return false; }
+        bool visit(const SpawnStmt& n, IdRefCollector& self)  { for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
+        bool visit(const MatchStmt& n, IdRefCollector& self) { if (n.expr) self.collectExpr(*n.expr); for (auto& c : n.cases) { if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) self.collectStmt(*cb); else self.collectExpr(*c.body); } } return false; }
+        bool visit(const ExprStmt& n, IdRefCollector& self)   { if (n.expr) self.collectExpr(*n.expr); return false; }
+        bool visit(const LetDecl& n, IdRefCollector& self)    { if (n.initializer) self.collectExpr(*n.initializer); return false; }
+        bool visit(const ConstDecl& n, IdRefCollector& self)  { if (n.initializer) self.collectExpr(*n.initializer); return false; }
+        bool visit(const BreakStmt&, IdRefCollector&)    { return false; }
+        bool visit(const ContinueStmt&, IdRefCollector&) { return false; }
+        // --- Expr visit ---
+        bool visit(const Identifier& n, IdRefCollector&) { out_.insert(n.name); return false; }
+        bool visit(const BinaryExpr& n, IdRefCollector& self) { self.collectExpr(*n.left); self.collectExpr(*n.right); return false; }
+        bool visit(const UnaryExpr& n, IdRefCollector& self) { self.collectExpr(*n.operand); return false; }
+        bool visit(const CallExpr& n, IdRefCollector& self) { self.collectExpr(*n.callee); for (auto& a : n.args) self.collectExpr(*a); return false; }
+        bool visit(const MethodCallExpr& n, IdRefCollector& self) { self.collectExpr(*n.object); for (auto& a : n.args) self.collectExpr(*a); return false; }
+        bool visit(const MemberAccessExpr& n, IdRefCollector& self) { self.collectExpr(*n.object); return false; }
+        bool visit(const IndexExpr& n, IdRefCollector& self) { self.collectExpr(*n.object); self.collectExpr(*n.index); return false; }
+        bool visit(const AssignExpr& n, IdRefCollector& self) { self.collectExpr(*n.target); self.collectExpr(*n.value); return false; }
+        bool visit(const ErrorPropagationExpr& n, IdRefCollector& self) { self.collectExpr(*n.expr); return false; }
+        bool visit(const PipeExpr& n, IdRefCollector& self) { self.collectExpr(*n.left); self.collectExpr(*n.right); return false; }
+        bool visit(const RecordExpr& n, IdRefCollector& self) { for (auto& f : n.fields) if (f.value) self.collectExpr(*f.value); return false; }
+        bool visit(const ListExpr& n, IdRefCollector& self) { for (auto& e : n.elements) if (e) self.collectExpr(*e); return false; }
+        bool visit(const IntLiteral&, IdRefCollector&)    { return false; }
+        bool visit(const FloatLiteral&, IdRefCollector&)   { return false; }
+        bool visit(const StringLiteral&, IdRefCollector&)  { return false; }
+        bool visit(const BoolLiteral&, IdRefCollector&)    { return false; }
+        bool visit(const NoneLiteral&, IdRefCollector&)    { return false; }
+        bool visit(const FunExpr& n, IdRefCollector& self) { if (n.body) for (auto& s : n.body->stmts) if (s) self.collectStmt(*s); return false; }
+    private:
+        std::set<std::string>& out_;
+    };
+
+    // DeclaredCollector — 收集 Stmt 子树中的局部变量声明
+    class DeclaredCollector {
+    public:
+        explicit DeclaredCollector(std::set<std::string>& out) : out_(out) {}
+        bool collectStmt(const Stmt& stmt) { return StmtWalker<DeclaredCollector>::walk(stmt, *this); }
+        bool visit(const LetDecl& n, DeclaredCollector&)     { out_.insert(n.name); return false; }
+        bool visit(const ConstDecl& n, DeclaredCollector&)   { out_.insert(n.name); return false; }
+        bool visit(const ForStmt& n, DeclaredCollector& self){ out_.insert(n.itemName); if (n.body) for (auto& s : n.body->stmts) if (s) self.collectStmt(*s); return false; }
+        bool visit(const TryCatchStmt& n, DeclaredCollector&){ out_.insert(n.catchVar); return false; }
+        bool visit(const MatchStmt& n, DeclaredCollector&)   { for (auto& c : n.cases) if (auto* tp = dynamic_cast<const TypePattern*>(c.pattern.get())) if (!tp->varName.empty()) out_.insert(tp->varName); return false; }
+        bool visit(const BlockStmt& n, DeclaredCollector& self){ for (auto& s : n.stmts) if (s) self.collectStmt(*s); return false; }
+        bool visit(const SyncStmt& n, DeclaredCollector& self) { if (n.body) for (auto& sb : n.body->stmts) if (sb) self.collectStmt(*sb); return false; }
+        bool visit(const SpawnStmt& n, DeclaredCollector& self){ for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
+        bool visit(const ReturnStmt&,  DeclaredCollector&) { return false; }
+        bool visit(const ThrowStmt&,   DeclaredCollector&) { return false; }
+        bool visit(const IfStmt&,      DeclaredCollector&) { return false; }
+        bool visit(const WhileStmt&,   DeclaredCollector&) { return false; }
+        bool visit(const LoopStmt&,    DeclaredCollector&) { return false; }
+        bool visit(const ExprStmt&,    DeclaredCollector&) { return false; }
+        bool visit(const BreakStmt&,   DeclaredCollector&) { return false; }
+        bool visit(const ContinueStmt&,DeclaredCollector&) { return false; }
+        bool visit(const FunExpr&,     DeclaredCollector&) { return false; }
+    private:
+        std::set<std::string>& out_;
+    };
+
+    // CoroScanner — 协程挂起点扫描器（实现见 CoroDecide.cpp）
+    class CoroScanner;
+
 private:
-    // ============================================================
-    // spawn 变量捕获分析（plan3: 协程 + lambda 按值捕获 = UB）
-    // ============================================================
-
-    // 收集 Stmt 子树中所有 Identifier 引用名
-    void collectIdRefs(const Stmt& stmt, std::set<std::string>& out) const;
-    void collectIdRefsExpr(const ASTNode& expr, std::set<std::string>& out) const;
-
-    // 收集 spawn 体内局部声明的变量名（let/const/for item/match binding/catch var）
-    void collectDeclared(const Stmt& stmt, std::set<std::string>& out) const;
 
     // ============================================================
     // 泛型模板参数收集
@@ -240,18 +312,12 @@ private:
     [[nodiscard]] std::string genErrorPropagation(const ErrorPropagationExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genPipeExpr(const PipeExpr& e, bool isCoroutine);
 
+    // --- 闭包 ---
+    [[nodiscard]] std::string genFunExpr(const FunExpr& e, bool isCoroutine);
+
     // ============================================================
     // 协程判定辅助
     // ============================================================
-
-    // 递归扫描 AST 节点中的调用，判断是否触发协程
-    bool scanForCoroutine(const ASTNode& node);
-    bool scanStmtForCoroutine(const Stmt& stmt);
-    bool scanExprForCoroutine(const ASTNode& expr);
-
-    // 判断表达式是否为「可能挂起」的调用
-    // plan §4.8: 返回 task<T> 的运行时原语 → 协程
-    [[nodiscard]] bool isSuspendingCall(const ASTNode& expr) const;
 
     // ============================================================
     // 输出辅助
@@ -295,6 +361,9 @@ private:
     // 待嵌入 struct 的方法声明（genRecordStruct 消费）
     std::vector<PendingMethod> pendingMethods_;
 
+    // 类型别名的模板参数表（type Name<T,...> = ... 或内部含泛型引用的类型别名）
+    std::unordered_map<std::string, std::vector<std::string>> typeAliasTemplateParams_;
+
     // 当前正在生成的方法/构造函数的接收者名（如 "self", "p"）
     // 用于在 genIdentifier 中将 self/p 映射为 C++ 的 this
     std::string currentReceiverName_;
@@ -310,6 +379,7 @@ private:
 
     // 当前函数的模板参数列表（用于调用泛型构造函数时传递类型参数）
     std::vector<std::string> currentTParams_;
+    std::string              currentLetName_;    // 当前 let 声明的变量名（递归闭包检测）
 
     // 字符串类型变量名集合（用于 genBinaryExpr 检测 string + T 拼接）
     std::set<std::string> stringVarNames_;

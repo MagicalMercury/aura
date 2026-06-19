@@ -69,8 +69,32 @@ std::unique_ptr<TypeExpr> Parser::parsePrimaryType() {
         return n;
     }
 
-    // 命名类型，可能是函数类型: Type -> RetType throws?
-    // 也可能是泛型实例化: Name<T> 或 Name<A, B>
+    // 函数类型: fun(params) throws? -> Ret
+    if (check(TokType::Fun)) {
+        advance(); // fun
+
+        auto ft = std::make_unique<FunctionType>();
+        setNodePos(ft.get(), peek());
+
+        consume(TokType::LParen, "expected '(' after 'fun' in function type");
+        if (!check(TokType::RParen)) {
+            do {
+                // 参数类型，可能包含 <T> 泛型标记
+                ft->paramTypes.push_back(parseType());
+            } while (match(TokType::Comma));
+        }
+        consume(TokType::RParen, "expected ')' after function type parameters");
+
+        if (match(TokType::Throws)) ft->throws = true;
+
+        if (match(TokType::Arrow)) {
+            ft->returnType = parseType();
+        }
+
+        return ft;
+    }
+
+    // 命名类型，可能是泛型实例化: Name<T> 或 Name<A, B>
     // 也可能是命名空间限定: ns.Name<T>
     // None 也是合法的类型名
     if (check(TokType::Identifier) || check(TokType::None)) {

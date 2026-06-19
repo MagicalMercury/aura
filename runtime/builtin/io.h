@@ -30,10 +30,10 @@ public:
     // ========== 终端 I/O ==========
 
     // println(value: string) — 输出一行文本（自动换行）
-    task<void> println(GcString* value);
+    task<void> println(GcString* value) const;
 
     // println_sync(value: string) — 同步版本，用于 spawn/嵌套协程中避免协程嵌套
-    void println_sync(GcString* value);
+    void println_sync(GcString* value) const;
 
     // readln() throws -> string — 读取一行标准输入
     task<GcString*> readln();

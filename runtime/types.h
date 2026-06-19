@@ -74,20 +74,22 @@ inline constexpr NoneType None{};
 // 数组长度由 lengthOffset 指定的字段给出。
 // ============================================================
 
-// 数组指针字段描述符（如 Array<GcString*>::elements）
-struct ArrayPtrField {
-    size_t ptrOffset;     // 指针字段在对象内的偏移
-    size_t lengthOffset;  // 长度字段在对象内的偏移（如 Array::length）
+// 内联数组字段描述符（如 ArrayChunk<GcString*> 的数据区在 this + 1 处）
+// 当 chunk 的 T 是指针类型时，data() 区域包含 GC 需要扫描的指针。
+struct InlineArrayField {
+    size_t offset;        // 数据区起始偏移（相对于对象基址）
+    size_t lengthOffset;  // 长度字段偏移（GC 读取它知道数组有多少有效元素）
+    bool   isPtrArray;    // 元素是否是指针（int 不用扫，GcString* 要扫）
 };
 
 struct TypeDescriptor {
-    size_t        size;             // 对象总大小（字节）
-    size_t        ptrFieldCount;    // 普通指针字段数量
-    const size_t* ptrFieldOffsets;  // 普通指针字段偏移数组
+    size_t        size;               // 对象总大小（字节），含内联数据
+    size_t        ptrFieldCount;      // 普通指针字段数量
+    const size_t* ptrFieldOffsets;    // 普通指针字段偏移数组
 
-    // 分代 GC 扩展
-    size_t              arrayPtrFieldCount = 0;  // 数组指针字段数量
-    const ArrayPtrField* arrayPtrFields = nullptr; // 数组指针字段描述符
+    // 内联数组字段 — 用于 ArrayChunk 等将数据紧跟在对象体之后的类型
+    size_t              inlineArrayFieldCount = 0;
+    const InlineArrayField* inlineArrayFields = nullptr;
 };
 
 // ============================================================
@@ -112,40 +114,39 @@ struct GcObject {
 
     // 分代 GC：0 = 新生代（young），1 = 老年代（old）
     uint8_t  generation = 0;
+
+    virtual ~GcObject() = default;
 };
 
 // ============================================================
-// GcString — 堆分配字符串
-//
-// plan §4.1: "string 映射为 GcString*"
-// plan §4.2 示例中将 GcString* 作为记录字段类型
-// plan §4.6 示例: "json->length == 0" — GcString 暴露 length 字段
-//
-// data 指向独立分配的 char 缓冲区（以 '\0' 结尾）。
-// data 指针本身注册在 TypeDescriptor 中，GC 不跟踪它指向的
-// 原始 char 数组（char 数组不含 GC 指针，无需扫描）。
+// GcString — 前向声明，完整定义见 builtin/string.h
 // ============================================================
+struct GcString; // 前向声明，Error 等类型中的 GcString* 指针需此声明
+
+/*
+// ── 旧 GcString（已迁移到 builtin/string.h）────────────────────
 struct GcString : GcObject {
     int32_t length = 0;
-    char*   data   = nullptr;
-
     static const TypeDescriptor _desc;
-
-    // 工厂方法（需要 gc.h，在 types.cpp 中实现）
     static GcString* make(const char* s);
     static GcString* make(const char* s, size_t len);
     static GcString* make(const std::string& s);
-
-    std::string_view view() const { return {data, static_cast<size_t>(length)}; }
-
-    // 值比较（比较字符串内容，而非指针地址）
-    bool operator==(const GcString& rhs) const {
-        return view() == rhs.view();
-    }
-    bool operator!=(const GcString& rhs) const {
-        return view() != rhs.view();
-    }
+    static GcString* from(const char* s);
+    static GcString* from(const char* s, size_t len);
+    static GcString* from(const std::string& s);
+    static GcString* from(int32_t val);
+    static GcString* from(double val);
+    static GcString* from(bool val);
+    GcString* concat(GcString* other) const;
+    char* data()             { return reinterpret_cast<char*>(this + 1); }
+    const char* data() const { return reinterpret_cast<const char*>(this + 1); }
+    std::string_view view() const { return {data(), static_cast<size_t>(length)}; }
+    bool operator==(const GcString& rhs) const { return view() == rhs.view(); }
+    bool operator!=(const GcString& rhs) const { return view() != rhs.view(); }
+    ~GcString() override = default;
+    int32_t len() const { return length; }
 };
+*/
 
 // ============================================================
 // Error — 内置错误对象
@@ -173,6 +174,8 @@ struct Error : GcObject {
     Error(GcString* k, GcString* m, GcObject* e = nullptr)
         : kind(k), message(m), extra(e) {}
     Error() = default;
+
+    ~Error() override = default;
 };
 
 // ============================================================
@@ -185,11 +188,15 @@ struct Error : GcObject {
 // 对于 T 为指针类型（如 Array<GcString*>），TypeDescriptor 中的
 // arrayPtrFields 会告诉 GC 如何扫描 elements 缓冲区中的 GC 指针。
 // ============================================================
+
+/*
 template <typename T>
 struct Array : GcObject {
     int32_t length   = 0;
     int32_t capacity = 0;
     T*      elements = nullptr;
+
+    ~Array() override = default;
 
     static const TypeDescriptor& desc() {
         if constexpr (std::is_pointer_v<T>) {
@@ -228,6 +235,10 @@ struct Array : GcObject {
     int32_t len() const { return length; }
 };
 
+*/
+
+// ── 旧版便捷工厂（已迁移到 builtin/string.h）────────────────────
+/*
 // ============================================================
 // 便捷工厂 & 字符串工具声明（实现在 types.cpp）
 // ============================================================
@@ -240,5 +251,6 @@ inline bool string_eq(GcString* a, GcString* b) {
     if (!a || !b) return false;
     return *a == *b;
 }
+*/
 
 } // namespace aura_rt

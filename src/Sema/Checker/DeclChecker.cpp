@@ -14,10 +14,6 @@ void SemAnalyzer::declareTopLevel(const Program& program) {
 
 void SemAnalyzer::declareDecl(const Decl& decl) {
     if (auto* t = dynamic_cast<const TypeDecl*>(&decl)) {
-        Symbol sym;
-        sym.kind = SymKind::TypeAlias;
-        sym.name = t->name;
-
         // 注册类型泛型参数（如 type Stack<T> 中的 T）
         for (auto& tp : t->typeParams) {
             Symbol tpSym;
@@ -26,10 +22,22 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
             symtab_.defineGlobal(std::move(tpSym));
         }
 
-        if (t->type) sym.type = resolveType(*t->type);
-        else sym.type = ErrorSemType::make();
+        // 先注册前向声明（解决自引用类型如 Tree<T> = {..., children: [Tree<T>]}）
+        Symbol fwd;
+        fwd.kind = SymKind::TypeAlias;
+        fwd.name = t->name;
+        fwd.type = ErrorSemType::make();  // 占位符，resolveType 完成后覆盖
+        symtab_.defineGlobal(std::move(fwd));
+        resolvingTypes_.insert(t->name);
 
-        symtab_.defineGlobal(std::move(sym));
+        if (t->type) {
+            auto resolved = resolveType(*t->type);
+            // 用完整类型更新占位符
+            auto* existing = symtab_.lookupGlobal(t->name);
+            if (existing) existing->type = std::move(resolved);
+        }
+
+        resolvingTypes_.erase(t->name);
         return;
     }
     if (auto* i = dynamic_cast<const InterfaceDecl*>(&decl)) {
@@ -123,12 +131,17 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
 // ============================================================
 
 void SemAnalyzer::checkFunBody(const FunDecl& decl) {
-    currentReturnType_ = decl.returnType ? resolveType(*decl.returnType) : nullptr;
-    currentFunctionThrows_ = decl.throws;
     insideLoop_ = false;
 
     symtab_.enterScope(ScopeKind::Function);
-    // 注册参数
+
+    // 1. 先注册泛型参数（后续类型解析需要能查到 T）
+    for (auto& p : decl.params) {
+        if (p.type) registerGenericParams(*p.type);
+    }
+    if (decl.returnType) registerGenericParams(*decl.returnType);
+
+    // 2. 注册参数（此时泛型已可解析）
     for (auto& p : decl.params) {
         Symbol sym;
         sym.kind = SymKind::Parameter;
@@ -136,42 +149,35 @@ void SemAnalyzer::checkFunBody(const FunDecl& decl) {
         sym.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
         symtab_.define(std::move(sym));
     }
-    // 注册泛型参数
-    for (auto& p : decl.params) {
-        if (p.type) registerGenericParams(*p.type);
-    }
-    if (decl.returnType) registerGenericParams(*decl.returnType);
+
+    // 3. 解析返回类型（泛型已注册，T 可正确解析为 GenericSemType）
+    currentReturnType_ = decl.returnType ? resolveType(*decl.returnType) : nullptr;
+    currentFunctionThrows_ = decl.throws;
 
     if (decl.body) checkBlock(*decl.body);
     symtab_.exitScope();
 }
 
 void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
-    currentReturnType_ = decl.returnType ? resolveType(*decl.returnType) : nullptr;
-    currentFunctionThrows_ = decl.throws;
     insideLoop_ = false;
 
     symtab_.enterScope(ScopeKind::Function);
-    // 注册参数
-    for (auto& p : decl.params) {
-        Symbol sym;
-        sym.kind = SymKind::Parameter;
-        sym.name = p.name;
-        sym.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
-        symtab_.define(std::move(sym));
-    }
-    // 注册泛型
-    for (auto& p : decl.params) {
-        if (p.type) registerGenericParams(*p.type);
-    }
-    if (decl.returnType) registerGenericParams(*decl.returnType);
-    // 注册接收者泛型参数
+
+    // 1. 先注册接收者泛型参数
     for (auto& ta : decl.receiverTypeArgs) {
         Symbol tpSym;
         tpSym.kind = SymKind::GenericParam;
         tpSym.name = ta;
         symtab_.define(std::move(tpSym));
     }
+
+    // 2. 注册参数泛型 + 返回类型泛型
+    for (auto& p : decl.params) {
+        if (p.type) registerGenericParams(*p.type);
+    }
+    if (decl.returnType) registerGenericParams(*decl.returnType);
+
+    // 3. 注册接收者 self
     {
         Symbol sym;
         sym.kind = SymKind::Parameter;
@@ -179,6 +185,19 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
         sym.type = resolveNamedType(decl.receiverType);
         symtab_.define(std::move(sym));
     }
+
+    // 4. 注册参数（泛型已就绪）
+    for (auto& p : decl.params) {
+        Symbol sym;
+        sym.kind = SymKind::Parameter;
+        sym.name = p.name;
+        sym.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
+        symtab_.define(std::move(sym));
+    }
+
+    // 5. 解析返回类型
+    currentReturnType_ = decl.returnType ? resolveType(*decl.returnType) : nullptr;
+    currentFunctionThrows_ = decl.throws;
 
     if (decl.body) checkBlock(*decl.body);
     symtab_.exitScope();
@@ -202,19 +221,18 @@ void SemAnalyzer::registerGenericParams(const TypeExpr& type) {
     if (auto* l = dynamic_cast<const ListType*>(&type)) {
         if (l->elementType) registerGenericParams(*l->elementType);
     }
-    if (auto* r = dynamic_cast<const RecordType*>(&type)) {
-        for (auto& f : r->fields) {
-            if (f.type) registerGenericParams(*f.type);
-        }
+    if (auto* f = dynamic_cast<const FunctionType*>(&type)) {
+        for (auto& p : f->paramTypes)
+            if (p) registerGenericParams(*p);
+        if (f->returnType) registerGenericParams(*f->returnType);
     }
     if (auto* u = dynamic_cast<const UnionType*>(&type)) {
-        for (auto& v : u->types) {
+        for (auto& v : u->types)
             if (v) registerGenericParams(*v);
-        }
     }
-    if (auto* fn = dynamic_cast<const FunctionType*>(&type)) {
-        for (auto& p : fn->paramTypes) { if (p) registerGenericParams(*p); }
-        if (fn->returnType) registerGenericParams(*fn->returnType);
+    if (auto* r = dynamic_cast<const RecordType*>(&type)) {
+        for (auto& f : r->fields)
+            if (f.type) registerGenericParams(*f.type);
     }
 }
 

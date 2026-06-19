@@ -3,6 +3,168 @@
 namespace Aura {
 
 // ============================================================
+// CoroScanner — 协程挂起点扫描器（基于 ASTWalker）
+// ============================================================
+class CodeGenerator::CoroScanner {
+public:
+    explicit CoroScanner(const std::set<std::string>& coroFns) : coroFns_(coroFns) {}
+
+    // 统一入口：自动区分 Stmt/Expr
+    bool scan(const ASTNode& node) {
+        if (auto* s = dynamic_cast<const Stmt*>(&node))
+            return StmtWalker<CoroScanner>::walk(*s, *this);
+        return ExprWalker<CoroScanner>::walk(node, *this);
+    }
+
+    // --- Stmt visit ---
+    bool visit(const BlockStmt& n, CoroScanner& self) {
+        for (auto& s : n.stmts)
+            if (s && self.scanStmt(*s)) return true;
+        return false;
+    }
+    bool visit(const IfStmt& n, CoroScanner& self) {
+        if (n.condition && self.scanExpr(*n.condition)) return true;
+        if (n.thenBranch && self.scanStmt(*n.thenBranch)) return true;
+        for (auto& ei : n.elseIfs) {
+            if (ei.condition && self.scanExpr(*ei.condition)) return true;
+            if (ei.body && self.scanStmt(*ei.body)) return true;
+        }
+        if (n.elseBranch && self.scanStmt(*n.elseBranch)) return true;
+        return false;
+    }
+    bool visit(const WhileStmt& n, CoroScanner& self) {
+        if (n.condition && self.scanExpr(*n.condition)) return true;
+        if (n.body && self.scanStmt(*n.body)) return true;
+        return false;
+    }
+    bool visit(const ForStmt& n, CoroScanner& self) {
+        if (n.iterable && self.scanExpr(*n.iterable)) return true;
+        if (n.body && self.scanStmt(*n.body)) return true;
+        return false;
+    }
+    bool visit(const LoopStmt& n, CoroScanner& self) {
+        return n.body && self.scanStmt(*n.body);
+    }
+    bool visit(const ReturnStmt& n, CoroScanner& self) {
+        return n.expr && self.scanExpr(*n.expr);
+    }
+    bool visit(const ThrowStmt& n, CoroScanner& self) {
+        return n.expr && self.scanExpr(*n.expr);
+    }
+    bool visit(const TryCatchStmt& n, CoroScanner& self) {
+        if (n.tryBody && self.scanStmt(*n.tryBody)) return true;
+        if (n.catchBody && self.scanStmt(*n.catchBody)) return true;
+        return false;
+    }
+    bool visit(const SyncStmt&, CoroScanner&) {
+        // sync 块要求协程上下文
+        return true;
+    }
+    bool visit(const SpawnStmt&, CoroScanner&) {
+        // spawn 块要求协程上下文
+        return true;
+    }
+    bool visit(const MatchStmt& n, CoroScanner& self) {
+        if (n.expr && self.scanExpr(*n.expr)) return true;
+        for (auto& c : n.cases)
+            if (c.body && self.scan(*c.body)) return true;
+        return false;
+    }
+    bool visit(const ExprStmt& n, CoroScanner& self) {
+        return n.expr && self.scanExpr(*n.expr);
+    }
+    bool visit(const LetDecl& n, CoroScanner& self) {
+        return n.initializer && self.scanExpr(*n.initializer);
+    }
+    bool visit(const ConstDecl& n, CoroScanner& self) {
+        return n.initializer && self.scanExpr(*n.initializer);
+    }
+    bool visit(const BreakStmt&,    CoroScanner&) { return false; }
+    bool visit(const ContinueStmt&, CoroScanner&) { return false; }
+
+    // --- Expr visit ---
+    bool visit(const CallExpr& n, CoroScanner& self) {
+        if (isSuspending(n)) return true;
+        for (auto& a : n.args)
+            if (a && self.scanExpr(*a)) return true;
+        return false;
+    }
+    bool visit(const MethodCallExpr& n, CoroScanner& self) {
+        if (isSuspending(n)) return true;
+        for (auto& a : n.args)
+            if (a && self.scanExpr(*a)) return true;
+        return false;
+    }
+    bool visit(const BinaryExpr& n, CoroScanner& self) {
+        return (n.left  && self.scanExpr(*n.left)) ||
+               (n.right && self.scanExpr(*n.right));
+    }
+    bool visit(const UnaryExpr& n, CoroScanner& self) {
+        return n.operand && self.scanExpr(*n.operand);
+    }
+    bool visit(const AssignExpr& n, CoroScanner& self) {
+        return (n.target && self.scanExpr(*n.target)) ||
+               (n.value  && self.scanExpr(*n.value));
+    }
+    bool visit(const ErrorPropagationExpr& n, CoroScanner& self) {
+        return n.expr && self.scanExpr(*n.expr);
+    }
+    bool visit(const PipeExpr& n, CoroScanner& self) {
+        return (n.left  && self.scanExpr(*n.left)) ||
+               (n.right && self.scanExpr(*n.right));
+    }
+    bool visit(const ListExpr& n, CoroScanner& self) {
+        for (auto& el : n.elements)
+            if (el && self.scanExpr(*el)) return true;
+        return false;
+    }
+    bool visit(const RecordExpr& n, CoroScanner& self) {
+        for (auto& f : n.fields)
+            if (f.value && self.scanExpr(*f.value)) return true;
+        return false;
+    }
+    bool visit(const IndexExpr& n, CoroScanner& self) {
+        return (n.object && self.scanExpr(*n.object)) ||
+               (n.index  && self.scanExpr(*n.index));
+    }
+    bool visit(const MemberAccessExpr& n, CoroScanner& self) {
+        return n.object && self.scanExpr(*n.object);
+    }
+    // 字面量/标识符 — 不产生挂起点
+    bool visit(const IntLiteral&,       CoroScanner&) { return false; }
+    bool visit(const FloatLiteral&,     CoroScanner&) { return false; }
+    bool visit(const StringLiteral&,    CoroScanner&) { return false; }
+    bool visit(const BoolLiteral&,      CoroScanner&) { return false; }
+    bool visit(const NoneLiteral&,      CoroScanner&) { return false; }
+    bool visit(const Identifier&,       CoroScanner&) { return false; }
+
+    // 闭包 — 不穿透扫描；闭包体内的调用不影响外层函数的协程判定
+    bool visit(const FunExpr&,          CoroScanner&) { return false; }
+
+private:
+    bool scanStmt(const Stmt& s)  { return StmtWalker<CoroScanner>::walk(s, *this); }
+    bool scanExpr(const ASTNode& e) { return ExprWalker<CoroScanner>::walk(e, *this); }
+
+    bool isSuspending(const ASTNode& expr) const {
+        if (auto* mc = dynamic_cast<const MethodCallExpr*>(&expr)) {
+            if (mc->object) {
+                if (auto* id = dynamic_cast<const Identifier*>(mc->object.get())) {
+                    if (id->name == "io") return true;
+                }
+            }
+        }
+        if (auto* call = dynamic_cast<const CallExpr*>(&expr)) {
+            if (auto* id = dynamic_cast<const Identifier*>(call->callee.get())) {
+                if (coroFns_.count(id->name)) return true;
+            }
+        }
+        return false;
+    }
+
+    const std::set<std::string>& coroFns_;
+};
+
+// ============================================================
 // 协程判定（plan §4.8）
 //
 // 决策算法：
@@ -15,174 +177,18 @@ namespace Aura {
 
 CoroDecision CodeGenerator::decideCoro(const FunDecl& decl) {
     if (!decl.body) return CoroDecision::Plain;
-    if (scanForCoroutine(*decl.body))
+    CoroScanner scanner(coroutineFunctions_);
+    if (scanner.scan(*decl.body))
         return CoroDecision::Coroutine;
     return CoroDecision::Plain;
 }
 
 CoroDecision CodeGenerator::decideCoro(const MethodDecl& decl) {
     if (!decl.body) return CoroDecision::Plain;
-    if (scanForCoroutine(*decl.body))
+    CoroScanner scanner(coroutineFunctions_);
+    if (scanner.scan(*decl.body))
         return CoroDecision::Coroutine;
     return CoroDecision::Plain;
-}
-
-// ============================================================
-// 递归扫描
-// ============================================================
-
-bool CodeGenerator::scanForCoroutine(const ASTNode& node) {
-    // 如果是语句节点，用 stmt 版本
-    if (auto* s = dynamic_cast<const Stmt*>(&node))
-        return scanStmtForCoroutine(*s);
-    // 如果是表达式节点
-    return scanExprForCoroutine(node);
-}
-
-bool CodeGenerator::scanStmtForCoroutine(const Stmt& stmt) {
-    if (auto* b = dynamic_cast<const BlockStmt*>(&stmt)) {
-        for (auto& s : b->stmts)
-            if (s && scanStmtForCoroutine(*s)) return true;
-        return false;
-    }
-    if (auto* i = dynamic_cast<const IfStmt*>(&stmt)) {
-        if (i->condition && scanExprForCoroutine(*i->condition)) return true;
-        if (i->thenBranch && scanStmtForCoroutine(*i->thenBranch)) return true;
-        for (auto& ei : i->elseIfs) {
-            if (ei.condition && scanExprForCoroutine(*ei.condition)) return true;
-            if (ei.body && scanStmtForCoroutine(*ei.body)) return true;
-        }
-        if (i->elseBranch && scanStmtForCoroutine(*i->elseBranch)) return true;
-        return false;
-    }
-    if (auto* w = dynamic_cast<const WhileStmt*>(&stmt)) {
-        if (w->condition && scanExprForCoroutine(*w->condition)) return true;
-        if (w->body && scanStmtForCoroutine(*w->body)) return true;
-        return false;
-    }
-    if (auto* f = dynamic_cast<const ForStmt*>(&stmt)) {
-        if (f->iterable && scanExprForCoroutine(*f->iterable)) return true;
-        if (f->body && scanStmtForCoroutine(*f->body)) return true;
-        return false;
-    }
-    if (auto* o = dynamic_cast<const LoopStmt*>(&stmt)) {
-        return o->body && scanStmtForCoroutine(*o->body);
-    }
-    if (auto* r = dynamic_cast<const ReturnStmt*>(&stmt)) {
-        return r->expr && scanExprForCoroutine(*r->expr);
-    }
-    if (auto* t = dynamic_cast<const ThrowStmt*>(&stmt)) {
-        return t->expr && scanExprForCoroutine(*t->expr);
-    }
-    if (auto* tc = dynamic_cast<const TryCatchStmt*>(&stmt)) {
-        if (tc->tryBody && scanStmtForCoroutine(*tc->tryBody)) return true;
-        if (tc->catchBody && scanStmtForCoroutine(*tc->catchBody)) return true;
-        return false;
-    }
-    if (dynamic_cast<const SyncStmt*>(&stmt)) {
-        // sync 块要求协程上下文
-        return true;
-    }
-    if (dynamic_cast<const SpawnStmt*>(&stmt)) {
-        // spawn 块要求协程上下文
-        return true;
-    }
-    if (auto* m = dynamic_cast<const MatchStmt*>(&stmt)) {
-        if (m->expr && scanExprForCoroutine(*m->expr)) return true;
-        for (auto& c : m->cases) {
-            if (c.body && scanForCoroutine(*c.body)) return true;
-        }
-        return false;
-    }
-    if (auto* e = dynamic_cast<const ExprStmt*>(&stmt)) {
-        return e->expr && scanExprForCoroutine(*e->expr);
-    }
-    if (auto* l = dynamic_cast<const LetDecl*>(&stmt)) {
-        return l->initializer && scanExprForCoroutine(*l->initializer);
-    }
-    if (auto* cn = dynamic_cast<const ConstDecl*>(&stmt)) {
-        return cn->initializer && scanExprForCoroutine(*cn->initializer);
-    }
-    // Break/Continue 不产生挂起点
-    return false;
-}
-
-bool CodeGenerator::scanExprForCoroutine(const ASTNode& expr) {
-    if (auto* e = dynamic_cast<const CallExpr*>(&expr)) {
-        if (isSuspendingCall(*e)) return true;
-        for (auto& a : e->args)
-            if (a && scanExprForCoroutine(*a)) return true;
-        return false;
-    }
-    if (auto* e = dynamic_cast<const MethodCallExpr*>(&expr)) {
-        if (isSuspendingCall(*e)) return true;
-        for (auto& a : e->args)
-            if (a && scanExprForCoroutine(*a)) return true;
-        return false;
-    }
-    if (auto* e = dynamic_cast<const BinaryExpr*>(&expr)) {
-        return (e->left  && scanExprForCoroutine(*e->left)) ||
-               (e->right && scanExprForCoroutine(*e->right));
-    }
-    if (auto* e = dynamic_cast<const UnaryExpr*>(&expr)) {
-        return e->operand && scanExprForCoroutine(*e->operand);
-    }
-    if (auto* e = dynamic_cast<const AssignExpr*>(&expr)) {
-        return (e->target && scanExprForCoroutine(*e->target)) ||
-               (e->value  && scanExprForCoroutine(*e->value));
-    }
-    if (auto* e = dynamic_cast<const ErrorPropagationExpr*>(&expr)) {
-        return e->expr && scanExprForCoroutine(*e->expr);
-    }
-    if (auto* e = dynamic_cast<const PipeExpr*>(&expr)) {
-        return (e->left  && scanExprForCoroutine(*e->left)) ||
-               (e->right && scanExprForCoroutine(*e->right));
-    }
-    // ListExpr / RecordExpr: 递归
-    if (auto* e = dynamic_cast<const ListExpr*>(&expr)) {
-        for (auto& el : e->elements)
-            if (el && scanExprForCoroutine(*el)) return true;
-        return false;
-    }
-    if (auto* e = dynamic_cast<const RecordExpr*>(&expr)) {
-        for (auto& f : e->fields)
-            if (f.value && scanExprForCoroutine(*f.value)) return true;
-        return false;
-    }
-    if (auto* e = dynamic_cast<const IndexExpr*>(&expr)) {
-        return (e->object && scanExprForCoroutine(*e->object)) ||
-               (e->index  && scanExprForCoroutine(*e->index));
-    }
-    return false;
-}
-
-// ============================================================
-// 挂起点判断
-// ============================================================
-
-bool CodeGenerator::isSuspendingCall(const ASTNode& expr) const {
-    // 方法调用：如果是 io.xxx 且返回 task<T> → 挂起点
-    if (auto* mc = dynamic_cast<const MethodCallExpr*>(&expr)) {
-        // io.* 调用
-        if (mc->object) {
-            if (auto* id = dynamic_cast<const Identifier*>(mc->object.get())) {
-                if (id->name == "io") {
-                    // io 的所有 I/O 方法都返回 task<T> → 挂起点
-                    return true;
-                }
-            }
-        }
-    }
-
-    // 函数调用：如果已在 coroutineFunctions_ 中 → 挂起点
-    if (auto* call = dynamic_cast<const CallExpr*>(&expr)) {
-        if (auto* id = dynamic_cast<const Identifier*>(call->callee.get())) {
-            if (coroutineFunctions_.count(id->name))
-                return true;
-        }
-    }
-
-    return false;
 }
 
 } // namespace Aura

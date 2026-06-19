@@ -30,10 +30,10 @@ public:
     bool define(Symbol sym);
 
     // 在本层查找（不向上搜索）
-    Symbol* lookupLocal(const std::string& name);
+    Symbol* lookupLocal(const std::string& name) const;
 
     // 向上搜索所有父作用域
-    Symbol* lookup(const std::string& name);
+    Symbol* lookup(const std::string& name) const;
 
     // 遍历本层所有符号
     void forEach(auto&& fn) const {
@@ -69,10 +69,10 @@ public:
     bool defineGlobal(Symbol sym);
 
     // 从当前作用域向上搜索
-    Symbol* lookup(const std::string& name);
+    Symbol* lookup(const std::string& name) const;
 
     // 只在全局作用域查找
-    Symbol* lookupGlobal(const std::string& name);
+    Symbol* lookupGlobal(const std::string& name) const;
 
     // 当前作用域指针
     Scope* currentScope() { return current_; }

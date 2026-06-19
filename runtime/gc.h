@@ -83,11 +83,14 @@ public:
     static GcHeap& instance();
     ~GcHeap();
 
-    // 分配一个 GC 对象（大小 + 类型描述符）
+    // 分配一个 GC 对象（大小 + 类型描述符），失败抛出 OutOfMemoryError
     GcObject* alloc(size_t size, const TypeDescriptor* desc);
 
-    // 分配原始字节（用于字符串 data buffer 等非 GcObject 附属分配）
-    void* allocRaw(size_t size);
+    // 尝试分配，GC 后仍失败则抛出 OutOfMemoryError
+    GcObject* tryAlloc(size_t size, const TypeDescriptor* desc);
+
+    // 主动抛出预缓存的 OutOfMemoryError（供外部 tryAlloc 降级路径使用）
+    [[noreturn]] void throwOutOfMemory();
 
     // 写屏障：记录 old→young 跨代引用
     void writeBarrier(GcObject* parent, void* fieldAddr, GcObject* newVal);
@@ -140,7 +143,7 @@ private:
     void  markPhase(bool youngOnly);
     void  markObject(GcObject* obj);
     void  markFields(GcObject* obj);
-    void  markArrayPtrFields(GcObject* obj);
+    void  markInlineArrayFields(GcObject* obj);
 
     // 清除阶段
     void  sweepPhaseYoung();  // 新生代清除 + 晋升
@@ -149,6 +152,9 @@ private:
     // 辅助
     void  promoteToOld(GcObject* obj);
     void  compactAndReclaim();
+
+    // 预分配 OOM 错误（首次 tryAlloc 时懒初始化）
+    void  ensureOomError();
 
     Page*   headPage_    = nullptr;
     Page*   currentPage_ = nullptr;
@@ -171,18 +177,30 @@ private:
 
     // 记忆集：记录 old→young 引用的 old 对象集合
     std::set<GcObject*> rememberedSet_;
+
+    // OOM 错误缓存（GC 启动时预分配，无需额外内存即可抛出）
+    Error oomError_;
+    bool  oomInit_      = false;  // 防止 ensureOomError → make_string → alloc → ensureOomError 递归
 };
 
 // ============================================================
 // 模板化便捷接口
 // ============================================================
 
-// 为类型 T 分配 GC 对象
+// 为类型 T 分配 GC 对象（失败抛出 OutOfMemoryError）
 template <typename T>
-T* gc_alloc(const TypeDescriptor* desc) {
+T* gc_alloc(const TypeDescriptor* desc, size_t size = 0) {
     static_assert(std::is_base_of_v<GcObject, T>,
                   "T must inherit from GcObject");
-    return static_cast<T*>(GcHeap::instance().alloc(sizeof(T), desc));
+    return static_cast<T*>(GcHeap::instance().alloc(!size ? sizeof(T) : size, desc));
+}
+
+// 尝试为类型 T 分配 GC 对象（失败抛出 OutOfMemoryError）
+template <typename T>
+T* gc_tryAlloc(const TypeDescriptor* desc, size_t size = 0) {
+    static_assert(std::is_base_of_v<GcObject, T>,
+                  "T must inherit from GcObject");
+    return static_cast<T*>(GcHeap::instance().tryAlloc(!size ? sizeof(T) : size, desc));
 }
 
 // 写屏障
@@ -213,7 +231,7 @@ inline void gc_unregister_stack_roots(void* begin, void* end) {
 // ============================================================
 template <typename T>
 GcRootHandle<T>::GcRootHandle(T& ref) : ptr_(&ref) {
-    if (ptr_) GcHeap::instance().registerRoot(this);
+    GcHeap::instance().registerRoot(this);
 }
 
 template <typename T>
@@ -228,31 +246,33 @@ GcRootHandle<T>::~GcRootHandle() {
 // ============================================================
 namespace aura_rt {
 
-template <typename T>
-Array<T>* Array<T>::make(int32_t initialCapacity) {
-    if (initialCapacity < 4) initialCapacity = 4;
-    auto* arr = gc_alloc<Array<T>>(&desc());
-    arr->capacity = initialCapacity;
-    arr->length   = 0;
-    arr->elements = static_cast<T*>(GcHeap::instance().allocRaw(sizeof(T) * initialCapacity));
-    return arr;
-}
+//template <typename T>
+//Array<T>* Array<T>::make(int32_t initialCapacity) {
+//    if (initialCapacity < 4) initialCapacity = 4;
+//    auto* arr = gc_alloc<Array<T>>(&desc());
+//    arr->capacity = initialCapacity;
+//    arr->length   = 0;
+//    arr->elements = static_cast<T*>(GcHeap::instance().allocRaw(sizeof(T) * initialCapacity));
+//    return arr;
+//}
 
-template <typename T>
-void Array<T>::push(const T& value) {
-    if (length >= capacity) {
-        int32_t newCap = capacity ? capacity * 2 : 4;
-        auto*   newBuf = static_cast<T*>(GcHeap::instance().allocRaw(sizeof(T) * newCap));
-        for (int32_t i = 0; i < length; ++i) newBuf[i] = elements[i];
-        elements = newBuf;
-        capacity = newCap;
-    }
-    elements[length++] = value;
-}
+//template <typename T>
+//void Array<T>::push(const T& value) {
+//    if (length >= capacity) {
+//        int32_t newCap = capacity ? capacity * 2 : 4;
+ //       auto*   newBuf = static_cast<T*>(GcHeap::instance().allocRaw(sizeof(T) * newCap));
+ //       for (int32_t i = 0; i < length; ++i) newBuf[i] = elements[i];
+ //       elements = newBuf;
+ //       capacity = newCap;
+//   }
+//    elements[length++] = value;
+//}
 
 // ============================================================
-// 字符串工具声明（实现在 types.cpp，链接 libaura_rt.a）
+// 字符串工具声明（已迁移到 builtin/string.h）
+// #include "builtin/string.h" 即可获得所有声明
 // ============================================================
+/*
 GcString* make_string(const char* s);
 GcString* make_string(const std::string& s);
 GcString* string_concat(GcString* a, GcString* b);
@@ -260,11 +280,12 @@ GcString* int_to_string(int32_t val);
 GcString* float_to_string(double val);
 GcString* concat(GcString* a, GcString* b);
 GcString* concat(GcString* a, int32_t b);
-GcString* concat(int32_t a,    GcString* b);
+GcString* concat(int32_t a, GcString* b);
 GcString* concat(GcString* a, double b);
-GcString* concat(double a,     GcString* b);
+GcString* concat(double a, GcString* b);
 GcString* bool_to_string(bool val);
 GcString* concat(GcString* a, bool b);
-GcString* concat(bool a,        GcString* b);
+GcString* concat(bool a, GcString* b);
+*/
 
 } // namespace aura_rt

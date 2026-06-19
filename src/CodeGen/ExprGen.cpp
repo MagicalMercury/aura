@@ -43,6 +43,8 @@ std::string CodeGenerator::genExpr(const ASTNode& expr, bool isCoroutine) {
         return genErrorPropagation(*e, isCoroutine);
     if (auto* e = dynamic_cast<const PipeExpr*>(&expr))
         return genPipeExpr(*e, isCoroutine);
+    if (auto* e = dynamic_cast<const FunExpr*>(&expr))
+        return genFunExpr(*e, isCoroutine);
     return "/* ??? */";
 }
 
@@ -120,7 +122,7 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
     oss << "    auto* " << var << " = aura_rt::Array<" << elemType
         << ">::make(" << e.elements.size() << ");\n";
     for (auto& expr : elemExprs)
-        oss << "    " << var << "->push(" << expr << ");\n";
+        oss << "    " << var << "->append(" << expr << ");\n";
     oss << "    return " << var << ";\n";
     oss << "  }()";
     return oss.str();
@@ -388,6 +390,181 @@ std::string CodeGenerator::genPipeExpr(const PipeExpr& e, bool isCoroutine) {
     // 简化：暂不支持，直接展开
     (void)e; (void)isCoroutine;
     return "/* pipe_expr */";
+}
+
+// ============================================================
+// 闭包表达式 → C++20 lambda
+// ============================================================
+
+std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
+    if (!e.body) return "[]{}";
+
+    (void)isCoroutine; // 闭包体始终生成非协程 lambda
+
+    // === 1. 捕获分析（复用 IdRefCollector + DeclaredCollector） ===
+    std::set<std::string> allRefs;
+    IdRefCollector idCol(allRefs);
+    for (auto& s : e.body->stmts)
+        if (s) idCol.collectStmt(*s);
+
+    std::set<std::string> declared;
+    DeclaredCollector declCol(declared);
+    for (auto& s : e.body->stmts)
+        if (s) declCol.collectStmt(*s);
+
+    std::set<std::string> paramNames;
+    for (auto& p : e.params) paramNames.insert(p.name);
+
+    std::set<std::string> builtins = {"_tasks"};
+    std::vector<std::string> captures;
+    for (auto& name : allRefs) {
+        if (declared.count(name))     continue;
+        if (paramNames.count(name))   continue;
+        if (builtins.count(name))     continue;
+        if (registeredTypes_.count(name)) continue;
+
+        auto it = registeredTypes_.find(name);
+        if (it != registeredTypes_.end() && it->second) {
+            error(e, "cannot capture heap-allocated variable '" + name +
+                  "' in closure (not yet supported)");
+            continue;
+        }
+        captures.push_back(name);
+    }
+
+    // === 2. 泛型分析（plan12 统一方案） ===
+    // 收集闭包参数/返回类型中的所有 GenericTypeRef
+    std::set<std::string> genericParams;
+    for (auto& p : e.params)
+        if (p.type) collectTParams(*p.type, genericParams);
+    if (e.returnType) collectTParams(*e.returnType, genericParams);
+
+    // 检测 FunctionType 回调参数 — 需要 F&& + invoke_result_t
+    // 对每个 fun(A) -> B 参数，收集 B 的泛型名 → invoke_result_t 推导
+    // 仅当泛型名**仅**出现在 FunctionType 返回类型中时才从模板参数移除
+    std::vector<size_t> callableParamIndices;
+    std::vector<std::string> callableResultGenerics;
+    for (size_t i = 0; i < e.params.size(); ++i) {
+        if (auto* ft = e.params[i].type
+                ? dynamic_cast<const FunctionType*>(e.params[i].type.get())
+                : nullptr) {
+            callableParamIndices.push_back(i);
+            // 此 FunctionType 返回类型的泛型名
+            std::set<std::string> retGen;
+            if (ft->returnType) collectTParams(*ft->returnType, retGen);
+            // 只移除仅在返回类型中出现的泛型（不损害其他地方也用的泛型如 T）
+            std::string retGenStr;
+            for (auto& g : retGen) {
+                // 检查 g 是否在其他参数或返回类型中也出现
+                bool appearsElsewhere = false;
+                for (size_t j = 0; j < e.params.size(); ++j) {
+                    if (j == i) continue;
+                    std::set<std::string> other;
+                    if (e.params[j].type) collectTParams(*e.params[j].type, other);
+                    if (other.count(g)) { appearsElsewhere = true; break; }
+                }
+                if (!appearsElsewhere && e.returnType) {
+                    std::set<std::string> rtGen;
+                    collectTParams(*e.returnType, rtGen);
+                    // 注意：retGen 就已经是返回类型的泛型，e.returnType 可能包含更多
+                    // 简化：检查 g 是否还在闭包级别的返回类型中（非 FunctionType 内部）
+                    if (rtGen.count(g) && !retGen.count(g))
+                        appearsElsewhere = true;
+                }
+                if (!retGenStr.empty()) retGenStr += ", ";
+                retGenStr += g;
+                if (!appearsElsewhere) genericParams.erase(g);
+            }
+            callableResultGenerics.push_back(retGenStr);
+        }
+    }
+
+    // === 3. 生成 C++ lambda ===
+    std::ostringstream oss;
+
+    // 捕获 + 模板参数
+    oss << "[";
+    for (size_t i = 0; i < captures.size(); ++i) {
+        if (i > 0) oss << ", ";
+        auto cn = safeName(captures[i]);
+        // 递归闭包：let 声明的变量被自身闭包引用 → 按引用捕获
+        if (!currentLetName_.empty() && captures[i] == currentLetName_)
+            oss << "&";
+        oss << cn;
+    }
+
+    // 模板参数列表
+    bool hasGeneric = !genericParams.empty() || !callableParamIndices.empty();
+    if (hasGeneric) {
+        oss << "]<";
+        bool first = true;
+        for (auto& g : genericParams) {
+            if (!first) oss << ", ";
+            oss << "typename " << g;
+            first = false;
+        }
+        for (size_t ci = 0; ci < callableParamIndices.size(); ++ci) {
+            if (!first) oss << ", ";
+            oss << "typename F" << ci;
+            first = false;
+        }
+        oss << ">";
+    } else {
+        oss << "]";
+    }
+
+    // 参数列表
+    oss << "(";
+    for (size_t i = 0; i < e.params.size(); ++i) {
+        if (i > 0) oss << ", ";
+        bool isCallable = false;
+        int  callableIdx = -1;
+        for (size_t ci = 0; ci < callableParamIndices.size(); ++ci) {
+            if (callableParamIndices[ci] == i) { isCallable = true; callableIdx = (int)ci; break; }
+        }
+        if (isCallable) {
+            oss << "F" << callableIdx << "&& " << safeName(e.params[i].name);
+        } else {
+            std::string paramType = e.params[i].type ? mapType(*e.params[i].type) : "auto";
+            oss << paramType << " " << safeName(e.params[i].name);
+        }
+    }
+    oss << ")";
+
+    // 返回类型：若有通过 invoke_result_t 推导的泛型，用 auto
+    if (e.returnType && !callableParamIndices.empty()) {
+        oss << " -> auto";
+    } else if (e.returnType) {
+        oss << " -> " << mapType(*e.returnType);
+    } else {
+        oss << " -> auto";
+    }
+
+    // === 函数体 ===
+    oss << " {\n";
+    indentLevel_++;
+
+    // invoke_result_t 推导声明
+    for (size_t ci = 0; ci < callableParamIndices.size(); ++ci) {
+        auto* ft = dynamic_cast<const FunctionType*>(
+            e.params[callableParamIndices[ci]].type.get());
+        if (ft && !ft->paramTypes.empty() && !callableResultGenerics[ci].empty()) {
+            // using U = std::invoke_result_t<F, T>;
+            std::string firstArg;
+            if (ft->paramTypes[0]) firstArg = mapType(*ft->paramTypes[0]);
+            oss << indentStr()
+                << "using " << callableResultGenerics[ci]
+                << " = std::invoke_result_t<F" << ci << ", " << firstArg << ">;\n";
+        }
+    }
+
+    for (auto& s : e.body->stmts) {
+        if (s) genStmt(oss, *s, false);
+    }
+    indentLevel_--;
+    oss << indentStr() << "}";
+
+    return oss.str();
 }
 
 } // namespace Aura

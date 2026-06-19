@@ -15,6 +15,16 @@ void SemAnalyzer::checkBlock(const BlockStmt& stmt) {
 }
 
 void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
+    // 先注册占位符号（若有类型标注则用标注类型，否则暂设 error），
+    // 使递归闭包能引用自身（如 let fact: fun(int)->int = fun(n) { return n * fact(n-1) }）
+    {
+        Symbol placeholder;
+        placeholder.kind = SymKind::Variable;
+        placeholder.name = decl.name;
+        placeholder.type = decl.type ? resolveType(*decl.type) : ErrorSemType::make();
+        symtab_.define(std::move(placeholder));
+    }
+
     auto inferredType = decl.initializer ? inferExpr(*decl.initializer) : ErrorSemType::make();
     if (decl.type) {
         auto declaredType = resolveType(*decl.type);
@@ -23,11 +33,9 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
         }
         inferredType = std::move(declaredType);
     }
-    Symbol sym;
-    sym.kind = SymKind::Variable;
-    sym.name = decl.name;
-    sym.type = inferredType->clone();
-    symtab_.define(std::move(sym));
+    // 更新符号类型为推断后的精确类型
+    auto* sym = symtab_.lookup(decl.name);
+    if (sym) sym->type = inferredType->clone();
 }
 
 void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
@@ -57,7 +65,7 @@ void SemAnalyzer::checkReturnStmt(const ReturnStmt& stmt) {
 }
 
 void SemAnalyzer::checkThrowStmt(const ThrowStmt& stmt) {
-    if (!currentFunctionThrows_) {
+    if (!currentFunctionThrows_ && insideTry_ == 0) {
         error(stmt, "'throw' used in non-throwing function");
     }
     if (stmt.expr) {
@@ -150,7 +158,9 @@ void SemAnalyzer::checkMatchStmt(const MatchStmt& stmt) {
 }
 
 void SemAnalyzer::checkTryCatchStmt(const TryCatchStmt& stmt) {
+    insideTry_++;
     if (stmt.tryBody) checkBlock(*stmt.tryBody);
+    insideTry_--;
     symtab_.enterScope();
     Symbol sym;
     sym.kind = SymKind::Variable;

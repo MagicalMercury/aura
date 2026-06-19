@@ -6,6 +6,8 @@
 // ============================================================
 
 #include "gc.h"
+#include "builtin/error.h"
+#include "builtin/string.h"
 #include <algorithm>
 #include <cstring>
 
@@ -37,6 +39,13 @@ GcHeap::~GcHeap() {
 // ============================================================
 
 GcObject* GcHeap::alloc(size_t size, const TypeDescriptor* desc) {
+    return tryAlloc(size, desc);  // tryAlloc 最终失败会 throw
+}
+
+GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
+    // 首次调用时懒初始化 OOM 错误字符串
+    ensureOomError();
+
     // 对齐到 8 字节
     size = (size + 7) & ~size_t(7);
 
@@ -57,8 +66,8 @@ GcObject* GcHeap::alloc(size_t size, const TypeDescriptor* desc) {
     }
 
     if (!mem) {
-        // GC 后仍失败 → OOM
-        std::abort();
+        // GC 后仍失败 → 抛出预缓存的 OutOfMemoryError
+        throwOutOfMemory();
     }
 
     GcObject* obj = static_cast<GcObject*>(mem);
@@ -71,13 +80,12 @@ GcObject* GcHeap::alloc(size_t size, const TypeDescriptor* desc) {
     youngBytes_ += size;
     allocatedBytes_ += size;
 
-    return obj;
-}
+    // 若老年代已超阈值（可能由之前的 promotion 导致），设置 GC 待处理
+    if (oldBytes_ >= kOldThreshold) {
+        gcPending_ = true;
+    }
 
-void* GcHeap::allocRaw(size_t size) {
-    // 对齐到 8 字节
-    size = (size + 7) & ~size_t(7);
-    return bumpAlloc(size);
+    return obj;
 }
 
 void* GcHeap::bumpAlloc(size_t size) {
@@ -112,6 +120,26 @@ GcHeap::Page* GcHeap::allocPage() {
 }
 
 // ============================================================
+// OOM 错误缓存 — 启动时预分配，OOM 时可安全抛出
+// ============================================================
+
+void GcHeap::ensureOomError() {
+    if (oomError_.kind) return;  // 已初始化
+    if (oomInit_) return;        // 递归防护
+
+    oomInit_ = true;
+    // 此时 instance() 已返回，make_string → GcHeap::instance().alloc() 安全
+    // ensureOomError 的递归调用会被 oomInit_ 挡掉
+    oomError_.kind    = make_string("OutOfMemoryError");
+    oomError_.message = make_string("memory exhausted after GC");
+    oomInit_ = false;
+}
+
+void GcHeap::throwOutOfMemory() {
+    throw oomError_;
+}
+
+// ============================================================
 // 写屏障 — 维护记忆集
 // ============================================================
 void GcHeap::writeBarrier(GcObject* parent, void* /*fieldAddr*/, GcObject* newVal) {
@@ -126,7 +154,13 @@ void GcHeap::writeBarrier(GcObject* parent, void* /*fieldAddr*/, GcObject* newVa
 // ============================================================
 void GcHeap::safepoint() {
     if (gcPending_) {
-        majorGc();
+        gcPending_ = false;
+        if (youngBytes_ >= kYoungThreshold / 2) {
+            minorGc();
+        }
+        if (oldBytes_ >= kOldThreshold) {
+            majorGc();
+        }
     }
 }
 
@@ -230,7 +264,7 @@ void GcHeap::markPhase(bool youngOnly) {
     if (youngOnly) {
         for (auto* oldObj : rememberedSet_) {
             markFields(oldObj);   // 递归标记 old 对象引用的 young 对象
-            markArrayPtrFields(oldObj);
+            markInlineArrayFields(oldObj);
         }
     }
 
@@ -239,10 +273,14 @@ void GcHeap::markPhase(bool youngOnly) {
         for (auto* obj : oldObjects_) {
             if (obj->marked) {
                 markFields(obj);
-                markArrayPtrFields(obj);
+                markInlineArrayFields(obj);
             }
         }
     }
+
+    // 5. 始终标记 OOM 错误缓存字符串（确保可随时抛出）
+    if (oomError_.kind) markObject(oomError_.kind);
+    if (oomError_.message) markObject(oomError_.message);
 }
 
 void GcHeap::markObject(GcObject* obj) {
@@ -251,7 +289,7 @@ void GcHeap::markObject(GcObject* obj) {
 
     // 递归标记所有指针字段
     markFields(obj);
-    markArrayPtrFields(obj);
+    markInlineArrayFields(obj);
 }
 
 void GcHeap::markFields(GcObject* obj) {
@@ -270,26 +308,22 @@ void GcHeap::markFields(GcObject* obj) {
     }
 }
 
-void GcHeap::markArrayPtrFields(GcObject* obj) {
+void GcHeap::markInlineArrayFields(GcObject* obj) {
     const TypeDescriptor* desc = obj->desc;
-    if (!desc || desc->arrayPtrFieldCount == 0 || !desc->arrayPtrFields) return;
+    if (!desc || desc->inlineArrayFieldCount == 0 || !desc->inlineArrayFields) return;
 
     char* base = reinterpret_cast<char*>(obj);
 
-    for (size_t i = 0; i < desc->arrayPtrFieldCount; ++i) {
-        const ArrayPtrField& af = desc->arrayPtrFields[i];
+    for (size_t i = 0; i < desc->inlineArrayFieldCount; ++i) {
+        const InlineArrayField& iaf = desc->inlineArrayFields[i];
+        if (!iaf.isPtrArray) continue;
 
-        // 读取指针字段（指向 GC 指针数组）
-        void** ptrField = reinterpret_cast<void**>(base + af.ptrOffset);
-        void*  bufferPtr = *ptrField;
-        if (!bufferPtr) continue;
-
-        // 读取长度字段
-        int32_t* lenField = reinterpret_cast<int32_t*>(base + af.lengthOffset);
+        // 读取长度字段（如 ArrayChunk::used）
+        int32_t* lenField = reinterpret_cast<int32_t*>(base + iaf.lengthOffset);
         int32_t  count = *lenField;
 
-        // 扫描数组中的每个 GC 指针
-        GcObject** elems = static_cast<GcObject**>(bufferPtr);
+        // 扫描内联数据区中的 GC 指针
+        GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
         for (int32_t j = 0; j < count; ++j) {
             GcObject* child = elems[j];
             if (child) {
@@ -304,24 +338,26 @@ void GcHeap::markArrayPtrFields(GcObject* obj) {
 // ============================================================
 
 void GcHeap::sweepPhaseYoung() {
-    std::vector<GcObject*> survivors;
-
+    // 晋升所有存活对象到老年代，清空新生代列表。
+    // 存活对象不应留在 youngObjects_ 中，否则下次 minor GC 会重复扫描老年代对象。
     for (auto* obj : youngObjects_) {
         if (obj->marked) {
             promoteToOld(obj);
             obj->marked = false;
-            survivors.push_back(obj);
         }
     }
 
     youngBytes_ = 0;
-    youngObjects_ = std::move(survivors);
+    youngObjects_.clear();
 }
 
 void GcHeap::promoteToOld(GcObject* obj) {
     obj->generation = 1;
     oldObjects_.push_back(obj);
     oldBytes_ += obj->desc ? obj->desc->size : 0;
+    if (oldBytes_ >= kOldThreshold) {
+        gcPending_ = true;
+    }
 }
 
 // ============================================================
@@ -346,10 +382,8 @@ void GcHeap::sweepPhaseAll() {
     for (auto* obj : oldObjects_) {
         if (obj->marked) {
             obj->marked = false;
-            // 晋升到老年代的对象可能仍在 youngObjects_ 中
-            if (obj->generation == 0) {
-                promoteToOld(obj);
-            }
+            // sweepePhaseYoung 已将晋升对象的 generation 设为 1，
+            // 此处的 gen==0 分支不再需要（且 promoteToOld 在迭代 oldObjects_ 时调用会 UB）
             liveOld.push_back(obj);
             liveOldBytes += obj->desc ? obj->desc->size : 0;
         }
@@ -364,10 +398,15 @@ void GcHeap::sweepPhaseAll() {
     oldBytes_     = liveOldBytes;
     allocatedBytes_ = youngBytes_ + oldBytes_;
 
-    // 2. 若大量对象死亡（>50%），执行紧缩：将存活对象拷贝到新页，释放旧页
-    if ((oldDead > 0 && oldDead > oldObjects_.size()) ||
-        (youngDead > 0 && youngDead > youngObjects_.size())) {
+    // 2. 若大量对象死亡（>=50%），执行紧缩：将存活对象拷贝到新页，释放旧页
+    if ((oldDead >= liveOld.size() && oldDead > 0) ||
+        (youngDead >= liveYoung.size() && youngDead > 0)) {
         compactAndReclaim();
+    }
+
+    // 3. 若老年代仍超阈值，标记需要 GC
+    if (oldBytes_ >= kOldThreshold) {
+        gcPending_ = true;
     }
 }
 

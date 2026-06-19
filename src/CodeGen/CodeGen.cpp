@@ -1,6 +1,7 @@
 #include "CodeGen.h"
 #include <filesystem>
 #include <sstream>
+#include <unordered_set>
 
 namespace Aura {
 
@@ -189,11 +190,23 @@ std::string CodeGenerator::indentStr() const {
 }
 
 std::string CodeGenerator::safeName(const std::string& name) const {
-    // C++ 关键字冲突保护
-    if (name == "class" || name == "template" || name == "typename" ||
-        name == "auto" || name == "const" || name == "new" ||
-        name == "delete" || name == "virtual" || name == "override")
-        return name + "_";
+    // C++ 关键字/保留字冲突保护 — 编译器遇到冲突变量名时加后缀 _
+    static const std::unordered_set<std::string> cppKeywords = {
+        "class", "template", "typename", "auto", "const", "new",
+        "delete", "virtual", "override", "default", "static", "enum",
+        "double", "float", "int", "bool", "char", "short", "long",
+        "void", "switch", "case", "break", "continue", "return",
+        "if", "else", "for", "while", "do", "goto", "try", "catch",
+        "throw", "namespace", "using", "public", "private", "protected",
+        "struct", "union", "operator", "sizeof", "this", "true", "false",
+        "nullptr", "noexcept", "mutable", "explicit", "export",
+        "volatile", "register", "extern", "inline", "typedef",
+        "friend", "constexpr", "consteval", "constinit", "decltype",
+        "concept", "requires", "co_await", "co_return", "co_yield",
+        "alignas", "alignof", "and", "and_eq", "bitand", "bitor",
+        "compl", "not", "not_eq", "or", "or_eq", "xor", "xor_eq"
+    };
+    if (cppKeywords.count(name)) return name + "_";
     return name;
 }
 

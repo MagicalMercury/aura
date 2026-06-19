@@ -6,6 +6,7 @@
 #include "../AST/Type.h"
 #include "SemType.h"
 #include "SymbolTable.h"
+#include <set>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,9 @@ private:
     [[nodiscard]] std::unique_ptr<SemType> inferErrorPropagation(const ErrorPropagationExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferPipe(const PipeExpr& e);
 
+    // --- 闭包 ---
+    [[nodiscard]] std::unique_ptr<SemType> inferFunExpr(const FunExpr& e);
+
     // ============ match 穷尽性检查 ============
     bool isMatchExhaustive(const SemType& matchedType,
                            const std::vector<MatchCase>& cases);
@@ -107,6 +111,11 @@ private:
     std::unique_ptr<SemType> currentReturnType_;
     bool currentFunctionThrows_ = false;
     bool insideLoop_ = false; // break/continue 仅在循环内合法
+    int  insideTry_  = 0;    // try 块嵌套深度（>0 时 ! 不报 non-throwing）
+
+    // ============ 递归类型解析 ============
+    // 正在解析中的类型名集合（用于检测自引用，如 Tree<T> = {..., children: [Tree<T>]}）
+    std::set<std::string> resolvingTypes_;
 
     // ============ 成员表 ============
     SymbolTable symtab_;

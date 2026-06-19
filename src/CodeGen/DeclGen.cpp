@@ -10,6 +10,8 @@ namespace Aura {
 void CodeGenerator::genTypeDecl(std::ostream& h, std::ostream& cpp,
                                  const TypeDecl& decl) {
     if (!decl.type) return;
+
+    // 记录类型 → 生成 struct
     if (auto* rec = dynamic_cast<const RecordType*>(decl.type.get())) {
         // 优先使用 TypeDecl 显式声明的泛型参数，否则从字段中扫描 GenericTypeRef
         std::vector<std::string> tparams = decl.typeParams;
@@ -21,7 +23,37 @@ void CodeGenerator::genTypeDecl(std::ostream& h, std::ostream& cpp,
             }
         }
         genRecordStruct(h, cpp, decl.name, *rec, tparams);
+        return;
     }
+
+    // 其他类型（函数类型、联合类型、命名类型）→ 生成 C++ using 别名
+    std::string mappedType = mapType(*decl.type);
+
+    // 注册类型名（使后续代码生成知晓该类型的存在）
+    registerTypeName(decl.name, false); // 函数/联合/命名类型默认非堆对象
+
+    // 收集泛型参数：优先用 decl.typeParams，否则从类型内部扫描 GenericTypeRef
+    std::vector<std::string> tparams = decl.typeParams;
+    if (tparams.empty()) {
+        std::set<std::string> tpSet;
+        collectTParams(*decl.type, tpSet);
+        tparams.assign(tpSet.begin(), tpSet.end());
+    }
+
+    // 记录类型别名的模板参数（供后续 funSignature 生成 Name<T,U> 形式的返回类型）
+    if (!tparams.empty())
+        typeAliasTemplateParams_[decl.name] = tparams;
+
+    // 模板前缀
+    if (!tparams.empty()) {
+        h << "template<";
+        for (size_t i = 0; i < tparams.size(); ++i) {
+            if (i > 0) h << ", ";
+            h << "typename " << tparams[i];
+        }
+        h << ">\n";
+    }
+    h << "using " << decl.name << " = " << mappedType << ";\n\n";
 }
 
 void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
@@ -124,10 +156,21 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
         }
     }
 
-    // 模板函数：体放入头文件（跨模块可见）
-    std::ostream& out = tparams.empty()
-        ? static_cast<std::ostream&>(cpp)
-        : static_cast<std::ostream&>(h);
+    // 模板函数或 auto 返回（泛型闭包）→ 体放入头文件（跨模块可见）
+    bool needsHeader = !tparams.empty();
+    if (!needsHeader && decl.returnType) {
+        // plan12: 泛型闭包返回 → auto → 需要 .h
+        std::set<std::string> retGen;
+        if (auto* ft = dynamic_cast<const FunctionType*>(decl.returnType.get())) {
+            collectTParams(*ft, retGen);
+            needsHeader = !retGen.empty();
+        } else if (auto* nt = dynamic_cast<const NamedType*>(decl.returnType.get())) {
+            needsHeader = typeAliasTemplateParams_.count(nt->name) > 0;
+        }
+    }
+    std::ostream& out = needsHeader
+        ? static_cast<std::ostream&>(h)
+        : static_cast<std::ostream&>(cpp);
 
     out << tprefix << sig << " {\n";
     if (decl.body) genBlock(out, *decl.body, isCoro);
@@ -142,7 +185,23 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
     std::ostringstream sig;
 
     std::string retType = decl.returnType ? mapType(*decl.returnType) : "void";
-    (void)tparams; // mapType 已正确解析 typeArgs 顺序（含泛型参数名）
+
+    // plan12: 泛型闭包返回 → auto
+    // 检测：tparams 为空（因为 collectFunTParams 检测到泛型闭包而不收集），
+    // 且返回类型是 FunctionType/GenericTypeRef 或别名
+    bool isGenClosureRet = tparams.empty() && decl.returnType;
+    if (isGenClosureRet) {
+        std::set<std::string> check;
+        collectTParams(*decl.returnType, check);
+        bool isGenericFT = (dynamic_cast<const FunctionType*>(decl.returnType.get()) && !check.empty());
+        bool isAlias = false;
+        if (auto* nt = dynamic_cast<const NamedType*>(decl.returnType.get()))
+            isAlias = typeAliasTemplateParams_.count(nt->name) > 0;
+        isGenClosureRet = isGenericFT || isAlias;
+    }
+
+    if (isGenClosureRet)
+        retType = "auto";
 
     sig << (isCoro ? "aura_rt::task<" + retType + ">" : retType);
     std::string fn = safeName(decl.name);
@@ -150,8 +209,18 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
     sig << " " << fn << "(";
     for (size_t i = 0; i < decl.params.size(); ++i) {
         if (i > 0) sig << ", ";
-        sig << (decl.params[i].type ? mapType(*decl.params[i].type) : "auto")
-            << " " << safeName(decl.params[i].name);
+        if (isGenClosureRet && decl.params[i].type) {
+            // 参数类型含泛型 → auto
+            std::set<std::string> pGen;
+            collectTParams(*decl.params[i].type, pGen);
+            if (!pGen.empty())
+                sig << "auto";
+            else
+                sig << mapType(*decl.params[i].type);
+        } else {
+            sig << (decl.params[i].type ? mapType(*decl.params[i].type) : "auto");
+        }
+        sig << " " << safeName(decl.params[i].name);
     }
     sig << ")";
     return sig.str();
@@ -322,6 +391,12 @@ void CodeGenerator::collectTParams(const TypeExpr& type, std::set<std::string>& 
     if (auto* n = dynamic_cast<const NamedType*>(&type)) {
         for (auto& a : n->typeArgs)
             if (a) collectTParams(*a, out);
+        // 若该名称是模板类型别名，添加其模板参数
+        auto aliasIt = typeAliasTemplateParams_.find(n->name);
+        if (aliasIt != typeAliasTemplateParams_.end()) {
+            for (auto& tp : aliasIt->second) out.insert(tp);
+            return;
+        }
         // 无 typeArgs + 非注册类型 → 是泛型参数（如 Pair<A,B> 中的 A/B）
         if (n->typeArgs.empty() && !registeredTypes_.count(n->name)
             && !interfaceNames_.count(n->name))
@@ -352,6 +427,19 @@ void CodeGenerator::collectTParams(const TypeExpr& type, std::set<std::string>& 
 
 std::vector<std::string> CodeGenerator::collectFunTParams(const FunDecl& decl) const {
     std::set<std::string> names;
+
+    // plan12 统一方案：若返回泛型闭包，外层函数不模板化，泛型由闭包自身声明
+    if (decl.returnType) {
+        std::set<std::string> retGen;
+        if (auto* ft = dynamic_cast<const FunctionType*>(decl.returnType.get())) {
+            collectTParams(*ft, retGen);
+            if (!retGen.empty()) return {}; // 泛型闭包 → 不模板化
+        } else if (auto* nt = dynamic_cast<const NamedType*>(decl.returnType.get())) {
+            if (typeAliasTemplateParams_.count(nt->name))
+                return {}; // 模板别名 → 不模板化
+        }
+    }
+
     for (auto& p : decl.params)
         if (p.type) collectTParams(*p.type, names);
     if (decl.returnType) collectTParams(*decl.returnType, names);
