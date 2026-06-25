@@ -8,6 +8,7 @@
 #include "../Lexer.h"
 #include "../Token.h"
 #include <functional>
+#include <map>
 #include <ostream>
 #include <set>
 #include <sstream>
@@ -208,6 +209,10 @@ private:
     [[nodiscard]] std::string mapType(const TypeExpr& type);
     [[nodiscard]] std::string mapNamedType(const std::string& name);
     [[nodiscard]] std::string mapGenericRef(const GenericTypeRef& g);
+    // 参数类型映射 — 接口类型自动加 const&
+    [[nodiscard]] std::string mapParamType(const TypeExpr& type);
+    // SemType → C++ 类型（从 ASTNode::inferredType 读取，替代文本启发式）
+    [[nodiscard]] std::string mapSemType(const SemType& semType);
 
     // 值类型映射（不加 *）
     [[nodiscard]] std::string mapValueType(const TypeExpr& type);
@@ -226,7 +231,8 @@ private:
     // ============================================================
 
     void genDecl(std::ostream& h, std::ostream& cpp,
-                 const Decl& decl, CompileUnit& unit);
+                 const Decl& decl, CompileUnit& unit,
+                 bool declarationsOnly = false);
 
     // --- 类型声明 (§4.2, §4.4) ---
     void genTypeDecl(std::ostream& h, std::ostream& cpp, const TypeDecl& decl);
@@ -245,9 +251,9 @@ private:
 
     // --- 函数/方法声明 + 实现 ---
     void genFunDecl(std::ostream& h, std::ostream& cpp,
-                    const FunDecl& decl);
+                    const FunDecl& decl, bool declarationsOnly = false);
     void genMethodDecl(std::ostream& h, std::ostream& cpp,
-                       const MethodDecl& decl);
+                       const MethodDecl& decl, bool declarationsOnly = false);
     void genConstructor(std::ostream& cpp,
                         const MethodDecl& decl);
 
@@ -373,6 +379,7 @@ private:
 
     // 列表表达式计数器 — 生成唯一的临时变量名
     int listCounter_ = 0;
+    int recordAllocCounter_ = 0;
 
     // 当前正在生成的函数的协程状态
     bool currentFunctionIsCoroutine_ = false;
@@ -381,11 +388,21 @@ private:
     std::vector<std::string> currentTParams_;
     std::string              currentLetName_;    // 当前 let 声明的变量名（递归闭包检测）
 
+    // 当前函数的 C++ 返回类型（用于 genReturnStmt 生成正确的 RecordExpr 构造）
+    std::string currentReturnCppType_;
+
     // 字符串类型变量名集合（用于 genBinaryExpr 检测 string + T 拼接）
     std::set<std::string> stringVarNames_;
 
     // 导入的命名空间名集合（路径名 + 别名，用于 genMethodCall 判断是否用 ::）
     std::set<std::string> importNsNames_;
+
+    // 函数名 → 其接口类型参数的位置（用于 genCallExpr 中自动包装闭包为 InterfaceFunc）
+    // 第一层 map: 函数名 → pair(参数索引, 接口类型名)
+    std::map<std::string, std::vector<std::pair<size_t, std::string>>> fnInterfaceParams_;
+
+    // 函数名 → 其 FunctionType 参数的位置（用于 genCallExpr 中包装裸 lambda 为 std::function）
+    std::map<std::string, std::vector<std::pair<size_t, std::string>>> fnCallbackParams_;
 
     // let/const 声明中类型标注的显式模板参数（如 math.Pair<float, bool> → {"float", "bool"}）
     // genLetStmt 设置，genMethodCall 的 ns-ctor 路径消费后清空

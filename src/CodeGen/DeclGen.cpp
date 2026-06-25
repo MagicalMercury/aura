@@ -23,6 +23,9 @@ void CodeGenerator::genTypeDecl(std::ostream& h, std::ostream& cpp,
             }
         }
         genRecordStruct(h, cpp, decl.name, *rec, tparams);
+        // 记录模板参数表（供后续 genLetStmt 等跳过模板类型的 canonicalName）
+        if (!tparams.empty())
+            typeAliasTemplateParams_[decl.name] = tparams;
         return;
     }
 
@@ -106,19 +109,55 @@ void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
 }
 
 // ============================================================
-// 接口声明（plan §4.5）
+// 接口声明 → 抽象基类 + std::function 包装器
 // ============================================================
 
 void CodeGenerator::genInterfaceDecl(std::ostream& h,
                                       const InterfaceDecl& decl) {
-    h << "// interface " << decl.name << " — ";
-    for (size_t i = 0; i < decl.methods.size(); ++i) {
-        if (i > 0) h << ", ";
-        h << decl.methods[i].name << "()";
+    std::string name = decl.name;
+
+    // 1. 抽象基类
+    h << "struct " << name << " {\n";
+    h << "  virtual ~" << name << "() = default;\n";
+    for (auto& m : decl.methods) {
+        std::string retType = m.returnType ? mapType(*m.returnType) : "void";
+        h << "  virtual " << retType << " " << m.name << "(";
+        for (size_t i = 0; i < m.params.size(); ++i) {
+            if (i > 0) h << ", ";
+            h << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
+              << " " << safeName(m.params[i].name);
+        }
+        h << ") const = 0;\n";
     }
-    h << '\n';
-    h << "// (full type-erasure wrapper TBD)\n\n";
-    (void)decl;
+    h << "};\n\n";
+
+    // 2. std::function 包装器（闭包适配器）
+    if (decl.methods.size() == 1) {
+        auto& m = decl.methods[0];
+        std::string retType = m.returnType ? mapType(*m.returnType) : "void";
+        std::string params;
+        for (size_t i = 0; i < m.params.size(); ++i) {
+            if (i > 0) params += ", ";
+            params += m.params[i].type ? mapType(*m.params[i].type) : "auto";
+        }
+        h << "struct " << name << "Func : " << name << " {\n";
+        h << "  std::function<" << retType << "(" << params << ")> func;\n";
+        h << "  " << name << "Func(std::function<" << retType << "(" << params
+          << ")> f) : func(std::move(f)) {}\n";
+        h << "  " << retType << " " << m.name << "(";
+        for (size_t i = 0; i < m.params.size(); ++i) {
+            if (i > 0) h << ", ";
+            h << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
+              << " " << safeName(m.params[i].name);
+        }
+        h << ") const override { return func(";
+        for (size_t i = 0; i < m.params.size(); ++i) {
+            if (i > 0) h << ", ";
+            h << safeName(m.params[i].name);
+        }
+        h << "); }\n";
+        h << "};\n\n";
+    }
 }
 
 // ============================================================
@@ -126,7 +165,7 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
 // ============================================================
 
 void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
-                                const FunDecl& decl) {
+                                const FunDecl& decl, bool declarationsOnly) {
     bool isCoro = coroutineFunctions_.count(decl.name);
     currentFunctionIsCoroutine_ = isCoro;
 
@@ -144,7 +183,31 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     }
 
     std::string sig = funSignature(decl, tparams);
-    h << tprefix << sig << ";\n";
+
+    // 注册回调类型参数（必须在 declarationsOnly return 之前，确保其他函数闭包体可见）
+    fnInterfaceParams_.erase(decl.name);
+    fnCallbackParams_.erase(decl.name);
+    for (size_t i = 0; i < decl.params.size(); ++i) {
+        if (auto* nt = decl.params[i].type
+                ? dynamic_cast<const NamedType*>(decl.params[i].type.get())
+                : nullptr) {
+            if (interfaceNames_.count(nt->name)) {
+                fnInterfaceParams_[decl.name].push_back({i, nt->name});
+            }
+        }
+        // 仅当函数本身是模板时，才注册回调包装（需要模板参数 T, U 在作用域内）
+        if (!tparams.empty() && decl.params[i].type
+            && dynamic_cast<const FunctionType*>(decl.params[i].type.get())) {
+            auto ft = dynamic_cast<const FunctionType*>(decl.params[i].type.get());
+            fnCallbackParams_[decl.name].push_back({i, mapType(*ft)});
+        }
+    }
+
+    // declarationsOnly 模式：仅输出前向声明
+    if (declarationsOnly) {
+        h << tprefix << sig << ";\n";
+        return;
+    }
 
     valueTypeVarNames_.clear();
     stringVarNames_.clear();
@@ -153,6 +216,17 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
             auto* nt = dynamic_cast<const NamedType*>(p.type.get());
             if (registeredTypes_.count(nt->name) && !registeredTypes_[nt->name])
                 valueTypeVarNames_.insert(p.name);
+        }
+        // 跟踪 string 类型参数 → lambda 捕获后 genBinaryExpr 用 concat
+        if (p.type && mapType(*p.type).find("aura_rt::GcString*") != std::string::npos) {
+            stringVarNames_.insert(p.name);
+        }
+        // 接口类型参数 → 值类型追踪（引用用 . 不是 ->）
+        if (p.type) {
+            if (auto* nt = dynamic_cast<const NamedType*>(p.type.get())) {
+                if (interfaceNames_.count(nt->name))
+                    valueTypeVarNames_.insert(p.name);
+            }
         }
     }
 
@@ -187,8 +261,6 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
     std::string retType = decl.returnType ? mapType(*decl.returnType) : "void";
 
     // plan12: 泛型闭包返回 → auto
-    // 检测：tparams 为空（因为 collectFunTParams 检测到泛型闭包而不收集），
-    // 且返回类型是 FunctionType/GenericTypeRef 或别名
     bool isGenClosureRet = tparams.empty() && decl.returnType;
     if (isGenClosureRet) {
         std::set<std::string> check;
@@ -203,14 +275,18 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
     if (isGenClosureRet)
         retType = "auto";
 
-    sig << (isCoro ? "aura_rt::task<" + retType + ">" : retType);
+    currentReturnCppType_ = retType;
+
     std::string fn = safeName(decl.name);
+    // 所有协程：NoneType 返回 → void（task<void> 有 return_void()，task<NoneType> 没有）
+    if (retType == "aura_rt::NoneType") retType = "void";
     if (fn == "main") fn = "aura_main";
+
+    sig << (isCoro ? "aura_rt::task<" + retType + ">" : retType);
     sig << " " << fn << "(";
     for (size_t i = 0; i < decl.params.size(); ++i) {
         if (i > 0) sig << ", ";
         if (isGenClosureRet && decl.params[i].type) {
-            // 参数类型含泛型 → auto
             std::set<std::string> pGen;
             collectTParams(*decl.params[i].type, pGen);
             if (!pGen.empty())
@@ -218,7 +294,7 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
             else
                 sig << mapType(*decl.params[i].type);
         } else {
-            sig << (decl.params[i].type ? mapType(*decl.params[i].type) : "auto");
+            sig << (decl.params[i].type ? mapParamType(*decl.params[i].type) : "auto");
         }
         sig << " " << safeName(decl.params[i].name);
     }
@@ -227,11 +303,13 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
 }
 
 void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
-                                   const MethodDecl& decl) {
+                                   const MethodDecl& decl,
+                                   bool declarationsOnly) {
     if (decl.isConstructor) {
         genConstructor(cpp, decl);
         return;
     }
+    if (declarationsOnly) return;  // 方法声明已在 struct 内部，无需重复
 
     bool isCoro = coroutineFunctions_.count(decl.name);
     currentFunctionIsCoroutine_ = isCoro;
@@ -263,11 +341,34 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     valueTypeVarNames_.clear();
     stringVarNames_.clear();
 
+    // 跟踪方法接收者 self 的类型
+    if (!decl.receiverTypeArgs.empty() || !registeredTypes_.count(decl.receiverType) || registeredTypes_[decl.receiverType])
+        ; // self 通常为指针类型
+    else
+        valueTypeVarNames_.insert(decl.receiverName);
+
+    for (auto& p : decl.params) {
+        if (p.type) {
+            auto mt = mapType(*p.type);
+            if (mt.find("aura_rt::GcString*") != std::string::npos)
+                stringVarNames_.insert(p.name);
+            // 接口类型参数 → 值类型追踪（引用用 . 不是 ->）
+            if (auto* nt = dynamic_cast<const NamedType*>(p.type.get())) {
+                if (interfaceNames_.count(nt->name))
+                    valueTypeVarNames_.insert(p.name);
+            }
+        }
+    }
+
     std::string retType = decl.returnType ? mapType(*decl.returnType) : "void";
+
+    // 存储 C++ 返回类型，供 genReturnStmt 生成正确 RecordExpr
+    currentReturnCppType_ = retType;
+
     std::string sig = retType + " " + recvFullType + "::" + safeName(decl.name) + "(";
     for (size_t i = 0; i < decl.params.size(); ++i) {
         if (i > 0) sig += ", ";
-        sig += (decl.params[i].type ? mapType(*decl.params[i].type) : "auto")
+        sig += (decl.params[i].type ? mapParamType(*decl.params[i].type) : "auto")
              + " " + safeName(decl.params[i].name);
     }
     sig += ")";
@@ -397,6 +498,11 @@ void CodeGenerator::collectTParams(const TypeExpr& type, std::set<std::string>& 
             for (auto& tp : aliasIt->second) out.insert(tp);
             return;
         }
+        // 排除内置类型（int/float/bool/string/None 不是泛型参数，无需 template<...>）
+        if (n->name == "int" || n->name == "float" || n->name == "bool"
+            || n->name == "string" || n->name == "None")
+            return;
+
         // 无 typeArgs + 非注册类型 → 是泛型参数（如 Pair<A,B> 中的 A/B）
         if (n->typeArgs.empty() && !registeredTypes_.count(n->name)
             && !interfaceNames_.count(n->name))
@@ -435,8 +541,12 @@ std::vector<std::string> CodeGenerator::collectFunTParams(const FunDecl& decl) c
             collectTParams(*ft, retGen);
             if (!retGen.empty()) return {}; // 泛型闭包 → 不模板化
         } else if (auto* nt = dynamic_cast<const NamedType*>(decl.returnType.get())) {
-            if (typeAliasTemplateParams_.count(nt->name))
-                return {}; // 模板别名 → 不模板化
+            // 仅函数式类型别名（如 Pipeline<T> = fun(T)->T，非堆类型）跳过模板化
+            // 堆类型（如 Tree<T>）保持模板参数
+            auto it = registeredTypes_.find(nt->name);
+            if (typeAliasTemplateParams_.count(nt->name)
+                && it != registeredTypes_.end() && !it->second)  // registered as non-heap
+                return {};
         }
     }
 

@@ -6,6 +6,9 @@ namespace Aura {
 // ============================================================
 // 构造 & 主入口
 // ============================================================
+#ifndef MAX_SEAL_DEPTH
+#define MAX_SEAL_DEPTH 128
+#endif
 
 SemAnalyzer::SemAnalyzer() {}
 
@@ -183,6 +186,7 @@ std::unique_ptr<SemType> SemAnalyzer::substitute(
     }
     if (auto* r = dynamic_cast<const RecordSemType*>(&type)) {
         auto n = std::make_unique<RecordSemType>();
+        n->canonicalName = r->canonicalName;
         for (auto& fld : r->fields) {
             n->fields.push_back({fld.name, fld.type ? substitute(*fld.type, genericName, concrete) : nullptr});
         }
@@ -200,6 +204,150 @@ std::unique_ptr<SemType> SemAnalyzer::substitute(
         return n;
     }
     return type.clone();
+}
+
+// ============================================================
+// collectGenericMapping — 递归匹配形参/实参，收集泛型→具体映射
+// ============================================================
+
+void SemAnalyzer::collectGenericMapping(
+    const SemType& formal, const SemType& actual,
+    std::map<std::string, std::unique_ptr<SemType>>& map) const
+{
+    // case 1: formal 是泛型变量 <T> → actual 就是 T 的具体绑定
+    if (auto* gf = dynamic_cast<const GenericSemType*>(&formal)) {
+        auto it = map.find(gf->name);
+        if (it != map.end()) {
+            // 已绑定 → 检查一致性（同一个泛型变量被推导为不同类型则冲突）
+            if (!isAssignable(*it->second, actual)) {
+                // 不匹配：保留第一个绑定（后续可在此记录 error）
+            }
+        } else {
+            map[gf->name] = actual.clone();
+        }
+        return;
+    }
+
+    // case 2: formal 和 actual 都是 List → 递归匹配元素类型
+    //         如 [T] vs [int] → T=int
+    if (auto* lf = dynamic_cast<const ListSemType*>(&formal)) {
+        if (auto* la = dynamic_cast<const ListSemType*>(&actual)) {
+            if (lf->elementType && la->elementType)
+                collectGenericMapping(*lf->elementType, *la->elementType, map);
+        }
+        return;
+    }
+
+    // case 3: formal 和 actual 都是函数类型 → 递归匹配参数和返回类型
+    //         如 fun(T)→U vs fun(int)→int → T=int, U=int
+    if (auto* ff = dynamic_cast<const FuncSemType*>(&formal)) {
+        if (auto* fa = dynamic_cast<const FuncSemType*>(&actual)) {
+            for (size_t i = 0; i < ff->paramTypes.size() && i < fa->paramTypes.size(); ++i) {
+                if (ff->paramTypes[i] && fa->paramTypes[i])
+                    collectGenericMapping(*ff->paramTypes[i], *fa->paramTypes[i], map);
+            }
+            if (ff->returnType && fa->returnType)
+                collectGenericMapping(*ff->returnType, *fa->returnType, map);
+        }
+        return;
+    }
+}
+
+// ============================================================
+// sealSelfRefs：将 GenericSemType("Tree") → RecordSemType(canonicalName=fullName)
+// ============================================================
+
+void SemAnalyzer::sealSelfRefs(std::unique_ptr<SemType>& node,
+                                const std::string& bareName,
+                                const std::string& fullName) {
+    if (++sealDepth_ > MAX_SEAL_DEPTH) { --sealDepth_; return; }  // MAX_SEAL_DEPTH 层遍历上限
+    if (auto* gs = dynamic_cast<GenericSemType*>(node.get())) {
+        if (gs->name == bareName) {
+            auto* sym = symtab_.lookup(bareName);
+            if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
+                auto resolved = sym->type->clone();
+                if (auto* rec = dynamic_cast<RecordSemType*>(resolved.get())) {
+                    rec->canonicalName = fullName;
+                    for (auto& f : rec->fields)
+                        if (f.type) sealSelfRefs(f.type, bareName, fullName);
+                }
+                node = std::move(resolved);
+            }
+            --sealDepth_;
+            return;
+        }
+        --sealDepth_;
+        return;
+    }
+    if (auto* r = dynamic_cast<RecordSemType*>(node.get())) {
+        for (auto& f : r->fields)
+            if (f.type) sealSelfRefs(f.type, bareName, fullName);
+    } else if (auto* l = dynamic_cast<ListSemType*>(node.get())) {
+        if (l->elementType) sealSelfRefs(l->elementType, bareName, fullName);
+    } else if (auto* u = dynamic_cast<UnionSemType*>(node.get())) {
+        for (auto& v : u->variants)
+            if (v) sealSelfRefs(v, bareName, fullName);
+    }
+    --sealDepth_;
+}
+
+// ============================================================
+// canonicalName 传播（RecordSemType → 嵌套 RecordExpr AST）
+// ============================================================
+
+void SemAnalyzer::propagateCanonicalName(const ASTNode& expr, const SemType* type) {
+    if (!type) return;
+
+    // GenericSemType：通过符号表解析回具体类型（如 Tree → RecordSemType）
+    if (auto* gs = dynamic_cast<const GenericSemType*>(type)) {
+        auto* sym = symtab_.lookup(gs->name);
+        if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
+            propagateCanonicalName(expr, sym->type.get());
+            return;
+        }
+        const_cast<ASTNode&>(expr).inferredType = type;
+        return;
+    }
+
+    // UnionSemType：试每个变体，取第一个可匹配的（如 children: [Tree<T>] | T）
+    if (auto* us = dynamic_cast<const UnionSemType*>(type)) {
+        for (auto& v : us->variants) {
+            if (v) { propagateCanonicalName(expr, v.get()); return; }
+        }
+        return;
+    }
+
+    // RecordExpr 匹配 RecordSemType ↔ 标注 + 传播到字段
+    if (auto* recExpr = dynamic_cast<const RecordExpr*>(&expr)) {
+        if (auto* rs = dynamic_cast<const RecordSemType*>(type)) {
+            if (!rs->canonicalName.empty())
+                const_cast<RecordExpr*>(recExpr)->inferredType = type;
+            for (auto& f : recExpr->fields) {
+                for (auto& ft : rs->fields) {
+                    if (f.name == ft.name && f.value) {
+                        if (ft.type)
+                            propagateCanonicalName(*f.value, ft.type.get());
+                        break;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // ListExpr 匹配 ListSemType ↔ 传播到每个元素
+    if (auto* listExpr = dynamic_cast<const ListExpr*>(&expr)) {
+        const_cast<ListExpr*>(listExpr)->inferredType = type;
+        if (auto* ls = dynamic_cast<const ListSemType*>(type)) {
+            for (auto& elem : listExpr->elements) {
+                if (elem) propagateCanonicalName(*elem, ls->elementType.get());
+            }
+        }
+        return;
+    }
+
+    // 叶节点：仅标注 inferredType
+    const_cast<ASTNode&>(expr).inferredType = type;
 }
 
 // ============================================================

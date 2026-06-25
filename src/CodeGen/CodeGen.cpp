@@ -123,9 +123,16 @@ CompileUnit CodeGenerator::generate(const Program& program,
         }
     }
 
+    // 第三遍 A：先生成所有声明（避免前向引用问题）
     for (auto& d : program.decls) {
         if (!d) continue;
-        genDecl(header, impl, *d, unit);
+        genDecl(header, impl, *d, unit, true);
+    }
+
+    // 第三遍 B：再生成所有定义
+    for (auto& d : program.decls) {
+        if (!d) continue;
+        genDecl(header, impl, *d, unit, false);
     }
 
     // 关闭命名空间（若有）
@@ -157,15 +164,28 @@ CompileUnit CodeGenerator::generate(const Program& program,
 // ============================================================
 
 void CodeGenerator::genDecl(std::ostream& h, std::ostream& cpp,
-                             const Decl& decl, CompileUnit& /*unit*/) {
-    if (auto* t = dynamic_cast<const TypeDecl*>(&decl))
-        { genTypeDecl(h, cpp, *t); return; }
-    if (auto* i = dynamic_cast<const InterfaceDecl*>(&decl))
-        { genInterfaceDecl(h, *i); return; }
-    if (auto* f = dynamic_cast<const FunDecl*>(&decl))
-        { genFunDecl(h, cpp, *f); return; }
-    if (auto* m = dynamic_cast<const MethodDecl*>(&decl))
-        { genMethodDecl(h, cpp, *m); return; }
+                             const Decl& decl, CompileUnit& /*unit*/,
+                             bool declarationsOnly) {
+    if (auto* t = dynamic_cast<const TypeDecl*>(&decl)) {
+        // 类型声明在 A 遍生成（B 遍跳过，避免重复）
+        if (declarationsOnly)
+            { genTypeDecl(h, cpp, *t); return; }
+        return;
+    }
+    if (auto* i = dynamic_cast<const InterfaceDecl*>(&decl)) {
+        // 接口声明在 A 遍生成
+        if (declarationsOnly)
+            { genInterfaceDecl(h, *i); return; }
+        return;
+    }
+    if (auto* f = dynamic_cast<const FunDecl*>(&decl)) {
+        genFunDecl(h, cpp, *f, declarationsOnly);
+        return;
+    }
+    if (auto* m = dynamic_cast<const MethodDecl*>(&decl)) {
+        genMethodDecl(h, cpp, *m, declarationsOnly);
+        return;
+    }
 }
 
 // ============================================================

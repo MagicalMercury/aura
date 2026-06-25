@@ -115,7 +115,7 @@ std::string CodeGenerator::mapNamedType(const std::string& name) {
         return name;
     }
 
-    // 接口类型 → 类型擦除包装
+    // 接口类型 → 保留原名（函数参数生成处做 const& 处理）
     if (interfaceNames_.contains(name)) {
         return name;
     }
@@ -136,6 +136,59 @@ std::string CodeGenerator::mapValueType(const TypeExpr& type) {
         result.pop_back();
     }
     return result;
+}
+
+std::string CodeGenerator::mapParamType(const TypeExpr& type) {
+    std::string result = mapType(type);
+    // 接口类型 → const&（抽象类不能按值传递）
+    if (auto* nt = dynamic_cast<const NamedType*>(&type)) {
+        if (interfaceNames_.count(nt->name)) {
+            return "const " + result + "&";
+        }
+    }
+    return result;
+}
+
+// ============================================================
+// SemType → C++ 类型映射
+// ============================================================
+
+std::string CodeGenerator::mapSemType(const SemType& semType) {
+    if (auto* p = dynamic_cast<const PrimSemType*>(&semType)) {
+        switch (p->kind) {
+            case PrimSemType::Int:    return "int32_t";
+            case PrimSemType::Float:  return "double";
+            case PrimSemType::Bool:   return "bool";
+            case PrimSemType::String: return "aura_rt::GcString*";
+        }
+    }
+    if (dynamic_cast<const NoneSemType*>(&semType))
+        return "aura_rt::NoneType";
+    if (dynamic_cast<const ErrorSemType*>(&semType))
+        return "/* error_type */";
+    if (auto* l = dynamic_cast<const ListSemType*>(&semType)) {
+        return "aura_rt::Array<" + mapSemType(*l->elementType) + ">*";
+    }
+    if (auto* r = dynamic_cast<const RecordSemType*>(&semType)) {
+        if (!r->canonicalName.empty()) {
+            return r->canonicalName + "*";
+        }
+        return "aura_rt::GcObject*";
+    }
+    if (auto* f = dynamic_cast<const FuncSemType*>(&semType)) {
+        std::string sig = "std::function<";
+        sig += f->returnType ? mapSemType(*f->returnType) : "void";
+        sig += "(";
+        for (size_t i = 0; i < f->paramTypes.size(); ++i) {
+            if (i > 0) sig += ", ";
+            sig += f->paramTypes[i] ? mapSemType(*f->paramTypes[i]) : "auto";
+        }
+        sig += ")>";
+        return sig;
+    }
+    if (dynamic_cast<const GenericSemType*>(&semType))
+        return "auto";
+    return "/* unknown_semtype */";
 }
 
 // ============================================================

@@ -69,6 +69,7 @@ std::string RecordSemType::toString() const {
 }
 std::unique_ptr<SemType> RecordSemType::clone() const {
     auto n = std::make_unique<RecordSemType>();
+    n->canonicalName = canonicalName;
     for (auto& f : fields) {
         n->fields.push_back({f.name, f.type ? f.type->clone() : nullptr});
     }

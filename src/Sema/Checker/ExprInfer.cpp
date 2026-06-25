@@ -61,10 +61,11 @@ std::unique_ptr<SemType> SemAnalyzer::inferIdentifier(const Identifier& e) {
 
 std::unique_ptr<SemType> SemAnalyzer::inferListExpr(const ListExpr& e) {
     if (e.elements.empty()) {
-        // 空列表，元素类型未知，待类型推断
         auto t = std::make_unique<ListSemType>();
         t->elementType = ErrorSemType::make();
-        return t;
+        typeStore_.push_back(std::move(t));
+        const_cast<ListExpr&>(e).inferredType = typeStore_.back().get();
+        return typeStore_.back()->clone();
     }
     auto elemType = inferExpr(*e.elements[0]);
     for (size_t i = 1; i < e.elements.size(); ++i) {
@@ -75,7 +76,9 @@ std::unique_ptr<SemType> SemAnalyzer::inferListExpr(const ListExpr& e) {
     }
     auto t = std::make_unique<ListSemType>();
     t->elementType = std::move(elemType);
-    return t;
+    typeStore_.push_back(std::move(t));
+    const_cast<ListExpr&>(e).inferredType = typeStore_.back().get();
+    return typeStore_.back()->clone();
 }
 
 std::unique_ptr<SemType> SemAnalyzer::inferRecordExpr(const RecordExpr& e) {
@@ -83,7 +86,9 @@ std::unique_ptr<SemType> SemAnalyzer::inferRecordExpr(const RecordExpr& e) {
     for (auto& f : e.fields) {
         t->fields.push_back({f.name, f.value ? inferExpr(*f.value) : ErrorSemType::make()});
     }
-    return t;
+    typeStore_.push_back(std::move(t));
+    const_cast<RecordExpr&>(e).inferredType = typeStore_.back().get();
+    return typeStore_.back()->clone();
 }
 
 std::unique_ptr<SemType> SemAnalyzer::inferBinaryExpr(const BinaryExpr& e) {
@@ -152,6 +157,8 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
         error(*e.callee, "undefined identifier '" + callee->name + "'");
         return ErrorSemType::make();
     }
+    // 泛型变量映射表：形参中的泛型名 → 实参的具体类型
+    std::map<std::string, std::unique_ptr<SemType>> genericMap;
     // 函数、方法、函数类型变量（let 绑定闭包）、函数类型参数
     if (sym->kind == SymKind::Function || sym->kind == SymKind::Method) {
         // 参数数量检查
@@ -164,8 +171,15 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
             if (sym->params[i].type && !isAssignable(*sym->params[i].type, *argTy)) {
                 error(*e.args[i], "argument type mismatch: expected '" + sym->params[i].type->toString() + "', got '" + argTy->toString() + "'");
             }
+            // 泛型替换：从实参推断泛型变量
+            if (sym->params[i].type)
+                collectGenericMapping(*sym->params[i].type, *argTy, genericMap);
         }
-        return sym->type ? sym->type->clone() : ErrorSemType::make();
+        auto result = sym->type ? sym->type->clone() : ErrorSemType::make();
+        for (auto& [name, concrete] : genericMap) {
+            result = substitute(*result, name, *concrete);
+        }
+        return result;
     }
     // Variable / Parameter 但类型是函数类型 → 可作为函数调用
     if (sym->kind == SymKind::Variable || sym->kind == SymKind::Parameter) {
@@ -180,8 +194,15 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
                 if (fst->paramTypes[i] && !isAssignable(*fst->paramTypes[i], *argTy)) {
                     error(*e.args[i], "argument type mismatch: expected '" + fst->paramTypes[i]->toString() + "', got '" + argTy->toString() + "'");
                 }
+                // 泛型替换：从实参推断泛型变量
+                if (fst->paramTypes[i])
+                    collectGenericMapping(*fst->paramTypes[i], *argTy, genericMap);
             }
-            return fst->returnType ? fst->returnType->clone() : NoneSemType::make();
+            auto result = fst->returnType ? fst->returnType->clone() : NoneSemType::make();
+            for (auto& [name, concrete] : genericMap) {
+                result = substitute(*result, name, *concrete);
+            }
+            return result;
         }
     }
     error(*e.callee, "undefined function '" + callee->name + "'");

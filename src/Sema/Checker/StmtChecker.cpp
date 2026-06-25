@@ -35,8 +35,16 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
     }
     // 更新符号类型为推断后的精确类型
     auto* sym = symtab_.lookup(decl.name);
-    if (sym) sym->type = inferredType->clone();
-}
+    if (sym) {
+        sym->type = inferredType->clone();
+        // 标注 AST 节点类型，供 CodeGen 读取
+        const_cast<LetDecl&>(decl).inferredType = sym->type.get();
+        // 标注初始值表达式类型，传播 canonicalName 到嵌套记录
+        if (decl.initializer) {
+            propagateCanonicalName(*decl.initializer, sym->type.get());
+        }
+    }
+}    
 
 void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
     auto inferredType = decl.initializer ? inferExpr(*decl.initializer) : ErrorSemType::make();
@@ -52,13 +60,26 @@ void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
     sym.name = decl.name;
     sym.type = inferredType->clone();
     symtab_.define(std::move(sym));
+    auto* stored = symtab_.lookup(decl.name);
+    if (stored) {
+        const_cast<ConstDecl&>(decl).inferredType = stored->type.get();
+    }
 }
 
 void SemAnalyzer::checkReturnStmt(const ReturnStmt& stmt) {
     if (stmt.expr) {
         auto retType = inferExpr(*stmt.expr);
-        if (currentReturnType_ && !isAssignable(*currentReturnType_, *retType)) {
-            error(*stmt.expr, "return type mismatch: expected '" + currentReturnType_->toString() + "', got '" + retType->toString() + "'");
+        // 存储推断类型到 typeStore_，标注表达式 AST 节点供 CodeGen 使用
+        typeStore_.push_back(std::move(retType));
+        const_cast<ReturnStmt&>(stmt).inferredType = typeStore_.back().get();
+        // 标注 return 表达式自身
+        if (auto* rec = dynamic_cast<const RecordExpr*>(stmt.expr.get())) {
+            const_cast<RecordExpr*>(rec)->inferredType = typeStore_.back().get();
+        } else {
+            const_cast<ASTNode*>(stmt.expr.get())->inferredType = typeStore_.back().get();
+        }
+        if (currentReturnType_ && !isAssignable(*currentReturnType_, *typeStore_.back())) {
+            error(*stmt.expr, "return type mismatch: expected '" + currentReturnType_->toString() + "', got '" + typeStore_.back()->toString() + "'");
         }
     }
     // 无表达式的 return 允许（void 等价）

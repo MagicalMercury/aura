@@ -58,8 +58,27 @@ void CodeGenerator::genStmt(std::ostream& cpp, const Stmt& stmt,
 // ============================================================
 
 void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
-    std::string type = decl.type
-        ? mapType(*decl.type) : "auto";
+    std::string type;
+    if (decl.type) {
+        type = mapType(*decl.type);
+    } else {
+        // 尝试从推断的 SemType 获取 C++ 类型（仅当可生产合法 C++ 类型时使用）
+        type = "auto";
+        if (auto* rs = dynamic_cast<const RecordSemType*>(decl.inferredType)) {
+            // 剥离未解析泛型参数（如 "Tree<U>" → "Tree"）
+            std::string baseName = rs->canonicalName;
+            size_t anglePos = baseName.find('<');
+            if (anglePos != std::string::npos)
+                baseName = baseName.substr(0, anglePos);
+            if (!baseName.empty()
+                && !typeAliasTemplateParams_.count(baseName))  // 模板类型跳过
+                type = rs->canonicalName + "*";
+        } else if (auto* ls = dynamic_cast<const ListSemType*>(decl.inferredType)) {
+            type = mapSemType(*ls);
+        } else if (auto* ps = dynamic_cast<const PrimSemType*>(decl.inferredType)) {
+            type = mapSemType(*ps);
+        }
+    }
 
     // 提取类型标注中的模板参数（如 math.Pair<float, bool>），供 genMethodCall 用于跨模块构造
     expectedTemplateArgs_.clear();
@@ -75,12 +94,49 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     std::string init;
     if (decl.initializer) {
         currentLetName_ = safeName(decl.name);
+
+        // RecordExpr 作为 let 初始值 → gc_alloc + 字段赋值
+        if (auto* rec = dynamic_cast<const RecordExpr*>(decl.initializer.get())) {
+            // 检查是否有可用的记录类型名（含 decl.type 或 inferredType 中的 canonicalName）
+            bool hasRecordType = false;
+            std::string recType;
+            if (decl.type) {
+                recType = mapType(*decl.type);
+                hasRecordType = true;
+            } else if (auto* rs = dynamic_cast<const RecordSemType*>(decl.inferredType)) {
+                if (!rs->canonicalName.empty()) {
+                    recType = rs->canonicalName + "*";
+                    hasRecordType = true;
+                }
+            }
+            if (hasRecordType) {
+                bool isPtr = recType.size() > 1 && recType.back() == '*';
+                if (isPtr) recType.pop_back();
+                if (isPtr) {
+                    init = "aura_rt::gc_alloc<" + recType + ">(&" + recType + "::_desc)";
+                    std::string var = safeName(decl.name);
+                    std::string fullDecl = type + " " + var + " = " + init + ";";
+                    writeLine(cpp, fullDecl);
+                    for (auto& f : rec->fields) {
+                        writeLine(cpp, var + "->" + safeName(f.name) + " = "
+                                  + (f.value ? genExpr(*f.value, currentFunctionIsCoroutine_) : "???") + ";");
+                    }
+                    currentLetName_.clear();
+                    expectedTemplateArgs_.clear();
+                    return;
+                }
+            }
+        }
+
         init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
         currentLetName_.clear();
     }
 
-    // 空列表 [] 在泛型闭包中 genListExpr 返回 nullptr → 用类型标注修正
-    if (init.find("nullptr") != std::string::npos && decl.type) {
+    // 空列表 [] 修复：genListExpr 在泛型上下文中可能返回 nullptr 或 Array<T>::make(0)
+    // 用 let 声明中的类型标注取正确元素类型
+    if (decl.type && (init.find("nullptr") != std::string::npos
+                      || init.find("Array<T>") != std::string::npos
+                      || init.find("Array<U>") != std::string::npos)) {
         std::string arrType = mapType(*decl.type);
         // arrType 形如 "aura_rt::Array<X>*"，取元素类型 X 并生成 make(0)
         if (arrType.find("aura_rt::Array<") == 0) {
@@ -147,6 +203,43 @@ void CodeGenerator::genConstStmt(std::ostream& cpp, const ConstDecl& decl) {
 void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
                                    bool isCoroutine) {
     std::string prefix = isCoroutine ? "co_return" : "return";
+
+    // RecordExpr 在 return 语句中 → 生成 gc_alloc + 字段赋值
+    if (stmt.expr && dynamic_cast<const RecordExpr*>(stmt.expr.get())) {
+        auto* rec = static_cast<const RecordExpr*>(stmt.expr.get());
+        // 优先从表达式 inferredType 取类型，其次从当前函数返回类型
+        std::string recType;
+        const RecordSemType* rs = dynamic_cast<const RecordSemType*>(stmt.expr->inferredType);
+        if (rs && !rs->canonicalName.empty()) {
+            recType = rs->canonicalName + "*";
+        } else {
+            recType = currentReturnCppType_;
+        }
+        bool isPtr = false;
+        if (recType.size() > 1 && recType.back() == '*') {
+            recType.pop_back();
+            isPtr = true;
+        }
+        // 如果是 aura_rt::task<T>，提取 T
+        if (recType.find("aura_rt::task<") == 0) {
+            recType = recType.substr(15, recType.size() - 16);
+            if (recType.back() == '*') { recType.pop_back(); isPtr = true; }
+        }
+
+        if (isPtr) {
+            int recIdx = listCounter_++;
+            std::string var = "_rec_" + std::to_string(recIdx);
+            writeLine(cpp, "auto* " + var + " = aura_rt::gc_alloc<" + recType
+                      + ">(&" + recType + "::_desc);");
+            for (auto& f : rec->fields) {
+                writeLine(cpp, var + "->" + safeName(f.name) + " = "
+                          + (f.value ? genExpr(*f.value, isCoroutine) : "???") + ";");
+            }
+            writeLine(cpp, prefix + " " + var + ";");
+            return;
+        }
+    }
+
     if (stmt.expr)
         writeLine(cpp, prefix + " " + genExpr(*stmt.expr, isCoroutine) + ";");
     else

@@ -55,6 +55,7 @@ struct RecordFieldSem {
 
 struct RecordSemType : SemType {
     std::vector<RecordFieldSem> fields; // 字段按定义顺序，但等价性检查忽略顺序
+    std::string canonicalName;          // 类型别名名（如 "Tree"），用于 CodeGen 映射 C++ 类型
     [[nodiscard]] bool equals(const SemType& other) const override;
     [[nodiscard]] std::string toString() const override;
     [[nodiscard]] std::unique_ptr<SemType> clone() const override;

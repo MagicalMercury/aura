@@ -6,6 +6,7 @@
 #include "../AST/Type.h"
 #include "SemType.h"
 #include "SymbolTable.h"
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -48,6 +49,11 @@ private:
         const SemType& type,
         const std::string& genericName,
         const SemType& concrete);
+
+    // 从一对 (形参类型, 实参类型) 中递归收集泛型→具体映射
+    void collectGenericMapping(
+        const SemType& formal, const SemType& actual,
+        std::map<std::string, std::unique_ptr<SemType>>& map) const;
 
     // ============ 声明注册（第 1 遍） ============
     void declareTopLevel(const Program& program);
@@ -114,8 +120,18 @@ private:
     int  insideTry_  = 0;    // try 块嵌套深度（>0 时 ! 不报 non-throwing）
 
     // ============ 递归类型解析 ============
+    void propagateCanonicalName(const ASTNode& expr, const SemType* type);
+    // seal self-referencing GenericSemType to RecordSemType with full canonicalName
+    void sealSelfRefs(std::unique_ptr<SemType>& node,
+                      const std::string& bareName,
+                      const std::string& fullName);
+    int sealDepth_ = 0;
     // 正在解析中的类型名集合（用于检测自引用，如 Tree<T> = {..., children: [Tree<T>]}）
     std::set<std::string> resolvingTypes_;
+
+    // ============ 表达式类型存储 ============
+    // 持有 inferExpr 返回的临时 SemType（供 ASTNode::inferredType 指向）
+    std::vector<std::unique_ptr<SemType>> typeStore_;
 
     // ============ 成员表 ============
     SymbolTable symtab_;

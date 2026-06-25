@@ -85,7 +85,17 @@ std::string CodeGenerator::genIdentifier(const Identifier& e) {
 
 std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
     if (e.elements.empty()) {
-        // 泛型上下文中的空列表：用第一个模板参数生成 Array<T>::make(0)
+        // 优先用 inferredType 推断空列表元素类型
+        if (e.inferredType) {
+            auto* listTy = dynamic_cast<const ListSemType*>(e.inferredType);
+            if (listTy && listTy->elementType) {
+                std::string semElem = mapSemType(*listTy->elementType);
+                if (semElem.find("GcObject") == std::string::npos
+                    && semElem != "auto")
+                    return "aura_rt::Array<" + semElem + ">::make(0)";
+            }
+        }
+        // 泛型上下文中的空列表：用第一个模板参数
         if (!currentTParams_.empty()) {
             return "aura_rt::Array<" + currentTParams_[0] + ">::make(0)";
         }
@@ -97,20 +107,64 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
     for (auto& elem : e.elements)
         elemExprs.push_back(elem ? genExpr(*elem, isCoroutine) : "???");
 
-    // 从第一个元素推断列表元素类型（简单启发式）
+    // 从第一个元素推断列表元素类型
     std::string elemType = "int32_t";  // 默认 int
-    const auto& first = elemExprs[0];
-    if (first.find("aura_rt::make_string") != std::string::npos
-        || first.find("aura_rt::concat") != std::string::npos)
-        elemType = "aura_rt::GcString*";
-    else if (first == "aura_rt::None")
-        elemType = "aura_rt::NoneType";
-    else if (first == "true" || first == "false")
-        elemType = "bool";
-    // 含小数点 → double（检查不匹配 make_string 的情况）
-    else if (first.find('.') != std::string::npos
-             && first.find("aura_rt::") == std::string::npos)
-        elemType = "double";
+
+    // 优先用 SemAnalyzer 推断的类型
+    if (e.inferredType) {
+        auto* listTy = dynamic_cast<const ListSemType*>(e.inferredType);
+        if (listTy && listTy->elementType) {
+            std::string semElemType = mapSemType(*listTy->elementType);
+            // 无效时（GenericSemType → "auto"），回退到第一个元素的 inferredType
+            if (semElemType == "auto" && e.elements.size() > 0 && e.elements[0]) {
+                if (auto* rs = dynamic_cast<const RecordSemType*>(e.elements[0]->inferredType)) {
+                    if (!rs->canonicalName.empty())
+                        semElemType = rs->canonicalName + "*";
+                }
+            }
+            if (semElemType.find("GcObject") == std::string::npos
+                && semElemType.find("/*") == std::string::npos
+                && semElemType != "auto")
+                elemType = semElemType;
+        }
+    }
+
+    // 文本启发式（SemType 未得到有意义类型时）
+    if (elemType == "int32_t") {
+        const auto& first = elemExprs[0];
+
+        // 检测 FunExpr（闭包）→ 转为 std::function
+        if (e.elements[0] && dynamic_cast<const FunExpr*>(e.elements[0].get())) {
+            auto* fe = static_cast<const FunExpr*>(e.elements[0].get());
+            std::string retType = fe->returnType ? mapType(*fe->returnType) : "auto";
+            std::string params;
+            for (size_t j = 0; j < fe->params.size(); ++j) {
+                if (j > 0) params += ", ";
+                params += fe->params[j].type ? mapType(*fe->params[j].type) : "auto";
+            }
+            elemType = "std::function<" + retType + "(" + params + ")>";
+        }
+        // 检测 RecordExpr → 用对应的注册堆类型名
+        else if (auto* rec = dynamic_cast<const RecordExpr*>(e.elements[0].get())) {
+            if (!rec->fields.empty()) {
+                std::string firstFieldType = rec->fields[0].value
+                    ? genExpr(*rec->fields[0].value, false) : "";
+                if (firstFieldType.find("aura_rt::make_string") != std::string::npos)
+                    elemType = "aura_rt::GcString*";
+                else if (firstFieldType == "true" || firstFieldType == "false")
+                    elemType = "bool";
+            }
+        } else if (first.find("aura_rt::make_string") != std::string::npos
+            || first.find("aura_rt::concat") != std::string::npos)
+            elemType = "aura_rt::GcString*";
+        else if (first == "aura_rt::None")
+            elemType = "aura_rt::NoneType";
+        else if (first == "true" || first == "false")
+            elemType = "bool";
+        else if (first.find('.') != std::string::npos
+                 && first.find("aura_rt::") == std::string::npos)
+            elemType = "double";
+    }
 
     // 生成唯一的列表临时变量名
     int idx = listCounter_++;
@@ -129,11 +183,32 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
 }
 
 std::string CodeGenerator::genRecordExpr(const RecordExpr& e, bool isCoroutine) {
+    // 堆记录类型：用 gc_alloc + IIFE 生成完整堆对象（替代 designated initializer）
+    if (auto* rs = dynamic_cast<const RecordSemType*>(e.inferredType)) {
+        if (!rs->canonicalName.empty()) {
+            std::string recType = rs->canonicalName;
+            int idx = recordAllocCounter_++;
+            std::string var = "_rec_" + std::to_string(idx);
+            std::ostringstream oss;
+            oss << "[&]() -> " << recType << "* {\n";
+            oss << "    auto* " << var << " = aura_rt::gc_alloc<" << recType
+                << ">(&" << recType << "::_desc);\n";
+            for (auto& f : e.fields) {
+                oss << "    " << var << "->" << safeName(f.name) << " = "
+                    << (f.value ? genExpr(*f.value, isCoroutine) : "???") << ";\n";
+            }
+            oss << "    return " << var << ";\n";
+            oss << "  }()";
+            return oss.str();
+        }
+    }
+
+    // 匿名记录：保持 designated initializer
     std::ostringstream oss;
     oss << "{";
     for (size_t i = 0; i < e.fields.size(); ++i) {
         if (i > 0) oss << ", ";
-        oss << e.fields[i].name << " = "
+        oss << "." << e.fields[i].name << " = "
             << (e.fields[i].value ? genExpr(*e.fields[i].value, isCoroutine) : "???");
     }
     oss << "}";
@@ -246,12 +321,40 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
         needAwait = coroutineFunctions_.count(calleeExpr) > 0;
     }
 
+    // 接口参数自动包装
+    auto ipIt = fnInterfaceParams_.find(calleeName);
+    auto cbIt = fnCallbackParams_.find(calleeName);
+    std::vector<std::string> argExprs;
+    for (size_t i = 0; i < e.args.size(); ++i) {
+        std::string arg = genExpr(*e.args[i], isCoroutine);
+        if (ipIt != fnInterfaceParams_.end()) {
+            for (auto& [idx, ifaceName] : ipIt->second) {
+                if (idx == i) {
+                    if (arg.find(ifaceName) == std::string::npos) {
+                        arg = ifaceName + "Func(" + arg + ")";
+                    }
+                    break;
+                }
+            }
+        }
+        // 回调参数：包装裸 lambda 为 std::function
+        if (cbIt != fnCallbackParams_.end()) {
+            for (auto& [idx, ftStr] : cbIt->second) {
+                if (idx == i) {
+                    arg = ftStr + "(" + arg + ")";
+                    break;
+                }
+            }
+        }
+        argExprs.push_back(arg);
+    }
+
     std::string prefix = needAwait ? "co_await " : "";
     std::ostringstream oss;
     oss << prefix << calleeExpr << targs << "(";
-    for (size_t i = 0; i < e.args.size(); ++i) {
+    for (size_t i = 0; i < argExprs.size(); ++i) {
         if (i > 0) oss << ", ";
-        oss << genExpr(*e.args[i], isCoroutine);
+        oss << argExprs[i];
     }
     oss << ")";
     return oss.str();
@@ -267,8 +370,9 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         if (id->name == "io") isIoCall = true;
     }
 
-    // spawn 块内 io.println → 用同步版本 println_sync，避免嵌套协程 crash
-    if (insideSpawn_ && isIoCall && e.method == "println") {
+    // 协程函数内的闭包 / spawn 块内 io.println → 用同步版本 println_sync，避免嵌套协程
+    if (isIoCall && e.method == "println"
+        && (insideSpawn_ || currentFunctionIsCoroutine_)) {
         oss << obj << ".println_sync(";
         for (size_t i = 0; i < e.args.size(); ++i) {
             if (i > 0) oss << ", ";
@@ -479,7 +583,188 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
         }
     }
 
-    // === 3. 生成 C++ lambda ===
+    // 移除仅在返回类型中出现的泛型（不能从参数推导，如 make_tree_mapper 中的 U）
+    std::set<std::string> returnOnlyGenerics;
+    if (e.returnType) {
+        std::set<std::string> retGen;
+        collectTParams(*e.returnType, retGen);
+        std::set<std::string> paramGen;
+        for (auto& p : e.params)
+            if (p.type) collectTParams(*p.type, paramGen);
+        for (auto& g : retGen) {
+            if (!paramGen.count(g)) {
+                genericParams.erase(g);
+                returnOnlyGenerics.insert(g);
+            }
+        }
+    }
+
+    // === 3. 检测是否修改捕获变量（决定 mutable 关键字） ===
+    bool needsMutable = false;
+    // 扫描：赋值左侧是捕获变量 → 直接 mutable
+    for (auto& cap : captures) {
+        for (auto& s : e.body->stmts) {
+            if (!s) continue;
+            struct AssignTargetCollector {
+                std::string targetName;
+                bool found = false;
+                bool collectStmt(const Stmt& stmt) {
+                    return StmtWalker<AssignTargetCollector>::walk(stmt, *this);
+                }
+                bool visit(const AssignExpr& n, AssignTargetCollector& /*self*/) {
+                    if (auto* id = dynamic_cast<const Identifier*>(n.target.get())) {
+                        if (id->name == targetName) { found = true; return true; }
+                    }
+                    return false;
+                }
+                bool visit(const BlockStmt& n, AssignTargetCollector& self) { for (auto& ss : n.stmts) if (ss && self.collectStmt(*ss)) return true; return false; }
+                bool visit(const IfStmt& n, AssignTargetCollector& self) { if (n.thenBranch && self.collectStmt(*n.thenBranch)) return true; if (n.elseBranch && self.collectStmt(*n.elseBranch)) return true; for (auto& ei : n.elseIfs) if (ei.body && self.collectStmt(*ei.body)) return true; return false; }
+                bool visit(const WhileStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
+                bool visit(const ForStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
+                bool visit(const LoopStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
+                bool visit(const TryCatchStmt& n, AssignTargetCollector& self) { if (n.tryBody && self.collectStmt(*n.tryBody)) return true; return n.catchBody && self.collectStmt(*n.catchBody); }
+                bool visit(const SyncStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
+                bool visit(const SpawnStmt& n, AssignTargetCollector& self) { for (auto& sb : n.body) if (sb && self.collectStmt(*sb)) return true; return false; }
+                bool visit(const MatchStmt& n, AssignTargetCollector& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.collectStmt(*cb)) return true; } else { if (auto* ae = dynamic_cast<const AssignExpr*>(c.body.get())) return self.visit(*ae, self); } } return false; }
+                bool visit(const ExprStmt& n, AssignTargetCollector& self) { if (auto* ae = dynamic_cast<const AssignExpr*>(n.expr.get())) return self.visit(*ae, self); return false; }
+                bool visit(const ReturnStmt&, AssignTargetCollector&) { return false; }
+                bool visit(const ThrowStmt&, AssignTargetCollector&) { return false; }
+                bool visit(const LetDecl&, AssignTargetCollector&) { return false; }
+                bool visit(const ConstDecl&, AssignTargetCollector&) { return false; }
+                bool visit(const BreakStmt&, AssignTargetCollector&) { return false; }
+                bool visit(const ContinueStmt&, AssignTargetCollector&) { return false; }
+            };
+            AssignTargetCollector collector;
+            collector.targetName = cap;
+            if (collector.collectStmt(*s)) { needsMutable = true; break; }
+        }
+        if (needsMutable) break;
+    }
+
+    // 扫描：捕获变量被用作调用目标 → 按值捕获的 lambda operator() 为 const，需 mutable
+    if (!needsMutable) {
+        for (auto& cap : captures) {
+            for (auto& s : e.body->stmts) {
+                if (!s) continue;
+                struct CallTargetScanner {
+                    std::string targetName;
+                    bool found = false;
+                    bool scanStmt(const Stmt& stmt) {
+                        return StmtWalker<CallTargetScanner>::walk(stmt, *this);
+                    }
+                    bool scanExpr(const ASTNode& node) {
+                        return ExprWalker<CallTargetScanner>::walk(node, *this);
+                    }
+                    // CallExpr visitor (used by both StmtWalker and ExprWalker)
+                    bool visit(const CallExpr& n, CallTargetScanner& /*self*/) {
+                        if (auto* id = dynamic_cast<const Identifier*>(n.callee.get()))
+                            if (id->name == targetName) { found = true; return true; }
+                        for (auto& a : n.args) if (a && scanExpr(*a)) return true;
+                        return false;
+                    }
+                    // Stmt visitors
+                    bool visit(const BlockStmt& n, CallTargetScanner& self) { for (auto& ss : n.stmts) if (ss && self.scanStmt(*ss)) return true; return false; }
+                    bool visit(const IfStmt& n, CallTargetScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; if (n.thenBranch && self.scanStmt(*n.thenBranch)) return true; for (auto& ei : n.elseIfs) { if (ei.condition && self.scanExpr(*ei.condition)) return true; if (ei.body && self.scanStmt(*ei.body)) return true; } if (n.elseBranch && self.scanStmt(*n.elseBranch)) return true; return false; }
+                    bool visit(const WhileStmt& n, CallTargetScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; return n.body && self.scanStmt(*n.body); }
+                    bool visit(const ForStmt& n, CallTargetScanner& self) { if (n.iterable && self.scanExpr(*n.iterable)) return true; return n.body && self.scanStmt(*n.body); }
+                    bool visit(const LoopStmt& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
+                    bool visit(const TryCatchStmt& n, CallTargetScanner& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
+                    bool visit(const SyncStmt& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
+                    bool visit(const SpawnStmt& n, CallTargetScanner& self) { for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
+                    bool visit(const MatchStmt& n, CallTargetScanner& self) { if (n.expr && self.scanExpr(*n.expr)) return true; for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } else if (self.scanExpr(*c.body)) return true; } return false; }
+                    bool visit(const ExprStmt& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
+                    bool visit(const ReturnStmt& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
+                    bool visit(const ThrowStmt& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
+                    bool visit(const LetDecl& n, CallTargetScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
+                    bool visit(const ConstDecl& n, CallTargetScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
+                    bool visit(const BreakStmt&, CallTargetScanner&) { return false; }
+                    bool visit(const ContinueStmt&, CallTargetScanner&) { return false; }
+                    // Expr visitors (called via ExprWalker in scanExpr)
+                    bool visit(const BinaryExpr& n, CallTargetScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
+                    bool visit(const MethodCallExpr& n, CallTargetScanner& self) { if (n.object && self.scanExpr(*n.object)) return true; for (auto& a : n.args) if (a && self.scanExpr(*a)) return true; return false; }
+                    bool visit(const UnaryExpr& n, CallTargetScanner& self) { return n.operand && self.scanExpr(*n.operand); }
+                    bool visit(const MemberAccessExpr& n, CallTargetScanner& self) { return n.object && self.scanExpr(*n.object); }
+                    bool visit(const IndexExpr& n, CallTargetScanner& self) { return (n.object && self.scanExpr(*n.object)) || (n.index && self.scanExpr(*n.index)); }
+                    bool visit(const AssignExpr& n, CallTargetScanner& self) { return (n.target && self.scanExpr(*n.target)) || (n.value && self.scanExpr(*n.value)); }
+                    bool visit(const ErrorPropagationExpr& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
+                    bool visit(const PipeExpr& n, CallTargetScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
+                    bool visit(const RecordExpr& n, CallTargetScanner& self) { for (auto& f : n.fields) if (f.value && self.scanExpr(*f.value)) return true; return false; }
+                    bool visit(const ListExpr& n, CallTargetScanner& self) { for (auto& e : n.elements) if (e && self.scanExpr(*e)) return true; return false; }
+                    bool visit(const FunExpr& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
+                    bool visit(const IntLiteral&, CallTargetScanner&) { return false; }
+                    bool visit(const FloatLiteral&, CallTargetScanner&) { return false; }
+                    bool visit(const StringLiteral&, CallTargetScanner&) { return false; }
+                    bool visit(const BoolLiteral&, CallTargetScanner&) { return false; }
+                    bool visit(const NoneLiteral&, CallTargetScanner&) { return false; }
+                    bool visit(const Identifier&, CallTargetScanner&) { return false; }
+                };
+                CallTargetScanner scanner;
+                scanner.targetName = cap;
+                if (scanner.scanStmt(*s)) { needsMutable = true; break; }
+            }
+            if (needsMutable) break;
+        }
+    }
+
+    // 收集在闭包体内被引用（作为调用参数或直接调用）的捕获变量名
+    std::set<std::string> calledCaptures;
+    {
+        struct CaptureArgScanner {
+            std::string name;
+            bool foundArg = false;
+            bool scanStmt(const Stmt& stmt) { return StmtWalker<CaptureArgScanner>::walk(stmt, *this); }
+            bool scanExpr(const ASTNode& node) { return ExprWalker<CaptureArgScanner>::walk(node, *this); }
+            bool visit(const CallExpr& n, CaptureArgScanner& self) {
+                if (auto* id = dynamic_cast<const Identifier*>(n.callee.get()))
+                    if (id->name == name) { foundArg = true; return true; }
+                for (auto& a : n.args) if (a && self.scanExpr(*a)) return true;
+                return false;
+            }
+            bool visit(const Identifier& n, CaptureArgScanner&) { if (n.name == name) { foundArg = true; return true; } return false; }
+            bool visit(const BlockStmt& n, CaptureArgScanner& self) { for (auto& ss : n.stmts) if (ss && self.scanStmt(*ss)) return true; return false; }
+            bool visit(const ReturnStmt& n, CaptureArgScanner& self) { return n.expr && self.scanExpr(*n.expr); }
+            bool visit(const ExprStmt& n, CaptureArgScanner& self) { return n.expr && self.scanExpr(*n.expr); }
+            bool visit(const IfStmt& n, CaptureArgScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; if (n.thenBranch && self.scanStmt(*n.thenBranch)) return true; for (auto& ei : n.elseIfs) { if (ei.condition && self.scanExpr(*ei.condition)) return true; if (ei.body && self.scanStmt(*ei.body)) return true; } if (n.elseBranch && self.scanStmt(*n.elseBranch)) return true; return false; }
+            bool visit(const WhileStmt& n, CaptureArgScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; return n.body && self.scanStmt(*n.body); }
+            bool visit(const ForStmt& n, CaptureArgScanner& self) { if (n.iterable && self.scanExpr(*n.iterable)) return true; return n.body && self.scanStmt(*n.body); }
+            bool visit(const LoopStmt& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
+            bool visit(const TryCatchStmt& n, CaptureArgScanner& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
+            bool visit(const SyncStmt& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
+            bool visit(const SpawnStmt& n, CaptureArgScanner& self) { for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
+            bool visit(const MatchStmt& n, CaptureArgScanner& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } else if (self.scanExpr(*c.body)) return true; } return false; }
+            bool visit(const LetDecl& n, CaptureArgScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
+            bool visit(const ConstDecl& n, CaptureArgScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
+            bool visit(const BinaryExpr& n, CaptureArgScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
+            bool visit(const UnaryExpr& n, CaptureArgScanner& self) { return n.operand && self.scanExpr(*n.operand); }
+            bool visit(const MethodCallExpr& n, CaptureArgScanner& self) { if (n.object && self.scanExpr(*n.object)) return true; for (auto& a : n.args) if (a && self.scanExpr(*a)) return true; return false; }
+            bool visit(const MemberAccessExpr& n, CaptureArgScanner& self) { return n.object && self.scanExpr(*n.object); }
+            bool visit(const IndexExpr& n, CaptureArgScanner& self) { return (n.object && self.scanExpr(*n.object)) || (n.index && self.scanExpr(*n.index)); }
+            bool visit(const AssignExpr& n, CaptureArgScanner& self) { return (n.target && self.scanExpr(*n.target)) || (n.value && self.scanExpr(*n.value)); }
+            bool visit(const ErrorPropagationExpr& n, CaptureArgScanner& self) { return n.expr && self.scanExpr(*n.expr); }
+            bool visit(const PipeExpr& n, CaptureArgScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
+            bool visit(const RecordExpr& n, CaptureArgScanner& self) { for (auto& f : n.fields) if (f.value && self.scanExpr(*f.value)) return true; return false; }
+            bool visit(const ListExpr& n, CaptureArgScanner& self) { for (auto& e : n.elements) if (e && self.scanExpr(*e)) return true; return false; }
+            bool visit(const FunExpr& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
+            bool visit(const IntLiteral&, CaptureArgScanner&) { return false; }
+            bool visit(const FloatLiteral&, CaptureArgScanner&) { return false; }
+            bool visit(const StringLiteral&, CaptureArgScanner&) { return false; }
+            bool visit(const BoolLiteral&, CaptureArgScanner&) { return false; }
+            bool visit(const NoneLiteral&, CaptureArgScanner&) { return false; }
+            bool visit(const ThrowStmt&, CaptureArgScanner&) { return false; }
+            bool visit(const BreakStmt&, CaptureArgScanner&) { return false; }
+            bool visit(const ContinueStmt&, CaptureArgScanner&) { return false; }
+        };
+        for (auto& cap : captures) {
+            for (auto& s : e.body->stmts) {
+                if (!s) continue;
+                CaptureArgScanner argScanner;
+                argScanner.name = cap;
+                if (argScanner.scanStmt(*s)) { calledCaptures.insert(cap); break; }
+            }
+        }
+    }
+
+    // === 4. 生成 C++ lambda ===
     std::ostringstream oss;
 
     // 捕获 + 模板参数
@@ -531,8 +816,12 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     }
     oss << ")";
 
-    // 返回类型：若有通过 invoke_result_t 推导的泛型，用 auto
-    if (e.returnType && !callableParamIndices.empty()) {
+    // mutable 关键字：闭包体修改了按值捕获的变量
+    if (needsMutable && !captures.empty())
+        oss << " mutable";
+
+    // 返回类型：有 callable 推导的泛型，或 return-only 泛型 → auto
+    if (e.returnType && (!callableParamIndices.empty() || !returnOnlyGenerics.empty())) {
         oss << " -> auto";
     } else if (e.returnType) {
         oss << " -> " << mapType(*e.returnType);
@@ -544,17 +833,59 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     oss << " {\n";
     indentLevel_++;
 
-    // invoke_result_t 推导声明
+    // invoke_result_t 推导声明（使用 F&& 完美转发）
     for (size_t ci = 0; ci < callableParamIndices.size(); ++ci) {
         auto* ft = dynamic_cast<const FunctionType*>(
             e.params[callableParamIndices[ci]].type.get());
         if (ft && !ft->paramTypes.empty() && !callableResultGenerics[ci].empty()) {
-            // using U = std::invoke_result_t<F, T>;
-            std::string firstArg;
-            if (ft->paramTypes[0]) firstArg = mapType(*ft->paramTypes[0]);
+            // 构建 invoke_result_t<F&&, P1&&, P2&&...>
+            std::string allArgs;
+            for (size_t pi = 0; pi < ft->paramTypes.size(); ++pi) {
+                if (pi > 0) allArgs += ", ";
+                allArgs += (ft->paramTypes[pi] ? mapType(*ft->paramTypes[pi]) : "auto");
+                allArgs += "&&";
+            }
+            // 拆分逗号分隔的泛型名（如 "U, V" → 两个 using）
+            std::string remaining = callableResultGenerics[ci];
+            size_t commaPos;
+            while (!remaining.empty()) {
+                commaPos = remaining.find(',');
+                std::string g = remaining.substr(0, commaPos);
+                // trim whitespace
+                size_t ts = g.find_first_not_of(" \t");
+                if (ts != std::string::npos) g = g.substr(ts);
+                size_t te = g.find_last_not_of(" \t");
+                if (te != std::string::npos) g = g.substr(0, te + 1);
+                if (!g.empty()) {
+                    oss << indentStr()
+                        << "using " << g
+                        << " = typename std::invoke_result_t<F" << ci << "&&, "
+                        << allArgs << ">;\n";
+                }
+                if (commaPos == std::string::npos) break;
+                remaining = remaining.substr(commaPos + 1);
+            }
+        }
+    }
+
+    // returnOnlyGenerics via captured callables（如 make_tree_mapper 闭包中的 U）
+    if (!returnOnlyGenerics.empty() && callableParamIndices.empty() && !calledCaptures.empty()) {
+        // 用第一个被调用的捕获变量 + 第一个闭包模板参数（或闭包参数类型）计算
+        std::string delegate = *calledCaptures.begin();
+        // 尝试从闭包的第一个参数获取输入类型
+        std::string srcType = "auto";
+        if (!e.params.empty() && e.params[0].type) {
+            auto* nt = dynamic_cast<const NamedType*>(e.params[0].type.get());
+            if (nt) {
+                // root: Tree<T> → srcType = T
+                if (!nt->typeArgs.empty() && nt->typeArgs[0])
+                    srcType = mapType(*nt->typeArgs[0]);
+            }
+        }
+        for (auto& g : returnOnlyGenerics) {
             oss << indentStr()
-                << "using " << callableResultGenerics[ci]
-                << " = std::invoke_result_t<F" << ci << ", " << firstArg << ">;\n";
+                << "using " << g << " = decltype("
+                << delegate << "(std::declval<" << srcType << ">()));\n";
         }
     }
 

@@ -138,8 +138,13 @@ public:
     bool visit(const NoneLiteral&,      CoroScanner&) { return false; }
     bool visit(const Identifier&,       CoroScanner&) { return false; }
 
-    // 闭包 — 不穿透扫描；闭包体内的调用不影响外层函数的协程判定
-    bool visit(const FunExpr&,          CoroScanner&) { return false; }
+    // 闭包 — 穿透扫描闭包体：闭包内的 io.xxx / 协程函数调用会传播到外层函数
+    bool visit(const FunExpr& n, CoroScanner& self) {
+        if (n.body)
+            for (auto& s : n.body->stmts)
+                if (s && self.scanStmt(*s)) return true;
+        return false;
+    }
 
 private:
     bool scanStmt(const Stmt& s)  { return StmtWalker<CoroScanner>::walk(s, *this); }
