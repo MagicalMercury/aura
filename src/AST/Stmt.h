@@ -376,6 +376,22 @@ struct ImportDecl : Decl {
     }
 };
 
+// #config 编译器指令： #namespace.key = value
+struct ConfigDecl : Decl {
+    std::string ns;      // 命名空间（如 "io"）
+    std::string key;     // 键（如 "sync"）
+    std::string value;   // 值（如 "true"）
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ConfigDecl>();
+        n->ns = ns;
+        n->key = key;
+        n->value = value;
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
 struct MethodDecl : Decl {
     std::string receiverName;
     std::string receiverType;

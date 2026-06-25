@@ -204,11 +204,13 @@ bool GenericSemType::equals(const SemType& other) const {
     return o && o->name == name;
 }
 std::string GenericSemType::toString() const {
+    if (!resolvedName.empty()) return resolvedName;
     return "<" + name + ">";
 }
 std::unique_ptr<SemType> GenericSemType::clone() const {
     auto n = std::make_unique<GenericSemType>();
     n->name = name;
+    n->resolvedName = resolvedName;
     return n;
 }
 

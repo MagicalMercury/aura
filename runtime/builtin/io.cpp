@@ -45,6 +45,15 @@ task<GcString*> Io::readln() {
     co_return make_string(line);
 }
 
+GcString* Io::readln_sync() {
+    std::string line;
+    if (!std::getline(std::cin, line)) {
+        throw Error(make_string("io_error"),
+                    make_string("failed to read from stdin"));
+    }
+    return make_string(line);
+}
+
 // ============================================================
 // 文件 I/O
 // ============================================================
@@ -62,6 +71,18 @@ task<GcString*> Io::read_file(const Path& path) {
     co_return make_string(oss.str());
 }
 
+GcString* Io::read_file_sync(const Path& path) {
+    std::ifstream file(path.native(), std::ios::binary);
+    if (!file.is_open()) {
+        throw Error(make_string("io_error"),
+                    make_string("cannot open file: " + path.native().string()));
+    }
+    std::ostringstream oss;
+    oss << file.rdbuf();
+    file.close();
+    return make_string(oss.str());
+}
+
 task<void> Io::write_file(const Path& path, const std::string& content) {
     std::ofstream file(path.native(), std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
@@ -76,6 +97,20 @@ task<void> Io::write_file(const Path& path, const std::string& content) {
     }
     file.close();
     co_return;
+}
+
+void Io::write_file_sync(const Path& path, const std::string& content) {
+    std::ofstream file(path.native(), std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        throw Error(make_string("io_error"),
+                    make_string("cannot write file: " + path.native().string()));
+    }
+    file.write(content.data(), static_cast<std::streamsize>(content.size()));
+    if (!file) {
+        throw Error(make_string("io_error"),
+                    make_string("write failed: " + path.native().string()));
+    }
+    file.close();
 }
 
 bool Io::file_exists(const Path& path) const {
@@ -96,6 +131,15 @@ task<void> Io::mkdir(const Path& path) {
     co_return;
 }
 
+void Io::mkdir_sync(const Path& path) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.native(), ec);
+    if (ec) {
+        throw Error(make_string("io_error"),
+                    make_string("cannot create directory: " + path.native().string() + " - " + ec.message()));
+    }
+}
+
 task<void> Io::remove(const Path& path) {
     std::error_code ec;
     if (std::filesystem::is_directory(path.native())) {
@@ -108,6 +152,19 @@ task<void> Io::remove(const Path& path) {
                     make_string("cannot remove: " + path.native().string() + " - " + ec.message()));
     }
     co_return;
+}
+
+void Io::remove_sync(const Path& path) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(path.native())) {
+        std::filesystem::remove(path.native(), ec);
+    } else {
+        std::filesystem::remove(path.native(), ec);
+    }
+    if (ec) {
+        throw Error(make_string("io_error"),
+                    make_string("cannot remove: " + path.native().string() + " - " + ec.message()));
+    }
 }
 
 task<Array<Path>*> Io::list_dir(const Path& path) {
@@ -128,6 +185,23 @@ task<Array<Path>*> Io::list_dir(const Path& path) {
         arr->append(entry);
     }
     co_return arr;
+}
+
+Array<Path>* Io::list_dir_sync(const Path& path) {
+    std::error_code ec;
+    std::vector<Path> entries;
+    for (auto& entry : std::filesystem::directory_iterator(path.native(), ec)) {
+        if (ec) {
+            throw Error(make_string("io_error"),
+                        make_string("cannot list directory: " + path.native().string() + " - " + ec.message()));
+        }
+        entries.push_back(Path(entry.path()));
+    }
+    auto* arr = Array<Path>::make(0);
+    for (auto& entry : entries) {
+        arr->append(entry);
+    }
+    return arr;
 }
 
 } // namespace aura_rt

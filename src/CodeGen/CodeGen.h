@@ -18,6 +18,8 @@
 
 namespace Aura {
 
+class SemAnalyzer;
+
 // ============================================================
 // PendingMethod — 暂存方法签名，供 genRecordStruct 嵌入 struct
 // ============================================================
@@ -44,6 +46,16 @@ struct CompileUnit {
     std::string impl;          // 实现文件内容（函数体、_desc 实例）
     std::string footer;        // 主入口 int main(...)
     bool        hasMain = false;
+};
+
+// ============================================================
+// CodeGenConfig — 编译器配置（来自 SemAnalyzer 的 #config 指令）
+// ============================================================
+struct CodeGenConfig {
+    bool ioSync = false;  // #io.sync = true → 同步模式
+
+    // 从 SemAnalyzer 中提取所有 #config 配置项（对外唯一入口）
+    void setConfig(const SemAnalyzer& sema);
 };
 
 // ============================================================
@@ -90,12 +102,11 @@ public:
 
     // -- 主入口 --
     // 生成一个编译单元（.aura → .cpp/.h）
-    // imports: 该模块的 import 列表（用于生成 #include 和命名空间别名）
-    // nsName:  该模块自己的 C++ 命名空间（空 = 不包裹命名空间）
     [[nodiscard]] CompileUnit generate(const Program& program,
                                         const std::string& moduleName = "main",
                                         const std::vector<CodeGenImport>& imports = {},
-                                        const std::string& nsName = "");
+                                        const std::string& nsName = "",
+                                        const CodeGenConfig& config = {});
 
     // -- 协程判定入口 --
     [[nodiscard]] CoroDecision decideCoro(const FunDecl& decl);
@@ -363,6 +374,8 @@ private:
 
     // 当前编译单元中已知的需要协程的函数名
     std::set<std::string> coroutineFunctions_;
+    std::set<std::string> coroClosureNames_;  // let 绑定的协程闭包名
+    bool lastClosureIsCoro_ = false;           // genFunExpr → genLetStmt 传递
 
     // 待嵌入 struct 的方法声明（genRecordStruct 消费）
     std::vector<PendingMethod> pendingMethods_;
@@ -386,7 +399,8 @@ private:
 
     // 当前函数的模板参数列表（用于调用泛型构造函数时传递类型参数）
     std::vector<std::string> currentTParams_;
-    std::string              currentLetName_;    // 当前 let 声明的变量名（递归闭包检测）
+    std::string              currentLetName_;    // 当前 let 声明的变量名
+    bool                     ioSync_ = false;    // 来自 CodeGenConfig
 
     // 当前函数的 C++ 返回类型（用于 genReturnStmt 生成正确的 RecordExpr 构造）
     std::string currentReturnCppType_;

@@ -479,6 +479,11 @@ void ImportDecl::print(std::ostream& os, int indent) const {
     os << '\n';
 }
 
+void ConfigDecl::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "ConfigDecl: #" << ns << "." << key << " = " << value << '\n';
+}
+
 void MethodDecl::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << (isConstructor ? "Constructor: " : "MethodDecl: ") << name << '\n';

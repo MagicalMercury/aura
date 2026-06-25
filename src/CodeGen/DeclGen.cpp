@@ -248,6 +248,13 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
 
     out << tprefix << sig << " {\n";
     if (decl.body) genBlock(out, *decl.body, isCoro);
+    // 协程函数末尾无 return 时补 co_return，确保 C++20 将其识别为协程
+    if (isCoro) {
+        bool lastIsReturn = decl.body && !decl.body->stmts.empty()
+            && dynamic_cast<const ReturnStmt*>(decl.body->stmts.back().get());
+        if (!lastIsReturn)
+            out << "  co_return;\n";
+    }
     out << "}\n\n";
     valueTypeVarNames_.clear();
     stringVarNames_.clear();
@@ -469,13 +476,17 @@ void CodeGenerator::genMainEntry(std::ostream& cpp, const FunDecl& mainDecl,
     cpp << "// ============================================================\n";
     cpp << "int main(int /*argc*/, char** /*argv*/) {\n";
     cpp << "  aura_rt::Io io;\n";
-    if (nsName.empty()) {
-        cpp << "  auto t = ::aura_main(io);\n";
+    std::string callPrefix = nsName.empty() ? "::aura_main" : nsName + "::aura_main";
+    if (ioSync_) {
+        // 同步模式：aura_main 返回 void，直接调用
+        cpp << "  " << callPrefix << "(io);\n";
+        cpp << "  return 0;\n";
     } else {
-        cpp << "  auto t = " << nsName << "::aura_main(io);\n";
+        // 异步模式：aura_main 返回 task<void>，走 run_event_loop
+        cpp << "  auto t = " << callPrefix << "(io);\n";
+        cpp << "  aura_rt::run_event_loop(t);\n";
+        cpp << "  return 0;\n";
     }
-    cpp << "  aura_rt::run_event_loop(t);\n";
-    cpp << "  return 0;\n";
     cpp << "}\n";
     (void)mainDecl;
 }

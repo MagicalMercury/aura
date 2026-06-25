@@ -101,7 +101,8 @@ struct InterfaceSemType : SemType {
 
 // 泛型类型变量 <T>（未实例化时保留名称，实例化后替换为具体类型）
 struct GenericSemType : SemType {
-    std::string name; // 如 "A", "T"
+    std::string name;           // 如 "A", "T"
+    std::string resolvedName;   // 自引用类型的 C++ 名（如 "Tree<int32_t>"），空 = 未解析
     [[nodiscard]] bool equals(const SemType& other) const override;
     [[nodiscard]] std::string toString() const override;
     [[nodiscard]] std::unique_ptr<SemType> clone() const override;

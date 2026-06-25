@@ -32,6 +32,7 @@ private:
     bool atEnd() const;
     void error(const std::string& msg);
     void setNodePos(ASTNode* node, const Token& tok);
+    static bool isKeywordIdent(TokType t) { return t >= TokType::Fun && t <= TokType::None; }
 
     // --- 解析声明 ---
     std::unique_ptr<Decl> parseDecl();
@@ -42,6 +43,7 @@ private:
     std::unique_ptr<InterfaceDecl> parseInterfaceDecl();
     std::unique_ptr<MethodDecl> parseMethodDecl();
     std::unique_ptr<ImportDecl> parseImportDecl();
+    std::unique_ptr<Decl> parseConfigDecl();
 
     // --- 解析语句 ---
     std::unique_ptr<Stmt> parseStmt();

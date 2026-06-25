@@ -1,9 +1,18 @@
 #include "CodeGen.h"
+#include "../Sema/SemAnalyzer.h"
 #include <filesystem>
 #include <sstream>
 #include <unordered_set>
 
 namespace Aura {
+
+// ============================================================
+// CodeGenConfig
+// ============================================================
+
+void CodeGenConfig::setConfig(const SemAnalyzer& sema) {
+    ioSync = sema.getIoSync();
+}
 
 // ============================================================
 // 构造 & 主入口
@@ -22,7 +31,9 @@ CodeGenerator::CodeGenerator() {
 CompileUnit CodeGenerator::generate(const Program& program,
                                      const std::string& moduleName,
                                      const std::vector<CodeGenImport>& imports,
-                                     const std::string& nsName) {
+                                     const std::string& nsName,
+                                     const CodeGenConfig& config) {
+    ioSync_ = config.ioSync;
     CompileUnit unit;
     unit.moduleName = moduleName;
     unit.nsName     = nsName;

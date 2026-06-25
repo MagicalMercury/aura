@@ -48,6 +48,7 @@ enum class TokType {
     RBracket,      // ]
     Comma,         // ,
     Semicolon,     // ;
+    Hash,          // #
 
     Eof,
     Error,

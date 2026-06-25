@@ -186,8 +186,10 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
         sig += ")>";
         return sig;
     }
-    if (dynamic_cast<const GenericSemType*>(&semType))
+    if (auto* gs = dynamic_cast<const GenericSemType*>(&semType)) {
+        if (!gs->resolvedName.empty()) return gs->resolvedName + "*";
         return "auto";
+    }
     return "/* unknown_semtype */";
 }
 

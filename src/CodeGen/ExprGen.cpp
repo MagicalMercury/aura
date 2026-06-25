@@ -184,23 +184,30 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
 
 std::string CodeGenerator::genRecordExpr(const RecordExpr& e, bool isCoroutine) {
     // 堆记录类型：用 gc_alloc + IIFE 生成完整堆对象（替代 designated initializer）
-    if (auto* rs = dynamic_cast<const RecordSemType*>(e.inferredType)) {
-        if (!rs->canonicalName.empty()) {
-            std::string recType = rs->canonicalName;
-            int idx = recordAllocCounter_++;
-            std::string var = "_rec_" + std::to_string(idx);
-            std::ostringstream oss;
-            oss << "[&]() -> " << recType << "* {\n";
-            oss << "    auto* " << var << " = aura_rt::gc_alloc<" << recType
-                << ">(&" << recType << "::_desc);\n";
-            for (auto& f : e.fields) {
-                oss << "    " << var << "->" << safeName(f.name) << " = "
-                    << (f.value ? genExpr(*f.value, isCoroutine) : "???") << ";\n";
-            }
-            oss << "    return " << var << ";\n";
-            oss << "  }()";
-            return oss.str();
+    auto getCanonical = [&]() -> std::string {
+        if (auto* rs = dynamic_cast<const RecordSemType*>(e.inferredType)) {
+            if (!rs->canonicalName.empty()) return rs->canonicalName;
         }
+        if (auto* gs = dynamic_cast<const GenericSemType*>(e.inferredType)) {
+            if (!gs->resolvedName.empty()) return gs->resolvedName;
+        }
+        return "";
+    };
+    std::string recType = getCanonical();
+    if (!recType.empty()) {
+        int idx = recordAllocCounter_++;
+        std::string var = "_rec_" + std::to_string(idx);
+        std::ostringstream oss;
+        oss << "[&]() -> " << recType << "* {\n";
+        oss << "    auto* " << var << " = aura_rt::gc_alloc<" << recType
+            << ">(&" << recType << "::_desc);\n";
+        for (auto& f : e.fields) {
+            oss << "    " << var << "->" << safeName(f.name) << " = "
+                << (f.value ? genExpr(*f.value, isCoroutine) : "???") << ";\n";
+        }
+        oss << "    return " << var << ";\n";
+        oss << "  }()";
+        return oss.str();
     }
 
     // 匿名记录：保持 designated initializer
@@ -318,7 +325,8 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
 
     bool needAwait = false;
     if (isCoroutine && !isCtor) {
-        needAwait = coroutineFunctions_.count(calleeExpr) > 0;
+        needAwait = coroutineFunctions_.count(calleeExpr) > 0
+                 || coroClosureNames_.count(calleeExpr) > 0;
     }
 
     // 接口参数自动包装
@@ -370,10 +378,9 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         if (id->name == "io") isIoCall = true;
     }
 
-    // 协程函数内的闭包 / spawn 块内 io.println → 用同步版本 println_sync，避免嵌套协程
-    if (isIoCall && e.method == "println"
-        && (insideSpawn_ || currentFunctionIsCoroutine_)) {
-        oss << obj << ".println_sync(";
+    // #io.sync = true：所有 IO 方法统一加 _sync 后缀，提前返回
+    if (isIoCall && ioSync_) {
+        oss << obj << "." << e.method << "_sync(";
         for (size_t i = 0; i < e.args.size(); ++i) {
             if (i > 0) oss << ", ";
             oss << genExpr(*e.args[i], false);
@@ -503,7 +510,41 @@ std::string CodeGenerator::genPipeExpr(const PipeExpr& e, bool isCoroutine) {
 std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     if (!e.body) return "[]{}";
 
-    (void)isCoroutine; // 闭包体始终生成非协程 lambda
+    // 检测闭包体内是否包含 io.xxx 调用 — 若有则在协程上下文中生成协程 lambda
+    bool closureHasIo = false;
+    if (isCoroutine && !ioSync_) {
+        struct IoDetector {
+            bool found = false;
+            bool scanStmt(const Stmt& stmt) { return StmtWalker<IoDetector>::walk(stmt, *this); }
+            bool visit(const MethodCallExpr& n, IoDetector&) {
+                if (n.object) {
+                    if (auto* id = dynamic_cast<const Identifier*>(n.object.get()))
+                        if (id->name == "io") { found = true; return true; }
+                }
+                return false;
+            }
+            bool visit(const BlockStmt& n, IoDetector& self) { for (auto& ss : n.stmts) if (ss && self.scanStmt(*ss)) return true; return false; }
+            bool visit(const IfStmt& n, IoDetector& self) { if (n.thenBranch && self.scanStmt(*n.thenBranch)) return true; for (auto& ei : n.elseIfs) if (ei.body && self.scanStmt(*ei.body)) return true; if (n.elseBranch && self.scanStmt(*n.elseBranch)) return true; return false; }
+            bool visit(const WhileStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
+            bool visit(const ForStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
+            bool visit(const LoopStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
+            bool visit(const TryCatchStmt& n, IoDetector& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
+            bool visit(const MatchStmt& n, IoDetector& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } } return false; }
+            bool visit(const ExprStmt& n, IoDetector& self) { if (n.expr) { if (auto* mc = dynamic_cast<const MethodCallExpr*>(n.expr.get())) return self.visit(*mc, self); } return false; }
+            bool visit(const ReturnStmt&, IoDetector&) { return false; }
+            bool visit(const ThrowStmt&, IoDetector&) { return false; }
+            bool visit(const LetDecl&, IoDetector&) { return false; }
+            bool visit(const ConstDecl&, IoDetector&) { return false; }
+            bool visit(const BreakStmt&, IoDetector&) { return false; }
+            bool visit(const ContinueStmt&, IoDetector&) { return false; }
+            bool visit(const SyncStmt&, IoDetector&) { return false; }
+            bool visit(const SpawnStmt&, IoDetector&) { return false; }
+        };
+        IoDetector detector;
+        for (auto& s : e.body->stmts)
+            if (s && detector.scanStmt(*s)) { closureHasIo = true; break; }
+    }
+    bool closureIsCoro = closureHasIo;
 
     // === 1. 捕获分析（复用 IdRefCollector + DeclaredCollector） ===
     std::set<std::string> allRefs;
@@ -820,8 +861,13 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     if (needsMutable && !captures.empty())
         oss << " mutable";
 
-    // 返回类型：有 callable 推导的泛型，或 return-only 泛型 → auto
-    if (e.returnType && (!callableParamIndices.empty() || !returnOnlyGenerics.empty())) {
+    // 返回类型：协程闭包 → task<...>；有 callable 推导 → auto
+    if (closureIsCoro) {
+        if (e.returnType)
+            oss << " -> aura_rt::task<" << mapType(*e.returnType) << ">";
+        else
+            oss << " -> aura_rt::task<void>";
+    } else if (e.returnType && (!callableParamIndices.empty() || !returnOnlyGenerics.empty())) {
         oss << " -> auto";
     } else if (e.returnType) {
         oss << " -> " << mapType(*e.returnType);
@@ -890,11 +936,19 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     }
 
     for (auto& s : e.body->stmts) {
-        if (s) genStmt(oss, *s, false);
+        if (s) genStmt(oss, *s, closureIsCoro);
+    }
+    // 协程闭包末尾补 co_return; 确保 C++20 将其识别为协程
+    if (closureIsCoro) {
+        bool lastIsReturn = !e.body->stmts.empty()
+            && dynamic_cast<const ReturnStmt*>(e.body->stmts.back().get());
+        if (!lastIsReturn)
+            oss << indentStr() << "co_return;\n";
     }
     indentLevel_--;
     oss << indentStr() << "}";
 
+    lastClosureIsCoro_ = closureIsCoro;
     return oss.str();
 }
 

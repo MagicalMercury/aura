@@ -6,9 +6,6 @@ namespace Aura {
 // ============================================================
 // 构造 & 主入口
 // ============================================================
-#ifndef MAX_SEAL_DEPTH
-#define MAX_SEAL_DEPTH 128
-#endif
 
 SemAnalyzer::SemAnalyzer() {}
 
@@ -260,25 +257,14 @@ void SemAnalyzer::collectGenericMapping(
 void SemAnalyzer::sealSelfRefs(std::unique_ptr<SemType>& node,
                                 const std::string& bareName,
                                 const std::string& fullName) {
-    if (++sealDepth_ > MAX_SEAL_DEPTH) { --sealDepth_; return; }  // MAX_SEAL_DEPTH 层遍历上限
+    // 自引用类型（如 Tree<T> 定义中的 children: [Tree<T>]）：标注 resolvedName，不展开
     if (auto* gs = dynamic_cast<GenericSemType*>(node.get())) {
         if (gs->name == bareName) {
-            auto* sym = symtab_.lookup(bareName);
-            if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
-                auto resolved = sym->type->clone();
-                if (auto* rec = dynamic_cast<RecordSemType*>(resolved.get())) {
-                    rec->canonicalName = fullName;
-                    for (auto& f : rec->fields)
-                        if (f.type) sealSelfRefs(f.type, bareName, fullName);
-                }
-                node = std::move(resolved);
-            }
-            --sealDepth_;
-            return;
+            gs->resolvedName = fullName;
         }
-        --sealDepth_;
         return;
     }
+    // 复合类型遍历写入 resolvedName
     if (auto* r = dynamic_cast<RecordSemType*>(node.get())) {
         for (auto& f : r->fields)
             if (f.type) sealSelfRefs(f.type, bareName, fullName);
@@ -288,7 +274,6 @@ void SemAnalyzer::sealSelfRefs(std::unique_ptr<SemType>& node,
         for (auto& v : u->variants)
             if (v) sealSelfRefs(v, bareName, fullName);
     }
-    --sealDepth_;
 }
 
 // ============================================================
@@ -300,6 +285,33 @@ void SemAnalyzer::propagateCanonicalName(const ASTNode& expr, const SemType* typ
 
     // GenericSemType：通过符号表解析回具体类型（如 Tree → RecordSemType）
     if (auto* gs = dynamic_cast<const GenericSemType*>(type)) {
+        // 已解析的自引用（如 Tree<int32_t>）：用模板体逐字段传播到嵌套 RecordExpr
+        if (!gs->resolvedName.empty()) {
+            if (auto* recExpr = dynamic_cast<const RecordExpr*>(&expr)) {
+                auto* sym = symtab_.lookup(gs->name);
+                if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
+                    auto resolved = sym->type->clone();
+                    // 对模板副本做 sealSelfRefs，用 resolvedName 标注所有自引用
+                    sealSelfRefs(resolved, gs->name, gs->resolvedName);
+                    if (auto* rs = dynamic_cast<RecordSemType*>(resolved.get())) {
+                        rs->canonicalName = gs->resolvedName;
+                        const_cast<RecordExpr*>(recExpr)->inferredType = rs;
+                        for (auto& f : recExpr->fields) {
+                            for (auto& ft : rs->fields) {
+                                if (f.name == ft.name && f.value && ft.type) {
+                                    propagateCanonicalName(*f.value, ft.type.get());
+                                    break;
+                                }
+                            }
+                        }
+                        typeStore_.push_back(std::move(resolved));
+                        return;
+                    }
+                }
+            }
+            const_cast<ASTNode&>(expr).inferredType = type;
+            return;
+        }
         auto* sym = symtab_.lookup(gs->name);
         if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
             propagateCanonicalName(expr, sym->type.get());
@@ -361,6 +373,12 @@ void SemAnalyzer::checkProgram(const Program& program) {
 }
 
 void SemAnalyzer::checkDecl(const Decl& decl) {
+    if (auto* cfg = dynamic_cast<const ConfigDecl*>(&decl)) {
+        if (cfg->ns == "io" && cfg->key == "sync") {
+            ioSync_ = (cfg->value == "true");
+        }
+        return;
+    }
     if (auto* f = dynamic_cast<const FunDecl*>(&decl)) {
         checkFunBody(*f);
     } else if (auto* m = dynamic_cast<const MethodDecl*>(&decl)) {

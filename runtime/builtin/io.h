@@ -38,13 +38,22 @@ public:
     // readln() throws -> string — 读取一行标准输入
     task<GcString*> readln();
 
+    // readln_sync() throws -> string — 同步版本
+    GcString* readln_sync();
+
     // ========== 文件 I/O (参数为 Path) ==========
 
     // read_file(path: Path) throws -> string — 读取文件内容
     task<GcString*> read_file(const Path& path);
 
+    // read_file_sync(path: Path) throws -> string — 同步版本
+    GcString* read_file_sync(const Path& path);
+
     // write_file(path: Path, content: string) throws — 写入文件（覆盖）
     task<void> write_file(const Path& path, const std::string& content);
+
+    // write_file_sync(path: Path, content: string) throws — 同步版本
+    void write_file_sync(const Path& path, const std::string& content);
 
     // file_exists(path: Path) -> bool — 检查文件或目录是否存在
     bool file_exists(const Path& path) const;
@@ -52,11 +61,20 @@ public:
     // mkdir(path: Path) throws — 创建目录
     task<void> mkdir(const Path& path);
 
+    // mkdir_sync(path: Path) throws — 同步版本
+    void mkdir_sync(const Path& path);
+
     // remove(path: Path) throws — 删除文件或空目录
     task<void> remove(const Path& path);
 
+    // remove_sync(path: Path) throws — 同步版本
+    void remove_sync(const Path& path);
+
     // list_dir(path: Path) throws -> [Path] — 列出目录内容
     task<Array<Path>*> list_dir(const Path& path);
+
+    // list_dir_sync(path: Path) throws -> [Path] — 同步版本
+    Array<Path>* list_dir_sync(const Path& path);
 
     // ========== 路径操作 ==========
 

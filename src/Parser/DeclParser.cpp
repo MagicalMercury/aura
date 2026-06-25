@@ -7,6 +7,7 @@ namespace Aura {
 // ============================================================
 
 std::unique_ptr<Decl> Parser::parseDecl() {
+    if (check(TokType::Hash)) return parseConfigDecl();
     if (check(TokType::Fun)) {
         if (peekNext().type == TokType::LParen) {
             return parseMethodDecl();
@@ -209,6 +210,54 @@ std::unique_ptr<ImportDecl> Parser::parseImportDecl() {
     }
 
     match(TokType::Semicolon);
+    return decl;
+}
+
+std::unique_ptr<Decl> Parser::parseConfigDecl() {
+    auto tok = advance(); // #
+    auto decl = std::make_unique<ConfigDecl>();
+    setNodePos(decl.get(), tok);
+
+    // namespace — 接受标识符（含关键字，如 "io"）
+    auto& nsTok = advance();
+    if (nsTok.type != TokType::Identifier && !isKeywordIdent(nsTok.type)) {
+        error("expected identifier after '#'");
+        return decl;
+    }
+    decl->ns = nsTok.lexeme;
+
+    if (!match(TokType::Dot)) {
+        error("expected '.' after namespace in config");
+        return decl;
+    }
+
+    // key — 接受标识符（含关键字，如 "sync"）
+    auto& keyTok = advance();
+    if (keyTok.type != TokType::Identifier && !isKeywordIdent(keyTok.type)) {
+        error("expected key after '.' in config");
+        return decl;
+    }
+    decl->key = keyTok.lexeme;
+
+    consume(TokType::Assign, "expected '=' after key in config");
+
+    // value: identifier/keyword (true/false) or string/number
+    if (check(TokType::Identifier) || isKeywordIdent(peek().type)
+        || check(TokType::True) || check(TokType::False)) {
+        decl->value = advance().lexeme;
+    } else if (check(TokType::StringLiteral)) {
+        auto& strTok = advance();
+        if (auto* s = std::get_if<std::string>(&strTok.literal))
+            decl->value = *s;
+        else
+            decl->value = strTok.lexeme;
+    } else if (check(TokType::IntLiteral) || check(TokType::FloatLiteral)) {
+        decl->value = advance().lexeme;
+    } else {
+        error("expected value after '=' in config");
+    }
+
+    match(TokType::Semicolon);  // optional
     return decl;
 }
 

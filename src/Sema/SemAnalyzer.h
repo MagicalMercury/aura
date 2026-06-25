@@ -28,6 +28,9 @@ public:
     // 主入口：分析整个程序，返回是否有错误
     [[nodiscard]] bool analyze(const Program& program);
 
+    // #io.sync 配置
+    [[nodiscard]] bool getIoSync() const { return ioSync_; }
+
     // 错误列表
     const std::vector<std::string>& errors() const { return errors_; }
 
@@ -125,9 +128,11 @@ private:
     void sealSelfRefs(std::unique_ptr<SemType>& node,
                       const std::string& bareName,
                       const std::string& fullName);
-    int sealDepth_ = 0;
     // 正在解析中的类型名集合（用于检测自引用，如 Tree<T> = {..., children: [Tree<T>]}）
     std::set<std::string> resolvingTypes_;
+
+    // ============ #config 配置 ============
+    bool ioSync_ = false;       // #io.sync = true → 同步模式
 
     // ============ 表达式类型存储 ============
     // 持有 inferExpr 返回的临时 SemType（供 ASTNode::inferredType 指向）

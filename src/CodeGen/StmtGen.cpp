@@ -65,14 +65,16 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
         // 尝试从推断的 SemType 获取 C++ 类型（仅当可生产合法 C++ 类型时使用）
         type = "auto";
         if (auto* rs = dynamic_cast<const RecordSemType*>(decl.inferredType)) {
-            // 剥离未解析泛型参数（如 "Tree<U>" → "Tree"）
             std::string baseName = rs->canonicalName;
             size_t anglePos = baseName.find('<');
             if (anglePos != std::string::npos)
                 baseName = baseName.substr(0, anglePos);
             if (!baseName.empty()
-                && !typeAliasTemplateParams_.count(baseName))  // 模板类型跳过
+                && !typeAliasTemplateParams_.count(baseName))
                 type = rs->canonicalName + "*";
+        } else if (auto* gs = dynamic_cast<const GenericSemType*>(decl.inferredType)) {
+            if (!gs->resolvedName.empty())
+                type = gs->resolvedName + "*";
         } else if (auto* ls = dynamic_cast<const ListSemType*>(decl.inferredType)) {
             type = mapSemType(*ls);
         } else if (auto* ps = dynamic_cast<const PrimSemType*>(decl.inferredType)) {
@@ -129,6 +131,10 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
         }
 
         init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
+        if (lastClosureIsCoro_) {
+            coroClosureNames_.insert(safeName(decl.name));
+            lastClosureIsCoro_ = false;
+        }
         currentLetName_.clear();
     }
 

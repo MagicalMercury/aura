@@ -129,7 +129,9 @@ int compileSingleFile(const CliOptions& opts) {
 
     // C++ 代码生成
     Aura::CodeGenerator cg;
-    auto unit = cg.generate(*program, moduleName);
+    Aura::CodeGenConfig cfg;
+    cfg.setConfig(sema);
+    auto unit = cg.generate(*program, moduleName, {}, "", cfg);
 
     if (!cg.errors().empty()) {
         std::cerr << "CodeGen errors:\n";

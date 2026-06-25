@@ -63,6 +63,7 @@ Token Lexer::scanOperatorOrDelimiter(char c) {
     case ']': return makeToken(TokType::RBracket,"]");
     case ',': return makeToken(TokType::Comma,   ",");
     case ';': return makeToken(TokType::Semicolon, ";");
+    case '#': return makeToken(TokType::Hash, "#");
 
     case '=':
         if (peek() == '=') { advance(); return makeToken(TokType::EqEq,     "=="); }

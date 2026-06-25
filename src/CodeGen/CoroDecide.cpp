@@ -7,7 +7,8 @@ namespace Aura {
 // ============================================================
 class CodeGenerator::CoroScanner {
 public:
-    explicit CoroScanner(const std::set<std::string>& coroFns) : coroFns_(coroFns) {}
+    explicit CoroScanner(const std::set<std::string>& coroFns, bool ioSync = false)
+        : coroFns_(coroFns), ioSync_(ioSync) {}
 
     // 统一入口：自动区分 Stmt/Expr
     bool scan(const ASTNode& node) {
@@ -154,7 +155,7 @@ private:
         if (auto* mc = dynamic_cast<const MethodCallExpr*>(&expr)) {
             if (mc->object) {
                 if (auto* id = dynamic_cast<const Identifier*>(mc->object.get())) {
-                    if (id->name == "io") return true;
+                    if (id->name == "io") return !ioSync_;
                 }
             }
         }
@@ -167,6 +168,7 @@ private:
     }
 
     const std::set<std::string>& coroFns_;
+    bool ioSync_ = false;
 };
 
 // ============================================================
@@ -182,7 +184,7 @@ private:
 
 CoroDecision CodeGenerator::decideCoro(const FunDecl& decl) {
     if (!decl.body) return CoroDecision::Plain;
-    CoroScanner scanner(coroutineFunctions_);
+    CoroScanner scanner(coroutineFunctions_, ioSync_);
     if (scanner.scan(*decl.body))
         return CoroDecision::Coroutine;
     return CoroDecision::Plain;
@@ -190,7 +192,7 @@ CoroDecision CodeGenerator::decideCoro(const FunDecl& decl) {
 
 CoroDecision CodeGenerator::decideCoro(const MethodDecl& decl) {
     if (!decl.body) return CoroDecision::Plain;
-    CoroScanner scanner(coroutineFunctions_);
+    CoroScanner scanner(coroutineFunctions_, ioSync_);
     if (scanner.scan(*decl.body))
         return CoroDecision::Coroutine;
     return CoroDecision::Plain;
