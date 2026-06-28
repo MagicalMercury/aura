@@ -82,9 +82,8 @@ struct Array : GcObject {
     Iterator end();
 
     static Array<T>* EMPTY() {
-        static Array<T>* empty = make(0);
-        return empty;
-}
+        return make(0);
+    }
 
 private:
     // pop 后合并稀疏相邻块（前 2 + 当前 + 后 2 = 5 窗）

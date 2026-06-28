@@ -25,6 +25,7 @@
 #include "Sema/SemAnalyzer.h"
 #include "CodeGen/CodeGen.h"
 #include "Module/ModuleManager.h"
+#include "Diag/DiagnosticEngine.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -86,121 +87,109 @@ std::string gccFlags(const CliOptions& opts) {
 // ============================================================
 // 单文件编译（原有逻辑，无 import 或仅内置模块）
 // ============================================================
-int compileSingleFile(const CliOptions& opts) {
+int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
     std::string source = Aura::readFile(opts.inputPath);
+    diag.setSourceView(source);
+    diag.reset();
     std::string moduleName = Aura::stemOf(opts.inputPath);
 
     // 词法 + 语法
     Aura::Lexer lexer(source);
     auto tokens = lexer.scanAll();
-    Aura::Parser parser(std::move(tokens));
+    Aura::Parser parser(std::move(tokens), diag);
     auto program = parser.parse();
 
-    if (!parser.errors().empty()) {
-        std::cerr << "Parse errors (" << parser.errors().size() << "):\n";
-        for (auto& err : parser.errors()) std::cerr << "  " << err << '\n';
-        return 1;
-    }
     if (!program) {
         std::cerr << "Error: failed to parse program.\n";
         return 1;
     }
 
-    // 语义分析
-    Aura::SemAnalyzer sema;
-    if (!sema.analyze(*program)) {
-        std::cerr << "Semantic errors:\n";
-        for (auto& err : sema.errors()) std::cerr << "  " << err << '\n';
-        return 1;
+    // 语义分析（尽力模式：Parser 有非致命错误也继续）
+    Aura::SemAnalyzer sema(diag);
+    (void)sema.analyze(*program);
+
+    // C++ 代码生成（仅在无错误时生成可用代码）
+    if (!diag.hasErrors()) {
+        Aura::CodeGenerator cg(diag);
+        Aura::CodeGenConfig cfg;
+        cfg.setConfig(sema);
+        auto unit = cg.generate(*program, moduleName, {}, "", cfg);
+        if (diag.hasErrors()) {
+            std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
+            diag.print(std::cerr);
+            return 1;
+        }
+
+        // 确定 cpp 输出路径
+        std::string cppPath = opts.cppOutput;
+        if (cppPath.empty()) {
+            std::string dir = opts.outputDir.empty()
+                ? std::filesystem::path(opts.inputPath).parent_path().string()
+                : opts.outputDir;
+            cppPath = dir.empty() ? (moduleName + ".gen.cpp")
+                                  : (dir + "/" + moduleName + ".gen.cpp");
+        }
+
+        // 写出
+        {
+            std::ostringstream fullCpp;
+            fullCpp << unit.header;
+            fullCpp << "// ============================================================\n";
+            fullCpp << "// " << moduleName << ".aura → C++20 translation\n";
+            fullCpp << "// ============================================================\n\n";
+            fullCpp << unit.impl;
+            if (!unit.footer.empty()) fullCpp << "\n" << unit.footer;
+            Aura::writeFile(cppPath, fullCpp.str());
+        }
+
+        if (opts.stopAfterCpp) return 0;
+
+        // 编译
+        std::string exePath = std::filesystem::path(cppPath).replace_extension(".exe").string();
+        std::ostringstream compileCmd;
+        compileCmd << "g++ -std=gnu++20 -fcoroutines " << gccFlags(opts)
+                   << " -w -I runtime"
+                   << " \"" << cppPath << "\""
+                   << " runtime/build/libaura_rt.a"
+                   << " -o \"" << exePath << "\""
+                   << " 2>&1";
+
+        int compileRet = std::system(compileCmd.str().c_str());
+        if (compileRet != 0) {
+            std::cerr << "Compilation failed.\n";
+            return 1;
+        }
+
+        if (opts.cppOutput.empty())
+            std::filesystem::remove(cppPath);
+
+        return 0;
     }
 
-    // DEPRECATED: --ast 输出已移除
-    /*
-    // AST 输出（仅 --ast）
-    if (!opts.astOutput.empty()) {
-        std::ostringstream astOut;
-        program->print(astOut, 0);
-        std::string astPath = opts.astOutput;
-        if (!opts.outputDir.empty() && astPath.find('/') == std::string::npos)
-            astPath = opts.outputDir + "/" + astPath;
-        Aura::writeFile(astPath, astOut.str());
-    }
-    */
-
-    // C++ 代码生成
-    Aura::CodeGenerator cg;
-    Aura::CodeGenConfig cfg;
-    cfg.setConfig(sema);
-    auto unit = cg.generate(*program, moduleName, {}, "", cfg);
-
-    if (!cg.errors().empty()) {
-        std::cerr << "CodeGen errors:\n";
-        for (auto& err : cg.errors()) std::cerr << "  " << err << '\n';
-        return 1;
-    }
-
-    // 确定 cpp 输出路径
-    std::string cppPath = opts.cppOutput;
-    if (cppPath.empty()) {
-        std::string dir = opts.outputDir.empty()
-            ? std::filesystem::path(opts.inputPath).parent_path().string()
-            : opts.outputDir;
-        cppPath = dir.empty() ? (moduleName + ".gen.cpp")
-                              : (dir + "/" + moduleName + ".gen.cpp");
-    }
-
-    // 写出
-    {
-        std::ostringstream fullCpp;
-        fullCpp << unit.header;
-        fullCpp << "// ============================================================\n";
-        fullCpp << "// " << moduleName << ".aura → C++20 translation\n";
-        fullCpp << "// ============================================================\n\n";
-        fullCpp << unit.impl;
-        if (!unit.footer.empty()) fullCpp << "\n" << unit.footer;
-        Aura::writeFile(cppPath, fullCpp.str());
-    }
-
-    if (opts.stopAfterCpp) return 0;
-
-    // 编译
-    std::string exePath = std::filesystem::path(cppPath).replace_extension(".exe").string();
-    std::ostringstream compileCmd;
-    compileCmd << "g++ -std=gnu++20 -fcoroutines " << gccFlags(opts)
-               << " -w -I runtime"
-               << " \"" << cppPath << "\""
-               << " runtime/build/libaura_rt.a"
-               << " -o \"" << exePath << "\""
-               << " 2>&1";
-
-    int compileRet = std::system(compileCmd.str().c_str());
-    if (compileRet != 0) {
-        std::cerr << "Compilation failed.\n";
-        return 1;
-    }
-
-    if (opts.cppOutput.empty())
-        std::filesystem::remove(cppPath);
-
-    return 0;
+    // 有错误 → 统一报告
+    std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
+    diag.print(std::cerr);
+    return 1;
 }
 
 // ============================================================
 // 多文件编译（有用户模块 import）
 // keepIntermediate: true = 保留 .cpp/.h 中间文件
 // ============================================================
-int compileMultiFile(const CliOptions& opts, bool keepIntermediate) {
-    Aura::ModuleManager mgr;
+int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::DiagnosticEngine& diag) {
+    diag.reset();
+    Aura::ModuleManager mgr(diag);
 
     // 1. 加载所有模块
     if (!mgr.loadAll(opts.inputPath)) {
-        for (auto& err : mgr.errors()) std::cerr << "Error: " << err << '\n';
+        std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
+        diag.print(std::cerr);
         return 1;
     }
 
     // 2. 循环检测
     if (mgr.hasCycle()) {
-        for (auto& err : mgr.errors()) std::cerr << "Error: " << err << '\n';
+        diag.print(std::cerr);
         return 1;
     }
 
@@ -210,11 +199,26 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate) {
     // 4. 入口点验证
     std::string entryModulePath;
     if (!mgr.validateEntry(entryModulePath)) {
-        for (auto& err : mgr.errors()) std::cerr << "Error: " << err << '\n';
+        diag.print(std::cerr);
         return 1;
     }
 
-    // 5. 确定输出目录
+    // 5. 语义分析各模块
+    for (auto& layer : layers) {
+        for (auto* mod : layer) {
+            if (mod->isBuiltin) continue;
+            if (!mod->ast) continue;
+            Aura::SemAnalyzer sema(diag);
+            (void)sema.analyze(*mod->ast);
+        }
+    }
+    if (diag.hasErrors()) {
+        std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
+        diag.print(std::cerr);
+        return 1;
+    }
+
+    // 6. 确定输出目录
     std::string outDir = opts.outputDir;
     if (outDir.empty()) {
         outDir = std::filesystem::absolute(opts.inputPath).parent_path().string();
@@ -222,7 +226,7 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate) {
     // 确保目录存在
     std::filesystem::create_directories(outDir);
 
-    // 6. 收集所有生成的 .cpp 文件路径
+    // 7. 收集所有生成的 .cpp 文件路径
     std::vector<std::string> allCppPaths;
 
     // 7. 按层编译各模块
@@ -250,12 +254,12 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate) {
             }
 
             // 代码生成
-            Aura::CodeGenerator cg;
+            Aura::CodeGenerator cg(diag);
             auto unit = cg.generate(*mod->ast, mod->moduleName, cgImports, mod->nsName);
 
-            if (!cg.errors().empty()) {
+            if (diag.hasErrors()) {
                 std::cerr << "CodeGen errors in " << mod->sourcePath << ":\n";
-                for (auto& err : cg.errors()) std::cerr << "  " << err << '\n';
+                diag.print(std::cerr);
                 return 1;
             }
 
@@ -358,12 +362,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    Aura::DiagnosticEngine diag;
+    diag.setFileName(opts.inputPath);
+
     // 2. 快速检查入口文件是否有 import 用户模块
     {
         std::string source = Aura::readFile(opts.inputPath);
+        diag.setSourceView(source);
         Aura::Lexer lexer(source);
         auto tokens = lexer.scanAll();
-        Aura::Parser parser(std::move(tokens));
+        Aura::Parser parser(std::move(tokens), diag);
         auto program = parser.parse();
 
         if (program) {
@@ -379,11 +387,13 @@ int main(int argc, char* argv[]) {
             if (hasUserImport) {
                 // 多文件模式：--cpp 是 .cpp/.h 输出目录，-o 是最终 exe 路径
                 opts.outputDir = opts.cppOutput;  // --cpp 指定的目录
-                return compileMultiFile(opts, !opts.cppOutput.empty());
+                diag.reset();  // 清除快速检查产生的错误
+                return compileMultiFile(opts, !opts.cppOutput.empty(), diag);
             }
         }
     }
 
     // 3. 无用户模块 import → 单文件模式
-    return compileSingleFile(opts);
+    diag.reset();  // 清除快速检查产生的错误
+    return compileSingleFile(opts, diag);
 }

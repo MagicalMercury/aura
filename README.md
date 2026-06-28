@@ -163,6 +163,27 @@ let p: Point = { x = 3, y = 4 }   // 按字段名
 let q: Point = { 3, 4 }            // 按字段顺序
 ```
 
+**自定义 record 类型的标注规则**：
+
+自定义记录类型（通过 `type` 定义的命名类型）在用于表达式时，必须通过变量类型标注或上下文告知类型名，否则编译器将其视为匿名 record：
+
+```aura
+type Tree<T> = { value: T, children: [Tree<T>] }
+
+// ✅ 有类型标注 → 编译器知道这是 Tree<int>
+let tree: Tree<int> = { value = 1, children = [] }
+
+// ✅ 上下文推断 → 函数参数/返回值已标注 Tree<T>
+fun make_root(n: int) -> Tree<int> {
+    return { value = n, children = [] }  // 返回类型已知
+}
+
+// ❌ 无标注 → 按匿名 record 处理，类型为 { value: int, children: [???] }
+let tree = { value = 1, children = [] }
+```
+
+> **规则**：自定义 `type` 类型的 record 字面量必须有外部类型标注（`let` 声明类型、函数返回类型、参数类型），编译器据此确定类型的 canonicalName 并生成正确的堆分配代码。无标注时退化为匿名 record，走 designated initializer。在 `isAssignable` 检查中，匿名 record 与命名 record 字段匹配即可赋值。
+
 **联合类型**：
 
 ```aura
@@ -1052,6 +1073,32 @@ fun main(io: Io) throws {
 | `path` 模块 | 纯路径操作，`import path`（无引号） |
 | `Error` 类型 | `{ kind: string, message: string, ... }` 可附加自定义字段 |
 | Path / string 转换 | 字符串字面量和变量可隐式转换为 `Path` |
+
+---
+
+## 附录 C：待开发特性
+
+### C.1 有界并发控制
+
+当前 `sync { spawn { ... } }` 模型适合少量、粗粒度的并发任务（如 3-5 个独立 I/O 操作）。对于大规模并发场景（如同时处理 10000 个文件），缺乏以下能力：
+
+| 缺失特性 | 用途 |
+|---------|------|
+| **有界并发原语**（semaphore / worker pool） | 控制同时运行的 `spawn` 数量，避免创建过多协程帧导致内存压力 |
+| **channel / stream** | 协程间传递数据，不必等全部 `sync` 完成再汇总结果 |
+| **迭代器并发** | 对 `for i in range` 自动分批并发执行，类似 data-parallel |
+
+**当前推荐的变通方案**：手动分批 `sync`，每批处理有限数量（如 100 个），外围用 `while` 循环串行推进各批；或使用递归分治减小单次并发数。
+
+> **注意**：当前所有 I/O 操作（`println`、`read_file`、`write_file`、`readln`、`mkdir`、`remove`、`list_dir`）均为**纯阻塞实现**。即便 `task<T>` 返回版本也只是在阻塞调用外包裹了一层协程壳（`co_return`），体内不包含真正的异步 I/O（如 `io_uring`、`OVERLAPPED`、`epoll` 等）。因此 `spawn` 多个文件读取任务并不会获得 I/O 并发——文件读写会逐个阻塞事件循环线程。真正的异步 I/O 需要底层运行时支持，列入待开发。
+
+### C.2 `spawn` 闭包传参语法
+
+`spawn` 启动的闭包应通过**显式传参**访问外部变量（而非闭包捕获），但具体语法尚未定义。当前 `spawn` 内的闭包行为与普通闭包一致（允许捕获），存在语义模糊。
+
+### C.3 闭包参数类型推断
+
+当前所有闭包参数必须显式标注类型。规范 §5.3 描述的场景——闭包赋值给已知函数类型变量时参数可从上下文推断——尚未实现（标记为 Phase 1）。
 
 ---
 

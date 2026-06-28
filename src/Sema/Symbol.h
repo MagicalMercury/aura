@@ -30,6 +30,7 @@ struct Symbol {
     SymKind  kind;
     std::string name;
     std::unique_ptr<SemType> type; // 符号的类型
+    bool isConst = false;  // const 绑定不可重新赋值
 
     // ——— 仅函数/方法 ———
     std::vector<SymParam> params;

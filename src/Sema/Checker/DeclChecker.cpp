@@ -3,6 +3,44 @@
 namespace Aura {
 
 // ============================================================
+// 辅助：收集 TypeExpr 中所有泛型类型引用名称
+// ============================================================
+void collectGenericRefs(const TypeExpr& type, std::set<std::string>& out) {
+    if (auto* g = dynamic_cast<const GenericTypeRef*>(&type)) {
+        out.insert(g->name);
+        return;
+    }
+    if (auto* n = dynamic_cast<const NamedType*>(&type)) {
+        for (auto& arg : n->typeArgs) {
+            if (arg) collectGenericRefs(*arg, out);
+        }
+        return;
+    }
+    if (auto* l = dynamic_cast<const ListType*>(&type)) {
+        if (l->elementType) collectGenericRefs(*l->elementType, out);
+        return;
+    }
+    if (auto* r = dynamic_cast<const RecordType*>(&type)) {
+        for (auto& f : r->fields) {
+            if (f.type) collectGenericRefs(*f.type, out);
+        }
+        return;
+    }
+    if (auto* u = dynamic_cast<const UnionType*>(&type)) {
+        for (auto& v : u->types) {
+            if (v) collectGenericRefs(*v, out);
+        }
+        return;
+    }
+    if (auto* fn = dynamic_cast<const FunctionType*>(&type)) {
+        for (auto& p : fn->paramTypes) {
+            if (p) collectGenericRefs(*p, out);
+        }
+        if (fn->returnType) collectGenericRefs(*fn->returnType, out);
+    }
+}
+
+// ============================================================
 // 第 1 遍：声明顶层符号
 // ============================================================
 
@@ -32,6 +70,19 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         resolvingTypes_.insert(t->name);
 
         if (t->type) {
+            // 检查类型表达式中使用的泛型参数是否都已声明
+            std::set<std::string> usedGenerics;
+            collectGenericRefs(*t->type, usedGenerics);
+            for (const std::string& g : usedGenerics) {
+                bool declared = false;
+                for (const std::string& tp : t->typeParams) {
+                    if (g == tp) { declared = true; break; }
+                }
+                if (!declared) {
+                    error(*t->type, "undefined type parameter '" + g + "' in type '" + t->name + "'; declare it with type " + t->name + "<" + g + ">");
+                }
+            }
+
             auto resolved = resolveType(*t->type);
             // 记录类型的规范名（如 "Tree"），供 CodeGen 映射 C++ 类型
             if (auto* rec = dynamic_cast<RecordSemType*>(resolved.get())) {
@@ -94,6 +145,12 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
 std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
     if (auto* n = dynamic_cast<const NamedType*>(&astType)) {
         auto result = resolveNamedType(n->name);
+        // 未找到类型 → 报错
+        if (dynamic_cast<const ErrorSemType*>(result.get()) &&
+            n->name != "None" && n->name != "int" && n->name != "float" &&
+            n->name != "bool" && n->name != "string") {
+            error(n->line, n->col, "undefined type '" + n->name + "'");
+        }
         // 若有名称类型且有泛型实参（如 Tree<int>），用 substitute 将泛型形参替换为实参
         if (!n->typeArgs.empty()) {
             auto* sym = symtab_.lookup(n->name);
@@ -242,6 +299,56 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
 
     if (decl.body) checkBlock(*decl.body);
     symtab_.exitScope();
+
+    // impl 接口一致性验证
+    if (!decl.implInterface.empty()) {
+        auto* ifaceSym = symtab_.lookup(decl.implInterface);
+        if (!ifaceSym || ifaceSym->kind != SymKind::Interface) {
+            error(decl, "interface '" + decl.implInterface + "' not found");
+        } else {
+            bool found = false;
+            for (auto& m : ifaceSym->interfaceMethods) {
+                if (m.name == decl.name) {
+                    found = true;
+                    if (decl.params.size() != m.paramTypes.size()) {
+                        error(decl, "impl method '" + decl.name + "' expects " +
+                              std::to_string(m.paramTypes.size()) + " parameter(s), got " +
+                              std::to_string(decl.params.size()));
+                    }
+                    for (size_t i = 0; i < decl.params.size() && i < m.paramTypes.size(); ++i) {
+                        if (decl.params[i].type && m.paramTypes[i]) {
+                            auto implParamTy = resolveType(*decl.params[i].type);
+                            if (!isAssignable(*m.paramTypes[i], *implParamTy)) {
+                                error(*decl.params[i].type,
+                                      "impl method '" + decl.name + "' parameter " +
+                                      std::to_string(i + 1) + " type mismatch: expected '" +
+                                      m.paramTypes[i]->toString() + "', got '" +
+                                      implParamTy->toString() + "'");
+                            }
+                        }
+                    }
+                    if (decl.returnType && m.returnType) {
+                        auto implRetTy = resolveType(*decl.returnType);
+                        if (!isAssignable(*m.returnType, *implRetTy)) {
+                            error(*decl.returnType,
+                                  "impl method '" + decl.name + "' return type mismatch: expected '" +
+                                  m.returnType->toString() + "', got '" +
+                                  implRetTy->toString() + "'");
+                        }
+                    }
+                    if (decl.throws != m.throws) {
+                        error(decl, "impl method '" + decl.name + "' throws mismatch: interface " +
+                              (m.throws ? "requires" : "does not require") + " 'throws'");
+                    }
+                    break;
+                }
+            }
+            if (!found) {
+                error(decl, "interface '" + decl.implInterface +
+                      "' has no method '" + decl.name + "'");
+            }
+        }
+    }
 }
 
 // ============================================================

@@ -7,6 +7,13 @@ namespace Aura {
 // ============================================================
 
 std::unique_ptr<Stmt> Parser::parseStmt() {
+    // 词法错误 Token 检测
+    if (check(TokType::Error)) {
+        Token& errTok = advance();
+        error("lexical error: " + errTok.lexeme);
+        return nullptr;
+    }
+
     if (check(TokType::If))       return parseIfStmt();
     if (check(TokType::While))    return parseWhileStmt();
     if (check(TokType::Loop))     return parseLoopStmt();
@@ -43,25 +50,19 @@ std::unique_ptr<BlockStmt> Parser::parseBlock() {
     auto block = std::make_unique<BlockStmt>();
     setNodePos(block.get(), tok);
 
+    // consume 失败（当前 token 不是 '{'）→ 返回空 Block，不进入 while 循环
+    // 避免吞噬后续所有声明直到 EOF
+    if (tok.type != TokType::LBrace) {
+        return block;
+    }
+
     while (!check(TokType::RBrace) && !atEnd()) {
         auto stmt = parseStmt();
         if (stmt) {
             block->stmts.push_back(std::move(stmt));
         } else {
-            // 错误恢复：跳过当前 token，再跳到下一个语句开头
-            advance();
-            while (!atEnd() && !check(TokType::RBrace) &&
-                   !check(TokType::If) && !check(TokType::While) &&
-                   !check(TokType::Loop) && !check(TokType::For) &&
-                   !check(TokType::Return) && !check(TokType::Throw) &&
-                   !check(TokType::Try) && !check(TokType::Sync) &&
-                   !check(TokType::Spawn) && !check(TokType::Match) &&
-                   !check(TokType::Break) && !check(TokType::Continue) &&
-                   !check(TokType::LBrace) && !check(TokType::Let) &&
-                   !check(TokType::Const) && !check(TokType::Fun) &&
-                   !check(TokType::Identifier) && !check(TokType::Semicolon)) {
-                advance();
-            }
+            // 错误恢复：同步到下一个安全恢复点
+            synchronize();
         }
     }
 
@@ -207,8 +208,13 @@ std::unique_ptr<Stmt> Parser::parseMatchStmt() {
 
         if (check(TokType::LBrace)) {
             mc.body = parseBlock();
+            match(TokType::Comma);  // 允许块形式后跟逗号
         } else {
             mc.body = parseExpr();
+            if (!mc.body) {
+                // 表达式解析失败 → 同步到下一个 '}' 或 ','
+                synchronize();
+            }
             match(TokType::Comma);
         }
 

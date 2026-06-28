@@ -26,7 +26,10 @@ std::unique_ptr<SemType> SemAnalyzer::inferExpr(const ASTNode& expr) {
     if (auto* e = dynamic_cast<const AssignExpr*>(&expr))          return inferAssign(*e);
     if (auto* e = dynamic_cast<const ErrorPropagationExpr*>(&expr))return inferErrorPropagation(*e);
     if (auto* e = dynamic_cast<const PipeExpr*>(&expr))            return inferPipe(*e);
-    if (auto* e = dynamic_cast<const FunExpr*>(&expr))            return inferFunExpr(*e);
+    if (auto* e = dynamic_cast<const FunExpr*>(&expr))             return inferFunExpr(*e);
+
+    // fallback：未知表达式节点类型
+    error(expr, "internal error: unknown expression node in type inference");
     return ErrorSemType::make();
 }
 
@@ -161,6 +164,12 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
     std::map<std::string, std::unique_ptr<SemType>> genericMap;
     // 函数、方法、函数类型变量（let 绑定闭包）、函数类型参数
     if (sym->kind == SymKind::Function || sym->kind == SymKind::Method) {
+        // throws 兼容性检查
+        if (!currentFunctionThrows_ && insideTry_ == 0 && sym->throws) {
+            error(e, DiagCode::E016_ThrowsViolation,
+                  "cannot call throwing function '" + callee->name + "' from non-throwing context",
+                  "add 'throws' to the function signature or wrap in 'try { ... } catch'");
+        }
         // 参数数量检查
         if (e.args.size() != sym->params.size()) {
             error(e, "function '" + callee->name + "' expects " + std::to_string(sym->params.size()) + " arguments, got " + std::to_string(e.args.size()));
@@ -184,6 +193,12 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
     // Variable / Parameter 但类型是函数类型 → 可作为函数调用
     if (sym->kind == SymKind::Variable || sym->kind == SymKind::Parameter) {
         if (auto* fst = dynamic_cast<const FuncSemType*>(sym->type.get())) {
+            // throws 兼容性检查
+            if (!currentFunctionThrows_ && insideTry_ == 0 && fst->throws) {
+                error(e, DiagCode::E016_ThrowsViolation,
+                      "cannot call throwing function from non-throwing context",
+                      "add 'throws' to the function signature or wrap in 'try { ... } catch'");
+            }
             // 参数数量检查（从 FuncSemType 提取）
             if (e.args.size() != fst->paramTypes.size()) {
                 error(e, "function expects " + std::to_string(fst->paramTypes.size()) + " arguments, got " + std::to_string(e.args.size()));
@@ -237,6 +252,12 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
             // 泛型返回（如 pop → T）→ 委托给 C++ 编译器
             return ErrorSemType::make();
         }
+        // 内置类型查表失败 → 报错，不再透传给 C++ 编译器
+        auto typeName = (typeKey == "[T]") ? std::string("array") : std::string("string");
+        error(e, DiagCode::E013_MethodNotFound,
+              "type '" + typeName + "' has no method '" + std::string(e.method) + "'",
+              typeKey == "[T]" ? "valid methods: append, pop, len, size, empty, insert, remove, capacity, front, back, clear, reserve" : "");
+        return ErrorSemType::make();
     }
 
     // 不在表中 → 放行，由 C++ 编译器验证方法存在性
@@ -268,6 +289,16 @@ std::unique_ptr<SemType> SemAnalyzer::inferIndexExpr(const IndexExpr& e) {
 }
 
 std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
+    // const 绑定不可重新赋值
+    if (auto* id = dynamic_cast<const Identifier*>(e.target.get())) {
+        if (auto* sym = symtab_.lookup(id->name)) {
+            if (sym->isConst) {
+                error(e, DiagCode::E015_ConstReassign,
+                      "cannot reassign to const binding '" + id->name + "'",
+                      "use 'let' instead of 'const' if you need to reassign");
+            }
+        }
+    }
     auto targetTy = inferExpr(*e.target);
     auto valueTy  = inferExpr(*e.value);
     if (!isAssignable(*targetTy, *valueTy)) {

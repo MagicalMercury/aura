@@ -7,14 +7,14 @@ namespace Aura {
 // 构造 & 主入口
 // ============================================================
 
-SemAnalyzer::SemAnalyzer() {}
+SemAnalyzer::SemAnalyzer(DiagnosticEngine& diag) : diag_(diag) {}
 
 bool SemAnalyzer::analyze(const Program& program) {
-    errors_.clear();
+    diag_.reset();
     declareTopLevel(program);
-    if (!errors_.empty()) return false;
+    if (diag_.hasErrors()) return false;
     checkProgram(program);
-    return errors_.empty();
+    return !diag_.hasErrors();
 }
 
 // ============================================================
@@ -22,11 +22,19 @@ bool SemAnalyzer::analyze(const Program& program) {
 // ============================================================
 
 void SemAnalyzer::error(const ASTNode& node, const std::string& msg) {
-    error(node.line, node.col, msg);
+    diag_.error(node, msg);
+}
+
+void SemAnalyzer::error(const ASTNode& node, DiagCode code, const std::string& msg, const std::string& hint) {
+    diag_.error(node, code, msg, hint);
 }
 
 void SemAnalyzer::error(int line, int col, const std::string& msg) {
-    errors_.push_back("[line " + std::to_string(line) + ":" + std::to_string(col) + "] " + msg);
+    diag_.error(line, col, msg);
+}
+
+void SemAnalyzer::error(int line, int col, DiagCode code, const std::string& msg, const std::string& hint) {
+    diag_.error(line, col, code, msg, hint);
 }
 
 // ============================================================
@@ -39,6 +47,11 @@ std::unique_ptr<SemType> SemAnalyzer::resolveNamedType(const std::string& name) 
     if (name == "float")  return floatType();
     if (name == "bool")   return boolType();
     if (name == "string") return stringType();
+
+    // None 不能作为独立变量类型（仅允许在联合类型中）
+    if (name == "None") {
+        return ErrorSemType::make();
+    }
 
     // 用户定义类型
     auto* sym = symtab_.lookup(name);
@@ -402,8 +415,14 @@ void SemAnalyzer::checkStmt(const Stmt& stmt) {
     if (auto* s = dynamic_cast<const SyncStmt*>(&stmt))         { checkSyncStmt(*s);    return; }
     if (auto* p = dynamic_cast<const SpawnStmt*>(&stmt))        { checkSpawnStmt(*p);   return; }
     if (auto* e = dynamic_cast<const ExprStmt*>(&stmt))         { checkExprStmt(*e);    return; }
-    if (dynamic_cast<const BreakStmt*>(&stmt))                     {                         return; }
-    if (dynamic_cast<const ContinueStmt*>(&stmt))                  {                         return; }
+    if (auto* br = dynamic_cast<const BreakStmt*>(&stmt)) {
+        if (!insideLoop_) error(*br, "'break' outside of loop");
+        return;
+    }
+    if (auto* co = dynamic_cast<const ContinueStmt*>(&stmt)) {
+        if (!insideLoop_) error(*co, "'continue' outside of loop");
+        return;
+    }
 }
 
 } // namespace Aura

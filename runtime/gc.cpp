@@ -242,9 +242,9 @@ void GcHeap::markPhase(bool youngOnly) {
 
     // 2. 从栈帧根出发标记（保守扫描栈中的指针）
     for (auto& [begin, end] : stackRoots_) {
-        char* start = static_cast<char*>(begin);
-        char* stop  = static_cast<char*>(end);
-        for (char* p = start; p + sizeof(void*) <= stop; p += sizeof(void*)) {
+        char* start2 = static_cast<char*>(begin);
+        char* stop2  = static_cast<char*>(end);
+        for (char* p = start2; p + sizeof(void*) <= stop2; p += sizeof(void*)) {
             void* candidate = *reinterpret_cast<void**>(p);
             if (!candidate) continue;
             // 保守检查：候选指针是否在 GC 页范围内
@@ -252,7 +252,9 @@ void GcHeap::markPhase(bool youngOnly) {
                 if (candidate >= static_cast<void*>(page->data) &&
                     candidate < static_cast<void*>(page->data + kPageSize)) {
                     GcObject* obj = static_cast<GcObject*>(candidate);
-                    if (youngOnly && obj->generation == 1) continue;
+                    // 验证是否为有效的 GC 对象再读取字段
+                    if (!obj->desc || obj->desc->size == 0) break;
+                    if (youngOnly && obj->generation == 1) break;
                     markObject(obj);
                     break;
                 }

@@ -6,6 +6,7 @@
 #include "../AST/Type.h"
 #include "SemType.h"
 #include "SymbolTable.h"
+#include "../Diag/DiagnosticEngine.h"
 #include <map>
 #include <set>
 #include <string>
@@ -23,7 +24,7 @@ namespace Aura {
 
 class SemAnalyzer {
 public:
-    SemAnalyzer();
+    SemAnalyzer(DiagnosticEngine& diag);
 
     // 主入口：分析整个程序，返回是否有错误
     [[nodiscard]] bool analyze(const Program& program);
@@ -32,12 +33,14 @@ public:
     [[nodiscard]] bool getIoSync() const { return ioSync_; }
 
     // 错误列表
-    const std::vector<std::string>& errors() const { return errors_; }
+    const std::vector<std::string>& errors() const { return diag_.errorMessages(); }
 
 private:
     // ============ 错误记录 ============
     void error(const ASTNode& node, const std::string& msg);
+    void error(const ASTNode& node, DiagCode code, const std::string& msg, const std::string& hint = "");
     void error(int line, int col, const std::string& msg);
+    void error(int line, int col, DiagCode code, const std::string& msg, const std::string& hint = "");
 
     // ============ 语义类型工具 ============
     // AST 类型 → 语义类型
@@ -120,6 +123,7 @@ private:
     std::unique_ptr<SemType> currentReturnType_;
     bool currentFunctionThrows_ = false;
     bool insideLoop_ = false; // break/continue 仅在循环内合法
+    bool insideSync_ = false; // spawn 仅在 sync 块内合法
     int  insideTry_  = 0;    // try 块嵌套深度（>0 时 ! 不报 non-throwing）
 
     // ============ 递归类型解析 ============
@@ -140,7 +144,7 @@ private:
 
     // ============ 成员表 ============
     SymbolTable symtab_;
-    std::vector<std::string> errors_;
+    DiagnosticEngine& diag_;
 };
 
 } // namespace Aura

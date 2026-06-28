@@ -11,6 +11,7 @@
 
 #include "../AST/Stmt.h"
 #include "../CodeGen/CodeGen.h"
+#include "../Diag/DiagnosticEngine.h"
 
 #include <memory>
 #include <string>
@@ -57,7 +58,7 @@ struct ModuleInfo {
 // ============================================================
 class ModuleManager {
 public:
-    ModuleManager() = default;
+    ModuleManager(DiagnosticEngine& diag);
 
     // 从入口文件开始，递归加载所有依赖模块
     bool loadAll(const std::string& entryPath);
@@ -76,7 +77,7 @@ public:
     const std::unordered_map<std::string, ModuleInfo>& modules() const { return modules_; }
 
     // 获取错误信息
-    const std::vector<std::string>& errors() const { return errors_; }
+    const std::vector<std::string>& errors() const { return diag_.errorMessages(); }
 
 private:
     // 解析单个 .aura 文件，返回 ModuleInfo（AST 常驻）
@@ -97,7 +98,7 @@ private:
     bool isKnownBuiltin(const std::string& name) const;
 
     std::unordered_map<std::string, ModuleInfo> modules_;
-    std::vector<std::string> errors_;
+    DiagnosticEngine& diag_;
 };
 
 // ============================================================

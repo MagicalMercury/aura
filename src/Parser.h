@@ -6,6 +6,7 @@
 #include "AST/Stmt.h"
 #include "AST/Type.h"
 #include "Token.h"
+#include "Diag/DiagnosticEngine.h"
 #include <memory>
 #include <vector>
 
@@ -13,13 +14,13 @@ namespace Aura {
 
 class Parser {
 public:
-    explicit Parser(std::vector<Token> tokens);
+    explicit Parser(std::vector<Token> tokens, DiagnosticEngine& diag);
 
     // 解析完整程序
     [[nodiscard]] std::unique_ptr<Program> parse();
 
     // 获取词法错误列表
-    const std::vector<std::string>& errors() const { return errors_; }
+    const std::vector<std::string>& errors() const { return diag_.errorMessages(); }
 
 private:
     // --- 辅助 ---
@@ -33,6 +34,10 @@ private:
     void error(const std::string& msg);
     void setNodePos(ASTNode* node, const Token& tok);
     static bool isKeywordIdent(TokType t) { return t >= TokType::Fun && t <= TokType::None; }
+
+    // --- 错误恢复 ---
+    void synchronize();                // 跳到下一个安全恢复点
+    void synchronizeTo(TokType type);  // 跳到特定 token 类型
 
     // --- 解析声明 ---
     std::unique_ptr<Decl> parseDecl();
@@ -93,7 +98,7 @@ private:
     // --- 数据 ---
     std::vector<Token> tokens_;
     size_t currentIdx_ = 0;
-    std::vector<std::string> errors_;
+    DiagnosticEngine& diag_;
 };
 
 } // namespace Aura

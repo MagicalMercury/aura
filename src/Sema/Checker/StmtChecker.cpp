@@ -15,6 +15,17 @@ void SemAnalyzer::checkBlock(const BlockStmt& stmt) {
 }
 
 void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
+    // None 不能作为独立变量类型
+    if (decl.type) {
+        if (auto* nt = dynamic_cast<const NamedType*>(decl.type.get())) {
+            if (nt->name == "None") {
+                error(decl, DiagCode::E017_NoneStandalone,
+                      "None cannot be used as a standalone type; use a union type (e.g. 'int | None')");
+                return;
+            }
+        }
+    }
+
     // 先注册占位符号（若有类型标注则用标注类型，否则暂设 error），
     // 使递归闭包能引用自身（如 let fact: fun(int)->int = fun(n) { return n * fact(n-1) }）
     {
@@ -47,6 +58,17 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
 }    
 
 void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
+    // None 不能作为独立变量类型
+    if (decl.type) {
+        if (auto* nt = dynamic_cast<const NamedType*>(decl.type.get())) {
+            if (nt->name == "None") {
+                error(decl, DiagCode::E017_NoneStandalone,
+                      "None cannot be used as a standalone type; use a union type (e.g. 'int | None')");
+                return;
+            }
+        }
+    }
+
     auto inferredType = decl.initializer ? inferExpr(*decl.initializer) : ErrorSemType::make();
     if (decl.type) {
         auto declaredType = resolveType(*decl.type);
@@ -56,7 +78,8 @@ void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
         inferredType = std::move(declaredType);
     }
     Symbol sym;
-    sym.kind = SymKind::Variable; // const 也按 variable 存储，后续由 const 语义保证
+    sym.kind = SymKind::Variable;
+    sym.isConst = true;
     sym.name = decl.name;
     sym.type = inferredType->clone();
     symtab_.define(std::move(sym));
@@ -174,7 +197,8 @@ void SemAnalyzer::checkMatchStmt(const MatchStmt& stmt) {
         }
     }
     if (matchedType && !isMatchExhaustive(*matchedType, stmt.cases)) {
-        // 弱警告：不阻止编译
+        error(stmt, DiagCode::E014_MatchNotExhaustive,
+              "match is not exhaustive: not all variants are covered");
     }
 }
 
@@ -193,10 +217,18 @@ void SemAnalyzer::checkTryCatchStmt(const TryCatchStmt& stmt) {
 }
 
 void SemAnalyzer::checkSyncStmt(const SyncStmt& stmt) {
+    insideSync_ = true;
     if (stmt.body) checkBlock(*stmt.body);
+    insideSync_ = false;
 }
 
 void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
+    if (!insideSync_) {
+        error(stmt, DiagCode::E018_SpawnOutsideSync,
+          "'spawn' can only be used inside a 'sync' block",
+          "wrap the spawn statement in 'sync { ... }'");
+        return;
+    }
     symtab_.enterScope();
     for (auto& s : stmt.body) {
         if (s) checkStmt(*s);

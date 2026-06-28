@@ -40,6 +40,7 @@ using enum PrimSemType::Kind;
 inline const MethodEntry kMethods[] = {
     // === string (→ GcString*) ===
     {"string", "len",           0, false, false, (int)Int},
+    {"string", "concat",        1, true,  false, 0},    // 返回 GcString*
 
     // === [T] (→ Array<T>*) ===
     {"[T]",    "append",        1, false, true,  0},
@@ -50,6 +51,11 @@ inline const MethodEntry kMethods[] = {
     {"[T]",    "empty",         0, false, false, (int)Bool},
     {"[T]",    "remove",        1, true,  false, 0},    // 返回 T
     {"[T]",    "insert",        2, false, true,  0},
+    {"[T]",    "capacity",      0, false, false, (int)Int},
+    {"[T]",    "front",         0, true,  false, 0},    // 返回 T
+    {"[T]",    "back",          0, true,  false, 0},    // 返回 T
+    {"[T]",    "clear",         0, false, true,  0},
+    {"[T]",    "reserve",       1, false, true,  0},
 };
 
 // --- 快速查找 ---

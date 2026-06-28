@@ -17,6 +17,11 @@
 namespace Aura {
 
 // ============================================================
+// ModuleManager 构造
+// ============================================================
+ModuleManager::ModuleManager(DiagnosticEngine& diag) : diag_(diag) {}
+
+// ============================================================
 // 文件工具
 // ============================================================
 std::string readFile(const std::string& path) {
@@ -107,7 +112,7 @@ ModuleInfo ModuleManager::parseModule(const std::string& sourcePath) {
 
     std::string source = readFile(sourcePath);
     if (source.empty()) {
-        errors_.push_back("cannot read file: " + sourcePath);
+        diag_.error(0, 0, sourcePath + ": cannot read file");
         return info;
     }
 
@@ -115,17 +120,11 @@ ModuleInfo ModuleManager::parseModule(const std::string& sourcePath) {
     Lexer lexer(source);
     auto tokens = lexer.scanAll();
 
-    Parser parser(std::move(tokens));
+    Parser parser(std::move(tokens), diag_);
     info.ast = parser.parse();
 
-    if (!parser.errors().empty()) {
-        for (auto& err : parser.errors())
-            errors_.push_back(sourcePath + ": " + err);
-        return info;
-    }
-
     if (!info.ast) {
-        errors_.push_back(sourcePath + ": failed to parse");
+        diag_.error(0, 0, sourcePath + ": failed to parse");
         return info;
     }
 
@@ -154,7 +153,7 @@ ModuleInfo ModuleManager::parseModule(const std::string& sourcePath) {
                 std::string importerDir = std::filesystem::path(sourcePath).parent_path().string();
                 std::string resolved = resolveImportPath(ii.path, importerDir);
                 if (resolved.empty()) {
-                    errors_.push_back(sourcePath + ": cannot resolve import '" + ii.path + "'");
+                    diag_.error(0, 0, sourcePath + ": cannot resolve import '" + ii.path + "'");
                     continue;
                 }
                 ii.path = resolved; // 存入解析后的绝对路径
@@ -218,7 +217,7 @@ bool ModuleManager::loadAll(const std::string& entryPath) {
 
         ModuleInfo info = parseModule(path);
         if (!info.ast) {
-            errors_.push_back("failed to parse: " + path);
+            diag_.error(0, 0, "failed to parse: " + path);
             return false;
         }
 
@@ -232,7 +231,7 @@ bool ModuleManager::loadAll(const std::string& entryPath) {
         modules_[path] = std::move(info);
     }
 
-    return errors_.empty();
+    return !diag_.hasErrors();
 }
 
 // ============================================================
@@ -259,7 +258,7 @@ bool ModuleManager::hasCycle() {
 
     for (auto& [path, _] : modules_) {
         if (color[path] == White && dfs(path)) {
-            errors_.push_back("circular dependency detected involving: " + path);
+            diag_.error(0, 0, "circular dependency detected involving: " + path);
             return true;
         }
     }
@@ -351,11 +350,11 @@ bool ModuleManager::validateEntry(std::string& outEntryModule) {
     }
 
     if (entryCount == 0) {
-        errors_.push_back("no entry point found: no module contains 'fun main(io: Io)'");
+        diag_.error(0, 0, "no entry point found: no module contains 'fun main(io: Io)'");
         return false;
     }
     if (entryCount > 1) {
-        errors_.push_back("multiple entry points found: more than one module defines 'fun main(io: Io)'");
+        diag_.error(0, 0, "multiple entry points found: more than one module defines 'fun main(io: Io)'");
         return false;
     }
 

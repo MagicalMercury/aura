@@ -13,11 +13,14 @@ std::unique_ptr<ASTNode> Parser::parseExpr() {
 std::unique_ptr<ASTNode> Parser::parseAssignment() {
     auto left = parsePipe();
 
+    if (!left) return nullptr;
+
     if (match(TokType::Assign)) {
         auto assign = std::make_unique<AssignExpr>();
         setNodePos(assign.get(), peek());
         assign->target = std::move(left);
         assign->value = parseAssignment();
+        if (!assign->value) return nullptr;
         return assign;
     }
 
@@ -27,11 +30,14 @@ std::unique_ptr<ASTNode> Parser::parseAssignment() {
 std::unique_ptr<ASTNode> Parser::parsePipe() {
     auto left = parseOr();
 
+    if (!left) return nullptr;
+
     while (match(TokType::Pipe)) {
         auto pipe = std::make_unique<PipeExpr>();
         setNodePos(pipe.get(), peek());
         pipe->left = std::move(left);
         pipe->right = parseOr();
+        if (!pipe->right) return nullptr;
         left = std::move(pipe);
     }
 
@@ -41,12 +47,15 @@ std::unique_ptr<ASTNode> Parser::parsePipe() {
 std::unique_ptr<ASTNode> Parser::parseOr() {
     auto left = parseAnd();
 
+    if (!left) return nullptr;
+
     while (match(TokType::Or)) {
         auto bin = std::make_unique<BinaryExpr>();
         setNodePos(bin.get(), peek());
         bin->op = "or";
         bin->left = std::move(left);
         bin->right = parseAnd();
+        if (!bin->right) return nullptr;
         left = std::move(bin);
     }
 
@@ -56,12 +65,15 @@ std::unique_ptr<ASTNode> Parser::parseOr() {
 std::unique_ptr<ASTNode> Parser::parseAnd() {
     auto left = parseEquality();
 
+    if (!left) return nullptr;
+
     while (match(TokType::And)) {
         auto bin = std::make_unique<BinaryExpr>();
         setNodePos(bin.get(), peek());
         bin->op = "and";
         bin->left = std::move(left);
         bin->right = parseEquality();
+        if (!bin->right) return nullptr;
         left = std::move(bin);
     }
 
@@ -71,6 +83,8 @@ std::unique_ptr<ASTNode> Parser::parseAnd() {
 std::unique_ptr<ASTNode> Parser::parseEquality() {
     auto left = parseComparison();
 
+    if (!left) return nullptr;
+
     while (check(TokType::EqEq) || check(TokType::NotEq)) {
         auto& opTok = advance();
         auto bin = std::make_unique<BinaryExpr>();
@@ -78,6 +92,7 @@ std::unique_ptr<ASTNode> Parser::parseEquality() {
         bin->op = opTok.lexeme;
         bin->left = std::move(left);
         bin->right = parseComparison();
+        if (!bin->right) return nullptr;
         left = std::move(bin);
     }
 
@@ -87,6 +102,8 @@ std::unique_ptr<ASTNode> Parser::parseEquality() {
 std::unique_ptr<ASTNode> Parser::parseComparison() {
     auto left = parseAddSub();
 
+    if (!left) return nullptr;
+
     while (check(TokType::Less) || check(TokType::LessEq) ||
            check(TokType::Greater) || check(TokType::GreaterEq)) {
         auto& opTok = advance();
@@ -95,6 +112,7 @@ std::unique_ptr<ASTNode> Parser::parseComparison() {
         bin->op = opTok.lexeme;
         bin->left = std::move(left);
         bin->right = parseAddSub();
+        if (!bin->right) return nullptr;
         left = std::move(bin);
     }
 
@@ -104,6 +122,8 @@ std::unique_ptr<ASTNode> Parser::parseComparison() {
 std::unique_ptr<ASTNode> Parser::parseAddSub() {
     auto left = parseMulDiv();
 
+    if (!left) return nullptr;
+
     while (check(TokType::Plus) || check(TokType::Minus)) {
         auto& opTok = advance();
         auto bin = std::make_unique<BinaryExpr>();
@@ -111,6 +131,7 @@ std::unique_ptr<ASTNode> Parser::parseAddSub() {
         bin->op = opTok.lexeme;
         bin->left = std::move(left);
         bin->right = parseMulDiv();
+        if (!bin->right) return nullptr;
         left = std::move(bin);
     }
 
@@ -120,6 +141,8 @@ std::unique_ptr<ASTNode> Parser::parseAddSub() {
 std::unique_ptr<ASTNode> Parser::parseMulDiv() {
     auto left = parseUnary();
 
+    if (!left) return nullptr;
+
     while (check(TokType::Star) || check(TokType::Slash) || check(TokType::Percent)) {
         auto& opTok = advance();
         auto bin = std::make_unique<BinaryExpr>();
@@ -127,6 +150,7 @@ std::unique_ptr<ASTNode> Parser::parseMulDiv() {
         bin->op = opTok.lexeme;
         bin->left = std::move(left);
         bin->right = parseUnary();
+        if (!bin->right) return nullptr;
         left = std::move(bin);
     }
 
@@ -220,6 +244,13 @@ std::unique_ptr<ASTNode> Parser::parseCall() {
 }
 
 std::unique_ptr<ASTNode> Parser::parsePrimary() {
+    // 词法错误 Token 检测
+    if (check(TokType::Error)) {
+        Token& errTok = advance();
+        error("lexical error: " + errTok.lexeme);
+        return nullptr;
+    }
+
     // 闭包表达式: fun (params) -> Ret { body }
     if (check(TokType::Fun)) {
         return parseFunExpr();

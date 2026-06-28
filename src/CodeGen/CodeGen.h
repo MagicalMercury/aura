@@ -7,6 +7,7 @@
 #include "../ASTWalker.h"
 #include "../Lexer.h"
 #include "../Token.h"
+#include "../Diag/DiagnosticEngine.h"
 #include <functional>
 #include <map>
 #include <ostream>
@@ -98,7 +99,7 @@ struct TypeMapEntry {
 // ============================================================
 class CodeGenerator {
 public:
-    CodeGenerator();
+    CodeGenerator(DiagnosticEngine& diag);
 
     // -- 主入口 --
     // 生成一个编译单元（.aura → .cpp/.h）
@@ -113,7 +114,7 @@ public:
     [[nodiscard]] CoroDecision decideCoro(const MethodDecl& decl);
 
     // -- 错误 --
-    const std::vector<std::string>& errors() const { return errors_; }
+    const std::vector<std::string>& errors() const { return diag_.errorMessages(); }
 
 public:
     // ============================================================
@@ -423,7 +424,7 @@ private:
     std::vector<std::string> expectedTemplateArgs_;
 
     // 错误列表
-    std::vector<std::string> errors_;
+    DiagnosticEngine& diag_;
 };
 
 } // namespace Aura

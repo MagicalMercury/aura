@@ -18,7 +18,7 @@ void CodeGenConfig::setConfig(const SemAnalyzer& sema) {
 // 构造 & 主入口
 // ============================================================
 
-CodeGenerator::CodeGenerator() {
+CodeGenerator::CodeGenerator(DiagnosticEngine& diag) : diag_(diag) {
     // 注册内置值类型
     registeredTypes_["int"]    = false;
     registeredTypes_["float"]  = false;
@@ -137,13 +137,17 @@ CompileUnit CodeGenerator::generate(const Program& program,
     // 第三遍 A：先生成所有声明（避免前向引用问题）
     for (auto& d : program.decls) {
         if (!d) continue;
+        if (diag_.errorCount() > 10) break;  // 错误过多，停止生成
         genDecl(header, impl, *d, unit, true);
     }
 
     // 第三遍 B：再生成所有定义
-    for (auto& d : program.decls) {
-        if (!d) continue;
-        genDecl(header, impl, *d, unit, false);
+    if (diag_.errorCount() <= 10) {
+        for (auto& d : program.decls) {
+            if (!d) continue;
+            if (diag_.errorCount() > 10) break;
+            genDecl(header, impl, *d, unit, false);
+        }
     }
 
     // 关闭命名空间（若有）
@@ -246,8 +250,7 @@ std::string CodeGenerator::safeName(const std::string& name) const {
 // ============================================================
 
 void CodeGenerator::error(const ASTNode& node, const std::string& msg) {
-    errors_.push_back("[line " + std::to_string(node.line) + ":" +
-                      std::to_string(node.col) + "] codegen: " + msg);
+    diag_.error(node, "codegen: " + msg);
 }
 
 } // namespace Aura
