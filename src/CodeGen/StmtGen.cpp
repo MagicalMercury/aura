@@ -1,4 +1,6 @@
 #include "CodeGen.h"
+#include "../Sema/BuiltinRegistry.h"
+#include "../Sema/SemType.h"
 
 namespace Aura {
 
@@ -45,6 +47,8 @@ void CodeGenerator::genStmt(std::ostream& cpp, const Stmt& stmt,
         { genTryCatchStmt(cpp, *tc, isCoroutine); return; }
     if (auto* s = dynamic_cast<const SyncStmt*>(&stmt))
         { genSyncStmt(cpp, *s, isCoroutine); return; }
+    if (auto* sf = dynamic_cast<const SyncForStmt*>(&stmt))
+        { genSyncForStmt(cpp, *sf, isCoroutine); return; }
     if (auto* sp = dynamic_cast<const SpawnStmt*>(&stmt))
         { genSpawnStmt(cpp, *sp, isCoroutine); return; }
     if (auto* m = dynamic_cast<const MatchStmt*>(&stmt))
@@ -177,6 +181,27 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                 valueTypeVarNames_.insert(safeName(decl.name));
         }
     }
+    // Phase 4: 通过 Sema 推断类型识别值类型（Io/Path 等）
+    if (decl.inferredType) {
+        if (auto* g = dynamic_cast<const GenericSemType*>(decl.inferredType)) {
+            if (auto* ti = BuiltinRegistry::get().findType(g->name)) {
+                if (!ti->isHeap)
+                    valueTypeVarNames_.insert(safeName(decl.name));
+            }
+        }
+    }
+    // Phase 4 fallback: 通过初始化代码模式检测 Path 值类型
+    if (!init.empty()) {
+        if (init.find("io.cwd()") != std::string::npos ||
+            init.find("io.file_exists") != std::string::npos) {
+            valueTypeVarNames_.insert(safeName(decl.name));
+        }
+    }
+
+    // 跟踪 channel 类型变量（用于后续 method call co_await 判定和 for-in-channel 展开）
+    if (!init.empty() && init.find("Channel<") != std::string::npos) {
+        channelVarNames_.insert(safeName(decl.name));
+    }
 }
 
 void CodeGenerator::genConstStmt(std::ostream& cpp, const ConstDecl& decl) {
@@ -297,6 +322,52 @@ void CodeGenerator::genWhileStmt(std::ostream& cpp, const WhileStmt& stmt,
 
 void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
                                 bool isCoroutine) {
+    // 检测 range() 调用 — 展开为 std::views::iota 或 step 循环
+    if (auto* call = dynamic_cast<const CallExpr*>(stmt.iterable.get())) {
+        auto* id = dynamic_cast<const Identifier*>(call->callee.get());
+        if (id && id->name == "range") {
+            std::string var = safeName(stmt.itemName);
+            if (call->args.size() == 1) {
+                std::string end = genExpr(*call->args[0], isCoroutine);
+                cpp << indentStr() << "for (auto " << var
+                    << " : std::views::iota(0, " << end << ")) {\n";
+            } else if (call->args.size() == 2) {
+                std::string start = genExpr(*call->args[0], isCoroutine);
+                std::string end   = genExpr(*call->args[1], isCoroutine);
+                cpp << indentStr() << "for (auto " << var
+                    << " : std::views::iota(" << start << ", " << end << ")) {\n";
+            } else if (call->args.size() == 3) {
+                std::string start = genExpr(*call->args[0], isCoroutine);
+                std::string end   = genExpr(*call->args[1], isCoroutine);
+                std::string step  = genExpr(*call->args[2], isCoroutine);
+                cpp << indentStr() << "for (auto " << var
+                    << " = " << start
+                    << "; " << var << " < " << end
+                    << "; " << var << " += " << step << ") {\n";
+            }
+            if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+            cpp << indentStr() << "}\n";
+            return;
+        }
+    }
+
+    // 检测 channel 遍历：for val in ch → while + co_await receive 循环
+    if (auto* id = dynamic_cast<const Identifier*>(stmt.iterable.get())) {
+        if (channelVarNames_.count(id->name)) {
+            std::string var = safeName(stmt.itemName);
+            std::string chName = safeName(id->name);
+            cpp << indentStr() << "while (true) {\n";
+            indentLevel_++;
+            writeLine(cpp, "if (" + chName + "->is_done()) break;");
+            writeLine(cpp, "auto " + var + " = co_await " + chName + "->receive();");
+            if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+            indentLevel_--;
+            cpp << indentStr() << "}\n";
+            return;
+        }
+    }
+
+    // 默认：数组/列表遍历
     std::string iter = genExpr(*stmt.iterable, isCoroutine);
     cpp << indentStr() << "for (auto " << safeName(stmt.itemName)
         << " : *" << iter << ") {\n";
@@ -424,16 +495,150 @@ void CodeGenerator::genTryCatchRaw(std::ostream& cpp,
 
 void CodeGenerator::genSyncStmt(std::ostream& cpp, const SyncStmt& stmt,
                                  bool /*isCoroutine*/) {
-    cpp << indentStr() << "{\n";
-    cpp << indentStr() << "    std::vector<aura_rt::task<void>> _tasks;\n";
+    if (stmt.maxExpr) {
+        // 有界版本：sync(max = N) { ... }
+        std::string maxN = genExpr(*stmt.maxExpr, false);
+        cpp << indentStr() << "{\n";
+        indentLevel_++;
+        writeLine(cpp, "aura_rt::bounded_sync _sync(" + maxN + ");");
+        writeLine(cpp, "auto& _tasks = _sync.tasks();");
+        if (stmt.body) genBlock(cpp, *stmt.body, true);
+        writeLine(cpp, "aura_rt::gc_safepoint();");
+        writeLine(cpp, "co_await _sync.wait_all();");
+        indentLevel_--;
+        cpp << indentStr() << "}\n";
+    } else {
+        // 无界版本（兼容旧语法）
+        cpp << indentStr() << "{\n";
+        writeLine(cpp, "std::vector<aura_rt::task<void>> _tasks;");
+        if (stmt.body) genBlock(cpp, *stmt.body, true);
+        writeLine(cpp, "aura_rt::gc_safepoint();");
+        writeLine(cpp, "co_await aura_rt::when_all(std::move(_tasks));");
+        cpp << indentStr() << "}\n";
+    }
+}
+
+void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt,
+                                    bool /*isCoroutine*/) {
+    std::string var = safeName(stmt.itemName);
+    bool hasMax = stmt.maxExpr != nullptr;
+
+    // 1. Open sync block
+    if (hasMax) {
+        std::string maxN = genExpr(*stmt.maxExpr, false);
+        cpp << indentStr() << "{\n";
+        indentLevel_++;
+        writeLine(cpp, "aura_rt::bounded_sync _sync(" + maxN + ");");
+        writeLine(cpp, "auto& _tasks = _sync.tasks();");
+    } else {
+        cpp << indentStr() << "{\n";
+        indentLevel_++;
+        writeLine(cpp, "std::vector<aura_rt::task<void>> _tasks;");
+    }
+
+    // 2. Generate for loop over iterable
+    bool isRangeCall = false;
+    if (auto* call = dynamic_cast<const CallExpr*>(stmt.iterable.get())) {
+        auto* id = dynamic_cast<const Identifier*>(call->callee.get());
+        if (id && id->name == "range") {
+            isRangeCall = true;
+            if (call->args.size() == 1) {
+                std::string end = genExpr(*call->args[0], true);
+                cpp << indentStr() << "for (auto " << var
+                    << " : std::views::iota(0, " << end << ")) {\n";
+            } else if (call->args.size() == 2) {
+                std::string start = genExpr(*call->args[0], true);
+                std::string end   = genExpr(*call->args[1], true);
+                cpp << indentStr() << "for (auto " << var
+                    << " : std::views::iota(" << start << ", " << end << ")) {\n";
+            }
+        }
+    }
+    if (!isRangeCall) {
+        std::string iter = genExpr(*stmt.iterable, true);
+        cpp << indentStr() << "for (auto " << var
+            << " : *" << iter << ") {\n";
+    }
+    indentLevel_++;
+
+    // 3. Generate spawn lambda
+    cpp << indentStr() << "_tasks.push_back([](auto " << var
+        << ", aura_rt::Io& io, std::vector<aura_rt::task<void>>& _tasks"
+        << ") -> aura_rt::task<void> {\n";
+    indentLevel_++;
+    insideSpawn_ = true;
     if (stmt.body) genBlock(cpp, *stmt.body, true);
-    cpp << indentStr() << "    aura_rt::gc_safepoint();\n";
-    cpp << indentStr() << "    co_await aura_rt::when_all(std::move(_tasks));\n";
+    insideSpawn_ = false;
+    writeLine(cpp, "co_return;");
+    indentLevel_--;
+    writeLine(cpp, "}(" + var + ", io, _tasks));");
+
+    // 4. Close for loop
+    indentLevel_--;
+    cpp << indentStr() << "}\n";
+
+    // 5. Close sync block
+    writeLine(cpp, "aura_rt::gc_safepoint();");
+    if (hasMax) {
+        writeLine(cpp, "co_await _sync.wait_all();");
+    } else {
+        writeLine(cpp, "co_await aura_rt::when_all(std::move(_tasks));");
+    }
+    indentLevel_--;
     cpp << indentStr() << "}\n";
 }
 
 void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
                                   bool /*isCoroutine*/) {
+    // === 显式传参模式（spawn (io: Io, n: int) { ... }） ===
+    if (!stmt.params.empty()) {
+        // 检查用户是否已声明 io / _tasks
+        bool hasIo = false;
+        bool hasTasks = false;
+        for (auto& p : stmt.params) {
+            if (p.name == "io") hasIo = true;
+            if (p.name == "_tasks") hasTasks = true;
+        }
+
+        // 生成 lambda 签名为显式参数
+        cpp << indentStr() << "_tasks.push_back([](";
+        for (size_t i = 0; i < stmt.params.size(); ++i) {
+            if (i > 0) cpp << ", ";
+            cpp << (stmt.params[i].type ? mapParamType(*stmt.params[i].type) : "auto")
+                << " " << safeName(stmt.params[i].name);
+        }
+        // 自动追加 io 和 _tasks（如果用户未声明）
+        if (!hasIo) cpp << ", aura_rt::Io& io";
+        if (!hasTasks) cpp << ", std::vector<aura_rt::task<void>>& _tasks";
+        cpp << ") -> aura_rt::task<void> {\n";
+        insideSpawn_ = true;
+
+        for (auto& s : stmt.body)
+            if (s) genStmt(cpp, *s, true);
+
+        insideSpawn_ = false;
+        cpp << indentStr() << "    co_return;\n";
+        cpp << indentStr() << "}(";
+
+        // 实参：同名自动绑定 or 显式传入
+        if (!stmt.args.empty()) {
+            for (size_t i = 0; i < stmt.args.size(); ++i) {
+                if (i > 0) cpp << ", ";
+                cpp << genExpr(*stmt.args[i], true);
+            }
+        } else {
+            for (size_t i = 0; i < stmt.params.size(); ++i) {
+                if (i > 0) cpp << ", ";
+                cpp << safeName(stmt.params[i].name); // 同名自动绑定
+            }
+        }
+        if (!hasIo) cpp << ", io";
+        if (!hasTasks) cpp << ", _tasks";
+        cpp << "));\n";
+        return;
+    }
+
+    // === 旧式语法（向后兼容：spawn { ... }，自动检测自由变量） ===
     // === plan3 修复：协程 + lambda 按值捕获 = UB ===
     // 协程帧只存 this 指针而非拷贝捕获值，lambda 析构后 this 野指针。
     // 正确做法：[] 空捕获 + 显式参数传值，让协程帧在创建时就拷贝参数。

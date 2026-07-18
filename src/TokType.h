@@ -9,6 +9,7 @@ enum class TokType {
     Fun, Let, Const, Throws, Throw, Try, Catch, Match,
     If, Else, For, While, Loop, Break, Continue,
     Spawn, Sync, Return, Import, Type, Interface, Impl,
+    Pub,         // pub
     True, False, None,
 
     // 字面量

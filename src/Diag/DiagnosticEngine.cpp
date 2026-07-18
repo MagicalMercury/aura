@@ -1,6 +1,5 @@
 #include "DiagnosticEngine.h"
 #include "../AST/ASTNode.h"
-#include <algorithm>
 #include <sstream>
 
 namespace Aura {

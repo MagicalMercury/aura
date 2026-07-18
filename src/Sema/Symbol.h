@@ -40,8 +40,16 @@ struct Symbol {
     // type 字段存储展开后的类型
     std::vector<std::string> typeParams; // 泛型参数名列表（如 type Stack<T> 的 {"T"}）
 
+    // 构造函数信息（当 fun (self T) T(...) 与 type T = ... 同名时填充）
+    std::vector<SymParam> ctorParams;
+    std::unique_ptr<SemType> ctorReturnType;
+
     // ——— 仅 Interface ———
     std::vector<InterfaceSemType::MethodSig> interfaceMethods;
+
+    // ——— 导入符号 ———
+    std::string belongsToModule;  // 非空 = 来自此模块的导入
+    bool isPublic = true;  // Phase B: 默认公开（向后兼容：无 pub 时暂不破坏现有行为）
 };
 
 } // namespace Aura

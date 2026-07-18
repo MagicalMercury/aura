@@ -4,8 +4,10 @@
 #include "../AST/Expr.h"
 #include "../AST/Stmt.h"
 #include "../AST/Type.h"
+#include "../Module/ModuleManager.h"
 #include "SemType.h"
 #include "SymbolTable.h"
+#include "BuiltinRegistry.h"
 #include "../Diag/DiagnosticEngine.h"
 #include <map>
 #include <set>
@@ -32,6 +34,10 @@ public:
     // #io.sync 配置
     [[nodiscard]] bool getIoSync() const { return ioSync_; }
 
+    // ============ 跨模块导入/导出（Phase A）============
+    void importExports(const std::string& alias, const ModuleExports& exports);
+    [[nodiscard]] ModuleExports extractExports() const;
+
     // 错误列表
     const std::vector<std::string>& errors() const { return diag_.errorMessages(); }
 
@@ -49,6 +55,16 @@ private:
 
     // 类型等价性
     [[nodiscard]] bool isAssignable(const SemType& target, const SemType& source) const;
+
+    // 函数签名匹配辅助：参数列表 + 返回值 + throws
+    [[nodiscard]] bool matchFuncSig(
+        const std::vector<std::unique_ptr<SemType>>& aParams,
+        const SemType* aReturn, bool aThrows,
+        const std::vector<std::unique_ptr<SemType>>& bParams,
+        const SemType* bReturn, bool bThrows) const;
+
+    // 从 BuiltinRegistry 返回类型构造 SemType（在 inferCall/inferMethodCall 三处复用）
+    [[nodiscard]] std::unique_ptr<SemType> semTypeFromBuiltinReturn(const ReturnTypeInfo& ret);
 
     // 泛型代换：将类型中所有 GenericSemType 替换为具体类型
     [[nodiscard]] std::unique_ptr<SemType> substitute(
@@ -88,6 +104,7 @@ private:
     void checkMatchStmt(const MatchStmt& stmt);
     void checkTryCatchStmt(const TryCatchStmt& stmt);
     void checkSyncStmt(const SyncStmt& stmt);
+    void checkSyncForStmt(const SyncForStmt& stmt);
     void checkSpawnStmt(const SpawnStmt& stmt);
     void checkExprStmt(const ExprStmt& stmt);
 
@@ -132,6 +149,17 @@ private:
     void sealSelfRefs(std::unique_ptr<SemType>& node,
                       const std::string& bareName,
                       const std::string& fullName);
+
+    // resolveType 辅助：应用泛型实参到类型
+    [[nodiscard]] std::unique_ptr<SemType> applyTypeArgs(
+        std::unique_ptr<SemType> result,
+        const Symbol& sym,
+        const std::vector<std::unique_ptr<TypeExpr>>& typeArgs);
+
+    // resolveType 辅助：为 RecordSemType 拼接 C++ canonicalName 并 seal 自引用
+    void materializeCanonicalName(
+        std::unique_ptr<SemType>& result,
+        const NamedType& n);
     // 正在解析中的类型名集合（用于检测自引用，如 Tree<T> = {..., children: [Tree<T>]}）
     std::set<std::string> resolvingTypes_;
 

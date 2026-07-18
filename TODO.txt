@@ -1,0 +1,339 @@
+# Aura 语言未实现 / 待完成内容清单
+#
+# 维护规则：
+#   - 完成后用 [x] 标记，并附上完成日期 / commit 摘要
+#   - 部分完成用 [~]，并说明缺什么
+#   - 暂不做用 [-]，并说明原因
+#   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
+#
+# 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
+# 最近更新：2026-07-18（重核 GC 实际状态 + 加入 GcString 优化清单）
+
+================================================================
+[ 一 ] 内置 API 与模块（plan/plan11.md）
+================================================================
+
+[ ] P0  string_to_int(s: string) throws -> int
+      - plan/plan11.md:41 明确规划
+      - 缺：BuiltinRegistry 注册 + runtime 实现
+      - 文件：src/Sema/BuiltinRegistry.h:249-254 (functions_ 表仅 range)
+
+[ ] P0  string_to_float(s: string) throws -> float
+      - plan/plan11.md:42 明确规划
+      - 缺：同上
+
+[ ] P1  math 内置模块
+      - plan/plan11.md:54 规划 math.abs / math.sqrt / math.floor 等 8 个函数
+      - 缺：builtins/math.aurai 文件 / BuiltinRegistry 加载逻辑
+      - 文件：builtins/ (仅 io.aurai, path.aurai)
+
+[ ] P1  数组 .iter() 方法
+      - plan/range_implementation.md:144 标注"后续单独做"
+      - 缺：[T] 方法表加 iter() 项 / IterSemType 元素从 [T] 推导
+      - 文件：src/Sema/BuiltinRegistry.h:229-243 (无 iter 项)
+
+================================================================
+[ 二 ] 高级类型 / 迭代器扩展（实验性，plan/range_implementation.md）
+================================================================
+
+[ ] P2  Iterator<T> 高级类型（与当前 IterSemType 整合）
+      - 现状：IterSemType 仅 range 使用，无 .map / .filter / .collect 链式
+      - 设计要点：
+          * .map(f: fun(T)->U) -> Iterator<U>
+          * .filter(p: fun(T)->bool) -> Iterator<T>
+          * .collect() -> [T]
+      - 缺：方法注册 / 类型推导（U 通过 f 的返回类型推断）/ CodeGen 桥接 std::views
+
+[ ] P2  Callable<T> 概念类型（统一函数类型与接口适配）
+      - 现状：FuncSemType + 单方法 InterfaceSemType 已能互相赋值
+      - 设计要点：
+          * 让任意"可调用对象"在类型系统中显式标注
+          * 替代当前 isAssignable 中 FuncSemType↔InterfaceSemType 的特例
+      - 缺：是否引入新 SemType 还是依赖接口结构匹配（建议先做接口扩展）
+      - 备注：当前不实现也能用，是"语法糖"性质
+
+[ ] P2  Result<T, E> / Optional<T> 标准库类型
+      - 现状：错误处理走 try/catch + ! 传播
+      - 设计要点：用 type 别名 + union 实现，无需新 SemType
+      - 备注：可作为示例库先在 builtins/ 提供
+
+================================================================
+[ 三 ] 跨模块可见性（plan/cross_module_visibility.md）
+================================================================
+
+[~] P1  pub 修饰符强制化
+      - 现状：Parser/AST/Symbol 已支持 pub 关键字
+      - 缺：Symbol::isPublic 默认 true（向后兼容），未强制要求 pub 才导出
+      - 文件：src/Sema/Symbol.h:52 (isPublic=true 默认)
+
+[ ] P2  用户自定义 .aurai 接口文件
+      - 现状：仅 builtins/io.aurai, builtins/path.aurai 可加载
+      - 缺：用户模块的 .aurai 接口导出机制
+      - 文件：src/Module/ModuleManager.cpp:207-222 (loadAuraiFile 仅查 builtins/)
+
+================================================================
+[ 四 ] 类型系统收尾
+================================================================
+
+[~] P2  Tree<T> 递归泛型自引用
+      - 现状：READMEs/06-generics.md:162 自述"部分支持，嵌套推断可能失败"
+      - 已有：sealSelfRefs / resolvingTypes_ 机制
+      - 缺：嵌套层级较深时仍会失败
+      - 文件：src/Sema/SemAnalyzer.h:134-141, src/Sema/Checker/DeclChecker.cpp:172-206
+
+[ ] P2  闭包赋值给接口类型参数
+      - READMEs/06-generics.md:163 自述"暂不支持"
+      - 缺：inferCall 中将闭包包装为接口适配器
+      - 文件：src/Sema/Checker/ExprInfer.cpp (无相关逻辑)
+
+[~] P2  字符串遍历 for ch in s
+      - READMEs/08-control-flow.md:42-46 承诺
+      - 缺：genForStmt 未对 string 做特殊处理，依赖 GcString 是否实现 begin/end
+      - 文件：src/CodeGen/StmtGen.cpp:346-351 (默认 *iter 遍历)
+
+[~] P2  Path/string 隐式转换
+      - READMEs/12-modules.md:32-40 承诺
+      - 现状：Sema 未显式处理，依赖 C++ 编译器隐式转换
+      - 缺：Sema 层路径参数类型检查
+
+================================================================
+[ 五 ] GC（plan/gc_analysis.md, plan/plan3.md, plan/plan4.md）
+================================================================
+
+[~] P0  GC 实际运行 — 根集合空转问题
+      - 现状更正（2026-07-18 重新核验）：
+        * GC 实现是完整的：markPhase/sweepPhaseYoung/sweepPhaseAll/
+          compactAndReclaim 都在工作，forceGc() 会真正执行 mark+sweep
+        * project_memory 中"完全空转的装饰器"描述已过时
+        * 真正的问题：roots_ 始终为空，因为 CodeGen 不生成 GcRootHandle 包装
+        * 后果：markPhase 从空 roots_ 出发，所有对象被标记为 dead，
+          sweepPhaseAll 会"回收"所有对象，但 compactAndReclaim 因找不到
+          存活对象而 freeAllPages → 实际效果接近"不回收，只清理 youngObjects_"
+      - 缺：CodeGen 在每个 GC 指针局部变量处生成 GcRootHandle 包装
+      - 文件：runtime/gc.h:43-62 (GcRootHandle 已定义),
+              src/CodeGen/ (无生成代码), src/Sema/SemAnalyzer.cpp (无根标记)
+
+[ ] P0  协程帧 GC 根追踪
+      - plan/gc_analysis.md:168-180 指出协程帧中 GC 指针为裸指针
+      - 缺：协程帧本身不在 GC 页上；帧内指针未注册为根
+      - 文件：src/CodeGen/ (无 GcRootHandle 生成代码),
+              runtime/task.cpp (协程帧分配)
+
+[ ] P0  Array<T*> 元素 GC 扫描
+      - plan/gc_analysis.md:54-131 详细分析
+      - 现状：Array<T>::desc() 始终返回 ptrFieldCount=0
+      - 缺：types.h 中数组描述符需根据 T 是否为堆类型动态返回
+      - 文件：runtime/builtin/array.h, runtime/types.h:81-89
+
+[ ] P1  GcString 的 TypeDescriptor ptrFieldCount 应支持 parent 字段
+      - 当前 [string.cpp:18-22](runtime/builtin/string.cpp#L18) ptrFieldCount=0
+      - 若引入子串共享（parent 字段），需更新为 ptrFieldCount=1
+      - 前置：先完成 Array<T*> 元素扫描同类的 ptrFields 机制
+
+----------------------------------------------------------------
+GC 缺失功能清单（基于 2026-07-18 重新核验 runtime/gc.h + gc.cpp）
+----------------------------------------------------------------
+
+[ ] P1  全局变量 / 静态变量的 GC 根注册
+      - 现状：roots_ 仅含 GcRootHandle（栈局部变量），但全局/静态的 GC 指针
+        （如 GcString::from(true) 缓存、单例）无法被 markPhase 发现
+      - 缺：注册全局根的 API（registerGlobalRoot）或在 GcHeap::instance()
+        初始化时扫描静态区
+      - 影响：GC 一旦启用，所有静态缓存的字符串会被错误回收
+
+[ ] P1  弱引用 GcWeakHandle<T>
+      - 现状：只有强引用 GcRootHandle
+      - 缺：弱引用类型，用于缓存场景（如字符串驻留表、Map 缓存）
+      - 设计：弱引用不阻止 GC 回收，访问前需检查 valid()
+
+[ ] P1  Finalizer（终结器）支持
+      - 现状：sweepPhaseYoung/sweepPhaseAll 直接回收，无回调
+      - 缺：GcObject 虚函数 finalize()，sweep 前调用
+      - 用途：资源句柄（文件、socket）在 GC 时关闭
+      - 风险：finalizer 中再分配会触发递归 GC
+
+[ ] P1  多线程 GC 暂停（stop-the-world）
+      - 现状：GC 单线程运行，无 safepoint 同步机制
+      - 缺：其他线程在 GC 期间需要暂停（mutator 暂停）
+      - 设计：safepoint() 检查 gcPending_ 时进入等待状态
+      - 影响：当前 Aura 协程模型是单线程协作式，暂可接受，但 sync 块并发后必加
+
+[ ] P2  精确栈扫描（替代保守扫描）
+      - 现状：[gc.cpp:243-262](runtime/gc.cpp#L243) markPhase 中 stackRoots_
+        采用"保守扫描"——按 sizeof(void*) 对齐扫描栈内存，把候选指针
+        当作 GcObject* 检查是否在 page 范围
+      - 缺：精确栈扫描（编译器生成栈帧描述符，告诉 GC 哪些栈槽是 GC 指针）
+      - 影响：保守扫描会"过度保留"对象（把整数误认为指针），导致内存泄漏
+      - 缓解：当前 GcRootHandle 是精确的，stackRoots_ 只是兜底，可逐步迁移
+
+[ ] P2  compactAndReclaim 的存活检测性能优化
+      - 现状：[gc.cpp:414-467](runtime/gc.cpp#L414) compactAndReclaim 用
+        O(n×m) 双重循环判断每个 page 是否有存活对象（n=pages, m=live objects）
+      - 缺：先按 page 地址对所有存活对象分桶（O(m log m) 排序），
+        再一次遍历 pages
+      - 影响：对象数大时 GC 暂停时间长
+
+[ ] P2  TLAB（Thread-Local Allocation Buffer）
+      - 现状：bumpAlloc 是全局单线程的（currentPage_ + bumpOffset）
+      - 缺：多线程并发分配需要每线程独立 TLAB，避免锁竞争
+      - 前置：先实现多线程 GC 暂停
+
+[ ] P2  GC 触发策略调优
+      - 现状：kYoungThreshold=256KB, kOldThreshold=1MB（写死）
+      - 缺：根据运行时负载动态调整阈值，或通过 #gc.young_threshold 配置
+      - 设计：参考 plan/plan-syncmode.md 的 ConfigDecl 机制
+
+[ ] P2  对象可移动性（compacting GC）
+      - 现状：compactAndReclaim 只回收整页，不搬运对象
+      - 缺：mark-compact 算法，存活对象拷贝到新页，消除碎片
+      - 影响：实现后需要转发指针（forwarding pointer）+ 更新所有引用
+      - 风险：高复杂度，涉及 GcRootHandle / stackRoots 的更新
+
+[ ] P3  分代年龄记录
+      - 现状：promoteToOld 一次晋升到老年代
+      - 缺：对象年龄（survival count），多次 minor GC 后才晋升
+      - 设计：GcObject 加 uint8_t age 字段，默认 age=2 晋升
+
+[ ] P3  并发 GC（concurrent marking）
+      - 现状：GC 全程 stop-the-world
+      - 缺：mark 阶段并发执行，仅 sweep 阶段暂停
+      - 风险：需要读屏障/写屏障配合，极复杂
+
+[ ] P3  Large Object Space（大对象区）
+      - 现状：大对象（如长 GcString）和小对象共用同一 page
+      - 缺：大对象独立分配，避免 page 碎片
+      - 设计：> 32KB 的对象直接从 OS 分配，独立追踪
+
+[ ] P3  GC 日志与统计
+      - 现状：gcCount/minorGcCount 已记录但无输出
+      - 缺：GC 事件日志（暂停时间、回收字节、晋升数量），
+        可通过 #gc.verbose = true 开启
+
+
+================================================================
+[ 六 ] 运行时库改进（plan/gcstring_optimization.md, plan/plan13.md）
+================================================================
+
+----------------------------------------------------------------
+GcString 优化（基于 plan/gcstring_optimization.md，2026-07-18 评估）
+分阶段：第一阶段不依赖 GC，可立即做；第二阶段需 GC 真正运行
+----------------------------------------------------------------
+
+[ ] P1  GcString::empty() / from(bool) / from(int) 静态缓存  [第一阶段]
+      - 现状：每次 from(bool) 都分配 5 字节字符串；from(int) 每次 snprintf+alloc
+      - 缺：empty() 返回全局单例；from(bool) 返回 "true"/"false" 单例；
+        from(int) 缓存 -128~127
+      - 风险：静态局部变量线程安全（C++11 起保证，但 Aura 协程模型需确认）
+      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
+      - 详见：plan/gcstring_optimization.md §三 Step 1
+
+[ ] P1  concat_multi 运行时支持  [第一阶段]
+      - 现状：[string.cpp:66-75](runtime/builtin/string.cpp#L66) concat 每次分配+memcpy
+      - 缺：新增 concat_multi(initializer_list<const GcString*>) 一次性分配
+      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
+      - 详见：plan/gcstring_optimization.md §三 Step 2
+
+[ ] P1  CodeGen 识别链式 string + string 脱糖为 concat_multi  [第一阶段]
+      - 现状：[ExprGen.cpp:254](src/CodeGen/ExprGen.cpp#L254) 生成
+        aura_rt::concat(aura_rt::concat(aura_rt::concat(a, b), c), d)
+        3 次分配 + 中间对象 memcpy 2 次
+      - 缺：genBinaryExpr 检测 BinaryExpr(Plus, ...) 链，≥3 个操作数时
+        脱糖为 aura_rt::concat_multi({a, b, c, d})
+      - 风险：链中混入非 string 类型（s + 42 + t）需 fallback 到 concat
+      - 文件：src/CodeGen/ExprGen.cpp:235-265
+      - 详见：plan/gcstring_optimization.md §三 Step 3
+      - 收益：a+b+c+d 从 3 次分配+6 次 memcpy → 1 次分配+1 次 memcpy
+
+[ ] P2  GcString 加 capacity 字段 + reserve/make_with_capacity API  [第二阶段]
+      - 前置：先做 GcStringBuilder 类型
+      - 现状：[string.h:27](runtime/builtin/string.h#L27) 仅 length，无 capacity
+      - 缺：int32_t capacity 字段；data() 偏移要改；
+        TypeDescriptor.size 需更新（仍 ptrFieldCount=0）
+      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
+      - 详见：plan/gcstring_optimization.md §三 Step 4
+
+[ ] P2  GcStringBuilder 类型（可变字符串缓冲区）  [第二阶段]
+      - plan/plan13.md 规划
+      - 现状：无此类型
+      - 缺：新类型支持 append + to_string；与 concat_multi 整合
+      - 前置：先做 capacity 字段
+      - 文件：runtime/builtin/string_builder.h (新增)
+
+[ ] P2  GcString 子串共享（零拷贝 slice）  [第二阶段]
+      - 前置：GC 真正运行 + parent 字段加入 ptrFieldOffsets
+      - 缺：GcString 加 parent + offset 字段；新增 slice(start, len) 方法
+      - 风险：parent 必须被 GC 正确扫描，否则悬空指针
+      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
+      - 详见：plan/gcstring_optimization.md §三 Step 5
+
+[ ] P2  GcString 哈希缓存  [第二阶段]
+      - 前置：引入 Map<K, V> 类型（当前无）
+      - 现状：string 当 map key 时每次重新计算 hash
+      - 缺：mutable uint32_t hash 字段，懒计算
+      - 当前收益：0（无 Map 类型）
+      - 文件：runtime/builtin/string.h
+
+[ ] P3  GcString Rope 表示  [远期]
+      - 前置：profiling 显示拼接是热点
+      - 缺：树形节点（left/right GC 指针 + length）；
+        c_str() 时扁平化；== 比较需重写
+      - 风险：架构级重构，影响所有 string 操作
+      - 文件：runtime/builtin/string.h
+      - 详见：plan/gcstring_optimization.md §二 C1
+
+[-] P3  GC 暂停期 interning  [不可行]
+      - 前置：GC 真正运行 + mark 阶段可遍历所有对象
+      - 当前：GC roots_ 为空，markPhase 无法工作
+      - 结论：推迟到 GC 完全落地后再考虑
+
+[-] P3  单引用原地修改（is_unique）  [不可行]
+      - 前置：GC 配合检测引用数 或 引入引用计数
+      - 当前：无引用计数机制
+      - 结论：推迟到引入引用计数后
+
+----------------------------------------------------------------
+其他运行时库改进
+----------------------------------------------------------------
+
+[ ] P2  Array chunked 链表实现
+      - plan/chunk_array_plan.md, plan/array_advise.md 规划
+      - 现状：连续数组，O(n) 插入/删除
+      - 缺：分块链表实现
+
+================================================================
+[ 七 ] 诊断 / 编译流程（plan/fix_plan.md）
+================================================================
+
+[~] P2  多阶段报告"尽力模式"
+      - plan/fix_plan.md Phase 7 规划
+      - 现状：main.cpp:117 仍是硬阻断 (if (!diag.hasErrors()) 才 CodeGen)
+      - 缺：ASTNode.hasError 标记 + 多文件模块级汇总
+      - 文件：src/main.cpp:112-117
+
+================================================================
+[ 九 ] 代码质量 / 重构（Res.md 屎山报告）
+================================================================
+
+[x] P1  genFunExpr 抽 4 个内联 walker 到 ASTWalker.h (2026-07-18)
+      - IoDetector / AssignTargetCollector / CallTargetScanner / CaptureArgScanner
+      - 4 个内联 struct → 4 个独立 class，带 static scan/anyMatch/collectMatched 入口
+      - genFunExpr 从 448 行降到 ~290 行
+      - 文件：src/ASTWalker.h:131-351, src/CodeGen/ExprGen.cpp:527-641
+
+[~] P3  Parser 二项式链样板（parseOr/parseAnd/parseEquality/...）
+      - Res.md 指出 30.8% 重复率
+      - 现状：可读性高，建议保留
+      - 文件：src/Parser/ExprParser.cpp:47-158
+
+[-] P3  scanOperatorOrDelimiter 复杂度 31 是虚高
+      - Res.md metric 误判，大 switch 是词法标准写法，不动
+
+================================================================
+[ 九 ] 文档与示例
+================================================================
+
+[ ] P2  READMEs/15-example.md 中的示例验证
+      - 需对照源码确认每个示例都能编译运行
+
+[ ] P3  plan/ 中历史文档归档
+      - plan1.md - plan17.md 等已完成的 plan 应移到 plan/done/ 子目录

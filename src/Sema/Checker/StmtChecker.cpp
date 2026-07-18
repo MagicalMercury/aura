@@ -151,9 +151,11 @@ void SemAnalyzer::checkForStmt(const ForStmt& stmt) {
     Symbol sym;
     sym.kind = SymKind::Variable;
     sym.name = stmt.itemName;
-    // 从列表类型推导元素类型
+    // 从列表/迭代器类型推导元素类型
     if (auto* listTy = dynamic_cast<ListSemType*>(iterType.get())) {
         sym.type = listTy->elementType ? listTy->elementType->clone() : ErrorSemType::make();
+    } else if (auto* iterTy = dynamic_cast<IterSemType*>(iterType.get())) {
+        sym.type = iterTy->elementType ? iterTy->elementType->clone() : ErrorSemType::make();
     } else {
         sym.type = ErrorSemType::make();
     }
@@ -217,8 +219,48 @@ void SemAnalyzer::checkTryCatchStmt(const TryCatchStmt& stmt) {
 }
 
 void SemAnalyzer::checkSyncStmt(const SyncStmt& stmt) {
+    // 检查 max 表达式
+    if (stmt.maxExpr) {
+        auto maxTy = inferExpr(*stmt.maxExpr);
+        if (!isAssignable(*intType(), *maxTy)) {
+            error(*stmt.maxExpr, "sync max must be int, got '" + maxTy->toString() + "'");
+        }
+    }
     insideSync_ = true;
     if (stmt.body) checkBlock(*stmt.body);
+    insideSync_ = false;
+}
+
+void SemAnalyzer::checkSyncForStmt(const SyncForStmt& stmt) {
+    // 检查可选的 max 表达式
+    if (stmt.maxExpr) {
+        auto maxTy = inferExpr(*stmt.maxExpr);
+        if (!isAssignable(*intType(), *maxTy)) {
+            error(*stmt.maxExpr, "sync for max must be int, got '" + maxTy->toString() + "'");
+        }
+    }
+
+    // 推断迭代器类型 → 获取元素类型作为 spawn 参数类型
+    auto iterType = inferExpr(*stmt.iterable);
+    std::unique_ptr<SemType> elemType = ErrorSemType::make();
+    if (auto* listTy = dynamic_cast<ListSemType*>(iterType.get())) {
+        elemType = listTy->elementType ? listTy->elementType->clone() : ErrorSemType::make();
+    } else if (auto* iterTy = dynamic_cast<IterSemType*>(iterType.get())) {
+        elemType = iterTy->elementType ? iterTy->elementType->clone() : ErrorSemType::make();
+    }
+
+    // 检查 body（spawn 体内 itemName 可用）
+    insideSync_ = true;
+    symtab_.enterScope();
+    {
+        Symbol sym;
+        sym.kind = SymKind::Variable;
+        sym.name = stmt.itemName;
+        sym.type = std::move(elemType);
+        symtab_.define(std::move(sym));
+    }
+    if (stmt.body) checkBlock(*stmt.body);
+    symtab_.exitScope();
     insideSync_ = false;
 }
 
@@ -229,11 +271,30 @@ void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
           "wrap the spawn statement in 'sync { ... }'");
         return;
     }
+
+    // 显式传参：将参数注册到 spawn 作用域（参数只读）
+    if (!stmt.params.empty()) {
+        symtab_.enterScope();
+        for (auto& p : stmt.params) {
+            Symbol sym;
+            sym.kind = SymKind::Variable;
+            sym.name = p.name;
+            sym.type = p.type ? resolveType(*p.type) : nullptr;
+            sym.isConst = true;  // spawn 参数只读
+            symtab_.define(std::move(sym));
+        }
+    }
+
+    // 处理 spawn 体
     symtab_.enterScope();
     for (auto& s : stmt.body) {
         if (s) checkStmt(*s);
     }
     symtab_.exitScope();
+
+    if (!stmt.params.empty()) {
+        symtab_.exitScope();
+    }
 }
 
 void SemAnalyzer::checkExprStmt(const ExprStmt& stmt) {

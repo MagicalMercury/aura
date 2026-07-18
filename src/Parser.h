@@ -1,8 +1,6 @@
 #pragma once
 
-#include "Lexer.h"
 #include "AST/ASTNode.h"
-#include "AST/Expr.h"
 #include "AST/Stmt.h"
 #include "AST/Type.h"
 #include "Token.h"
@@ -19,10 +17,14 @@ public:
     // 解析完整程序
     [[nodiscard]] std::unique_ptr<Program> parse();
 
+    // 解析 .aurai 接口声明文件（跳过函数体，禁止实现语句）
+    [[nodiscard]] std::unique_ptr<Program> parseAurai();
+
     // 获取词法错误列表
     const std::vector<std::string>& errors() const { return diag_.errorMessages(); }
 
 private:
+    bool noBody_ = false;  // .aurai 模式：跳过函数体
     // --- 辅助 ---
     Token& advance();
     Token& peek();
@@ -61,9 +63,25 @@ private:
     std::unique_ptr<Stmt> parseThrowStmt();
     std::unique_ptr<Stmt> parseTryCatchStmt();
     std::unique_ptr<Stmt> parseSyncStmt();
+    std::unique_ptr<Stmt> parseSyncForStmt();
     std::unique_ptr<Stmt> parseSpawnStmt();
     std::unique_ptr<Stmt> parseMatchStmt();
     std::unique_ptr<Stmt> parseExprStmt();
+
+    // 共用 let/const 解析（模板方法）
+    template <typename DeclT>
+    std::unique_ptr<DeclT> parseLetOrConstDeclBody(Token tok, const char* kw) {
+        auto decl = std::make_unique<DeclT>();
+        setNodePos(decl.get(), tok);
+        std::string errMsg = std::string("expected name after '") + kw + "'";
+        auto& nameTok = consume(TokType::Identifier, errMsg);
+        decl->name = nameTok.lexeme;
+        if (match(TokType::Colon)) decl->type = parseType();
+        consume(TokType::Assign, "expected '=' in declaration");
+        decl->initializer = parseExpr();
+        match(TokType::Semicolon);
+        return decl;
+    }
 
     // --- 解析表达式 ---
     std::unique_ptr<ASTNode> parseExpr();

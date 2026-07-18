@@ -7,21 +7,29 @@ namespace Aura {
 // ============================================================
 
 std::unique_ptr<Decl> Parser::parseDecl() {
-    if (check(TokType::Hash)) return parseConfigDecl();
-    if (check(TokType::Fun)) {
-        if (peekNext().type == TokType::LParen) {
-            return parseMethodDecl();
-        }
-        return parseFunDecl();
-    }
-    if (check(TokType::Let))       return parseLetDecl();
-    if (check(TokType::Const))     return parseConstDecl();
-    if (check(TokType::Type))      return parseTypeDecl();
-    if (check(TokType::Interface)) return parseInterfaceDecl();
-    if (check(TokType::Import))    return parseImportDecl();
+    bool isPublic = match(TokType::Pub);
 
-    error("expected declaration");
-    return nullptr;
+    std::unique_ptr<Decl> decl;
+    if (check(TokType::Hash))       decl = parseConfigDecl();
+    else if (check(TokType::Fun)) {
+        if (peekNext().type == TokType::LParen) {
+            decl = parseMethodDecl();
+        } else {
+            decl = parseFunDecl();
+        }
+    }
+    else if (check(TokType::Let))      decl = parseLetDecl();
+    else if (check(TokType::Const))    decl = parseConstDecl();
+    else if (check(TokType::Type))     decl = parseTypeDecl();
+    else if (check(TokType::Interface)) decl = parseInterfaceDecl();
+    else if (check(TokType::Import))   decl = parseImportDecl();
+    else {
+        error("expected declaration");
+        return nullptr;
+    }
+
+    if (decl) decl->isPublic = isPublic;
+    return decl;
 }
 
 std::unique_ptr<FunDecl> Parser::parseFunDecl() {
@@ -31,6 +39,12 @@ std::unique_ptr<FunDecl> Parser::parseFunDecl() {
 
     auto& nameTok = consume(TokType::Identifier, "expected function name");
     decl->name = nameTok.lexeme;
+
+    // .aurai 语法：fun path.new(...) / fun json.parse(...)
+    if (match(TokType::Dot)) {
+        auto& subName = consume(TokType::Identifier, "expected function name after '.'");
+        decl->name = decl->name + "." + subName.lexeme;
+    }
 
     consume(TokType::LParen, "expected '(' after function name");
     if (!check(TokType::RParen)) {
@@ -44,44 +58,18 @@ std::unique_ptr<FunDecl> Parser::parseFunDecl() {
         decl->returnType = parseType();
     }
 
-    decl->body = parseBlock();
+    if (!noBody_) {
+        decl->body = parseBlock();
+    }
     return decl;
 }
 
 std::unique_ptr<LetDecl> Parser::parseLetDecl() {
-    auto tok = advance(); // let
-    auto decl = std::make_unique<LetDecl>();
-    setNodePos(decl.get(), tok);
-
-    auto& nameTok = consume(TokType::Identifier, "expected variable name after 'let'");
-    decl->name = nameTok.lexeme;
-
-    if (match(TokType::Colon)) {
-        decl->type = parseType();
-    }
-
-    consume(TokType::Assign, "expected '=' in let declaration");
-    decl->initializer = parseExpr();
-    match(TokType::Semicolon);
-    return decl;
+    return parseLetOrConstDeclBody<LetDecl>(advance(), "let");
 }
 
 std::unique_ptr<ConstDecl> Parser::parseConstDecl() {
-    auto tok = advance(); // const
-    auto decl = std::make_unique<ConstDecl>();
-    setNodePos(decl.get(), tok);
-
-    auto& nameTok = consume(TokType::Identifier, "expected constant name after 'const'");
-    decl->name = nameTok.lexeme;
-
-    if (match(TokType::Colon)) {
-        decl->type = parseType();
-    }
-
-    consume(TokType::Assign, "expected '=' in const declaration");
-    decl->initializer = parseExpr();
-    match(TokType::Semicolon);
-    return decl;
+    return parseLetOrConstDeclBody<ConstDecl>(advance(), "const");
 }
 
 std::unique_ptr<TypeDecl> Parser::parseTypeDecl() {
@@ -99,6 +87,16 @@ std::unique_ptr<TypeDecl> Parser::parseTypeDecl() {
             decl->typeParams.push_back(tp.lexeme);
         } while (match(TokType::Comma));
         consume(TokType::Greater, "expected '>' after type parameters");
+    }
+
+    // .aurai 模式下：type Name 可作为前向声明（无 = TypeExpr）
+    if (noBody_) {
+        if (match(TokType::Assign)) {
+            decl->type = parseType();
+        }
+        // 否则只是前向声明，不赋值 type 字段
+        match(TokType::Semicolon);
+        return decl;
     }
 
     consume(TokType::Assign, "expected '=' in type declaration");
@@ -172,7 +170,9 @@ std::unique_ptr<MethodDecl> Parser::parseMethodDecl() {
         decl->returnType = parseType();
     }
 
-    decl->body = parseBlock();
+    if (!noBody_) {
+        decl->body = parseBlock();
+    }
     return decl;
 }
 

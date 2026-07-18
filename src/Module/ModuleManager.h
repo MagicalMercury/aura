@@ -10,16 +10,35 @@
 // ============================================================
 
 #include "../AST/Stmt.h"
-#include "../CodeGen/CodeGen.h"
 #include "../Diag/DiagnosticEngine.h"
+#include "../Sema/SemType.h"
+#include "../Sema/Symbol.h"
 
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace Aura {
+
+// ============================================================
+// FuncExport — 一个导出函数的签名
+// ============================================================
+struct FuncExport {
+    std::vector<SymParam> params;
+    std::unique_ptr<SemType> returnType;
+    bool throws = false;
+};
+
+// ============================================================
+// ModuleExports — 一个模块的导出表
+// ============================================================
+struct ModuleExports {
+    std::string nsName;                                            // C++ 命名空间
+    std::unordered_map<std::string, std::unique_ptr<SemType>> types; // 类型名 → SemType
+    std::unordered_map<std::string, FuncExport> funcs;             // 函数名 → 签名
+    std::unordered_map<std::string, FuncExport> ctors;             // 构造函数名 → 签名
+};
 
 // ============================================================
 // ImportInfo — 一条 import 语句的解析结果
@@ -51,6 +70,9 @@ struct ModuleInfo {
 
     // AST 常驻内存（§4.1 一次解析，编译阶段直接使用）
     std::unique_ptr<Program> ast;
+
+    // 本模块的导出表（SemAnalyzer 分析后填充）
+    ModuleExports exports;
 };
 
 // ============================================================
@@ -62,6 +84,12 @@ public:
 
     // 从入口文件开始，递归加载所有依赖模块
     bool loadAll(const std::string& entryPath);
+
+    // 加载 builtins/ 下的 .aurai 文件（始终加载：io.aurai）
+    void loadBuiltinAurai();
+
+    // 按需加载单个 .aurai 文件（如 import path → loadAuraiFile("path.aurai")）
+    void loadAuraiFile(const std::string& baseName);
 
     // 循环依赖检测（Tarjan 算法）
     bool hasCycle();

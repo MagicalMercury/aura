@@ -9,8 +9,8 @@
 // ============================================================
 
 #include "../types.h"
-#include "../gc.h"
-#include <type_traits>
+#include <string>
+#include <string_view>
 #include <concepts>
 
 namespace aura_rt {

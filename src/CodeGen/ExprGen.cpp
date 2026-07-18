@@ -1,4 +1,5 @@
 #include "CodeGen.h"
+#include "../Sema/BuiltinRegistry.h"
 #include <cctype>
 #include <sstream>
 
@@ -292,6 +293,13 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
     if (auto* id = dynamic_cast<const Identifier*>(e.callee.get()))
         calleeName = id->name;
 
+    // channel 构造函数特殊处理：channel(cap) → new Channel<T>(cap)
+    if (calleeName == "channel") {
+        std::string targ = expectedTemplateArgs_.empty() ? "int32_t" : expectedTemplateArgs_[0];
+        std::string cap = e.args.empty() ? "0" : genExpr(*e.args[0], isCoroutine);
+        return "(new aura_rt::Channel<" + targ + ">(" + cap + "))";
+    }
+
     bool isCtor = false;
     bool hasUserCtor = false;
 
@@ -389,8 +397,17 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         return oss.str();
     }
 
-    // io.* 调用需要 co_await，其他方法调用默认不需要
-    bool needAwait = isIoCall && isCoroutine;
+    // io.* 调用需要 co_await（仅对有异步版本的方法）
+    bool needAwait = isIoCall && isCoroutine
+                     && BuiltinRegistry::get().methodHasAsync("Io", e.method);
+
+    // channel.send / channel.receive 需要 co_await
+    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+        if (channelVarNames_.count(id->name) && (e.method == "send" || e.method == "receive")) {
+            needAwait = needAwait || isCoroutine;
+        }
+    }
+
     std::string prefix = needAwait ? "co_await " : "";
 
     // 判断是命名空间限定下的构造调用：math.Pair(...) → math::Pair_ctor(...)
@@ -511,40 +528,7 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     if (!e.body) return "[]{}";
 
     // 检测闭包体内是否包含 io.xxx 调用 — 若有则在协程上下文中生成协程 lambda
-    bool closureHasIo = false;
-    if (isCoroutine && !ioSync_) {
-        struct IoDetector {
-            bool found = false;
-            bool scanStmt(const Stmt& stmt) { return StmtWalker<IoDetector>::walk(stmt, *this); }
-            bool visit(const MethodCallExpr& n, IoDetector&) {
-                if (n.object) {
-                    if (auto* id = dynamic_cast<const Identifier*>(n.object.get()))
-                        if (id->name == "io") { found = true; return true; }
-                }
-                return false;
-            }
-            bool visit(const BlockStmt& n, IoDetector& self) { for (auto& ss : n.stmts) if (ss && self.scanStmt(*ss)) return true; return false; }
-            bool visit(const IfStmt& n, IoDetector& self) { if (n.thenBranch && self.scanStmt(*n.thenBranch)) return true; for (auto& ei : n.elseIfs) if (ei.body && self.scanStmt(*ei.body)) return true; if (n.elseBranch && self.scanStmt(*n.elseBranch)) return true; return false; }
-            bool visit(const WhileStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
-            bool visit(const ForStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
-            bool visit(const LoopStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
-            bool visit(const TryCatchStmt& n, IoDetector& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
-            bool visit(const MatchStmt& n, IoDetector& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } } return false; }
-            bool visit(const ExprStmt& n, IoDetector& self) { if (n.expr) { if (auto* mc = dynamic_cast<const MethodCallExpr*>(n.expr.get())) return self.visit(*mc, self); } return false; }
-            bool visit(const ReturnStmt&, IoDetector&) { return false; }
-            bool visit(const ThrowStmt&, IoDetector&) { return false; }
-            bool visit(const LetDecl&, IoDetector&) { return false; }
-            bool visit(const ConstDecl&, IoDetector&) { return false; }
-            bool visit(const BreakStmt&, IoDetector&) { return false; }
-            bool visit(const ContinueStmt&, IoDetector&) { return false; }
-            bool visit(const SyncStmt&, IoDetector&) { return false; }
-            bool visit(const SpawnStmt&, IoDetector&) { return false; }
-        };
-        IoDetector detector;
-        for (auto& s : e.body->stmts)
-            if (s && detector.scanStmt(*s)) { closureHasIo = true; break; }
-    }
-    bool closureIsCoro = closureHasIo;
+    bool closureIsCoro = isCoroutine && !ioSync_ && IoDetector::scan(*e.body);
 
     // === 1. 捕获分析（复用 IdRefCollector + DeclaredCollector） ===
     std::set<std::string> allRefs;
@@ -641,169 +625,14 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     }
 
     // === 3. 检测是否修改捕获变量（决定 mutable 关键字） ===
-    bool needsMutable = false;
-    // 扫描：赋值左侧是捕获变量 → 直接 mutable
-    for (auto& cap : captures) {
-        for (auto& s : e.body->stmts) {
-            if (!s) continue;
-            struct AssignTargetCollector {
-                std::string targetName;
-                bool found = false;
-                bool collectStmt(const Stmt& stmt) {
-                    return StmtWalker<AssignTargetCollector>::walk(stmt, *this);
-                }
-                bool visit(const AssignExpr& n, AssignTargetCollector& /*self*/) {
-                    if (auto* id = dynamic_cast<const Identifier*>(n.target.get())) {
-                        if (id->name == targetName) { found = true; return true; }
-                    }
-                    return false;
-                }
-                bool visit(const BlockStmt& n, AssignTargetCollector& self) { for (auto& ss : n.stmts) if (ss && self.collectStmt(*ss)) return true; return false; }
-                bool visit(const IfStmt& n, AssignTargetCollector& self) { if (n.thenBranch && self.collectStmt(*n.thenBranch)) return true; if (n.elseBranch && self.collectStmt(*n.elseBranch)) return true; for (auto& ei : n.elseIfs) if (ei.body && self.collectStmt(*ei.body)) return true; return false; }
-                bool visit(const WhileStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
-                bool visit(const ForStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
-                bool visit(const LoopStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
-                bool visit(const TryCatchStmt& n, AssignTargetCollector& self) { if (n.tryBody && self.collectStmt(*n.tryBody)) return true; return n.catchBody && self.collectStmt(*n.catchBody); }
-                bool visit(const SyncStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
-                bool visit(const SpawnStmt& n, AssignTargetCollector& self) { for (auto& sb : n.body) if (sb && self.collectStmt(*sb)) return true; return false; }
-                bool visit(const MatchStmt& n, AssignTargetCollector& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.collectStmt(*cb)) return true; } else { if (auto* ae = dynamic_cast<const AssignExpr*>(c.body.get())) return self.visit(*ae, self); } } return false; }
-                bool visit(const ExprStmt& n, AssignTargetCollector& self) { if (auto* ae = dynamic_cast<const AssignExpr*>(n.expr.get())) return self.visit(*ae, self); return false; }
-                bool visit(const ReturnStmt&, AssignTargetCollector&) { return false; }
-                bool visit(const ThrowStmt&, AssignTargetCollector&) { return false; }
-                bool visit(const LetDecl&, AssignTargetCollector&) { return false; }
-                bool visit(const ConstDecl&, AssignTargetCollector&) { return false; }
-                bool visit(const BreakStmt&, AssignTargetCollector&) { return false; }
-                bool visit(const ContinueStmt&, AssignTargetCollector&) { return false; }
-            };
-            AssignTargetCollector collector;
-            collector.targetName = cap;
-            if (collector.collectStmt(*s)) { needsMutable = true; break; }
-        }
-        if (needsMutable) break;
-    }
+    bool needsMutable = !captures.empty() && AssignTargetCollector::anyMatch(*e.body, captures);
 
     // 扫描：捕获变量被用作调用目标 → 按值捕获的 lambda operator() 为 const，需 mutable
-    if (!needsMutable) {
-        for (auto& cap : captures) {
-            for (auto& s : e.body->stmts) {
-                if (!s) continue;
-                struct CallTargetScanner {
-                    std::string targetName;
-                    bool found = false;
-                    bool scanStmt(const Stmt& stmt) {
-                        return StmtWalker<CallTargetScanner>::walk(stmt, *this);
-                    }
-                    bool scanExpr(const ASTNode& node) {
-                        return ExprWalker<CallTargetScanner>::walk(node, *this);
-                    }
-                    // CallExpr visitor (used by both StmtWalker and ExprWalker)
-                    bool visit(const CallExpr& n, CallTargetScanner& /*self*/) {
-                        if (auto* id = dynamic_cast<const Identifier*>(n.callee.get()))
-                            if (id->name == targetName) { found = true; return true; }
-                        for (auto& a : n.args) if (a && scanExpr(*a)) return true;
-                        return false;
-                    }
-                    // Stmt visitors
-                    bool visit(const BlockStmt& n, CallTargetScanner& self) { for (auto& ss : n.stmts) if (ss && self.scanStmt(*ss)) return true; return false; }
-                    bool visit(const IfStmt& n, CallTargetScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; if (n.thenBranch && self.scanStmt(*n.thenBranch)) return true; for (auto& ei : n.elseIfs) { if (ei.condition && self.scanExpr(*ei.condition)) return true; if (ei.body && self.scanStmt(*ei.body)) return true; } if (n.elseBranch && self.scanStmt(*n.elseBranch)) return true; return false; }
-                    bool visit(const WhileStmt& n, CallTargetScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; return n.body && self.scanStmt(*n.body); }
-                    bool visit(const ForStmt& n, CallTargetScanner& self) { if (n.iterable && self.scanExpr(*n.iterable)) return true; return n.body && self.scanStmt(*n.body); }
-                    bool visit(const LoopStmt& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
-                    bool visit(const TryCatchStmt& n, CallTargetScanner& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
-                    bool visit(const SyncStmt& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
-                    bool visit(const SpawnStmt& n, CallTargetScanner& self) { for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
-                    bool visit(const MatchStmt& n, CallTargetScanner& self) { if (n.expr && self.scanExpr(*n.expr)) return true; for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } else if (self.scanExpr(*c.body)) return true; } return false; }
-                    bool visit(const ExprStmt& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-                    bool visit(const ReturnStmt& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-                    bool visit(const ThrowStmt& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-                    bool visit(const LetDecl& n, CallTargetScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
-                    bool visit(const ConstDecl& n, CallTargetScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
-                    bool visit(const BreakStmt&, CallTargetScanner&) { return false; }
-                    bool visit(const ContinueStmt&, CallTargetScanner&) { return false; }
-                    // Expr visitors (called via ExprWalker in scanExpr)
-                    bool visit(const BinaryExpr& n, CallTargetScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
-                    bool visit(const MethodCallExpr& n, CallTargetScanner& self) { if (n.object && self.scanExpr(*n.object)) return true; for (auto& a : n.args) if (a && self.scanExpr(*a)) return true; return false; }
-                    bool visit(const UnaryExpr& n, CallTargetScanner& self) { return n.operand && self.scanExpr(*n.operand); }
-                    bool visit(const MemberAccessExpr& n, CallTargetScanner& self) { return n.object && self.scanExpr(*n.object); }
-                    bool visit(const IndexExpr& n, CallTargetScanner& self) { return (n.object && self.scanExpr(*n.object)) || (n.index && self.scanExpr(*n.index)); }
-                    bool visit(const AssignExpr& n, CallTargetScanner& self) { return (n.target && self.scanExpr(*n.target)) || (n.value && self.scanExpr(*n.value)); }
-                    bool visit(const ErrorPropagationExpr& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-                    bool visit(const PipeExpr& n, CallTargetScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
-                    bool visit(const RecordExpr& n, CallTargetScanner& self) { for (auto& f : n.fields) if (f.value && self.scanExpr(*f.value)) return true; return false; }
-                    bool visit(const ListExpr& n, CallTargetScanner& self) { for (auto& e : n.elements) if (e && self.scanExpr(*e)) return true; return false; }
-                    bool visit(const FunExpr& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
-                    bool visit(const IntLiteral&, CallTargetScanner&) { return false; }
-                    bool visit(const FloatLiteral&, CallTargetScanner&) { return false; }
-                    bool visit(const StringLiteral&, CallTargetScanner&) { return false; }
-                    bool visit(const BoolLiteral&, CallTargetScanner&) { return false; }
-                    bool visit(const NoneLiteral&, CallTargetScanner&) { return false; }
-                    bool visit(const Identifier&, CallTargetScanner&) { return false; }
-                };
-                CallTargetScanner scanner;
-                scanner.targetName = cap;
-                if (scanner.scanStmt(*s)) { needsMutable = true; break; }
-            }
-            if (needsMutable) break;
-        }
-    }
+    if (!needsMutable && !captures.empty())
+        needsMutable = CallTargetScanner::anyMatch(*e.body, captures);
 
     // 收集在闭包体内被引用（作为调用参数或直接调用）的捕获变量名
-    std::set<std::string> calledCaptures;
-    {
-        struct CaptureArgScanner {
-            std::string name;
-            bool foundArg = false;
-            bool scanStmt(const Stmt& stmt) { return StmtWalker<CaptureArgScanner>::walk(stmt, *this); }
-            bool scanExpr(const ASTNode& node) { return ExprWalker<CaptureArgScanner>::walk(node, *this); }
-            bool visit(const CallExpr& n, CaptureArgScanner& self) {
-                if (auto* id = dynamic_cast<const Identifier*>(n.callee.get()))
-                    if (id->name == name) { foundArg = true; return true; }
-                for (auto& a : n.args) if (a && self.scanExpr(*a)) return true;
-                return false;
-            }
-            bool visit(const Identifier& n, CaptureArgScanner&) { if (n.name == name) { foundArg = true; return true; } return false; }
-            bool visit(const BlockStmt& n, CaptureArgScanner& self) { for (auto& ss : n.stmts) if (ss && self.scanStmt(*ss)) return true; return false; }
-            bool visit(const ReturnStmt& n, CaptureArgScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-            bool visit(const ExprStmt& n, CaptureArgScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-            bool visit(const IfStmt& n, CaptureArgScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; if (n.thenBranch && self.scanStmt(*n.thenBranch)) return true; for (auto& ei : n.elseIfs) { if (ei.condition && self.scanExpr(*ei.condition)) return true; if (ei.body && self.scanStmt(*ei.body)) return true; } if (n.elseBranch && self.scanStmt(*n.elseBranch)) return true; return false; }
-            bool visit(const WhileStmt& n, CaptureArgScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; return n.body && self.scanStmt(*n.body); }
-            bool visit(const ForStmt& n, CaptureArgScanner& self) { if (n.iterable && self.scanExpr(*n.iterable)) return true; return n.body && self.scanStmt(*n.body); }
-            bool visit(const LoopStmt& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
-            bool visit(const TryCatchStmt& n, CaptureArgScanner& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
-            bool visit(const SyncStmt& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
-            bool visit(const SpawnStmt& n, CaptureArgScanner& self) { for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
-            bool visit(const MatchStmt& n, CaptureArgScanner& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } else if (self.scanExpr(*c.body)) return true; } return false; }
-            bool visit(const LetDecl& n, CaptureArgScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
-            bool visit(const ConstDecl& n, CaptureArgScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
-            bool visit(const BinaryExpr& n, CaptureArgScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
-            bool visit(const UnaryExpr& n, CaptureArgScanner& self) { return n.operand && self.scanExpr(*n.operand); }
-            bool visit(const MethodCallExpr& n, CaptureArgScanner& self) { if (n.object && self.scanExpr(*n.object)) return true; for (auto& a : n.args) if (a && self.scanExpr(*a)) return true; return false; }
-            bool visit(const MemberAccessExpr& n, CaptureArgScanner& self) { return n.object && self.scanExpr(*n.object); }
-            bool visit(const IndexExpr& n, CaptureArgScanner& self) { return (n.object && self.scanExpr(*n.object)) || (n.index && self.scanExpr(*n.index)); }
-            bool visit(const AssignExpr& n, CaptureArgScanner& self) { return (n.target && self.scanExpr(*n.target)) || (n.value && self.scanExpr(*n.value)); }
-            bool visit(const ErrorPropagationExpr& n, CaptureArgScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-            bool visit(const PipeExpr& n, CaptureArgScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
-            bool visit(const RecordExpr& n, CaptureArgScanner& self) { for (auto& f : n.fields) if (f.value && self.scanExpr(*f.value)) return true; return false; }
-            bool visit(const ListExpr& n, CaptureArgScanner& self) { for (auto& e : n.elements) if (e && self.scanExpr(*e)) return true; return false; }
-            bool visit(const FunExpr& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
-            bool visit(const IntLiteral&, CaptureArgScanner&) { return false; }
-            bool visit(const FloatLiteral&, CaptureArgScanner&) { return false; }
-            bool visit(const StringLiteral&, CaptureArgScanner&) { return false; }
-            bool visit(const BoolLiteral&, CaptureArgScanner&) { return false; }
-            bool visit(const NoneLiteral&, CaptureArgScanner&) { return false; }
-            bool visit(const ThrowStmt&, CaptureArgScanner&) { return false; }
-            bool visit(const BreakStmt&, CaptureArgScanner&) { return false; }
-            bool visit(const ContinueStmt&, CaptureArgScanner&) { return false; }
-        };
-        for (auto& cap : captures) {
-            for (auto& s : e.body->stmts) {
-                if (!s) continue;
-                CaptureArgScanner argScanner;
-                argScanner.name = cap;
-                if (argScanner.scanStmt(*s)) { calledCaptures.insert(cap); break; }
-            }
-        }
-    }
+    std::set<std::string> calledCaptures = CaptureArgScanner::collectMatched(*e.body, captures);
 
     // === 4. 生成 C++ lambda ===
     std::ostringstream oss;

@@ -1,4 +1,5 @@
 #include "CodeGen.h"
+#include "../Sema/BuiltinRegistry.h"
 
 namespace Aura {
 
@@ -11,12 +12,18 @@ void CodeGenerator::registerTypeName(const std::string& auraName, bool isHeap) {
 }
 
 bool CodeGenerator::isValueType(const std::string& auraName) const {
+    // 先查 BuiltinRegistry
+    if (auto* ti = Aura::BuiltinRegistry::get().findType(auraName))
+        return !ti->isHeap;
     auto it = registeredTypes_.find(auraName);
     if (it == registeredTypes_.end()) return false;
     return !it->second;
 }
 
 bool CodeGenerator::isHeapType(const std::string& auraName) const {
+    // 先查 BuiltinRegistry
+    if (auto* ti = Aura::BuiltinRegistry::get().findType(auraName))
+        return ti->isHeap;
     auto it = registeredTypes_.find(auraName);
     if (it == registeredTypes_.end()) return false;
     return it->second;
@@ -90,16 +97,10 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
 }
 
 std::string CodeGenerator::mapNamedType(const std::string& name) {
-    // 内置值类型
-    if (name == "int")    return "int32_t";
-    if (name == "float")  return "double";
-    if (name == "bool")   return "bool";
-
-    // string → GcString*
-    if (name == "string") return "aura_rt::GcString*";
-
-    // None 在值上下文
-    if (name == "None")   return "aura_rt::NoneType";
+    // 先查 BuiltinRegistry（内置类型）
+    if (auto* ti = Aura::BuiltinRegistry::get().findType(name)) {
+        return ti->cppType;
+    }
 
     // 用户定义类型
     auto it = registeredTypes_.find(name);
@@ -107,10 +108,6 @@ std::string CodeGenerator::mapNamedType(const std::string& name) {
         // 堆对象 → 返回指针类型
         if (it->second) {
             return name + "*";
-        }
-        // 运行时值类型 → 加 aura_rt:: 前缀
-        if (name == "Io" || name == "Path") {
-            return "aura_rt::" + name;
         }
         return name;
     }

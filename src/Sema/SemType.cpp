@@ -214,4 +214,15 @@ std::unique_ptr<SemType> GenericSemType::clone() const {
     return n;
 }
 
+// ============================================================
+// IterSemType
+// ============================================================
+bool IterSemType::equals(const SemType& other) const {
+    auto* o = dynamic_cast<const IterSemType*>(&other);
+    return o && typeEquals(elementType, o->elementType);
+}
+std::unique_ptr<SemType> IterSemType::clone() const {
+    return make(elementType ? elementType->clone() : nullptr);
+}
+
 } // namespace Aura

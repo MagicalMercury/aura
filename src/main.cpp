@@ -29,7 +29,6 @@
 
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -88,6 +87,12 @@ std::string gccFlags(const CliOptions& opts) {
 // 单文件编译（原有逻辑，无 import 或仅内置模块）
 // ============================================================
 int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
+    // 0. 加载内置 .aurai（始终加载 io.aurai）
+    {
+        Aura::ModuleManager mgr(diag);
+        mgr.loadBuiltinAurai();
+    }
+
     std::string source = Aura::readFile(opts.inputPath);
     diag.setSourceView(source);
     diag.reset();
@@ -180,6 +185,9 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
     diag.reset();
     Aura::ModuleManager mgr(diag);
 
+    // 0. 加载内置 .aurai 接口声明（始终加载 io.aurai）
+    mgr.loadBuiltinAurai();
+
     // 1. 加载所有模块
     if (!mgr.loadAll(opts.inputPath)) {
         std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
@@ -203,13 +211,31 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
         return 1;
     }
 
-    // 5. 语义分析各模块
+    // 5. 语义分析各模块（按拓扑层，逐模块注入依赖导出表）
     for (auto& layer : layers) {
         for (auto* mod : layer) {
             if (mod->isBuiltin) continue;
             if (!mod->ast) continue;
+
             Aura::SemAnalyzer sema(diag);
+
+            // Phase A: 注入依赖模块的导出表
+            for (auto& depPath : mod->deps) {
+                auto depIt = mgr.modules().find(depPath);
+                if (depIt == mgr.modules().end()) continue;
+                auto& depInfo = depIt->second;
+                // 找到 dep 对应的 import alias
+                std::string alias;
+                for (auto& imp : mod->imports) {
+                    if (imp.path == depPath) { alias = imp.alias; break; }
+                }
+                sema.importExports(alias, depInfo.exports);
+            }
+
             (void)sema.analyze(*mod->ast);
+
+            // Phase A: 提取本模块导出表，供后续层依赖使用
+            mod->exports = sema.extractExports();
         }
     }
     if (diag.hasErrors()) {
@@ -342,7 +368,7 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
 int main(int argc, char* argv[]) {
     // 1. 解析命令行
     std::vector<std::string_view> args;
-    for (int i = 1; i < argc; ++i) args.push_back(argv[i]);
+    for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
     auto opts = parseArgs(args);
 
     if (opts.inputPath.empty()) {

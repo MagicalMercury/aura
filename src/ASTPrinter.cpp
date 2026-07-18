@@ -344,7 +344,17 @@ void TryCatchStmt::print(std::ostream& os, int indent) const {
 
 void SyncStmt::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "SyncStmt" << '\n';
+    os << "SyncStmt";
+    if (maxExpr) os << " (max)";
+    os << '\n';
+    if (body) body->print(os, indent + 1);
+}
+
+void SyncForStmt::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "SyncForStmt";
+    if (maxExpr) os << " (max)";
+    os << " item=" << itemName << '\n';
     if (body) body->print(os, indent + 1);
 }
 

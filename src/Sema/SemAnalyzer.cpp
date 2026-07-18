@@ -1,4 +1,5 @@
 #include "SemAnalyzer.h"
+#include "BuiltinRegistry.h"
 #include <algorithm>
 
 namespace Aura {
@@ -10,9 +11,7 @@ namespace Aura {
 SemAnalyzer::SemAnalyzer(DiagnosticEngine& diag) : diag_(diag) {}
 
 bool SemAnalyzer::analyze(const Program& program) {
-    diag_.reset();
     declareTopLevel(program);
-    if (diag_.hasErrors()) return false;
     checkProgram(program);
     return !diag_.hasErrors();
 }
@@ -42,15 +41,21 @@ void SemAnalyzer::error(int line, int col, DiagCode code, const std::string& msg
 // ============================================================
 
 std::unique_ptr<SemType> SemAnalyzer::resolveNamedType(const std::string& name) {
-    // 内置类型
-    if (name == "int")    return intType();
-    if (name == "float")  return floatType();
-    if (name == "bool")   return boolType();
-    if (name == "string") return stringType();
-
-    // None 不能作为独立变量类型（仅允许在联合类型中）
-    if (name == "None") {
-        return ErrorSemType::make();
+    // 先查 BuiltinRegistry
+    if (auto* ti = BuiltinRegistry::get().findType(name)) {
+        switch (ti->primKind) {
+            case BuiltinPrim::Int:    return intType();
+            case BuiltinPrim::Float:  return floatType();
+            case BuiltinPrim::Bool:   return boolType();
+            case BuiltinPrim::String: return stringType();
+            case BuiltinPrim::None_:  return ErrorSemType::make(); // None 不能独立使用
+            case BuiltinPrim::Other: {
+                // Io / Path 等非基础内置类型 → GenericSemType 占位
+                auto t = std::make_unique<GenericSemType>();
+                t->name = name;
+                return t;
+            }
+        }
     }
 
     // 用户定义类型
@@ -93,6 +98,57 @@ std::unique_ptr<SemType> SemAnalyzer::resolveNamedType(const std::string& name) 
     return ErrorSemType::make();
 }
 
+bool SemAnalyzer::matchFuncSig(
+    const std::vector<std::unique_ptr<SemType>>& aParams,
+    const SemType* aReturn, bool aThrows,
+    const std::vector<std::unique_ptr<SemType>>& bParams,
+    const SemType* bReturn, bool bThrows) const {
+    if (aThrows != bThrows) return false;
+    if (aParams.size() != bParams.size()) return false;
+    for (size_t i = 0; i < aParams.size(); ++i)
+        if (!isAssignable(*aParams[i], *bParams[i])) return false;
+    if (aReturn && bReturn)
+        return isAssignable(*aReturn, *bReturn);
+    return !aReturn && !bReturn;
+}
+
+std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(const ReturnTypeInfo& ret) {
+    switch (ret.kind) {
+        case ReturnTypeInfo::Kind::None:
+            return NoneSemType::make();
+        case ReturnTypeInfo::Kind::Named: {
+            if (ret.typeName == "int")    return intType();
+            if (ret.typeName == "float")  return floatType();
+            if (ret.typeName == "bool")   return boolType();
+            if (ret.typeName == "string") return stringType();
+            if (BuiltinRegistry::get().findType(ret.typeName)) {
+                auto g = std::make_unique<GenericSemType>();
+                g->name = ret.typeName;
+                return g;
+            }
+            if (ret.typeName.size() >= 2 && ret.typeName[0] == '[' && ret.typeName.back() == ']') {
+                auto lt = std::make_unique<ListSemType>();
+                std::string inner = ret.typeName.substr(1, ret.typeName.size() - 2);
+                if (BuiltinRegistry::get().findType(inner)) {
+                    auto g = std::make_unique<GenericSemType>();
+                    g->name = inner;
+                    lt->elementType = std::move(g);
+                } else {
+                    lt->elementType = ErrorSemType::make();
+                }
+                typeStore_.push_back(std::move(lt));
+                return typeStore_.back()->clone();
+            }
+            return ErrorSemType::make();
+        }
+        case ReturnTypeInfo::Kind::Generator:
+            return IterSemType::make(intType());
+        case ReturnTypeInfo::Kind::Generic:
+            return ErrorSemType::make();
+    }
+    return ErrorSemType::make();
+}
+
 bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) const {
     // 静默传播 error 类型
     if (dynamic_cast<const ErrorSemType*>(&target) || dynamic_cast<const ErrorSemType*>(&source))
@@ -132,13 +188,8 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
     // 函数类型：逐参数检查（支持泛型参数）
     if (auto* ft = dynamic_cast<const FuncSemType*>(&target)) {
         if (auto* fs = dynamic_cast<const FuncSemType*>(&source)) {
-            if (ft->throws != fs->throws) return false;
-            if (ft->paramTypes.size() != fs->paramTypes.size()) return false;
-            for (size_t i = 0; i < ft->paramTypes.size(); ++i)
-                if (!isAssignable(*ft->paramTypes[i], *fs->paramTypes[i])) return false;
-            if (ft->returnType && fs->returnType)
-                return isAssignable(*ft->returnType, *fs->returnType);
-            return !ft->returnType && !fs->returnType;
+            return matchFuncSig(ft->paramTypes, ft->returnType.get(), ft->throws,
+                               fs->paramTypes, fs->returnType.get(), fs->throws);
         }
         return false;
     }
@@ -148,13 +199,8 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
         if (auto* func = dynamic_cast<const FuncSemType*>(&source)) {
             if (iface->methods.size() == 1) {
                 auto& m = iface->methods[0];
-                if (m.throws != func->throws) return false;
-                if (m.paramTypes.size() != func->paramTypes.size()) return false;
-                for (size_t i = 0; i < m.paramTypes.size(); ++i)
-                    if (!isAssignable(*m.paramTypes[i], *func->paramTypes[i])) return false;
-                if (m.returnType && func->returnType)
-                    return isAssignable(*m.returnType, *func->returnType);
-                return !m.returnType && !func->returnType;
+                return matchFuncSig(m.paramTypes, m.returnType.get(), m.throws,
+                                   func->paramTypes, func->returnType.get(), func->throws);
             }
             return false;
         }
@@ -289,6 +335,47 @@ void SemAnalyzer::sealSelfRefs(std::unique_ptr<SemType>& node,
     }
 }
 
+std::unique_ptr<SemType> SemAnalyzer::applyTypeArgs(
+    std::unique_ptr<SemType> result,
+    const Symbol& sym,
+    const std::vector<std::unique_ptr<TypeExpr>>& typeArgs) {
+    for (size_t i = 0; i < typeArgs.size() && i < sym.typeParams.size(); ++i) {
+        auto concrete = resolveType(*typeArgs[i]);
+        result = substitute(*result, sym.typeParams[i], *concrete);
+    }
+    return result;
+}
+
+void SemAnalyzer::materializeCanonicalName(
+    std::unique_ptr<SemType>& result,
+    const NamedType& n) {
+    auto* rec = dynamic_cast<RecordSemType*>(result.get());
+    if (!rec) return;
+
+    bool allConcrete = true;
+    std::string fullName = rec->canonicalName + "<";
+    for (size_t i = 0; i < n.typeArgs.size(); ++i) {
+        if (i > 0) fullName += ", ";
+        std::string auraName;
+        if (auto* argNt = dynamic_cast<const NamedType*>(n.typeArgs[i].get()))
+            auraName = argNt->name;
+        else if (dynamic_cast<const GenericTypeRef*>(n.typeArgs[i].get())) {
+            allConcrete = false; break;
+        }
+        if (auraName == "int")    fullName += "int32_t";
+        else if (auraName == "float")  fullName += "double";
+        else if (auraName == "bool")   fullName += "bool";
+        else if (auraName == "string") fullName += "aura_rt::GcString*";
+        else fullName += auraName;
+    }
+    fullName += ">";
+
+    if (allConcrete) {
+        rec->canonicalName = fullName;
+        sealSelfRefs(result, n.name, fullName);
+    }
+}
+
 // ============================================================
 // canonicalName 传播（RecordSemType → 嵌套 RecordExpr AST）
 // ============================================================
@@ -413,6 +500,7 @@ void SemAnalyzer::checkStmt(const Stmt& stmt) {
     if (auto* m = dynamic_cast<const MatchStmt*>(&stmt))        { checkMatchStmt(*m);   return; }
     if (auto* t = dynamic_cast<const TryCatchStmt*>(&stmt))     { checkTryCatchStmt(*t);return; }
     if (auto* s = dynamic_cast<const SyncStmt*>(&stmt))         { checkSyncStmt(*s);    return; }
+    if (auto* sf = dynamic_cast<const SyncForStmt*>(&stmt))     { checkSyncForStmt(*sf);return; }
     if (auto* p = dynamic_cast<const SpawnStmt*>(&stmt))        { checkSpawnStmt(*p);   return; }
     if (auto* e = dynamic_cast<const ExprStmt*>(&stmt))         { checkExprStmt(*e);    return; }
     if (auto* br = dynamic_cast<const BreakStmt*>(&stmt)) {
@@ -423,6 +511,101 @@ void SemAnalyzer::checkStmt(const Stmt& stmt) {
         if (!insideLoop_) error(*co, "'continue' outside of loop");
         return;
     }
+}
+
+// ============================================================
+// 跨模块导入/导出（Phase A）
+// ============================================================
+
+void SemAnalyzer::importExports(const std::string& alias, const ModuleExports& exports) {
+    for (auto& [name, type] : exports.types) {
+        Symbol sym;
+        sym.kind = SymKind::TypeAlias;
+        sym.name = alias.empty() ? name : (alias + "." + name);
+        sym.type = type->clone();
+        symtab_.defineGlobal(std::move(sym));
+    }
+    for (auto& [name, f] : exports.ctors) {
+        Symbol sym;
+        sym.kind = SymKind::Function;
+        sym.name = alias.empty() ? name : (alias + "." + name);
+        for (auto& p : f.params) {
+            SymParam sp;
+            sp.name = p.name;
+            sp.type = p.type ? p.type->clone() : nullptr;
+            sym.params.push_back(std::move(sp));
+        }
+        sym.type   = f.returnType ? f.returnType->clone() : nullptr;
+        sym.throws = f.throws;
+        symtab_.defineGlobal(std::move(sym));
+    }
+    for (auto& [name, f] : exports.funcs) {
+        Symbol sym;
+        sym.kind = SymKind::Function;
+        sym.name = alias.empty() ? name : (alias + "." + name);
+        for (auto& p : f.params) {
+            SymParam sp;
+            sp.name = p.name;
+            sp.type = p.type ? p.type->clone() : nullptr;
+            sym.params.push_back(std::move(sp));
+        }
+        sym.type   = f.returnType ? f.returnType->clone() : nullptr;
+        sym.throws = f.throws;
+        symtab_.defineGlobal(std::move(sym));
+    }
+    // 注册 import 别名本身（供 inferMethodCall 检测命名空间调用）
+    if (!alias.empty()) {
+        Symbol aliasSym;
+        aliasSym.kind = SymKind::Variable;
+        aliasSym.name = alias;
+        aliasSym.belongsToModule = alias;
+        aliasSym.type = ErrorSemType::make();
+        symtab_.defineGlobal(std::move(aliasSym));
+    }
+}
+
+ModuleExports SemAnalyzer::extractExports() const {
+    ModuleExports e;
+    for (auto& scope : symtab_.allScopes()) {
+        if (scope->kind() != ScopeKind::Global) continue;
+        scope->forEach([&](const std::string& name, const Symbol& sym) {
+            if (!sym.isPublic) return;  // Phase B: 跳过私有符号
+            switch (sym.kind) {
+                case SymKind::TypeAlias:
+                    e.types[name] = sym.type ? sym.type->clone() : ErrorSemType::make();
+                    if (!sym.ctorParams.empty()) {
+                        FuncExport fe;
+                        for (auto& p : sym.ctorParams) {
+                            SymParam sp;
+                            sp.name = p.name;
+                            sp.type = p.type ? p.type->clone() : nullptr;
+                            fe.params.push_back(std::move(sp));
+                        }
+                        fe.returnType = sym.ctorReturnType ? sym.ctorReturnType->clone()
+                                        : (sym.type ? sym.type->clone() : ErrorSemType::make());
+                        fe.throws     = sym.throws;
+                        e.ctors[name] = std::move(fe);
+                    }
+                    break;
+                case SymKind::Function: {
+                    FuncExport fe;
+                    for (auto& p : sym.params) {
+                        SymParam sp;
+                        sp.name = p.name;
+                        sp.type = p.type ? p.type->clone() : nullptr;
+                        fe.params.push_back(std::move(sp));
+                    }
+                    fe.returnType = sym.type ? sym.type->clone() : nullptr;
+                    fe.throws     = sym.throws;
+                    e.funcs[name] = std::move(fe);
+                    break;
+                }
+                default: break;
+            }
+        });
+        break;
+    }
+    return e;
 }
 
 } // namespace Aura

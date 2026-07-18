@@ -1,4 +1,5 @@
 #include "CodeGen.h"
+#include "../Sema/BuiltinRegistry.h"
 #include <sstream>
 
 namespace Aura {
@@ -77,10 +78,12 @@ void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
     h << tprefix << "struct " << name << " : aura_rt::GcObject {\n";
 
     std::vector<std::string> ptrFields;
+    std::set<std::string> fieldNames;
 
     for (auto& f : body.fields) {
         std::string cppType = f.type ? mapType(*f.type) : "???";
         h << "  " << cppType << " " << safeName(f.name) << ";\n";
+        fieldNames.insert(f.name);
 
         // 检测 GC 指针字段：任何映射后以 * 结尾的 C++ 类型都是堆对象指针
         // 包括 NamedType（如 User*）、ListType（如 Array<T>*）、GcString* 等
@@ -89,10 +92,16 @@ void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
         }
     }
 
+    structFieldNames_[name] = fieldNames;
+
     // 收集此类型的所有方法声明并嵌入 struct 内部
     for (auto& md : pendingMethods_) {
         if (md.receiverType == name) {
-            h << "  " << md.returnTypeStr << " " << safeName(md.methodName) << "(";
+            // 检测方法名与字段名冲突（C++ 不允许同名成员函数与成员变量）
+            std::string cppMethodName = safeName(md.methodName);
+            if (fieldNames.count(cppMethodName))
+                cppMethodName += "_fun";
+            h << "  " << md.returnTypeStr << " " << cppMethodName << "(";
             for (size_t i = 0; i < md.paramTypes.size(); ++i) {
                 if (i > 0) h << ", ";
                 h << md.paramTypes[i] << " " << safeName(md.paramNames[i]);
@@ -214,7 +223,9 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     for (auto& p : decl.params) {
         if (p.type && dynamic_cast<const NamedType*>(p.type.get())) {
             auto* nt = dynamic_cast<const NamedType*>(p.type.get());
-            if (registeredTypes_.count(nt->name) && !registeredTypes_[nt->name])
+            if ((registeredTypes_.count(nt->name) && !registeredTypes_[nt->name])
+                || (BuiltinRegistry::get().findType(nt->name) != nullptr
+                    && !BuiltinRegistry::get().isHeapType(nt->name)))
                 valueTypeVarNames_.insert(p.name);
         }
         // 跟踪 string 类型参数 → lambda 捕获后 genBinaryExpr 用 concat
@@ -313,7 +324,8 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
                                    const MethodDecl& decl,
                                    bool declarationsOnly) {
     if (decl.isConstructor) {
-        genConstructor(cpp, decl);
+        if (!declarationsOnly)  // 构造函数体只在定义阶段生成
+            genConstructor(cpp, decl);
         return;
     }
     if (declarationsOnly) return;  // 方法声明已在 struct 内部，无需重复
@@ -372,7 +384,13 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     // 存储 C++ 返回类型，供 genReturnStmt 生成正确 RecordExpr
     currentReturnCppType_ = retType;
 
-    std::string sig = retType + " " + recvFullType + "::" + safeName(decl.name) + "(";
+    // 检测方法名与 receiver 的字段名是否冲突，冲突时加 _fun 后缀
+    std::string methodCppName = safeName(decl.name);
+    auto fnIt = structFieldNames_.find(decl.receiverType);
+    if (fnIt != structFieldNames_.end() && fnIt->second.count(methodCppName))
+        methodCppName += "_fun";
+
+    std::string sig = retType + " " + recvFullType + "::" + methodCppName + "(";
     for (size_t i = 0; i < decl.params.size(); ++i) {
         if (i > 0) sig += ", ";
         sig += (decl.params[i].type ? mapParamType(*decl.params[i].type) : "auto")
@@ -516,7 +534,8 @@ void CodeGenerator::collectTParams(const TypeExpr& type, std::set<std::string>& 
 
         // 无 typeArgs + 非注册类型 → 是泛型参数（如 Pair<A,B> 中的 A/B）
         if (n->typeArgs.empty() && !registeredTypes_.count(n->name)
-            && !interfaceNames_.count(n->name))
+            && !interfaceNames_.count(n->name)
+            && !BuiltinRegistry::get().findType(n->name))
             out.insert(n->name);
         return;
     }

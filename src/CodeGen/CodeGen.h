@@ -5,14 +5,10 @@
 #include "../AST/Stmt.h"
 #include "../AST/Type.h"
 #include "../ASTWalker.h"
-#include "../Lexer.h"
-#include "../Token.h"
 #include "../Diag/DiagnosticEngine.h"
-#include <functional>
 #include <map>
 #include <ostream>
 #include <set>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -138,6 +134,7 @@ public:
         bool visit(const LoopStmt& n, IdRefCollector& self)   { if (n.body) self.collectStmt(*n.body); return false; }
         bool visit(const TryCatchStmt& n, IdRefCollector& self) { if (n.tryBody) self.collectStmt(*n.tryBody); if (n.catchBody) self.collectStmt(*n.catchBody); return false; }
         bool visit(const SyncStmt& n, IdRefCollector& self)   { if (n.body) self.collectStmt(*n.body); return false; }
+        bool visit(const SyncForStmt& n, IdRefCollector& self) { if (n.iterable) self.collectExpr(*n.iterable); if (n.body) self.collectStmt(*n.body); return false; }
         bool visit(const SpawnStmt& n, IdRefCollector& self)  { for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
         bool visit(const MatchStmt& n, IdRefCollector& self) { if (n.expr) self.collectExpr(*n.expr); for (auto& c : n.cases) { if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) self.collectStmt(*cb); else self.collectExpr(*c.body); } } return false; }
         bool visit(const ExprStmt& n, IdRefCollector& self)   { if (n.expr) self.collectExpr(*n.expr); return false; }
@@ -180,6 +177,7 @@ public:
         bool visit(const MatchStmt& n, DeclaredCollector&)   { for (auto& c : n.cases) if (auto* tp = dynamic_cast<const TypePattern*>(c.pattern.get())) if (!tp->varName.empty()) out_.insert(tp->varName); return false; }
         bool visit(const BlockStmt& n, DeclaredCollector& self){ for (auto& s : n.stmts) if (s) self.collectStmt(*s); return false; }
         bool visit(const SyncStmt& n, DeclaredCollector& self) { if (n.body) for (auto& sb : n.body->stmts) if (sb) self.collectStmt(*sb); return false; }
+        bool visit(const SyncForStmt& n, DeclaredCollector& self){ out_.insert(n.itemName); if (n.body) for (auto& sb : n.body->stmts) if (sb) self.collectStmt(*sb); return false; }
         bool visit(const SpawnStmt& n, DeclaredCollector& self){ for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
         bool visit(const ReturnStmt&,  DeclaredCollector&) { return false; }
         bool visit(const ThrowStmt&,   DeclaredCollector&) { return false; }
@@ -300,6 +298,7 @@ private:
     void genContinueStmt(std::ostream& cpp);
     void genTryCatchStmt(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
     void genSyncStmt(std::ostream& cpp, const SyncStmt& stmt, bool isCoroutine);
+    void genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, bool isCoroutine);
 
     // 原始 try/catch（非协程模式回退，被 genTryCatchStmt 复用）
     void genTryCatchRaw(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
@@ -411,6 +410,12 @@ private:
 
     // 导入的命名空间名集合（路径名 + 别名，用于 genMethodCall 判断是否用 ::）
     std::set<std::string> importNsNames_;
+
+    // channel 类型变量名集合（用于 genMethodCall 的 co_await 判定和 genForStmt 展开）
+    std::set<std::string> channelVarNames_;
+
+    // record struct 的字段名集合（key = struct name），用于检测方法名与字段名冲突
+    std::unordered_map<std::string, std::set<std::string>> structFieldNames_;
 
     // 函数名 → 其接口类型参数的位置（用于 genCallExpr 中自动包装闭包为 InterfaceFunc）
     // 第一层 map: 函数名 → pair(参数索引, 接口类型名)

@@ -3,7 +3,6 @@
 // ============================================================
 
 #include "types.h"
-#include "gc.h"   // 需要 gc_alloc / allocRaw
 #include <cstdio>
 #include <cstring>
 

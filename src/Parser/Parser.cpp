@@ -124,4 +124,17 @@ std::unique_ptr<Program> Parser::parse() {
     return prog;
 }
 
+std::unique_ptr<Program> Parser::parseAurai() {
+    noBody_ = true;
+    auto prog = std::make_unique<Program>();
+    while (!atEnd()) {
+        auto decl = parseDecl();
+        if (decl) {
+            prog->decls.push_back(std::move(decl));
+        }
+    }
+    noBody_ = false;
+    return prog;
+}
+
 } // namespace Aura

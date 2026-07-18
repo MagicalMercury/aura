@@ -1,4 +1,5 @@
 #include "CodeGen.h"
+#include "../Sema/BuiltinRegistry.h"
 #include "../Sema/SemAnalyzer.h"
 #include <filesystem>
 #include <sstream>
@@ -19,13 +20,6 @@ void CodeGenConfig::setConfig(const SemAnalyzer& sema) {
 // ============================================================
 
 CodeGenerator::CodeGenerator(DiagnosticEngine& diag) : diag_(diag) {
-    // 注册内置值类型
-    registeredTypes_["int"]    = false;
-    registeredTypes_["float"]  = false;
-    registeredTypes_["bool"]   = false;
-    registeredTypes_["string"] = true; // GcString* 是堆指针
-    registeredTypes_["Io"]     = false; // value type — qualified as aura_rt::Io
-    registeredTypes_["Path"]   = false; // value type — qualified as aura_rt::Path
 }
 
 CompileUnit CodeGenerator::generate(const Program& program,

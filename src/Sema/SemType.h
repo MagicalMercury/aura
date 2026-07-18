@@ -108,6 +108,21 @@ struct GenericSemType : SemType {
     [[nodiscard]] std::unique_ptr<SemType> clone() const override;
 };
 
+// 迭代器类型 — range() 返回 Iter<int>，未来 .iter() 返回 Iter<T>
+struct IterSemType : SemType {
+    std::unique_ptr<SemType> elementType;
+    [[nodiscard]] bool equals(const SemType& other) const override;
+    [[nodiscard]] std::string toString() const override {
+        return "Iter<" + (elementType ? elementType->toString() : "?") + ">";
+    }
+    [[nodiscard]] std::unique_ptr<SemType> clone() const override;
+    static std::unique_ptr<IterSemType> make(std::unique_ptr<SemType> el) {
+        auto n = std::make_unique<IterSemType>();
+        n->elementType = std::move(el);
+        return n;
+    }
+};
+
 // ============================================================
 // 工具函数
 // ============================================================

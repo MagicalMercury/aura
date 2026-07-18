@@ -5,8 +5,10 @@
 #include "ModuleManager.h"
 #include "../Lexer.h"
 #include "../Parser.h"
+#include "../Sema/BuiltinRegistry.h"
 
 #include <algorithm>
+#include <functional>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -146,7 +148,8 @@ ModuleInfo ModuleManager::parseModule(const std::string& sourcePath) {
             }
 
             if (ii.isBuiltin) {
-                // 内置模块：不加载源文件
+                // 内置模块：按需加载对应 .aurai
+                loadAuraiFile(ii.path + ".aurai");
                 info.imports.push_back(ii);
             } else {
                 // 用户模块：解析路径并记录依赖
@@ -194,6 +197,35 @@ std::string ModuleManager::resolveImportPath(const std::string& importPath,
     if (fs::exists(abs)) return fs::absolute(abs).string();
 
     return {};
+}
+
+// ============================================================
+// 加载 .aurai 内置接口声明
+//   io.aurai   → 始终加载（语言级内置能力）
+//   path.aurai → 按需加载（遇到 import path 时）
+// ============================================================
+void ModuleManager::loadAuraiFile(const std::string& baseName) {
+    namespace fs = std::filesystem;
+    fs::path auraiPath = fs::current_path() / "builtins" / baseName;
+    if (!fs::exists(auraiPath)) return;
+    std::string src = readFile(auraiPath.string());
+    if (src.empty()) return;
+
+    Lexer lexer(src);
+    auto tokens = lexer.scanAll();
+
+    DiagnosticEngine dummyDiag;  // .aurai 解析错误不影响主流程
+    Parser parser(std::move(tokens), dummyDiag);
+    auto ast = parser.parseAurai();
+    if (ast) {
+        auto& reg = BuiltinRegistry::get();
+        reg.tryLoadAurai(baseName, *ast);
+    }
+}
+
+void ModuleManager::loadBuiltinAurai() {
+    loadAuraiFile("io.aurai");
+    // path.aurai 不在此加载——由 import path 时按需加载
 }
 
 // ============================================================

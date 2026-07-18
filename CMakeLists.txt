@@ -63,7 +63,7 @@ set(AURA_HEADERS
     src/Sema/Symbol.h
     src/Sema/SymbolTable.h
     src/Sema/SemAnalyzer.h
-    src/Sema/BuiltinMethods.h
+    src/Sema/BuiltinRegistry.h
     src/CodeGen/CodeGen.h
     src/Module/ModuleManager.h
     src/Diag/Diagnostic.h

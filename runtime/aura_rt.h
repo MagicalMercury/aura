@@ -10,3 +10,9 @@
 #include "builtin/path.h"
 #include "builtin/io.h"
 #include "builtin/array.h"
+#include "builtin/sync.h"
+#include "builtin/channel.h"
+
+#include <functional>
+#include <ranges>
+#include <variant>

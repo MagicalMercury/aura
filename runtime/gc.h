@@ -23,8 +23,6 @@
 #include <cstdio>
 #include <cstring>
 #include <cstddef>
-#include <cstdint>
-#include <functional>
 #include <set>
 #include <vector>
 

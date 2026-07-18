@@ -6,6 +6,7 @@
 // ============================================================
 
 #include "string.h"
+#include "../gc.h"
 #include <cstdio>
 #include <cstring>
 

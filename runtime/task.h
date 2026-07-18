@@ -14,15 +14,8 @@
 //       gc.h 仅 task.cpp 需要（run_event_loop 实现中注册 GC 栈根）
 // ============================================================
 
-#include "types.h"
-
-#include <concepts>
 #include <coroutine>
 #include <exception>
-#include <functional>
-#include <iostream>
-#include <queue>
-#include <variant>
 #include <vector>
 
 namespace aura_rt {

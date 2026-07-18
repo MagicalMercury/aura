@@ -1,6 +1,5 @@
 #include "Sema/SemAnalyzer.h"
-#include "Sema/BuiltinMethods.h"
-#include <algorithm>
+#include "Sema/BuiltinRegistry.h"
 
 namespace Aura {
 
@@ -157,6 +156,18 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
     }
     auto* sym = symtab_.lookup(callee->name);
     if (!sym) {
+        // 不在符号表中 → 查 BuiltinRegistry 全局函数
+        if (auto* fn = BuiltinRegistry::get().findFunction(callee->name, (int)e.args.size())) {
+            auto& ret = fn->returns;
+            switch (ret.kind) {
+                case ReturnTypeInfo::Kind::None:
+                    return NoneSemType::make();
+                case ReturnTypeInfo::Kind::Named:
+                case ReturnTypeInfo::Kind::Generator:
+                case ReturnTypeInfo::Kind::Generic:
+                    return semTypeFromBuiltinReturn(ret);
+            }
+        }
         error(*e.callee, "undefined identifier '" + callee->name + "'");
         return ErrorSemType::make();
     }
@@ -190,6 +201,22 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
         }
         return result;
     }
+    // TypeAlias 有显式构造函数（fun (self T) T(...)）→ 作为构造函数调用
+    if (sym->kind == SymKind::TypeAlias && !sym->ctorParams.empty()) {
+        if (e.args.size() != sym->ctorParams.size()) {
+            error(e, "constructor '" + callee->name + "' expects " +
+                  std::to_string(sym->ctorParams.size()) + " arguments, got " +
+                  std::to_string(e.args.size()));
+        }
+        for (size_t i = 0; i < e.args.size() && i < sym->ctorParams.size(); ++i) {
+            auto argTy = inferExpr(*e.args[i]);
+            if (sym->ctorParams[i].type && !isAssignable(*sym->ctorParams[i].type, *argTy)) {
+                error(*e.args[i], "argument type mismatch: expected '" +
+                      sym->ctorParams[i].type->toString() + "', got '" + argTy->toString() + "'");
+            }
+        }
+        return sym->type ? sym->type->clone() : ErrorSemType::make();
+    }
     // Variable / Parameter 但类型是函数类型 → 可作为函数调用
     if (sym->kind == SymKind::Variable || sym->kind == SymKind::Parameter) {
         if (auto* fst = dynamic_cast<const FuncSemType*>(sym->type.get())) {
@@ -220,43 +247,117 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
             return result;
         }
     }
+
     error(*e.callee, "undefined function '" + callee->name + "'");
     return ErrorSemType::make();
 }
 
 std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
+    // Phase A: import 命名空间调用（如 math.Point(3, 4), math.zip(1, "x")）
+    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+        auto* objSym = symtab_.lookup(id->name);
+        if (objSym && !objSym->belongsToModule.empty()) {
+            auto* imported = symtab_.lookupGlobal(id->name + "." + e.method);
+            if (imported && (imported->kind == SymKind::Function || imported->kind == SymKind::TypeAlias)) {
+                // 类型构造函数调用 → 返回该类型
+                if (imported->kind == SymKind::TypeAlias) {
+                    return imported->type ? imported->type->clone() : ErrorSemType::make();
+                }
+                // 函数调用 — 复用 inferCall 检查逻辑
+                if (!currentFunctionThrows_ && insideTry_ == 0 && imported->throws) {
+                    error(e, DiagCode::E016_ThrowsViolation,
+                          "cannot call throwing function '" + e.method + "' from non-throwing context",
+                          "add 'throws' to the function signature or wrap in 'try { ... } catch'");
+                }
+                if (e.args.size() != imported->params.size()) {
+                    error(e, "function '" + e.method + "' expects "
+                          + std::to_string(imported->params.size()) + " arguments, got "
+                          + std::to_string(e.args.size()));
+                }
+                for (size_t i = 0; i < e.args.size() && i < imported->params.size(); ++i) {
+                    auto argTy = inferExpr(*e.args[i]);
+                    if (imported->params[i].type && !isAssignable(*imported->params[i].type, *argTy)) {
+                        error(*e.args[i], "argument type mismatch: expected '"
+                              + imported->params[i].type->toString() + "', got '" + argTy->toString() + "'");
+                    }
+                }
+                return imported->type ? imported->type->clone() : NoneSemType::make();
+            }
+            error(e, "module '" + id->name + "' has no exported symbol '" + e.method + "'");
+            return ErrorSemType::make();
+        }
+    }
+
+    // 内置模块函数调用（如 path.new(...), path.join(...)）
+    // 这些函数的对象是内置模块名，不在符号表中，直接查 BuiltinRegistry。
+    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+        std::string fqName = id->name + "." + e.method;
+        if (auto* fn = BuiltinRegistry::get().findFunction(fqName, (int)e.args.size())) {
+            auto& ret = fn->returns;
+            switch (ret.kind) {
+                case ReturnTypeInfo::Kind::None:
+                    return NoneSemType::make();
+                case ReturnTypeInfo::Kind::Named:
+                case ReturnTypeInfo::Kind::Generator:
+                case ReturnTypeInfo::Kind::Generic:
+                    return semTypeFromBuiltinReturn(ret);
+            }
+        }
+    }
+
     auto objType = inferExpr(*e.object);
 
-    // 查 BuiltinMethods 表：若对象类型匹配已知 C++ 运行时类型，
-    // 返回表中注册的返回类型，让下游 CodeGen 生成正确调用。
+    // 查 BuiltinRegistry：若对象类型匹配已知内置类型，
+    // 返回注册的返回类型。
     std::string typeKey;
-    if (dynamic_cast<const PrimSemType*>(objType.get())) {
-        auto* p = static_cast<const PrimSemType*>(objType.get());
+    if (auto* p = dynamic_cast<const PrimSemType*>(objType.get())) {
         if (p->kind == PrimSemType::String) typeKey = "string";
     } else if (dynamic_cast<const ListSemType*>(objType.get())) {
         typeKey = "[T]";
+    } else if (auto* g = dynamic_cast<const GenericSemType*>(objType.get())) {
+        // Io / Path 等内置非基础类型（Phase 4）
+        if (BuiltinRegistry::get().findType(g->name))
+            typeKey = g->name;
     }
 
     if (!typeKey.empty()) {
-        if (auto* entry = BuiltinMethods::lookup(typeKey, e.method)) {
-            // 参数数量检查
-            if (entry->paramCount >= 0 && (int)e.args.size() != entry->paramCount) {
-                error(e, "method '" + std::string(e.method) + "' expects " +
-                      std::to_string(entry->paramCount) + " argument(s), got " +
-                      std::to_string(e.args.size()));
+        if (auto* entry = BuiltinRegistry::get().findMethod(typeKey, e.method, (int)e.args.size())) {
+            auto& ret = entry->returns;
+            switch (ret.kind) {
+                case ReturnTypeInfo::Kind::None:
+                    return NoneSemType::make();
+                case ReturnTypeInfo::Kind::Named:
+                case ReturnTypeInfo::Kind::Generator:
+                case ReturnTypeInfo::Kind::Generic:
+                    return semTypeFromBuiltinReturn(ret);
             }
-            if (entry->returnsNone)
-                return NoneSemType::make();
-            if (!entry->isGeneric)
-                return std::make_unique<PrimSemType>(static_cast<PrimSemType::Kind>(entry->returnPrim));
-            // 泛型返回（如 pop → T）→ 委托给 C++ 编译器
-            return ErrorSemType::make();
         }
-        // 内置类型查表失败 → 报错，不再透传给 C++ 编译器
-        auto typeName = (typeKey == "[T]") ? std::string("array") : std::string("string");
+        // 内置类型查表失败 → 报错
+        std::string typeName;
+        if (typeKey == "[T]") {
+            typeName = "array";
+        } else if (typeKey == "Io" || typeKey == "Path") {
+            typeName = typeKey;  // 保持原始名称
+        } else {
+            typeName = typeKey;  // "string" 等
+        }
+        // 检查方法名是否存在（不考虑参数数量），给出更有用的错误提示
+        std::string hint;
+        if (BuiltinRegistry::get().hasMethodName(typeKey, e.method)) {
+            // 方法存在但参数数量不匹配 — 列出该方法的所有重载
+            hint = "check argument count";
+        } else {
+            // 方法不存在 — 列出所有可用方法
+            auto names = BuiltinRegistry::get().listMethodNames(typeKey);
+            hint = "valid methods: ";
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (i > 0) hint += ", ";
+                hint += names[i];
+            }
+        }
         error(e, DiagCode::E013_MethodNotFound,
               "type '" + typeName + "' has no method '" + std::string(e.method) + "'",
-              typeKey == "[T]" ? "valid methods: append, pop, len, size, empty, insert, remove, capacity, front, back, clear, reserve" : "");
+              hint);
         return ErrorSemType::make();
     }
 

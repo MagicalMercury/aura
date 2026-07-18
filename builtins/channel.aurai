@@ -1,0 +1,18 @@
+// ============================================================
+// builtins/channel.aurai — 协程间通信 Channel<T>
+//
+// Channel<T> 是有缓冲的协程通道，用于协程间传递数据。
+//   - channel(cap: int) 创建容量为 cap 的通道
+//   - ch.send(value: T) 发送值（缓冲区满时挂起）
+//   - ch.receive() -> T 接收值（缓冲区空时挂起）
+//   - ch.close() 关闭通道，通知接收方不再有数据
+//   - for val in ch { ... } 迭代接收，直到通道关闭且缓冲为空
+//
+// C++: template<typename T> struct aura_rt::Channel
+// ============================================================
+
+type channel<T>
+
+fun (self channel<T>) send(value: T)
+fun (self channel<T>) receive() -> T
+fun (self channel<T>) close()

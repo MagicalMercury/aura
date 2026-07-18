@@ -1,4 +1,5 @@
 #include "CodeGen.h"
+#include "../Sema/BuiltinRegistry.h"
 
 namespace Aura {
 
@@ -59,6 +60,10 @@ public:
     }
     bool visit(const SyncStmt&, CoroScanner&) {
         // sync 块要求协程上下文
+        return true;
+    }
+    bool visit(const SyncForStmt&, CoroScanner&) {
+        // sync for 展开为 sync + spawn → 协程
         return true;
     }
     bool visit(const SpawnStmt&, CoroScanner&) {
@@ -155,7 +160,12 @@ private:
         if (auto* mc = dynamic_cast<const MethodCallExpr*>(&expr)) {
             if (mc->object) {
                 if (auto* id = dynamic_cast<const Identifier*>(mc->object.get())) {
-                    if (id->name == "io") return !ioSync_;
+                    if (id->name == "io") {
+                        // Phase 4: 用 BuiltinRegistry 精确判定是否需要挂起
+                        if (BuiltinRegistry::get().methodHasAsync("Io", mc->method))
+                            return !ioSync_;
+                        return false;  // file_exists / cwd 等无异步版本
+                    }
                 }
             }
         }

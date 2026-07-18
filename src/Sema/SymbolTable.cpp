@@ -7,11 +7,21 @@ namespace Aura {
 // ============================================================
 
 bool Scope::define(Symbol sym) {
-    std::string name = sym.name; // 先拷贝名字，move 后再用
-    // 函数和方法允许重载（暂用简单策略：同名直接覆盖，后续可扩展参数签名重载）
+    std::string name = sym.name;
     if (sym.kind == SymKind::Function || sym.kind == SymKind::Method) {
         auto it = symbols_.find(name);
-        if (it != symbols_.end() && it->second.kind == sym.kind) {
+        if (it != symbols_.end()) {
+            if (it->second.kind == sym.kind) {
+                return false;  // 同种类 → 不覆盖
+            }
+            // 构造函数 Method 与 TypeAlias 同名 → 存到 TypeAlias 符号上
+            if (sym.kind == SymKind::Method && it->second.kind == SymKind::TypeAlias
+                && sym.name == name) {
+                it->second.ctorParams = std::move(sym.params);
+                it->second.ctorReturnType = std::move(sym.type);
+                return true;
+            }
+            // 其他不同种类 → 不覆盖
             return false;
         }
     } else {

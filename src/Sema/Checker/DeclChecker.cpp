@@ -64,6 +64,7 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         Symbol fwd;
         fwd.kind = SymKind::TypeAlias;
         fwd.name = t->name;
+        fwd.isPublic = t->isPublic;  // Phase B
         fwd.typeParams = t->typeParams;    // 泛型参数名列表
         fwd.type = ErrorSemType::make();  // 占位符，resolveType 完成后覆盖
         symtab_.defineGlobal(std::move(fwd));
@@ -100,6 +101,7 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         Symbol sym;
         sym.kind = SymKind::Interface;
         sym.name = i->name;
+        sym.isPublic = i->isPublic;  // Phase B
         for (auto& m : i->methods) {
             InterfaceSemType::MethodSig sig;
             sig.name   = m.name;
@@ -117,10 +119,22 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         sym.kind   = SymKind::Function;
         sym.name   = f->name;
         sym.throws = f->throws;
+        sym.isPublic = f->isPublic;  // Phase B
+
+        // 先注册泛型参数（从参数类型中提取 <T>/<U> 等），
+        // 再解析参数类型和返回类型，这样 Tree<U> 中的 U 才能正确解析。
+        symtab_.enterScope(ScopeKind::Function);
+        for (auto& p : f->params) {
+            if (p.type) registerGenericParams(*p.type);
+        }
+        if (f->returnType) registerGenericParams(*f->returnType);
+
         for (auto& p : f->params) {
             sym.params.push_back({p.name, p.type ? resolveType(*p.type) : ErrorSemType::make()});
         }
         sym.type = f->returnType ? resolveType(*f->returnType) : nullptr;
+        symtab_.exitScope();
+
         symtab_.defineGlobal(std::move(sym));
         return;
     }
@@ -129,6 +143,7 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         sym.kind   = SymKind::Method;
         sym.name   = m->name;
         sym.throws = m->throws;
+        sym.isPublic = m->isPublic;  // Phase B
         for (auto& p : m->params) {
             sym.params.push_back({p.name, p.type ? resolveType(*p.type) : ErrorSemType::make()});
         }
@@ -144,46 +159,22 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
 
 std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
     if (auto* n = dynamic_cast<const NamedType*>(&astType)) {
-        auto result = resolveNamedType(n->name);
-        // 未找到类型 → 报错
+        std::string fullName = n->name;
+        if (!n->namespacePrefix.empty())
+            fullName = n->namespacePrefix[0] + "." + n->name;
+        auto result = resolveNamedType(fullName);
+        // 未找到类型 → 报错（Io/Path 为内置能力类型，由 CodeGen 注册）
         if (dynamic_cast<const ErrorSemType*>(result.get()) &&
-            n->name != "None" && n->name != "int" && n->name != "float" &&
-            n->name != "bool" && n->name != "string") {
-            error(n->line, n->col, "undefined type '" + n->name + "'");
+            fullName != "None" && fullName != "int" && fullName != "float" &&
+            fullName != "bool" && fullName != "string" && fullName != "Io" && fullName != "Path") {
+            error(n->line, n->col, "undefined type '" + fullName + "'");
         }
         // 若有名称类型且有泛型实参（如 Tree<int>），用 substitute 将泛型形参替换为实参
         if (!n->typeArgs.empty()) {
-            auto* sym = symtab_.lookup(n->name);
+            auto* sym = symtab_.lookup(fullName);
             if (sym && sym->kind == SymKind::TypeAlias && !sym->typeParams.empty()) {
-                for (size_t i = 0; i < n->typeArgs.size() && i < sym->typeParams.size(); ++i) {
-                    auto concrete = resolveType(*n->typeArgs[i]);
-                    result = substitute(*result, sym->typeParams[i], *concrete);
-                }
-                // 构建完整 C++ 类型名（如 "Tree<int32_t>"），跳过全泛型参数
-                if (auto* rec = dynamic_cast<RecordSemType*>(result.get())) {
-                    bool allConcrete = true;
-                    std::string fullName = rec->canonicalName + "<";
-                    for (size_t i = 0; i < n->typeArgs.size(); ++i) {
-                        if (i > 0) fullName += ", ";
-                        std::string auraName;
-                        if (auto* argNt = dynamic_cast<const NamedType*>(n->typeArgs[i].get()))
-                            auraName = argNt->name;
-                        else if (dynamic_cast<const GenericTypeRef*>(n->typeArgs[i].get())) {
-                            allConcrete = false; break;
-                        }
-                        if (auraName == "int")    fullName += "int32_t";
-                        else if (auraName == "float")  fullName += "double";
-                        else if (auraName == "bool")   fullName += "bool";
-                        else if (auraName == "string") fullName += "aura_rt::GcString*";
-                        else fullName += auraName;
-                    }
-                    fullName += ">";
-                    if (allConcrete) {
-                        rec->canonicalName = fullName;
-                        // seal：将子引用中的裸 GenericSemType 替换为带 canonicalName 的记录
-                        sealSelfRefs(result, n->name, fullName);
-                    }
-                }
+                result = applyTypeArgs(std::move(result), *sym, n->typeArgs);
+                materializeCanonicalName(result, *n);
             }
         }
         return result;

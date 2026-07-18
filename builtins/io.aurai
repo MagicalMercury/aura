@@ -1,0 +1,30 @@
+// ============================================================
+// builtins/io.aurai — Io 能力类
+//
+// Io 是 Aura 语言的内置能力对象，通过 fun main(io: Io) 注入。
+// 所有 I/O 副作用必须通过 io 对象调用，遵循能力安全模型。
+//
+// C++ 双版本说明（对 Aura 用户透明）：
+//   每个 I/O 方法在 C++ 中有异步版（返回 task<T>）和同步版（_sync 后缀）。
+//   编译器根据上下文自动选择：
+//     - 协程函数中 → co_await io.xxx()（异步版）
+//     - #io.sync=true → io.xxx_sync()（同步版）
+//   Aura 用户始终只看到一个方法签名。
+// ============================================================
+
+type Io
+
+// 终端 I/O
+fun (self Io) println(msg: string)
+fun (self Io) readln() throws -> string
+
+// 文件 I/O（Path 由 path.aurai 定义）
+fun (self Io) read_file(path: Path) throws -> string
+fun (self Io) write_file(path: Path, content: string) throws
+fun (self Io) file_exists(path: Path) -> bool
+fun (self Io) mkdir(path: Path) throws
+fun (self Io) remove(path: Path) throws
+fun (self Io) list_dir(path: Path) throws -> [Path]
+
+// 路径操作
+fun (self Io) cwd() -> Path

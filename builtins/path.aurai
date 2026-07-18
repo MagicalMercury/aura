@@ -1,0 +1,20 @@
+// ============================================================
+// builtins/path.aurai — Path 类型 + path 模块
+//
+// Path 是值类型（非 GC 托管），可自由拷贝。
+// path 模块通过 import path 加载（按需加载）。
+// ============================================================
+
+type Path
+
+// 模块级函数（通过 path.xxx 调用）
+fun path.new(s: string) -> Path
+fun path.join(base: Path, seg: string) -> Path
+fun path.join(base: Path, seg: Path) -> Path
+
+// Path 实例方法
+fun (self Path) parent() -> Path
+fun (self Path) file_name() -> string
+fun (self Path) extension() -> string
+fun (self Path) is_absolute() -> bool
+fun (self Path) to_string() -> string

@@ -6,7 +6,6 @@
 // ============================================================
 
 #include "gc.h"
-#include "builtin/error.h"
 #include "builtin/string.h"
 #include <algorithm>
 #include <cstring>

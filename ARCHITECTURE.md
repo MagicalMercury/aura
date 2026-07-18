@@ -1,8 +1,8 @@
 # Aura 编译器架构文档
 
-> 版本：v0.7
-> 日期：2026-06-19
-> 状态：GcString 重构完成，Array 块链表就绪，CodeGen 闭包/递归/make_mapper 全场景通过
+> 版本：v0.8
+> 日期：2026-06-30
+> 状态：统一诊断引擎就绪、Sema 检查全覆盖、spawn 显式传参、运行时内存安全加固、README 文档重组完成
 
 ---
 
@@ -14,6 +14,7 @@
      ├─ 单文件模式（无用户 import）
      │       ↓
      │   [Lexer] → [Parser] → [SemAnalyzer] → [CodeGen] → .gen.cpp → g++ → .exe
+     │                                       ↗ DiagnosticEngine（贯穿）
      │
      └─ 多文件模式（有 import "..."）
              ↓
@@ -21,9 +22,9 @@
              ↓
          循环检测 (DFS) → 拓扑分层 (Kahn BFS) → 入口验证 (hasMain)
              ↓
-         按层编译（每模块独立 CodeGenerator）:
+         按层编译(每模块独立 SemAnalyzer + CodeGenerator):
            .aura → .aura.h (模板/类型/声明) + .aura.cpp (非模板实现/TypeDescriptor/入口)
-             ↓
+             ↓                                                ↗ DiagnosticEngine
          g++ 一次性链接所有 .cpp + libaura_rt.a → .exe
 ```
 
@@ -31,12 +32,13 @@
 
 | 阶段 | 模块 | 状态 |
 |------|------|------|
-| 词法分析 | `src/Lexer.cpp` | ✅ 完成 |
-| 语法分析 | `src/Parser/` (5 文件) | ✅ 完成（含 import as / 命名空间类型限定 `ns.Type<T>`） |
-| 语义分析 | `src/Sema/` (4 头文件 + 4 cpp) | ✅ 完成 |
-| 代码生成 | `src/CodeGen/` (1 头文件 + 6 cpp) | ✅ 完成（含命名空间包裹、跨模块模板体、构造调用） |
-| 模块系统 | `src/Module/` (2 文件) | ✅ 完成（递归加载、循环检测、拓扑分层、入口验证） |
-| 运行时库 | `runtime/` (9 头文件 + 6 cpp) | ✅ 完成（GcString 重构、Array 块链表、扩展 API、错误工厂） |
+| 词法分析 | `src/Lexer.cpp` | ✅ 完成（含 Error Token 检测） |
+| 语法分析 | `src/Parser/` (5 文件) | ✅ 完成（含级联错误抑制 synchronize） |
+| 语义分析 | `src/Sema/` (5 头文件 + 4 cpp) | ✅ 完成（含 Sema 补齐 Phase 4/5/8） |
+| 代码生成 | `src/CodeGen/` (1 头文件 + 6 cpp) | ✅ 完成（含 spawn 显式参数） |
+| 模块系统 | `src/Module/` (2 文件) | ✅ 完成（含多文件 SemAnalyzer） |
+| 诊断引擎 | `src/Diag/` (2 头文件 + 1 cpp) | ✅ 完成（源码上下文 + fix-hint + 错误码） |
+| 运行时库 | `runtime/` (9 头文件 + 6 cpp) | ✅ 完成（含 GC 安全加固） |
 
 ---
 
@@ -45,43 +47,47 @@
 ```
 d:\you\Aura\
 ├── src/                          # 编译器源码
-│   ├── main.cpp                  # 入口（CLI + 单文件/多文件路由）
+│   ├── main.cpp                  # 入口（CLI + 单文件/多文件路由 + DiagnosticEngine 初始化）
 │   ├── Lexer.{h,cpp}             # 词法分析器
 │   ├── Token.h / TokType.{h,cpp} # Token 类型定义
 │   ├── KeyWords.h                # 关键字映射表
 │   ├── Parser.h                  # Parser 主接口
 │   ├── Parser/
-│   │   ├── Parser.cpp            # 主解析器（入口 + 调度）
+│   │   ├── Parser.cpp            # 主解析器（入口 + 调度 + synchronize 错误恢复）
 │   │   ├── DeclParser.cpp        # 声明解析(type/interface/fun/method/import as)
-│   │   ├── StmtParser.cpp        # 语句解析(if/for/while/match/try等)
-│   │   ├── ExprParser.cpp        # 表达式解析(Pratt 解析)
+│   │   ├── StmtParser.cpp        # 语句解析(if/for/while/match/try/sync/spawn)
+│   │   ├── ExprParser.cpp        # 表达式解析(Pratt 解析 + 空指针保护)
 │   │   └── TypeParser.cpp        # 类型解析（含 ns.Type<T> 命名空间前缀）
 │   ├── AST/
-│   │   ├── ASTNode.h             # 基类 + print/clone 虚函数
+│   │   ├── ASTNode.h             # 基类 + hasError 标记 + print/clone 虚函数
 │   │   ├── Expr.h                # 表达式节点 (17 种，含 IndexExpr)
-│   │   ├── Stmt.h                # 语句 + 声明节点 (20+ 种)
+│   │   ├── Stmt.h                # 语句 + 声明节点 (20+ 种，含 SpawnStmt 显式参数)
 │   │   └── Type.h                # 类型表达式节点 (6 种)
 │   ├── ASTPrinter.{h,cpp}        # AST 打印（调试用）
+│   ├── Diag/
+│   │   ├── Diagnostic.h          # Diagnostic 数据结构（severity/range/fixHint/DiagCode）
+│   │   ├── DiagnosticEngine.h    # 统一诊断引擎接口
+│   │   └── DiagnosticEngine.cpp  # 格式化打印（源码行 + ^~~~ 指示 + 颜色）
 │   ├── Module/
 │   │   ├── ModuleManager.h       # 模块元信息、依赖图、拓扑分层接口
 │   │   └── ModuleManager.cpp     # 递归加载、DFS 循环检测、Kahn 分层、入口验证
 │   ├── Sema/
-│   │   ├── SemType.{h,cpp}       # 语义类型层次（9 种子类）
-│   │   ├── Symbol.h              # 符号条目定义
+│   │   ├── SemType.{h,cpp}       # 语义类型层次（10 种子类，含 RangeSemType）
+│   │   ├── Symbol.h              # 符号条目定义（含 isConst 字段）
 │   │   ├── SymbolTable.{h,cpp}   # 作用域 / 符号表
 │   │   ├── BuiltinMethods.h      # 内置方法映射表（string.len / [T].append 等）
 │   │   ├── SemAnalyzer.h         # SemAnalyzer 主头文件
 │   │   ├── SemAnalyzer.cpp       # 主流程 + 工具 + 调度
 │   │   └── Checker/
-│   │       ├── DeclChecker.cpp   # 声明注册（第 1 遍）
-│   │       ├── StmtChecker.cpp   # 语句检查
-│   │       └── ExprInfer.cpp     # 表达式类型推断 + match 穷尽 + string 拼接
+│   │       ├── DeclChecker.cpp   # 声明注册（第 1 遍）+ 泛型引入 + impl 验证
+│   │       ├── StmtChecker.cpp   # 语句检查（含 break/continue/sync/const 检查）
+│   │       └── ExprInfer.cpp     # 表达式类型推断 + match 穷尽 + 方法/函数调用校验
 │   └── CodeGen/
 │       ├── CodeGen.h             # CodeGenerator 主头文件
 │       ├── CodeGen.cpp           # 主流程 + 命名空间包裹 + #include/别名生成
 │       ├── TypeMap.cpp           # 类型映射 (Aura → C++) + TypeDescriptor 生成
 │       ├── DeclGen.cpp           # 声明生成 (struct/interface/函数/方法/ctor/入口)
-│       ├── StmtGen.cpp           # 语句生成（含值类型跟踪、模板参数提取）
+│       ├── StmtGen.cpp           # 语句生成（含值类型跟踪、spawn 显式参数 lambda）
 │       ├── ExprGen.cpp           # 表达式生成（含跨模块 ns::ctor 调用）
 │       └── CoroDecide.cpp        # 协程判定
 │
@@ -89,34 +95,33 @@ d:\you\Aura\
 │   ├── CMakeLists.txt            # 独立构建
 │   ├── aura_rt.h                 # 总头文件
 │   ├── types.{h,cpp}             # GcObject, Error, NoneType, TypeDescriptor
-│   ├── gc.{h,cpp}                # GcHeap 分代 GC（标记-清除 + 写屏障 + 记忆集）
-│   │                             #   + OOM 错误缓存 + 老年代阈值检查
-│   ├── task.{h,cpp}              # task<T>, when_all, run_event_loop
+│   ├── gc.{h,cpp}                # GcHeap 分代 GC（含 obj->desc 空指针保护）
+│   ├── task.{h,cpp}              # task<T>, when_all, run_event_loop（含页对齐栈扫描）
 │   └── builtin/
 │       ├── string.{h,cpp}        # GcString 定义 + TypeDescriptor + make/from/concat
-│       │                         #   + ToString concept + operator+ 多重重载
-│       ├── array.h               # Array<T> 块链表实现（ArrayChunk + 迭代器 + 合并）
-│       ├── error.h               # 8 种内置错误工厂（Index/Type/Value/Key/IO/OOM...）
-│       ├── path.h                # Path + path 模块 (返回 GcString*，无 std::string)
+│       ├── array.h               # Array<T> 块链表实现（含 EMPTY() 修复）
+│       ├── error.h               # 8 种内置错误工厂
+│       ├── path.h                # Path + path 模块
 │       ├── io.h                  # Io 能力类声明
-│       └── io.cpp                # Io 实现 (println/readln/read_file/write_file/list_dir)
+│       └── io.cpp                # Io 实现
 ├── CMakeLists.txt                # 主构建 (aurac.exe)
-├── README.md                     # 语言使用手册
+├── README.md                     # 语言参考手册（精简目录 + 附录 C）
 ├── ARCHITECTURE.md               # 本文档
-├── change.md                     # Array 旧 API → 新 API 替换指南
-├── chunk_array_plan.md           # Array 块链表设计（ArrayChunk + maybeCompact）
-├── array_advise.md               # Array API 审查与改进建议（empty/size/clear...）
-├── coroutine_gc_review.md        # 协程 GC 根注册审查
-├── error.md                      # 运行时 Bug 追踪（全部已修复）
-├── Res.md                        # 项目总结 / TODO 总表
+├── READMEs/                      # 语言规范拆分文档（18 文件）
 ├── plan/                         # 实现计划书
-│   ├── plan.md                   # 总计划
-│   ├── plan6.md                  # 分代 GC + 写屏障
-│   ├── plan11.md                 # 值方法调用（s.len() / arr.push(val)）
-│   ├── plan12.md                 # 闭包泛型 + 递归闭包 + make_mapper
-│   ├── plan13.md                 # GcString 重构（API 内聚 + operator+ + ToString）
-│   └── plan14.md                 # 分析器已知限制（递归泛型类型 + 闭包→接口匹配）
-```
+│   ├── fix_plan.md               # 综合修复计划（7 Phase + 附录 3 Phase）
+│   ├── concurrency_lang_spec.md  # 并发语言规范设计
+│   ├── range_implementation.md   # range() 内置函数实施计划
+│   ├── builtin_registry_plan.md  # BuiltinRegistry 集中注册计划
+│   └── ...                       # 历史计划
+├── doc/
+│   ├── error_handling_analysis.md # 错误处理分析（12 类问题）
+│   ├── memory_ub_analysis.md      # 运行时内存安全审查
+│   └── memory/                    # 经验教训
+├── example/                       # 测试用例
+│   ├── test.aura                  # 错误检测测试集（4 大类全覆盖）
+│   └── output.txt                 # 预期输出
+└── change.md / chunk_array_plan.md / ...  # 历史文档
 
 ---
 
@@ -272,11 +277,167 @@ CoroDecide.cpp ── 协程判定  ──────────────�
 
 | 编号 | 问题 | 优先级 | 计划 |
 |------|------|--------|------|
-| F1 | 接口类型擦除（当前输出占位） | 中 | plan14 |
+| F1 | 接口类型擦除（当前输出占位） | 中 | — |
 | F2 | `match` 分支变量 lambda 捕获完整性 | 中 | — |
 | F3 | 编译期路径表达式（`import path.join(...)`） | 低 | 延后 |
-| F4 | 递归泛型类型推断（`Tree<T> = {..., children: [Tree<T>]}`） | 高 | plan14 |
-| F5 | 闭包到接口的结构匹配（`fun(string) -> string` 作为 `interface` 参数） | 高 | plan14 |
+| F4 | 递归泛型类型推断（`Tree<T> = {..., children: [Tree<T>]}`） | 高 | — |
+| F5 | 闭包到接口的结构匹配（`fun(string) -> string` 作为 `interface` 参数） | 高 | — |
+
+---
+
+## 4A. 诊断引擎 (DiagnosticEngine — Phase 1 + 6)
+
+v0.8 新增，取代各组件独立的 `errors_` vector。
+
+### 4A.1 架构
+
+```
+DiagnosticEngine（main.cpp 单例）
+  ├── setSourceView(source)   ← 传递源码文本，用于打印时提取行
+  ├── setFileName("test.aura")← 用于错误位置标注
+  ├── setMaxErrors(20)        ← 避免错误洪泛
+  ├── error(DiagCode, node, msg) / warn / note
+  │     = help: fixHint（可选）
+  └── print(ostream)          ← 统一格式化输出
+        │
+        └── format: error[E013]: msg
+              --> file.aura:11:9
+               |  代码行
+               |         ^ 位置指示
+               = help: 修复建议
+```
+
+### 4A.2 错误码体系
+
+| 错误码 | 含义 | 触发位置 |
+|--------|------|---------|
+| E001 | 语法错误 | Parser |
+| E002 | 类型不匹配 | Sema |
+| E003 | 未定义标识符 | Sema |
+| E004 | 参数数量不匹配 | Sema |
+| E005 | 返回类型不匹配 | Sema |
+| E006 | throws 缺失 | Sema |
+| E007 | 泛型参数错误 | Sema |
+| E008 | 接口不一致 | Sema |
+| E009 | match 穷尽缺失 | Sema (E014) |
+| E010 | const 重赋值 | Sema (E015) |
+| E011 | spawn 位置错误 | Sema (E018) |
+| E012 | None 独立类型 | Sema (E017) |
+| E013 | 方法不存在 | Sema |
+| E014 | match 不穷尽 | Sema |
+| E015 | const 重赋值 | Sema |
+| E016 | throws 调用错误 | Sema |
+| E017 | None 独立类型 | Sema |
+| E018 | spawn 在 sync 外 | Sema |
+| E019 | 泛型引入无效 | Sema |
+
+### 4A.3 Fix-Hint 示例
+
+| 场景 | Hint |
+|------|------|
+| 方法不存在 | `valid methods: append, pop, len, ...` |
+| const 重赋值 | `use 'let' instead of 'const' if you need to reassign` |
+| throws 调用 | `add 'throws' to the function signature or wrap in 'try { ... } catch'` |
+| spawn 在 sync 外 | `wrap the spawn statement in 'sync { ... }'` |
+| None 独立类型 | `use a union type (e.g. 'int | None')` |
+
+---
+
+## 4B. Sema 检查补齐 (Phase 4 + 5 + 8)
+
+### 4B.1 Phase 4 — 该报错的不报错
+
+| 检查项 | 位置 | 说明 |
+|--------|------|------|
+| Match 穷尽性 | `StmtChecker.cpp:176` | 联合类型缺少 variant → E014 |
+| const 重赋值 | `ExprInfer.cpp:inferAssign` / `Symbol.h` | `Symbol::isConst` → E015 |
+| 非 throws 调 throws | `ExprInfer.cpp:inferCall/inferMethodCall` | 检查 `currentFunctionThrows_` / `insideTry_` → E016 |
+| None 独立类型 | `SemAnalyzer.cpp:checkLetDecl/checkConstDecl` | `let x: None` → E017 |
+| spawn 在 sync 外 | `StmtChecker.cpp:checkSpawnStmt` | `insideSync_` 标记 → E018 |
+| `!` 在非 throws | `StmtChecker.cpp` | `!` 只能在 throws 函数或 try 块内使用 |
+
+### 4B.2 Phase 5 — 类型系统完善
+
+| 检查项 | 位置 | 说明 |
+|--------|------|------|
+| 泛型参数引入 | `DeclChecker.cpp:checkMethodBody` | 泛型必须从参数或返回类型（泛型函数类型）引入 |
+| impl 接口一致性 | `DeclChecker.cpp:checkMethodBody` | 参数数/类型、返回类型、throws 比对 |
+
+### 4B.3 Phase 8 — 健壮性加固
+
+| 修复 | 位置 | 说明 |
+|------|------|------|
+| `isAssignable(ErrorSemType, _)` → false | `SemAnalyzer.cpp:isAssignable` | 不再静默接受错误类型（配合 resolveNamedType/inferExpr 报错） |
+| break/continue 上下文检查 | `StmtChecker.cpp:checkStmt` | `break`/`continue` 不在循环内 → error |
+| inferExpr fallback 报错 | `ExprInfer.cpp:inferExpr` | 未知 AST 节点类型 → error |
+| resolveNamedType 报错 | `SemAnalyzer.cpp` | 未找到类型 → error |
+
+---
+
+## 4C. 多阶段尽力报告 (Phase 7)
+
+**核心改动**：阶段门控从硬阻断（Parser 有错 → return 1，Sema 不跑）改为尽力模式：
+
+```
+旧：Parser 有错 → return 1（Sema 不跑）
+新：Parser 有错 → 标记 failed，继续跑 Sema → 所有阶段统一汇总打印
+
+输出格式：
+  Compilation failed with N error(s):
+  error[E001]: ...
+  error[E013]: ...
+```
+
+**ASTNode::hasError**：CodeGen 可跳过有错误的节点（生成 `// [skipped]` 注释）。
+
+---
+
+## 4D. 运行时内存安全加固 (v0.8)
+
+### 4D.1 协程帧保守栈扫描
+
+**问题**：`task.cpp` 固定假设协程帧大小 4096 字节，实际帧可能远小于此值，导致读取未映射内存。
+
+**修复**：动态计算帧边界 → 页对齐上限，不超过 `pageEnd - frameAddr`。
+
+### 4D.2 GC 严格别名违规
+
+**问题**：`gc.cpp:247` 将栈上内存直接读取为 `void*`，在标准 C++ 中属于 UB。
+
+**修复**：在读取 `candidate` 后，先验证 `obj->desc != nullptr && obj->desc->size > 0`，再读取 `obj->generation`。
+
+### 4D.3 EMPTY() 哨兵
+
+**问题**：`Array<T>::EMPTY()` 返回 static 局部指针，不在 GC 页中，Major GC 后可能成为悬垂指针。
+
+**修复**：改为每次调用 `make(0)` 分配新 Array（成本极低：1 个空 chunk）。
+
+---
+
+## 4E. Spawn 显式传参 (Concurrency Spec C.2)
+
+### 4E.1 语法
+
+```aura
+// 同名自动绑定
+spawn (io: Io, n: int) {
+    io.println("processing " + n)
+}
+
+// 异名显式传参
+spawn (io: Io) {
+    io.println("hello")
+}(my_io)
+```
+
+### 4E.2 编译链
+
+| 层 | 实现 |
+|----|------|
+| AST | `SpawnStmt::params` (vector\<Param\>) + `args` (vector\<ASTNode\*>) |
+| Parser | `parseSpawnStmt` 消费 `(` → `parseParams()` → `)` → `parseBlock()` → 可选 `(args)` |
+| Sema | 参数注册为只读 Symbol；双作用域（params + body）隔离 |
+| CodeGen | lambda 签名为 params；同名自动绑定或显式 args；旧式隐式捕获作为 fallback |
 
 ---
 
@@ -519,7 +680,7 @@ cmake --build build
 |------|------|
 | 后端目标 C++20 | 利用协程、模板、variant、concepts |
 | 分代 GC | mark-sweep + generational（young/old + remembered set + 写屏障） |
-| 保守栈根 | `registerStackRoots` 扫描协程帧内存范围 |
+| 保守栈根 | `registerStackRoots` 扫描协程帧内存范围（页对齐上限） |
 | 精确标记 | TypeDescriptor + ptrFieldOffsets + InlineArrayField |
 | 模板体入 .h | 跨模块实例化必须可见 |
 | `as` 别名屏蔽原名 | 有 alias 时不生成原名别名 |
@@ -537,6 +698,12 @@ cmake --build build
 | 字符串拼接分析 | `inferBinaryExpr` 中 string + X → string，在算术之前判断 |
 | 递归闭包引用捕获 | `genFunExpr` 检测 `let f = fun(...) { ... f(...) }` 模式 → 加 `&` |
 | 空列表空指针修正 | `genLetStmt` 中检测 `nullptr` 初始化 → 用类型标注重写为 `Array<T>::make(0)` |
+| **统一诊断引擎** | 所有阶段共享一个 `DiagnosticEngine`，源码上下文 + fix-hint + 错误码 |
+| **尽力编译** | Parser 有错继续跑 Sema → 全阶段统一汇总（不再硬阻断） |
+| **spawn 显式参数** | `spawn (params) { body }(args)` → CodeGen 生成 lambda 签名 + 自动/显式绑定 |
+| **isAssignable 加固** | ErrorSemType 不再静默返回 true（暴露隐藏类型错误） |
+| **GC 安全加固** | 协程帧页对齐扫描 + obj->desc 空指针验证 + EMPTY() 每次分配 |
+| **ERROR_TOKEN 检测** | Parser 入口检查 `TokType::Error`，直接报 lexical error |
 
 ---
 
@@ -603,7 +770,7 @@ cmake --build build
 
 | 类型 | 说明 |
 |------|------|
-| `ErrorSemType` | 错误类型（静默传播） |
+| `ErrorSemType` | 错误类型（v0.8：isAssignable 中不再静默返回 true） |
 | `PrimSemType` | int / float / bool / string |
 | `NoneSemType` | None |
 | `RecordSemType` | 记录类型（结构等价） |
@@ -611,22 +778,29 @@ cmake --build build
 | `ListSemType` | 列表类型 |
 | `FuncSemType` | 函数类型 |
 | `InterfaceSemType` | 接口类型 |
+| `RangeSemType` | 整数范围类型（range() 返回） |
 
-### BuiltinMethods — 内置方法映射表
+### BuiltinMethods — 内置方法映射表 (v0.8: 将迁移至 BuiltinRegistry)
 
-位于 `Sema/BuiltinMethods.h`，将 Aura 方法名映射到已知 C++ 运行时类型的方法签名，供语义分析器查找返回类型，避免将所有方法调用退回为 `ErrorSemType`。
+位于 `Sema/BuiltinMethods.h`，将 Aura 方法名映射到已知 C++ 运行时类型的方法签名，供语义分析器查找返回类型。v0.8 新增：方法不在表中时直接报 E013 错误（旧行为：透传给 g++）。
 
 | 类型键 | 方法 | 参数 | 返回 | 说明 |
 |--------|------|:---:|------|------|
 | `string` | `len` | 0 | `Int` | 字符串长度 |
-| `[T]` | `append` | 1 | void | 尾部追加（原名 `push`） |
+| `string` | `concat` | 1 | `string` | 字符串拼接 |
+| `[T]` | `append` | 1 | None | 尾部追加 |
 | `[T]` | `pop` | 0 | 泛型 `T` | 弹出末尾 |
 | `[T]` | `pop` | 1 | 泛型 `T` | 弹出指定索引 |
 | `[T]` | `len` | 0 | `Int` | 元素数量 |
 | `[T]` | `size` | 0 | `Int` | 同 len（STL 兼容） |
 | `[T]` | `empty` | 0 | `Bool` | 判空 |
 | `[T]` | `remove` | 1 | 泛型 `T` | pop(idx) 别名 |
-| `[T]` | `insert` | 2 | void | 指定位置插入 |
+| `[T]` | `insert` | 2 | None | 指定位置插入 |
+| `[T]` | `capacity` | 0 | `Int` | 容量 |
+| `[T]` | `front` | 0 | 泛型 `T` | 首元素 |
+| `[T]` | `back` | 0 | 泛型 `T` | 末元素 |
+| `[T]` | `clear` | 0 | None | 清空 |
+| `[T]` | `reserve` | 1 | None | 预分配容量 |
 
 ### ExprInfer 字符串拼接修复
 

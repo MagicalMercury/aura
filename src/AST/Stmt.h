@@ -217,24 +217,54 @@ struct TryCatchStmt : Stmt {
 
 struct SyncStmt : Stmt {
     std::unique_ptr<BlockStmt> body;
+    std::unique_ptr<ASTNode> maxExpr;  // 可选：sync(max=N) 中的 N 表达式
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<SyncStmt>();
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
+        if (maxExpr) n->maxExpr = maxExpr->clone();
         n->line = line; n->col = col;
         return n;
     }
 };
 
 struct SpawnStmt : Stmt {
+    std::vector<Param> params;                     // spawn 参数列表（显式传参）
+    std::vector<std::unique_ptr<ASTNode>> args;    // 可选的显式实参（异名时使用）
     std::vector<std::unique_ptr<Stmt>> body;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<SpawnStmt>();
+        for (auto& p : params) {
+            Param cp;
+            cp.name = p.name;
+            if (p.type) cp.type.reset(static_cast<TypeExpr*>(p.type->clone().release()));
+            n->params.push_back(std::move(cp));
+        }
+        for (auto& a : args)
+            n->args.emplace_back(a->clone());
         for (auto& s : body) {
             if (s) n->body.emplace_back(static_cast<Stmt*>(s->clone().release()));
             else n->body.push_back(nullptr);
         }
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
+// sync for — 并行迭代器语法糖
+struct SyncForStmt : Stmt {
+    std::unique_ptr<ASTNode> maxExpr;  // 可选：sync for(max=N) 中的 N
+    std::string itemName;
+    std::unique_ptr<ASTNode> iterable;
+    std::unique_ptr<BlockStmt> body;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<SyncForStmt>();
+        if (maxExpr) n->maxExpr = maxExpr->clone();
+        n->itemName = itemName;
+        n->iterable = iterable ? iterable->clone() : nullptr;
+        if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
         n->line = line; n->col = col;
         return n;
     }
@@ -268,7 +298,9 @@ struct MatchStmt : Stmt {
 // Decl ─ 声明节点
 // ============================================================
 
-struct Decl : Stmt { };
+struct Decl : Stmt {
+    bool isPublic = false;  // Phase B
+};
 
 struct FunDecl : Decl {
     std::string name;
@@ -284,6 +316,7 @@ struct FunDecl : Decl {
         n->throws = throws;
         if (returnType) n->returnType.reset(static_cast<TypeExpr*>(returnType->clone().release()));
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
+        n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
     }
@@ -299,6 +332,7 @@ struct LetDecl : Decl {
         n->name = name;
         if (type) n->type.reset(static_cast<TypeExpr*>(type->clone().release()));
         n->initializer = initializer ? initializer->clone() : nullptr;
+        n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
     }
@@ -314,6 +348,7 @@ struct ConstDecl : Decl {
         n->name = name;
         if (type) n->type.reset(static_cast<TypeExpr*>(type->clone().release()));
         n->initializer = initializer ? initializer->clone() : nullptr;
+        n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
     }
@@ -329,6 +364,7 @@ struct TypeDecl : Decl {
         n->name = name;
         n->typeParams = typeParams;
         if (type) n->type.reset(static_cast<TypeExpr*>(type->clone().release()));
+        n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
     }
@@ -356,6 +392,7 @@ struct InterfaceDecl : Decl {
             if (m.returnType) sig.returnType.reset(static_cast<TypeExpr*>(m.returnType->clone().release()));
             n->methods.push_back(std::move(sig));
         }
+        n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
     }
@@ -371,6 +408,7 @@ struct ImportDecl : Decl {
         n->path = path;
         n->alias = alias;
         n->isBuiltin = isBuiltin;
+        n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
     }
@@ -387,6 +425,7 @@ struct ConfigDecl : Decl {
         n->ns = ns;
         n->key = key;
         n->value = value;
+        n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
     }
@@ -416,6 +455,7 @@ struct MethodDecl : Decl {
         n->throws = throws;
         if (returnType) n->returnType.reset(static_cast<TypeExpr*>(returnType->clone().release()));
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
+        n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
     }

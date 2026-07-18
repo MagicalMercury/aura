@@ -105,6 +105,7 @@ TokType lookupKeyword(const std::string& ident) {
         {"type",      TokType::Type},
         {"interface", TokType::Interface},
         {"impl",      TokType::Impl},
+        {"pub",       TokType::Pub},
         {"true",      TokType::True},
         {"false",     TokType::False},
         {"None",      TokType::None},

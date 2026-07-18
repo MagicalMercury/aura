@@ -21,7 +21,12 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
     if (check(TokType::Return))   return parseReturnStmt();
     if (check(TokType::Throw))    return parseThrowStmt();
     if (check(TokType::Try))      return parseTryCatchStmt();
-    if (check(TokType::Sync))     return parseSyncStmt();
+    if (check(TokType::Sync)) {
+        // lookahead：sync for 还是 sync？
+        if (peekNext().type == TokType::For)
+            return parseSyncForStmt();
+        return parseSyncStmt();
+    }
     if (check(TokType::Spawn))    return parseSpawnStmt();
     if (check(TokType::Match))    return parseMatchStmt();
     if (check(TokType::Break))    {
@@ -172,6 +177,39 @@ std::unique_ptr<Stmt> Parser::parseSyncStmt() {
     auto stmt = std::make_unique<SyncStmt>();
     setNodePos(stmt.get(), tok);
 
+    // 可选参数：sync(max = expr) { ... }
+    if (check(TokType::LParen)) {
+        advance(); // (
+        consume(TokType::Identifier, "expected 'max' after 'sync('");
+        consume(TokType::Assign, "expected '=' after 'max'");
+        stmt->maxExpr = parseExpr();
+        consume(TokType::RParen, "expected ')' after sync max expression");
+    }
+
+    stmt->body = parseBlock();
+    return stmt;
+}
+
+std::unique_ptr<Stmt> Parser::parseSyncForStmt() {
+    auto tok = advance(); // sync
+    advance();            // skip 'for'
+    auto stmt = std::make_unique<SyncForStmt>();
+    setNodePos(stmt.get(), tok);
+
+    // 可选参数：sync for(max = expr)
+    if (check(TokType::LParen)) {
+        advance(); // (
+        consume(TokType::Identifier, "expected 'max' after 'sync for('");
+        consume(TokType::Assign, "expected '=' after 'max'");
+        stmt->maxExpr = parseExpr();
+        consume(TokType::RParen, "expected ')' after sync for max expression");
+    }
+
+    // 循环变量
+    auto& itemTok = consume(TokType::Identifier, "expected loop variable after 'for'");
+    stmt->itemName = itemTok.lexeme;
+    consume(TokType::Identifier, "expected 'in' after loop variable");
+    stmt->iterable = parseExpr();
     stmt->body = parseBlock();
     return stmt;
 }
@@ -181,6 +219,15 @@ std::unique_ptr<Stmt> Parser::parseSpawnStmt() {
     auto stmt = std::make_unique<SpawnStmt>();
     setNodePos(stmt.get(), tok);
 
+    // 可选参数列表：spawn (io: Io, n: int) { ... }
+    if (check(TokType::LParen)) {
+        advance(); // consume '('
+        if (!check(TokType::RParen))
+            stmt->params = parseParams();
+        consume(TokType::RParen, "expected ')' after spawn parameters");
+    }
+
+    // 向后兼容：无参数列表时允许旧式 spawn { ... }
     consume(TokType::LBrace, "expected '{' after 'spawn'");
 
     while (!check(TokType::RBrace) && !atEnd()) {
@@ -189,6 +236,19 @@ std::unique_ptr<Stmt> Parser::parseSpawnStmt() {
     }
 
     consume(TokType::RBrace, "expected '}' after spawn body");
+
+    // 可选的显式实参调用：...(arg1, arg2)
+    if (check(TokType::LParen)) {
+        advance(); // (
+        while (!check(TokType::RParen) && !atEnd()) {
+            auto arg = parseExpr();
+            if (arg) stmt->args.push_back(std::move(arg));
+            if (!check(TokType::RParen))
+                consume(TokType::Comma, "expected ',' between spawn arguments");
+        }
+        consume(TokType::RParen, "expected ')' after spawn arguments");
+    }
+
     return stmt;
 }
 
