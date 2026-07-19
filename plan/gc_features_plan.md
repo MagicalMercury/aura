@@ -37,11 +37,11 @@
 |:---:|:---|:---:|
 | P0 | GC 实际运行（CodeGen 生成 GcRootHandle） | §二 |
 | P0 | 协程帧 GC 根追踪 | §三 |
-| P0 | Array<T*> 元素 GC 扫描 | §四 |
 | P1 | 全局变量/静态变量的 GC 根注册 | §五 |
 | P1 | 弱引用 GcWeakHandle<T> | §六 |
 | P1 | Finalizer（终结器）支持 | §七 |
 | P1 | 多线程 GC 暂停（stop-the-world） | §八 |
+| P1 | forceGc 暴露给 Aura 语言 + 多线程安全 | §十八 |
 | P2 | 精确栈扫描（替代保守扫描） | §九 |
 | P2 | compactAndReclaim 性能优化 | §十 |
 | P2 | TLAB（Thread-Local Allocation Buffer） | §十一 |
@@ -148,58 +148,6 @@ task<void> foo() {
 | 3.1 | 在 `genFunDecl` 中检测是否为协程 | [src/CodeGen/DeclGen.cpp](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp) |
 | 3.2 | 协程函数内的 GC 变量用 GcRootHandle 包装（同 §二） | 同上 |
 | 3.3 | 验证协程挂起/恢复时 GC 根正确 | - |
-
----
-
-## 四、P0 — Array<T*> 元素 GC 扫描
-
-### 4.1 问题
-
-[runtime/builtin/array.h](file:///d:/you/Aura/runtime/builtin/array.h) 的 `Array<T>::desc()` 始终返回 `ptrFieldCount=0`，导致 `markFields` 不扫描数组元素。
-
-### 4.2 设计
-
-**动态 TypeDescriptor**：根据 T 是否为 GC 类型返回不同描述符。
-
-```cpp
-// runtime/builtin/array.h
-template <typename T>
-const TypeDescriptor& Array<T>::desc() {
-    if constexpr (std::is_pointer_v<T> && std::is_base_of_v<GcObject, std::remove_pointer_t<T>>) {
-        // T 是 GC 指针类型（如 GcString*）
-        static const TypeDescriptor d = {
-            .size = sizeof(Array<T>),
-            .ptrFieldCount = 1,
-            .ptrFieldOffsets = new size_t[1]{offsetof(Array<T>, elements)},
-            .inlineArrayFieldCount = 1,
-            .inlineArrayFields = new InlineArrayField[1]{
-                {.offset = offsetof(Array<T>, elements),
-                 .lengthOffset = offsetof(Array<T>, length),
-                 .isPtrArray = true}
-            }
-        };
-        return d;
-    } else {
-        // T 不是 GC 类型（如 int, float, Path）
-        static const TypeDescriptor d = {
-            .size = sizeof(Array<T>),
-            .ptrFieldCount = 0,
-            .inlineArrayFieldCount = 0
-        };
-        return d;
-    }
-}
-```
-
-### 4.3 验证
-
-```aura
-fun main(io: Io) {
-    let arr = ["hello", "world", "foo"]   // Array<GcString*>
-    force_gc()
-    io.println(arr[0])  // 应当仍然可用
-}
-```
 
 ---
 
@@ -882,7 +830,217 @@ private:
 
 ---
 
-## 十八、实施优先级总览
+## 十八、P1 — forceGc 暴露给 Aura 语言 + 多线程安全
+
+### 18.1 当前状态
+
+[gc.h:100](file:///d:/you/Aura/runtime/gc.h#L100) 声明 `void forceGc()`，[gc.cpp:196-199](file:///d:/you/Aura/runtime/gc.cpp#L196) 实现：
+
+```cpp
+void GcHeap::forceGc() {
+    gcPending_ = false;
+    majorGc();   // 直接调 majorGc，无 STW 保护
+}
+```
+
+[gc.h:215-217](file:///d:/you/Aura/runtime/gc.h#L215) 提供内联 C++ API：
+
+```cpp
+inline void force_gc() {
+    GcHeap::instance().forceGc();
+}
+```
+
+### 18.2 三个核心问题
+
+| # | 问题 | 影响 |
+|:---:|:---|:---|
+| Q1 | **未暴露给 Aura 语言** — BuiltinRegistry 无 GC 函数注册 | Aura 用户无法手动触发 GC（我之前 plan §二.4 的验证代码用了 `force_gc()`，实际 Aura 不支持） |
+| Q2 | **多线程不安全** — 直接调 `majorGc()`，没有 STW | 多线程下会与 mutator 并发访问对象，导致 use-after-free 或标记错误 |
+| Q3 | **无返回值/统计** — void 返回 | 用户/调试无法知道 GC 回收了多少内存、耗时多久 |
+
+### 18.3 Q1 — 暴露给 Aura 语言
+
+**设计**：在 BuiltinRegistry 注册 `gc_force` / `gc_force_minor` / `gc_stats` 函数。
+
+```cpp
+// src/Sema/BuiltinRegistry.h 中 functions_ 表新增
+// 参考 [BuiltinRegistry.h:249-254](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L249) 的 range 注册方式
+{
+    "gc_force",
+    BuiltinFunction{
+        .returnType = ReturnTypeInfo{.kind = ReturnTypeInfo::Kind::None},
+        .paramCount = 0,
+        .async = false,  // 同步函数
+    }
+},
+{
+    "gc_force_minor",
+    BuiltinFunction{
+        .returnType = ReturnTypeInfo{.kind = ReturnTypeInfo::Kind::None},
+        .paramCount = 0,
+        .async = false,
+    }
+},
+{
+    "gc_stats",
+    BuiltinFunction{
+        .returnType = ReturnTypeInfo{
+            .kind = ReturnTypeInfo::Kind::Named,
+            .typeName = "string"  // 返回统计信息字符串
+        },
+        .paramCount = 0,
+        .async = false,
+    }
+}
+```
+
+**Aura 调用方式**：
+
+```aura
+fun main(io: Io) {
+    let s = "hello"
+    gc_force()              // 手动触发 major GC
+    gc_force_minor()        // 手动触发 minor GC
+    let info = gc_stats()   // 获取统计信息
+    io.println(info)
+    io.println(s)           // s 仍可用
+}
+```
+
+**runtime 实现层**：
+
+```cpp
+// runtime/gc.h 新增公开 API
+inline void gc_force_major() { GcHeap::instance().forceGc(); }
+inline void gc_force_minor_gc() { GcHeap::instance().forceMinorGc(); }
+inline GcStats gc_get_stats() { return GcHeap::instance().getStats(); }
+```
+
+### 18.4 Q2 — 多线程安全
+
+**问题**：[gc.cpp:196-199](file:///d:/you/Aura/runtime/gc.cpp#L196) 的 `forceGc()` 直接调 `majorGc()`，在多线程场景下：
+- 其他线程可能正在修改对象图（mutator 与 marker 并发）
+- 导致标记错误或 use-after-free
+
+**改造**：forceGc 走 STW 流程，不直接执行 GC。
+
+```cpp
+// gc.cpp 改造
+void GcHeap::forceGc() {
+    // 不直接调 majorGc，而是设置 gcPending_ 让 safepoint 处理
+    gcPending_ = true;
+    forceRequested_ = true;  // 新增：标记是用户主动请求
+
+    // 单线程场景：当前线程直接执行
+    if (registered_threads_.size() <= 1) {
+        gcPending_ = false;
+        forceRequested_ = false;
+        majorGc();
+        return;
+    }
+
+    // 多线程场景：请求 STW，等待所有线程到达 safepoint
+    // （复用 §八 的 STW 机制）
+    safepoint();
+    forceRequested_ = false;
+}
+```
+
+**前置**：§八 多线程 GC 暂停（STW）
+
+### 18.5 Q3 — 返回统计信息
+
+**设计**：新增 `GcStats` 结构 + `gc_stats()` 函数。
+
+```cpp
+// runtime/gc.h 新增
+struct GcStats {
+    size_t allocatedBytes;
+    size_t youngBytes;
+    size_t oldBytes;
+    size_t gcCount;
+    size_t minorGcCount;
+    size_t liveObjectCount;     // 新增：存活对象数
+    size_t pageCount;           // 新增：GC 页数
+    int64_t lastGcDurationMs;   // 新增：上次 GC 耗时
+};
+
+class GcHeap {
+public:
+    GcStats getStats() const;
+private:
+    int64_t lastGcDurationMs_ = 0;
+};
+```
+
+**gc_stats() Aura 返回**：格式化字符串（类似 JVM 的 `-XX:+PrintGC`）。
+
+```
+GC Stats: allocated=1.2MB young=256KB old=960KB
+  gcCount=3 minorGcCount=12 liveObjects=42 pages=8
+  lastGc=2ms
+```
+
+### 18.6 新增 forceMinorGc
+
+当前只有 `forceGc()`（major），应该补充 `forceMinorGc()`：
+
+```cpp
+// runtime/gc.h
+class GcHeap {
+public:
+    void forceGc();         // major（已有）
+    void forceMinorGc();   // 新增：minor
+};
+
+// runtime/gc.cpp
+void GcHeap::forceMinorGc() {
+    gcPending_ = true;
+    forceMinorRequested_ = true;
+    if (registered_threads_.size() <= 1) {
+        gcPending_ = false;
+        forceMinorRequested_ = false;
+        minorGc();
+        return;
+    }
+    safepoint();
+    forceMinorRequested_ = false;
+}
+```
+
+### 18.7 实施步骤
+
+| Step | 内容 | 文件 | 优先级 |
+|:---|:---|:---|:---:|
+| 18.1 | BuiltinRegistry 注册 `gc_force` / `gc_force_minor` / `gc_stats` | [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) | P1 |
+| 18.2 | runtime 新增 `GcStats` 结构 + `getStats()` | [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) + [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | P1 |
+| 18.3 | CodeGen 生成 `gc_force()` 调用 `aura_rt::gc_force_major()` | [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | P1 |
+| 18.4 | `forceGc()` 多线程安全改造（走 STW） | [runtime/gc.cpp:196](file:///d:/you/Aura/runtime/gc.cpp#L196) | P1（依赖 §八） |
+| 18.5 | 新增 `forceMinorGc()` | [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) + [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | P2 |
+| 18.6 | `gc_stats()` 格式化字符串实现 | [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | P2 |
+
+### 18.8 验证
+
+```aura
+fun main(io: Io) {
+    let s = "hello"
+    gc_force()                          // 用户主动触发 GC
+    io.println("after gc: " + s)        // s 仍可用
+    let info = gc_stats()
+    io.println(info)                     // 打印统计
+    gc_force_minor()                     // minor GC
+}
+```
+
+### 18.9 与其他 plan 的依赖
+
+- **依赖**：§八 多线程 GC 暂停（Q2 多线程安全）
+- **被依赖**：gcstring_optimization 第一阶段验证代码需要 `gc_force()`
+
+---
+
+## 十九、实施优先级总览
 
 ### Phase 1：让 GC 真正工作（P0）
 
@@ -890,13 +1048,13 @@ private:
 |:---:|:---|:---|
 | 1 | §二 CodeGen 生成 GcRootHandle | 无 |
 | 2 | §三 协程帧 GC 根追踪 | §二 |
-| 3 | §四 Array<T*> 元素 GC 扫描 | 无 |
 
 ### Phase 2：多线程支持（P1）
 
 | 顺序 | 任务 | 依赖 |
 |:---:|:---|:---|
-| 4 | §八 多线程 GC 暂停 | §二 |
+| 3 | §八 多线程 GC 暂停 | §二 |
+| 4 | §十八 forceGc 暴露 + 多线程安全（Q1/Q3） | §二 |
 | 5 | §五 全局变量 GC 根注册 | §二 |
 | 6 | §六 弱引用 GcWeakHandle | §二 |
 | 7 | §七 Finalizer | §二 |
@@ -910,19 +1068,20 @@ private:
 | 10 | §十一 TLAB | §八 |
 | 11 | §十二 GC 触发策略调优 | 无 |
 | 12 | §十三 对象可移动性 | §九 |
+| 13 | §十八 forceMinorGc + gc_stats 格式化（Q3 剩余） | §八 |
 
 ### Phase 4：远期（P3）
 
 | 顺序 | 任务 | 依赖 |
 |:---:|:---|:---|
-| 13 | §十四 分代年龄记录 | 无 |
-| 14 | §十五 并发 GC | §十三 |
-| 15 | §十六 Large Object Space | 无 |
-| 16 | §十七 GC 日志与统计 | 无 |
+| 14 | §十四 分代年龄记录 | 无 |
+| 15 | §十五 并发 GC | §十三 |
+| 16 | §十六 Large Object Space | 无 |
+| 17 | §十七 GC 日志与统计 | 无 |
 
 ---
 
-## 十九、风险总结
+## 二十、风险总结
 
 ### 19.1 主要风险
 
@@ -944,7 +1103,7 @@ private:
 
 ---
 
-## 二十、与 sync_thread_plan / io_coroutine_plan 的关系
+## 二十一、与 sync_thread_plan / io_coroutine_plan 的关系
 
 | plan | 依赖的 GC 功能 |
 |:---|:---|
@@ -953,18 +1112,18 @@ private:
 | [gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) | §二 CodeGen 生成 GcRootHandle（间接） |
 
 **关键路径**：
-1. **先做 §二/§三/§四**（让 GC 真正工作）
+1. **先做 §二/§三**（让 GC 真正工作）
 2. **再做 §八**（多线程 GC 暂停）
 3. **然后才能做 sync_thread / io_coroutine**
 
 ---
 
-## 二十一、总结
+## 二十二、总结
 
-GC 缺失功能共 16 项，按优先级分 4 个 Phase：
+GC 缺失功能共 17 项，按优先级分 4 个 Phase：
 
 - **Phase 1（P0）**：让 GC 真正工作（§二/§三/§四）— 没有这个，所有其他优化都没意义
-- **Phase 2（P1）**：多线程支持（§八/§五/§六/§七）— sync_thread 和 io_coroutine 的前置
+- **Phase 2（P1）**：多线程支持（§八/§十八/§五/§六/§七）— sync_thread 和 io_coroutine 的前置
 - **Phase 3（P2）**：性能优化（§十/§九/§十一/§十二/§十三）— 内存泄漏 / 性能问题
 - **Phase 4（P3）**：远期功能（§十四/§十五/§十六/§十七）— 高级 GC 特性
 

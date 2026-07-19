@@ -121,10 +121,11 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                 if (isPtr) {
                     init = "aura_rt::gc_alloc<" + recType + ">(&" + recType + "::_desc)";
                     std::string var = safeName(decl.name);
-                    std::string fullDecl = type + " " + var + " = " + init + ";";
-                    writeLine(cpp, fullDecl);
+                    writeLine(cpp, type + " " + var + "_raw = " + init + ";");
+                    writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + var + "(" + var + "_raw);");
+                    gcRootVarNames_.insert(var);
                     for (auto& f : rec->fields) {
-                        writeLine(cpp, var + "->" + safeName(f.name) + " = "
+                        writeLine(cpp, var + ".get()->" + safeName(f.name) + " = "
                                   + (f.value ? genExpr(*f.value, currentFunctionIsCoroutine_) : "???") + ";");
                     }
                     currentLetName_.clear();
@@ -159,26 +160,35 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
 
     expectedTemplateArgs_.clear();
 
-    writeLine(cpp, type + " " + safeName(decl.name) +
-              (init.empty() ? ";" : " = " + init + ";"));
+    std::string varName = safeName(decl.name);
+
+    // GC 指针类型 → 包装为 GcRootHandle，注册为 GC 根
+    if (isGcPointerType(type) && !init.empty()) {
+        writeLine(cpp, type + " " + varName + "_raw = " + init + ";");
+        writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + varName + "(" + varName + "_raw);");
+        gcRootVarNames_.insert(varName);
+    } else {
+        writeLine(cpp, type + " " + varName +
+                  (init.empty() ? ";" : " = " + init + ";"));
+    }
 
     // 跟踪字符串变量（用于后续 string + T 拼接检测）
     if (!init.empty() &&
         (init.find("aura_rt::make_string") != std::string::npos ||
          init.find("aura_rt::concat") != std::string::npos)) {
-        stringVarNames_.insert(safeName(decl.name));
+        stringVarNames_.insert(varName);
     }
 
     // 跟踪值类型变量（如 Path，用 . 而非 ->）
     if (!init.empty() && (
         init.find("path::") != std::string::npos ||
         init.find("Path(") != std::string::npos)) {
-        valueTypeVarNames_.insert(safeName(decl.name));
+        valueTypeVarNames_.insert(varName);
     }
     if (decl.type) {
         if (auto* nt = dynamic_cast<const NamedType*>(decl.type.get())) {
             if (nt->name == "Path" || (!nt->namespacePrefix.empty() && nt->namespacePrefix[0] == "path"))
-                valueTypeVarNames_.insert(safeName(decl.name));
+                valueTypeVarNames_.insert(varName);
         }
     }
     // Phase 4: 通过 Sema 推断类型识别值类型（Io/Path 等）
@@ -186,7 +196,7 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
         if (auto* g = dynamic_cast<const GenericSemType*>(decl.inferredType)) {
             if (auto* ti = BuiltinRegistry::get().findType(g->name)) {
                 if (!ti->isHeap)
-                    valueTypeVarNames_.insert(safeName(decl.name));
+                    valueTypeVarNames_.insert(varName);
             }
         }
     }
@@ -194,13 +204,13 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     if (!init.empty()) {
         if (init.find("io.cwd()") != std::string::npos ||
             init.find("io.file_exists") != std::string::npos) {
-            valueTypeVarNames_.insert(safeName(decl.name));
+            valueTypeVarNames_.insert(varName);
         }
     }
 
     // 跟踪 channel 类型变量（用于后续 method call co_await 判定和 for-in-channel 展开）
     if (!init.empty() && init.find("Channel<") != std::string::npos) {
-        channelVarNames_.insert(safeName(decl.name));
+        channelVarNames_.insert(varName);
     }
 }
 
@@ -223,8 +233,18 @@ void CodeGenerator::genConstStmt(std::ostream& cpp, const ConstDecl& decl) {
 
     expectedTemplateArgs_.clear();
 
-    writeLine(cpp, "const " + type + " " + safeName(decl.name) +
-              (init.empty() ? ";" : " = " + init + ";"));
+    std::string varName = safeName(decl.name);
+
+    // GC 指针类型 const 变量 → 包装为 GcRootHandle
+    if (isGcPointerType(type) && !init.empty()) {
+        writeLine(cpp, "const " + type + " " + varName + "_raw = " + init + ";");
+        writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + varName
+                  + "(const_cast<" + type + "&>(" + varName + "_raw));");
+        gcRootVarNames_.insert(varName);
+    } else {
+        writeLine(cpp, "const " + type + " " + varName +
+                  (init.empty() ? ";" : " = " + init + ";"));
+    }
 }
 
 // ============================================================

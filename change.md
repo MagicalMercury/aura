@@ -1,695 +1,958 @@
-# 重构 Plan: genFunExpr 抽 4 个内联 walker 到 ASTWalker.h
+# GC Phase 2 P1 项实现 Plan
 
-> 来源：[TODO.txt L147-152](file:///d:/you/Aura/TODO.txt#L147)
-> 目标：消除 [ExprGen.cpp:527-974](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L527) `genFunExpr` 中 4 个内联 walker 结构体
-> 策略：**纯结构重构，行为零变化** — 每个 visit 方法逐字符复制
-> 归属选择：放 [ASTWalker.h](file:///d:/you/Aura/src/ASTWalker.h)（而非 CodeGen.h）— 这些 walker 是纯 AST 分析工具，不依赖 CodeGenerator 任何成员，可被 CodeGen/CoroDecide/Sema 等任意模块复用
+> 对应 [plan/gc_features_plan.md](file:///d:/you/Aura/plan/gc_features_plan.md) §五/§六/§七/§八/§十八
+> 前置：P0 已全部完成（[change.md 上一版本](file:///d:/you/Aura/change.md) 已验收）
 > 日期：2026-07-18
+> 状态：草案（待批准）
 
 ---
 
-## 1. 现状分析
+## 一、深度阅读后的现状修正
 
-### 1.1 genFunExpr 实际规模（已核实）
+### 1.1 §五 全局变量 GC 根注册 — **应用场景澄清**
 
-| 区段 | 行范围 | 行数 | 说明 |
-|:---|:---|:---:|:---|
-| 函数总体 | [L527-974](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L527) | 448 | TODO 中"309 行"偏低，实际更大 |
-| 内联 IoDetector | [L533-560](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L533) | 28 | Stmt-only，不递归到 Expr |
-| 内联 AssignTargetCollector | [L667-696](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L667) | 30 | Stmt-only，不递归到 Expr |
-| 内联 CallTargetScanner | [L709-761](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L709) | 53 | Stmt+Expr，完整递归 |
-| 内联 CaptureArgScanner | [L773-818](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L773) | 46 | Stmt+Expr，完整递归 |
-| **小计：4 个 walker** |  | **157** |  |
+**重要发现**：[CodeGen.cpp:175-198](file:///d:/you/Aura/src/CodeGen/CodeGen.cpp#L175) 的 `genDecl` **仅处理 TypeDecl / InterfaceDecl / FunDecl / MethodDecl**，**Aura 语言当前不支持顶层 `let` 全局变量**。
 
-### 1.2 关键行为差异（必须严格保留）
+所以 §五 真正的应用场景不是"Aura 源码中的全局变量"，而是：
 
-四个 walker **不是同构的**，分两类：
+| 场景 | 描述 | 当前状态 |
+|:---|:---|:---|
+| **A. 运行时缓存** | [gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) 第一阶段规划的 `GcString::empty()` / `from(bool)` / `from(int)` 静态缓存 | 未实现 |
+| **B. interned 字符串** | 属性名 / 关键字 / 错误消息字符串驻留 | 未实现 |
+| **C. OOM 错误缓存** | [gc.cpp:125-135](file:///d:/you/Aura/runtime/gc.cpp#L125) 已有 `oomError_`，但通过 `if (oomError_.kind) markObject(...)` 特例处理 | 已实现，但用特例而非通用机制 |
+| **D. Aura 全局 let** | Aura 语言层面支持 `let x = ...` 在模块顶层 | **不支持，本 plan 不实现** |
 
-| Walker | 遍历范围 | `IfStmt.condition` | `ExprStmt.expr` |
-|:---|:---|:---|:---|
-| IoDetector | Stmt-only | **不扫描** | 仅检查是否为 `MethodCallExpr`（不递归） |
-| AssignTargetCollector | Stmt-only | **不扫描** | 仅检查是否为 `AssignExpr`（不递归） |
-| CallTargetScanner | Stmt+Expr | **扫描** | 递归 `scanExpr` |
-| CaptureArgScanner | Stmt+Expr | **扫描** | 递归 `scanExpr` |
+**结论**：§五 实际只需要做 A/B 场景的 `GcGlobalRoot<T>` 模板，让运行时缓存的字符串等能正确注册为 GC 根。
 
-**重构陷阱**：若把 IoDetector/AssignTargetCollector 也加上 Expr 递归（"统一"），会导致行为变化：
-- 性能：扫描更多节点
-- 正确性：可能误报（如条件表达式里的赋值被算作 mutable 触发）
+### 1.2 §六 弱引用 — 设计可行，无修正
 
-**结论**：必须**逐字符复制**每个 visit 方法，不可"顺手统一"。
+[gc.h](file:///d:/you/Aura/runtime/gc.h) 无 `GcWeakHandle`，[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 无 `weakHandles_`。需要新增。
 
-### 1.3 已有基础设施
+### 1.3 §七 Finalizer — 设计可行，需补充
 
-[ASTWalker.h](file:///d:/you/Aura/src/ASTWalker.h) 已定义 `StmtWalker<V>` / `ExprWalker<V>` 模板框架。[CodeGen.h:122-193](file:///d:/you/Aura/src/CodeGen/CodeGen.h#L122) 中 `IdRefCollector` / `DeclaredCollector` 是基于该框架的范式参考（但作为 CodeGenerator 嵌套类，未来可考虑也迁出）。
+[types.h](file:///d:/you/Aura/runtime/types.h) 中 `TypeDescriptor` 已有 `ptrFieldOffsets` / `inlineArrayFields` 等，但**无 `finalizer` 函数指针**。`GcObject` 也**无 `finalized` 字段**。
 
-**插入点**：[ASTWalker.h L125](file:///d:/you/Aura/src/ASTWalker.h#L125) `ExprWalker` 模板结束 `};` 之后，L127 `} // namespace Aura` 之前。
+需要新增字段。但要注意：`GcObject` 头部布局的修改会影响所有 GC 对象（[gc.h:73](file:///d:/you/Aura/runtime/gc.h#L73)）。
 
-**归属选择理由**：
-- ✅ 4 个 walker 都是纯 AST 遍历工具，不依赖 CodeGenerator 任何成员
-- ✅ ASTWalker.h 是"基于 AST 的遍历工具集合"的天然归属
-- ✅ CoroScanner 已在 [CoroDecide.cpp](file:///d:/you/Aura/src/CodeGen/CoroDecide.cpp) 独立实现，证明这类 walker 本就跨文件复用
-- ✅ 让 CodeGen.h 更聚焦于"代码生成"，不塞各种 walker
-- ⚠️ IoDetector 含 `id->name == "io"` 业务关键字检测，但仍是 AST 形态分析，放 ASTWalker.h 可接受
+### 1.4 §八 多线程 STW — 关键依赖项
+
+当前 [gc.cpp:154-164](file:///d:/you/Aura/runtime/gc.cpp#L154) `safepoint()` 是单线程实现：
+
+```cpp
+void GcHeap::safepoint() {
+    if (gc_pending_) {
+        gc_pending_ = false;
+        if (youngBytes_ >= kYoungThreshold / 2) minorGc();
+        if (oldBytes_ >= kOldThreshold) majorGc();
+    }
+}
+```
+
+无 `std::mutex` / `std::thread` / `std::condition_variable` 引入（[Grep `std::mutex|std::thread` runtime/](file:///d:/you/Aura/runtime) 无匹配）。
+
+[sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md) 和 [io_coroutine_plan.md](file:///d:/you/Aura/plan/io_coroutine_plan.md) 都依赖此项。
+
+### 1.5 §十八 forceGc 暴露 + 多线程安全 — 简化
+
+[BuiltinRegistry.h:255-262](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L255) `functions_` 表只有 `range` 和 `channel`，无 GC 函数注册。
+
+[gc.h:215-217](file:///d:/you/Aura/runtime/gc.h#L215) 已有 `inline void force_gc()` C++ API，[gc.cpp:196-199](file:///d:/you/Aura/runtime/gc.cpp#L196) 的 `forceGc()` 单线程直接调 `majorGc()`，**多线程下不安全**。
+
+但 §十八的"多线程安全改造"实际就是依赖 §八 STW 机制 — 可合并入 §八 一起做，避免重复设计。
 
 ---
 
-## 2. 提议改动
+## 二、修改目标与原因
 
-### Step 0: 准备 — 补充 ASTWalker.h 头文件 + 不可变前缀
+### 2.1 目标
 
-**0.1 补充 include**：在 [ASTWalker.h L18-19](file:///d:/you/Aura/src/ASTWalker.h#L18) 现有 `#include "AST/Expr.h"` / `#include "AST/Stmt.h"` 之后追加：
+实现 GC Phase 2 五项 P1 功能：
+
+1. **§八 多线程 STW**（最基础，其他几项都依赖）
+2. **§十八 forceGc 暴露**（依赖 §八）
+3. **§五 GcGlobalRoot<T>**（独立，运行时缓存场景）
+4. **§六 GcWeakHandle<T>**（独立，未来 interning / Map 场景）
+5. **§七 Finalizer**（独立，资源句柄场景）
+
+### 2.2 原因
+
+- P0 完成后 GC 已能工作，但单线程限制阻塞了 [sync_thread_plan](file:///d:/you/Aura/plan/sync_thread_plan.md) 和 [io_coroutine_plan](file:///d:/you/Aura/plan/io_coroutine_plan.md)
+- 当前 `forceGc()` 多线程下不安全
+- 运行时缓存字符串（[gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md)）需要全局根支持
+- 资源句柄（文件 / 锁 / 套接字）的清理需要 Finalizer
+
+---
+
+## 三、受影响的文件和模块
+
+| 文件 | 改动内容 | 行数估计 |
+|:---|:---|:---:|
+| [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) | 新增 `GcGlobalRoot<T>` / `GcWeakHandle<T>` 模板，`GcHeap` 加 `globalRoots_` / `weakHandles_` / `threads_m_` 等成员 | +120 |
+| [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | safepoint 改造为 STW、register/unregister API 实现、markPhase 扫描 globalRoots、sweepPhase 清空弱引用 + 调 finalizer、forceGc 走 STW | +180 |
+| [runtime/types.h](file:///d:/you/Aura/runtime/types.h) | `GcObject` 加 `finalized` 字段，`TypeDescriptor` 加 `finalizer` 函数指针 | +8 |
+| [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) | 注册 `gc_force` / `gc_stats` 全局函数 | +15 |
+| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genCallExpr` 识别 `gc_force()` / `gc_stats()` 生成对应 C++ 调用 | +20 |
+| **总计** | | **~343 行** |
+
+---
+
+## 四、修改步骤（按依赖顺序，每步独立 commit）
+
+### Phase 1：§八 多线程 STW（基础，最先做）
+
+#### Step 1.1：GcHeap 加线程管理成员
+
+**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) 在 `GcHeap` private 区追加：
 
 ```cpp
-#include <set>
-#include <string>
-#include <vector>
-```
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
-理由：4 个 walker 使用 `std::set<std::string>` / `std::vector<std::string>` / `std::string`，当前 ASTWalker.h 未包含这些标准头。
-
-**0.2 分隔注释**：在 ASTWalker.h 中 `ExprWalker` 模板之后、`} // namespace Aura` 之前插入分隔注释：
-
-```cpp
-// ============================================================
-// 闭包分析 Walker（基于 ASTWalker 模板）
-// 用于 genFunExpr 中的捕获/协程/mutable 推导
-//
-// 这些 walker 是纯 AST 遍历工具，不依赖 CodeGenerator 状态，
-// 可被 CodeGen/CoroDecide/Sema 等任意模块复用。
-// ============================================================
-```
-
-### Step 1: 新增 IoDetector 到 ASTWalker.h
-
-**位置**：[ASTWalker.h L125](file:///d:/you/Aura/src/ASTWalker.h#L125) 之后（`ExprWalker` 模板结束 `};` 之后，`} // namespace Aura` 之前）
-
-**代码**（逐字符复制 [ExprGen.cpp:533-560](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L533) 的内联 struct，仅删除 `struct` 改为 `class`、移除缩进、加 `public:` 前缀、加 `static scan` 入口）：
-
-```cpp
-// IoDetector — 检测闭包体内是否包含 io.xxx 方法调用
-// 用于判定闭包是否需要协程化（genFunExpr 中 isCoroutine && !ioSync_ 场景）
-//
-// 注意：Stmt-only，不递归到 Expr。IfStmt 不扫条件（与原内联实现一致）。
-class IoDetector {
+class GcHeap {
 public:
-    bool found = false;
-    bool scanStmt(const Stmt& stmt) { return StmtWalker<IoDetector>::walk(stmt, *this); }
-    // 便捷入口：扫描整个闭包体
-    static bool scan(const BlockStmt& body) {
-        IoDetector d;
-        for (auto& s : body.stmts)
-            if (s && d.scanStmt(*s)) { d.found = true; break; }
-        return d.found;
-    }
-    bool visit(const MethodCallExpr& n, IoDetector&) {
-        if (n.object) {
-            if (auto* id = dynamic_cast<const Identifier*>(n.object.get()))
-                if (id->name == "io") { found = true; return true; }
-        }
-        return false;
-    }
-    bool visit(const BlockStmt& n, IoDetector& self) { for (auto& ss : n.stmts) if (ss && self.scanStmt(*ss)) return true; return false; }
-    bool visit(const IfStmt& n, IoDetector& self) { if (n.thenBranch && self.scanStmt(*n.thenBranch)) return true; for (auto& ei : n.elseIfs) if (ei.body && self.scanStmt(*ei.body)) return true; if (n.elseBranch && self.scanStmt(*n.elseBranch)) return true; return false; }
-    bool visit(const WhileStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const ForStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const LoopStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const TryCatchStmt& n, IoDetector& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
-    bool visit(const MatchStmt& n, IoDetector& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } } return false; }
-    bool visit(const ExprStmt& n, IoDetector& self) { if (n.expr) { if (auto* mc = dynamic_cast<const MethodCallExpr*>(n.expr.get())) return self.visit(*mc, self); } return false; }
-    bool visit(const ReturnStmt&, IoDetector&) { return false; }
-    bool visit(const ThrowStmt&, IoDetector&) { return false; }
-    bool visit(const LetDecl&, IoDetector&) { return false; }
-    bool visit(const ConstDecl&, IoDetector&) { return false; }
-    bool visit(const BreakStmt&, IoDetector&) { return false; }
-    bool visit(const ContinueStmt&, IoDetector&) { return false; }
-    bool visit(const SyncStmt&, IoDetector&) { return false; }
-    bool visit(const SyncForStmt&, IoDetector&) { return false; }
-    bool visit(const SpawnStmt&, IoDetector&) { return false; }
+    // 线程注册（用于 GC stop-the-world）
+    void registerThread(std::thread::id id);
+    void unregisterThread(std::thread::id id);
+
+private:
+    // --- 多线程 STW ---
+    std::mutex             threads_m_;
+    std::vector<std::thread::id> registered_threads_;
+    std::atomic<bool>      gc_in_progress_{false};
+    std::atomic<int>       stopped_threads_{0};
+    std::condition_variable all_stopped_cv_;
+    std::mutex             all_stopped_m_;
 };
 ```
 
-**验证关键**：
-- ✅ `IfStmt` 不调用 `scanExpr(*n.condition)`（与原一致）
-- ✅ `ExprStmt` 仅 `dynamic_cast<const MethodCallExpr*>`，不递归（与原一致）
-- ✅ `MatchStmt` 仅处理 `BlockStmt` case body，不处理 AssignExpr case body（与原一致）
+**关键**：`registered_threads_` 在 `registerThread`/`unregisterThread` 中用 `threads_m_` 保护，但在 `safepoint` 中只读不需要锁（容忍短暂数据竞争，最坏情况是某线程未注册但被忽略）。
 
-### Step 2: 新增 AssignTargetCollector 到 ASTWalker.h
+#### Step 1.2：registerThread / unregisterThread 实现
 
-**位置**：IoDetector 之后
-
-**代码**（逐字符复制 [ExprGen.cpp:667-696](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L667)）：
+**改动**：[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 新增：
 
 ```cpp
-// AssignTargetCollector — 检测指定名称的捕获变量是否在赋值表达式左侧出现
-// 用于决定闭包是否需要 mutable 关键字
-//
-// 注意：Stmt-only，不递归到 Expr。IfStmt 不扫条件（与原内联实现一致）。
-class AssignTargetCollector {
-public:
-    std::string targetName;
-    bool found = false;
-    bool collectStmt(const Stmt& stmt) {
-        return StmtWalker<AssignTargetCollector>::walk(stmt, *this);
+void GcHeap::registerThread(std::thread::id id) {
+    std::lock_guard<std::mutex> lk(threads_m_);
+    registered_threads_.push_back(id);
+}
+
+void GcHeap::unregisterThread(std::thread::id id) {
+    std::lock_guard<std::mutex> lk(threads_m_);
+    auto it = std::find(registered_threads_.begin(), registered_threads_.end(), id);
+    if (it != registered_threads_.end()) {
+        registered_threads_.erase(it);
     }
-    // 便捷入口：captures 列表中任一被赋值则返回 true
-    static bool anyMatch(const BlockStmt& body, const std::vector<std::string>& captures) {
-        for (auto& cap : captures) {
-            AssignTargetCollector c;
-            c.targetName = cap;
-            for (auto& s : body.stmts)
-                if (s && c.collectStmt(*s)) return true;
-        }
-        return false;
-    }
-    bool visit(const AssignExpr& n, AssignTargetCollector& /*self*/) {
-        if (auto* id = dynamic_cast<const Identifier*>(n.target.get())) {
-            if (id->name == targetName) { found = true; return true; }
-        }
-        return false;
-    }
-    bool visit(const BlockStmt& n, AssignTargetCollector& self) { for (auto& ss : n.stmts) if (ss && self.collectStmt(*ss)) return true; return false; }
-    bool visit(const IfStmt& n, AssignTargetCollector& self) { if (n.thenBranch && self.collectStmt(*n.thenBranch)) return true; if (n.elseBranch && self.collectStmt(*n.elseBranch)) return true; for (auto& ei : n.elseIfs) if (ei.body && self.collectStmt(*ei.body)) return true; return false; }
-    bool visit(const WhileStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
-    bool visit(const ForStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
-    bool visit(const LoopStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
-    bool visit(const TryCatchStmt& n, AssignTargetCollector& self) { if (n.tryBody && self.collectStmt(*n.tryBody)) return true; return n.catchBody && self.collectStmt(*n.catchBody); }
-    bool visit(const SyncStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
-    bool visit(const SpawnStmt& n, AssignTargetCollector& self) { for (auto& sb : n.body) if (sb && self.collectStmt(*sb)) return true; return false; }
-    bool visit(const MatchStmt& n, AssignTargetCollector& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.collectStmt(*cb)) return true; } else { if (auto* ae = dynamic_cast<const AssignExpr*>(c.body.get())) return self.visit(*ae, self); } } return false; }
-    bool visit(const ExprStmt& n, AssignTargetCollector& self) { if (auto* ae = dynamic_cast<const AssignExpr*>(n.expr.get())) return self.visit(*ae, self); return false; }
-    bool visit(const ReturnStmt&, AssignTargetCollector&) { return false; }
-    bool visit(const ThrowStmt&, AssignTargetCollector&) { return false; }
-    bool visit(const LetDecl&, AssignTargetCollector&) { return false; }
-    bool visit(const ConstDecl&, AssignTargetCollector&) { return false; }
-    bool visit(const BreakStmt&, AssignTargetCollector&) { return false; }
-    bool visit(const ContinueStmt&, AssignTargetCollector&) { return false; }
-    bool visit(const SyncForStmt&, AssignTargetCollector&) { return false; }
-};
+}
 ```
 
-**验证关键**：
-- ✅ `MatchStmt` 处理两种 case body：`BlockStmt` 和 `AssignExpr`（与原一致）
-- ✅ `ExprStmt` 仅检查 `AssignExpr`（与原一致）
+#### Step 1.3：safepoint 改造为 STW
 
-### Step 3: 新增 CallTargetScanner 到 ASTWalker.h
-
-**位置**：AssignTargetCollector 之后
-
-**代码**（逐字符复制 [ExprGen.cpp:709-761](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L709)）：
+**改动**：[gc.cpp:154-164](file:///d:/you/Aura/runtime/gc.cpp#L154) 替换为：
 
 ```cpp
-// CallTargetScanner — 检测捕获变量是否作为调用目标（被调用）
-// 用于决定闭包是否需要 mutable 关键字
-//
-// 注意：Stmt+Expr 完整递归。IfStmt 扫描条件（与原内联实现一致）。
-class CallTargetScanner {
-public:
-    std::string targetName;
-    bool found = false;
-    bool scanStmt(const Stmt& stmt) {
-        return StmtWalker<CallTargetScanner>::walk(stmt, *this);
-    }
-    bool scanExpr(const ASTNode& node) {
-        return ExprWalker<CallTargetScanner>::walk(node, *this);
-    }
-    static bool anyMatch(const BlockStmt& body, const std::vector<std::string>& captures) {
-        for (auto& cap : captures) {
-            CallTargetScanner s;
-            s.targetName = cap;
-            for (auto& stmt : body.stmts)
-                if (stmt && s.scanStmt(*stmt)) return true;
-        }
-        return false;
-    }
-    bool visit(const CallExpr& n, CallTargetScanner& /*self*/) {
-        if (auto* id = dynamic_cast<const Identifier*>(n.callee.get()))
-            if (id->name == targetName) { found = true; return true; }
-        for (auto& a : n.args) if (a && scanExpr(*a)) return true;
-        return false;
-    }
-    // Stmt visitors
-    bool visit(const BlockStmt& n, CallTargetScanner& self) { for (auto& ss : n.stmts) if (ss && self.scanStmt(*ss)) return true; return false; }
-    bool visit(const IfStmt& n, CallTargetScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; if (n.thenBranch && self.scanStmt(*n.thenBranch)) return true; for (auto& ei : n.elseIfs) { if (ei.condition && self.scanExpr(*ei.condition)) return true; if (ei.body && self.scanStmt(*ei.body)) return true; } if (n.elseBranch && self.scanStmt(*n.elseBranch)) return true; return false; }
-    bool visit(const WhileStmt& n, CallTargetScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; return n.body && self.scanStmt(*n.body); }
-    bool visit(const ForStmt& n, CallTargetScanner& self) { if (n.iterable && self.scanExpr(*n.iterable)) return true; return n.body && self.scanStmt(*n.body); }
-    bool visit(const LoopStmt& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const TryCatchStmt& n, CallTargetScanner& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
-    bool visit(const SyncStmt& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const SyncForStmt& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const SpawnStmt& n, CallTargetScanner& self) { for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
-    bool visit(const MatchStmt& n, CallTargetScanner& self) { if (n.expr && self.scanExpr(*n.expr)) return true; for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } else if (self.scanExpr(*c.body)) return true; } return false; }
-    bool visit(const ExprStmt& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-    bool visit(const ReturnStmt& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-    bool visit(const ThrowStmt& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-    bool visit(const LetDecl& n, CallTargetScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
-    bool visit(const ConstDecl& n, CallTargetScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
-    bool visit(const BreakStmt&, CallTargetScanner&) { return false; }
-    bool visit(const ContinueStmt&, CallTargetScanner&) { return false; }
-    // Expr visitors
-    bool visit(const BinaryExpr& n, CallTargetScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
-    bool visit(const MethodCallExpr& n, CallTargetScanner& self) { if (n.object && self.scanExpr(*n.object)) return true; for (auto& a : n.args) if (a && self.scanExpr(*a)) return true; return false; }
-    bool visit(const UnaryExpr& n, CallTargetScanner& self) { return n.operand && self.scanExpr(*n.operand); }
-    bool visit(const MemberAccessExpr& n, CallTargetScanner& self) { return n.object && self.scanExpr(*n.object); }
-    bool visit(const IndexExpr& n, CallTargetScanner& self) { return (n.object && self.scanExpr(*n.object)) || (n.index && self.scanExpr(*n.index)); }
-    bool visit(const AssignExpr& n, CallTargetScanner& self) { return (n.target && self.scanExpr(*n.target)) || (n.value && self.scanExpr(*n.value)); }
-    bool visit(const ErrorPropagationExpr& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-    bool visit(const PipeExpr& n, CallTargetScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
-    bool visit(const RecordExpr& n, CallTargetScanner& self) { for (auto& f : n.fields) if (f.value && self.scanExpr(*f.value)) return true; return false; }
-    bool visit(const ListExpr& n, CallTargetScanner& self) { for (auto& e : n.elements) if (e && self.scanExpr(*e)) return true; return false; }
-    bool visit(const FunExpr& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const IntLiteral&, CallTargetScanner&) { return false; }
-    bool visit(const FloatLiteral&, CallTargetScanner&) { return false; }
-    bool visit(const StringLiteral&, CallTargetScanner&) { return false; }
-    bool visit(const BoolLiteral&, CallTargetScanner&) { return false; }
-    bool visit(const NoneLiteral&, CallTargetScanner&) { return false; }
-    bool visit(const Identifier&, CallTargetScanner&) { return false; }
-};
-```
+void GcHeap::safepoint() {
+    if (!gc_pending_) return;
 
-**验证关键**：
-- ✅ `IfStmt` 扫描 `n.condition`（与原一致）
-- ✅ 完整 Expr visitors 列表（与原一致）
-- ✅ `Identifier` visitor 返回 false（与原一致，避免误报）
-
-### Step 4: 新增 CaptureArgScanner 到 ASTWalker.h
-
-**位置**：CallTargetScanner 之后
-
-**代码**（逐字符复制 [ExprGen.cpp:773-818](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L773)）：
-
-```cpp
-// CaptureArgScanner — 收集 captures 中被调用（作为 callee 或参数）的变量名
-// 用于 returnOnlyGenerics 推导（如 make_tree_mapper 闭包中的 U）
-//
-// 注意：Stmt+Expr 完整递归。Identifier 直接命中即返回 true（与原一致）。
-class CaptureArgScanner {
-public:
-    std::string name;
-    bool foundArg = false;
-    bool scanStmt(const Stmt& stmt) { return StmtWalker<CaptureArgScanner>::walk(stmt, *this); }
-    bool scanExpr(const ASTNode& node) { return ExprWalker<CaptureArgScanner>::walk(node, *this); }
-    static std::set<std::string> collectMatched(const BlockStmt& body,
-                                                 const std::vector<std::string>& captures) {
-        std::set<std::string> result;
-        for (auto& cap : captures) {
-            CaptureArgScanner s;
-            s.name = cap;
-            for (auto& stmt : body.stmts) {
-                if (stmt && s.scanStmt(*stmt)) { result.insert(cap); break; }
-            }
-        }
-        return result;
-    }
-    bool visit(const CallExpr& n, CaptureArgScanner& self) {
-        if (auto* id = dynamic_cast<const Identifier*>(n.callee.get()))
-            if (id->name == name) { foundArg = true; return true; }
-        for (auto& a : n.args) if (a && self.scanExpr(*a)) return true;
-        return false;
-    }
-    bool visit(const Identifier& n, CaptureArgScanner&) { if (n.name == name) { foundArg = true; return true; } return false; }
-    bool visit(const BlockStmt& n, CaptureArgScanner& self) { for (auto& ss : n.stmts) if (ss && self.scanStmt(*ss)) return true; return false; }
-    bool visit(const ReturnStmt& n, CaptureArgScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-    bool visit(const ExprStmt& n, CaptureArgScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-    bool visit(const IfStmt& n, CaptureArgScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; if (n.thenBranch && self.scanStmt(*n.thenBranch)) return true; for (auto& ei : n.elseIfs) { if (ei.condition && self.scanExpr(*ei.condition)) return true; if (ei.body && self.scanStmt(*ei.body)) return true; } if (n.elseBranch && self.scanStmt(*n.elseBranch)) return true; return false; }
-    bool visit(const WhileStmt& n, CaptureArgScanner& self) { if (n.condition && self.scanExpr(*n.condition)) return true; return n.body && self.scanStmt(*n.body); }
-    bool visit(const ForStmt& n, CaptureArgScanner& self) { if (n.iterable && self.scanExpr(*n.iterable)) return true; return n.body && self.scanStmt(*n.body); }
-    bool visit(const LoopStmt& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const TryCatchStmt& n, CaptureArgScanner& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
-    bool visit(const SyncStmt& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const SyncForStmt& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const SpawnStmt& n, CaptureArgScanner& self) { for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
-    bool visit(const MatchStmt& n, CaptureArgScanner& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } else if (self.scanExpr(*c.body)) return true; } return false; }
-    bool visit(const LetDecl& n, CaptureArgScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
-    bool visit(const ConstDecl& n, CaptureArgScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
-    bool visit(const BinaryExpr& n, CaptureArgScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
-    bool visit(const UnaryExpr& n, CaptureArgScanner& self) { return n.operand && self.scanExpr(*n.operand); }
-    bool visit(const MethodCallExpr& n, CaptureArgScanner& self) { if (n.object && self.scanExpr(*n.object)) return true; for (auto& a : n.args) if (a && self.scanExpr(*a)) return true; return false; }
-    bool visit(const MemberAccessExpr& n, CaptureArgScanner& self) { return n.object && self.scanExpr(*n.object); }
-    bool visit(const IndexExpr& n, CaptureArgScanner& self) { return (n.object && self.scanExpr(*n.object)) || (n.index && self.scanExpr(*n.index)); }
-    bool visit(const AssignExpr& n, CaptureArgScanner& self) { return (n.target && self.scanExpr(*n.target)) || (n.value && self.scanExpr(*n.value)); }
-    bool visit(const ErrorPropagationExpr& n, CaptureArgScanner& self) { return n.expr && self.scanExpr(*n.expr); }
-    bool visit(const PipeExpr& n, CaptureArgScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
-    bool visit(const RecordExpr& n, CaptureArgScanner& self) { for (auto& f : n.fields) if (f.value && self.scanExpr(*f.value)) return true; return false; }
-    bool visit(const ListExpr& n, CaptureArgScanner& self) { for (auto& e : n.elements) if (e && self.scanExpr(*e)) return true; return false; }
-    bool visit(const FunExpr& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const IntLiteral&, CaptureArgScanner&) { return false; }
-    bool visit(const FloatLiteral&, CaptureArgScanner&) { return false; }
-    bool visit(const StringLiteral&, CaptureArgScanner&) { return false; }
-    bool visit(const BoolLiteral&, CaptureArgScanner&) { return false; }
-    bool visit(const NoneLiteral&, CaptureArgScanner&) { return false; }
-    bool visit(const ThrowStmt&, CaptureArgScanner&) { return false; }
-    bool visit(const BreakStmt&, CaptureArgScanner&) { return false; }
-    bool visit(const ContinueStmt&, CaptureArgScanner&) { return false; }
-};
-```
-
-**验证关键**：
-- ✅ `MatchStmt` **不**扫描 `n.expr`（与原一致，注意原代码 L796 没有 `if (n.expr && self.scanExpr(*n.expr))`）
-- ✅ `Identifier` visitor 命中即返回 true（与原一致，与 CallTargetScanner 不同）
-
-### Step 5: 替换 genFunExpr 中的 4 个内联块
-
-**文件**：[src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp)
-
-#### 5.1 替换 IoDetector 区段（L530-564）
-
-**原代码** [L530-565](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L530)：
-
-```cpp
-    // 检测闭包体内是否包含 io.xxx 调用 — 若有则在协程上下文中生成协程 lambda
-    bool closureHasIo = false;
-    if (isCoroutine && !ioSync_) {
-        struct IoDetector { ... };  // L533-560
-        IoDetector detector;
-        for (auto& s : e.body->stmts)
-            if (s && detector.scanStmt(*s)) { closureHasIo = true; break; }
-    }
-    bool closureIsCoro = closureHasIo;
-```
-
-**替换为**：
-
-```cpp
-    // 检测闭包体内是否包含 io.xxx 调用 — 若有则在协程上下文中生成协程 lambda
-    bool closureHasIo = isCoroutine && !ioSync_ && IoDetector::scan(*e.body);
-    bool closureIsCoro = closureHasIo;
-```
-
-**减少行数**：~35 → 2 行
-
-#### 5.2 替换 AssignTargetCollector 区段（L661-702）
-
-**原代码** [L661-702](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L661)：
-
-```cpp
-    // === 3. 检测是否修改捕获变量（决定 mutable 关键字） ===
-    bool needsMutable = false;
-    // 扫描：赋值左侧是捕获变量 → 直接 mutable
-    for (auto& cap : captures) {
-        for (auto& s : e.body->stmts) {
-            if (!s) continue;
-            struct AssignTargetCollector { ... };  // L667-696
-            AssignTargetCollector collector;
-            collector.targetName = cap;
-            if (collector.collectStmt(*s)) { needsMutable = true; break; }
-        }
-        if (needsMutable) break;
-    }
-```
-
-**替换为**：
-
-```cpp
-    // === 3. 检测是否修改捕获变量（决定 mutable 关键字） ===
-    bool needsMutable = !captures.empty() && AssignTargetCollector::anyMatch(*e.body, captures);
-```
-
-**减少行数**：~42 → 2 行
-
-#### 5.3 替换 CallTargetScanner 区段（L704-768）
-
-**原代码** [L704-768](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L704)：
-
-```cpp
-    // 扫描：捕获变量被用作调用目标 → 按值捕获的 lambda operator() 为 const，需 mutable
-    if (!needsMutable) {
-        for (auto& cap : captures) {
-            for (auto& s : e.body->stmts) {
-                if (!s) continue;
-                struct CallTargetScanner { ... };  // L709-761
-                CallTargetScanner scanner;
-                scanner.targetName = cap;
-                if (scanner.scanStmt(*s)) { needsMutable = true; break; }
-            }
-            if (needsMutable) break;
-        }
-    }
-```
-
-**替换为**：
-
-```cpp
-    // 扫描：捕获变量被用作调用目标 → 按值捕获的 lambda operator() 为 const，需 mutable
-    if (!needsMutable && !captures.empty()) {
-        needsMutable = CallTargetScanner::anyMatch(*e.body, captures);
-    }
-```
-
-**减少行数**：~65 → 4 行
-
-#### 5.4 替换 CaptureArgScanner 区段（L770-827）
-
-**原代码** [L770-827](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L770)：
-
-```cpp
-    // 收集在闭包体内被引用（作为调用参数或直接调用）的捕获变量名
-    std::set<std::string> calledCaptures;
+    // 单线程场景：直接执行 GC
+    size_t threadCount;
     {
-        struct CaptureArgScanner { ... };  // L773-818
-        for (auto& cap : captures) {
-            for (auto& s : e.body->stmts) {
-                if (!s) continue;
-                CaptureArgScanner argScanner;
-                argScanner.name = cap;
-                if (argScanner.scanStmt(*s)) { calledCaptures.insert(cap); break; }
+        std::lock_guard<std::mutex> lk(threads_m_);
+        threadCount = registered_threads_.size();
+    }
+    if (threadCount <= 1) {
+        gc_pending_ = false;
+        if (youngBytes_ >= kYoungThreshold / 2) minorGc();
+        if (oldBytes_ >= kOldThreshold) majorGc();
+        return;
+    }
+
+    // 多线程场景：本线程成为 GC 执行者
+    if (!gc_in_progress_.exchange(true)) {
+        // 抢到 GC 锁：等待其他线程到达 safepoint
+        {
+            std::unique_lock<std::mutex> lk(all_stopped_m_);
+            all_stopped_cv_.wait(lk, [this, &threadCount]{
+                return stopped_threads_.load() >= static_cast<int>(threadCount) - 1;
+            });
+        }
+        // 所有其他线程已停止，执行 GC
+        gc_pending_ = false;
+        if (youngBytes_ >= kYoungThreshold / 2) minorGc();
+        if (oldBytes_ >= kOldThreshold) majorGc();
+
+        // 唤醒所有线程
+        gc_in_progress_ = false;
+        stopped_threads_ = 0;
+        all_stopped_cv_.notify_all();
+    } else {
+        // 其他线程正在执行 GC，本线程停止
+        stopped_threads_++;
+        std::unique_lock<std::mutex> lk(all_stopped_m_);
+        all_stopped_cv_.wait(lk, [this]{ return !gc_in_progress_.load(); });
+        // 注意：lk 析构时才释放锁，但 wait 已释放
+    }
+}
+```
+
+**注意点**：
+- 第一个进入的线程成为 GC 执行者，其他线程阻塞
+- `gc_in_progress_.exchange(true)` 用原子操作避免竞争
+- `stopped_threads_` 计数器用于判断是否所有非 GC 线程都已到达 safepoint
+- 完成后 `notify_all` 唤醒所有阻塞线程
+
+#### Step 1.4：run_event_loop 注册主线程
+
+**改动**：[task.cpp:13-30](file:///d:/you/Aura/runtime/task.cpp#L13) 在 `run_event_loop` 入口注册主线程：
+
+```cpp
+void run_event_loop(task<void>& mainTask) {
+    auto& gc = GcHeap::instance();
+    gc.registerThread(std::this_thread::get_id());
+
+    auto handle = mainTask.handle();
+    if (!handle) {
+        gc.unregisterThread(std::this_thread::get_id());
+        return;
+    }
+    // ...（原有逻辑保持不变）
+    gc_unregister_stack_roots(framePtr, ...);
+
+    gc.unregisterThread(std::this_thread::get_id());
+}
+```
+
+**验收**：编译通过，单线程场景行为不变（threadCount <= 1 走原逻辑）。
+
+---
+
+### Phase 2：§十八 forceGc 暴露 + 多线程安全（依赖 Phase 1）
+
+#### Step 2.1：forceGc 改造为走 STW
+
+**改动**：[gc.cpp:196-199](file:///d:/you/Aura/runtime/gc.cpp#L196) 替换为：
+
+```cpp
+void GcHeap::forceGc() {
+    // 多线程场景：设置 gc_pending_，等待 safepoint 处理
+    size_t threadCount;
+    {
+        std::lock_guard<std::mutex> lk(threads_m_);
+        threadCount = registered_threads_.size();
+    }
+
+    if (threadCount <= 1) {
+        // 单线程场景：直接执行
+        gcPending_ = false;
+        majorGc();
+        return;
+    }
+
+    // 多线程场景：设置 gc_pending_，由各线程 safepoint 触发
+    gc_pending_ = true;
+    // 本线程也走到 safepoint
+    safepoint();
+}
+```
+
+**关键**：`forceGc()` 不再直接调 `majorGc()`，而是设置 `gc_pending_ = true` 后调 `safepoint()`，由 STW 机制保证安全。
+
+#### Step 2.2：新增 GcStats 结构 + getStats()
+
+**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) 新增：
+
+```cpp
+struct GcStats {
+    size_t allocatedBytes;
+    size_t youngBytes;
+    size_t oldBytes;
+    size_t gcCount;
+    size_t minorGcCount;
+    size_t liveObjectCount;     // youngObjects_.size() + oldObjects_.size()
+    size_t pageCount;           // 遍历 headPage_ 计数
+};
+
+class GcHeap {
+public:
+    GcStats getStats() const;
+};
+```
+
+**改动**：[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 新增：
+
+```cpp
+GcStats GcHeap::getStats() const {
+    GcStats s;
+    s.allocatedBytes  = allocatedBytes_;
+    s.youngBytes      = youngBytes_;
+    s.oldBytes        = oldBytes_;
+    s.gcCount         = gcCount_;
+    s.minorGcCount    = minorGcCount_;
+    s.liveObjectCount = youngObjects_.size() + oldObjects_.size();
+    s.pageCount = 0;
+    for (Page* p = headPage_; p; p = p->next) s.pageCount++;
+    return s;
+}
+```
+
+**新增便捷 C++ API**（[gc.h](file:///d:/you/Aura/runtime/gc.h) 末尾）：
+
+```cpp
+inline void gc_force_major() { GcHeap::instance().forceGc(); }
+inline GcStats gc_get_stats() { return GcHeap::instance().getStats(); }
+```
+
+#### Step 2.3：BuiltinRegistry 注册 gc_force / gc_stats
+
+**改动**：[BuiltinRegistry.h:255-262](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L255) `functions_` 表追加：
+
+```cpp
+{
+    "gc_force", {}, ReturnTypeInfo::None()
+},
+{
+    "gc_stats", {}, ReturnTypeInfo::Named("string")
+},
+```
+
+**注意**：`gc_stats` 返回 `string`，但实际 C++ 返回 `GcStats` 结构。需要在 CodeGen 中特殊处理 — 把 `GcStats` 格式化为字符串。
+
+**简化方案**：让 `gc_stats()` 在 C++ 端直接返回 `GcString*`，内部格式化：
+
+```cpp
+// runtime/gc.cpp 新增
+GcString* gc_stats_string() {
+    auto s = GcHeap::instance().getStats();
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "GC: alloc=%zuKB young=%zuKB old=%zuKB gc=%zu minor=%zu live=%zu pages=%zu",
+        s.allocatedBytes / 1024, s.youngBytes / 1024, s.oldBytes / 1024,
+        s.gcCount, s.minorGcCount, s.liveObjectCount, s.pageCount);
+    return make_string(buf);
+}
+```
+
+#### Step 2.4：CodeGen 识别 gc_force / gc_stats
+
+**改动**：[ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) 的 `genCallExpr` 中（在 `range` 处理之后）追加：
+
+```cpp
+// 识别 gc_force() / gc_stats() 等内置 GC 函数
+if (auto* id = dynamic_cast<const Identifier*>(e.callee.get())) {
+    if (id->name == "gc_force" && e.args.empty()) {
+        return "aura_rt::gc_force_major()";
+    }
+    if (id->name == "gc_stats" && e.args.empty()) {
+        return "aura_rt::gc_stats_string()";
+    }
+}
+```
+
+**Aura 使用方式**：
+
+```aura
+fun main(io: Io) {
+    let s = "hello"
+    gc_force()              // 触发 GC
+    io.println(s)           // s 仍可用
+    let info = gc_stats()
+    io.println(info)
+}
+```
+
+**验收**：
+- 单线程下 `gc_force()` 直接执行 GC
+- 多线程下 `gc_force()` 走 STW 流程
+- `gc_stats()` 返回正确的格式化字符串
+
+---
+
+### Phase 3：§五 GcGlobalRoot<T>（独立，可与 Phase 2 并行）
+
+#### Step 3.1：GcHeap 加 globalRoots_
+
+**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) `GcHeap` private 区追加：
+
+```cpp
+// 全局根：长期存活的对象（运行时缓存 / interned 字符串等）
+// 不像 GcRootHandle 那样自动析构取消注册，需手动 register/unregister
+std::vector<GcObject**> globalRoots_;
+std::mutex globalRoots_m_;
+```
+
+```cpp
+public:
+    void registerGlobalRoot(GcObject** rootPtr);
+    void unregisterGlobalRoot(GcObject** rootPtr);
+```
+
+#### Step 3.2：register/unregister 实现
+
+**改动**：[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 新增：
+
+```cpp
+void GcHeap::registerGlobalRoot(GcObject** rootPtr) {
+    std::lock_guard<std::mutex> lk(globalRoots_m_);
+    globalRoots_.push_back(rootPtr);
+}
+
+void GcHeap::unregisterGlobalRoot(GcObject** rootPtr) {
+    std::lock_guard<std::mutex> lk(globalRoots_m_);
+    auto it = std::find(globalRoots_.begin(), globalRoots_.end(), rootPtr);
+    if (it != globalRoots_.end()) {
+        globalRoots_.erase(it);
+    }
+}
+```
+
+#### Step 3.3：markPhase 扫描 globalRoots_
+
+**改动**：[gc.cpp:235-285](file:///d:/you/Aura/runtime/gc.cpp#L235) `markPhase` 入口追加（在 roots_ 扫描之后）：
+
+```cpp
+// 3. 从全局根出发标记（运行时缓存 / interned 字符串）
+{
+    std::lock_guard<std::mutex> lk(globalRoots_m_);
+    for (auto* rootPtr : globalRoots_) {
+        if (rootPtr && *rootPtr) {
+            markObject(*rootPtr);
+        }
+    }
+}
+```
+
+#### Step 3.4：GcGlobalRoot<T> 模板
+
+**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) 在 GcRootHandle 之后追加：
+
+```cpp
+// 全局根句柄：用于运行时缓存的 GC 对象（如 GcString::empty() 单例）
+// 构造时注册，析构时取消。常用于 static 局部变量。
+template <typename T>
+class GcGlobalRoot {
+public:
+    explicit GcGlobalRoot(T* obj) : ptr_(obj) {
+        GcHeap::instance().registerGlobalRoot(
+            reinterpret_cast<GcObject**>(&ptr_));
+    }
+    ~GcGlobalRoot() {
+        GcHeap::instance().unregisterGlobalRoot(
+            reinterpret_cast<GcObject**>(&ptr_));
+    }
+    GcGlobalRoot(const GcGlobalRoot&) = delete;
+    GcGlobalRoot& operator=(const GcGlobalRoot&) = delete;
+
+    T* get() const { return ptr_; }
+    T* operator->() const { return ptr_; }
+
+private:
+    T* ptr_;
+};
+```
+
+**关键约束**：
+- `T` 必须继承 `GcObject`（保证 `reinterpret_cast<GcObject**>` 合法）
+- `&ptr_` 是 `T**`，重解释为 `GcObject**` 后，`*ptr` 读取的是 `T*` 的值（指针值），类型重解释为 `GcObject*` — 与 `GcRootHandle` 同样的 reinterpret_cast 模式
+- `ptr_` 字段地址在对象生命周期内不变，所以 `&ptr_` 注册一次即可
+
+#### Step 3.5：应用 — 替换 OOM 错误特例
+
+**改动**：[gc.h:179-181](file:///d:/you/Aura/runtime/gc.h#L179) `oomError_` 字段改造为 `GcGlobalRoot`：
+
+```cpp
+// 改动前：
+Error oomError_;
+bool  oomInit_ = false;
+
+// 改动后（保持向后兼容，渐进迁移）：
+Error oomError_;
+bool  oomInit_ = false;
+// 在 ensureOomError 中使用 GcGlobalRoot 包装（可选优化，本 plan 不强制）
+```
+
+**实际不强制改 oomError_**：[gc.cpp:283-284](file:///d:/you/Aura/runtime/gc.cpp#L283) 已通过 `if (oomError_.kind) markObject(oomError_.kind)` 特例处理，行为正确。`GcGlobalRoot` 主要为 [gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) 的 `GcString::empty()` 等新缓存服务。
+
+**验收**：
+- 编译通过
+- 简单测试：在 `GcString::empty()` 实现中用 `static GcGlobalRoot<GcString> _empty(GcString::make(""));` 验证 GC 后仍可用
+
+---
+
+### Phase 4：§六 GcWeakHandle<T>（独立）
+
+#### Step 4.1：GcHeap 加 weakHandles_
+
+**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) `GcHeap` private 区追加：
+
+```cpp
+// 弱引用句柄：sweep 时清空指向已回收对象的句柄
+std::vector<GcWeakHandleBase*> weakHandles_;
+std::mutex weakHandles_m_;
+```
+
+```cpp
+public:
+    void registerWeak(GcWeakHandleBase* wh);
+    void unregisterWeak(GcWeakHandleBase* wh);
+```
+
+#### Step 4.2：GcWeakHandleBase / GcWeakHandle<T> 模板
+
+**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) 在 GcRootHandle 之后、GcHeap 之前追加：
+
+```cpp
+// 弱引用基类：通过基类指针统一管理不同 T 的弱引用
+class GcWeakHandleBase {
+public:
+    explicit GcWeakHandleBase(GcObject* obj) : ptr_(obj) {
+        GcHeap::instance().registerWeak(this);
+    }
+    ~GcWeakHandleBase() {
+        GcHeap::instance().unregisterWeak(this);
+    }
+    GcWeakHandleBase(const GcWeakHandleBase&) = delete;
+    GcWeakHandleBase& operator=(const GcWeakHandleBase&) = delete;
+
+    GcObject* get() const { return ptr_; }
+    bool valid() const { return ptr_ != nullptr; }
+    void clear() { ptr_ = nullptr; }   // 仅 GC 在 sweep 时调用
+
+private:
+    GcObject* ptr_;
+    friend class GcHeap;
+};
+
+template <typename T>
+class GcWeakHandle : public GcWeakHandleBase {
+public:
+    explicit GcWeakHandle(T* obj) : GcWeakHandleBase(static_cast<GcObject*>(obj)) {}
+    T* get() const { return static_cast<T*>(GcWeakHandleBase::get()); }
+};
+```
+
+#### Step 4.3：register/unregister 实现
+
+**改动**：[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 新增：
+
+```cpp
+void GcHeap::registerWeak(GcWeakHandleBase* wh) {
+    std::lock_guard<std::mutex> lk(weakHandles_m_);
+    weakHandles_.push_back(wh);
+}
+
+void GcHeap::unregisterWeak(GcWeakHandleBase* wh) {
+    std::lock_guard<std::mutex> lk(weakHandles_m_);
+    auto it = std::find(weakHandles_.begin(), weakHandles_.end(), wh);
+    if (it != weakHandles_.end()) {
+        weakHandles_.erase(it);
+    }
+}
+```
+
+#### Step 4.4：sweep 时清空无效弱引用
+
+**改动**：[gc.cpp:341-353](file:///d:/you/Aura/runtime/gc.cpp#L341) `sweepPhaseYoung` 在清除前先清空弱引用：
+
+```cpp
+void GcHeap::sweepPhaseYoung() {
+    // 1. 清空指向未标记对象的弱引用
+    {
+        std::lock_guard<std::mutex> lk(weakHandles_m_);
+        for (auto* wh : weakHandles_) {
+            GcObject* obj = wh->get();
+            if (obj && !obj->marked) {
+                wh->clear();
             }
         }
     }
-```
 
-**替换为**：
-
-```cpp
-    // 收集在闭包体内被引用（作为调用参数或直接调用）的捕获变量名
-    std::set<std::string> calledCaptures = CaptureArgScanner::collectMatched(*e.body, captures);
-```
-
-**减少行数**：~58 → 2 行
-
-### Step 6: genFunExpr 重构后的完整结构
-
-**重构后 genFunExpr（L527-约 815）**：
-
-```cpp
-std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
-    if (!e.body) return "[]{}";
-
-    // === 1. 协程判定（原 L530-565，压缩为 2 行） ===
-    bool closureIsCoro = isCoroutine && !ioSync_ && IoDetector::scan(*e.body);
-
-    // === 2. 捕获分析（原 L567-596，完全不变） ===
-    std::set<std::string> allRefs;
-    IdRefCollector idCol(allRefs);
-    for (auto& s : e.body->stmts)
-        if (s) idCol.collectStmt(*s);
-
-    std::set<std::string> declared;
-    DeclaredCollector declCol(declared);
-    for (auto& s : e.body->stmts)
-        if (s) declCol.collectStmt(*s);
-
-    std::set<std::string> paramNames;
-    for (auto& p : e.params) paramNames.insert(p.name);
-
-    std::set<std::string> builtins = {"_tasks"};
-    std::vector<std::string> captures;
-    for (auto& name : allRefs) {
-        if (declared.count(name))     continue;
-        if (paramNames.count(name))   continue;
-        if (builtins.count(name))     continue;
-        if (registeredTypes_.count(name)) continue;
-
-        auto it = registeredTypes_.find(name);
-        if (it != registeredTypes_.end() && it->second) {
-            error(e, "cannot capture heap-allocated variable '" + name +
-                  "' in closure (not yet supported)");
-            continue;
+    // 2. 晋升 + 清除（原有逻辑保持不变）
+    for (auto* obj : youngObjects_) {
+        if (obj->marked) {
+            promoteToOld(obj);
+            obj->marked = false;
         }
-        captures.push_back(name);
     }
-
-    // === 3. 泛型分析（原 L598-659，完全不变） ===
-    // collectTParams / callableParamIndices / callableResultGenerics / returnOnlyGenerics
-    // ... 约 60 行原样保留
-
-    // === 4. mutable 检测（原 L661-768，压缩为 5 行） ===
-    bool needsMutable = !captures.empty() && AssignTargetCollector::anyMatch(*e.body, captures);
-    if (!needsMutable && !captures.empty())
-        needsMutable = CallTargetScanner::anyMatch(*e.body, captures);
-
-    // === 5. 被调用的捕获变量（原 L770-827，压缩为 2 行） ===
-    std::set<std::string> calledCaptures = CaptureArgScanner::collectMatched(*e.body, captures);
-
-    // === 6. 生成 C++ lambda（原 L829-974，完全不变） ===
-    // ... 约 145 行原样保留
-    // oss 构造 / 模板参数 / 参数列表 / 返回类型 / invoke_result_t 声明 / 函数体
+    youngBytes_ = 0;
+    youngObjects_.clear();
 }
 ```
 
----
+**改动**：[gc.cpp:368-412](file:///d:/you/Aura/runtime/gc.cpp#L368) `sweepPhaseAll` 同样在清除前先清空弱引用（在统计 liveYoung/liveOld 之后、compactAndReclaim 之前）：
 
-## 3. 关键假设与决策
+```cpp
+void GcHeap::sweepPhaseAll() {
+    // 1. 统计存活对象（原有逻辑）
+    // ...
 
-### 3.1 关键假设
+    // 2. 清空指向死亡对象的弱引用
+    {
+        std::lock_guard<std::mutex> lk(weakHandles_m_);
+        for (auto* wh : weakHandles_) {
+            GcObject* obj = wh->get();
+            if (obj && !obj->marked) {
+                wh->clear();
+            }
+        }
+    }
 
-1. **行为完全不变**：4 个 walker 的 visit 方法逐字符复制，唯一改动是 `struct` → `class` + `public:` 前缀 + 加 `static scan/anyMatch/collectMatched` 入口
-2. **4 个 walker 行为差异保留**：
-   - IoDetector / AssignTargetCollector：Stmt-only，`IfStmt` 不扫条件
-   - CallTargetScanner / CaptureArgScanner：Stmt+Expr，`IfStmt` 扫条件
-   - CaptureArgScanner 的 `Identifier` 直接命中（CallTargetScanner 不命中）
-3. **`captures.empty()` 短路**：原代码中 `for (auto& cap : captures)` 在 captures 为空时自然不执行。新代码显式加 `!captures.empty()` 前置条件，行为等价但更清晰
-4. **`ioSync_` 是 CodeGenerator 成员**：已确认 [CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) 中存在（CoroDecide.cpp 使用过）
+    // 3. 更新对象列表 + 字节统计（原有逻辑）
+    // ...
 
-### 3.2 关键决策
-
-1. **不修改 genFunExpr 中其他部分**：泛型分析（L598-659）、lambda 生成（L829-974）完全不动
-2. **不修改 public API**：`genFunExpr` 签名不变
-3. **4 个 walker 作为 Aura 命名空间独立类放到 ASTWalker.h**：纯 AST 分析工具，不依赖 CodeGenerator 状态，可跨模块复用
-4. **不引入新依赖**：ASTWalker.h 已 include AST/Expr.h + AST/Stmt.h，已含所需所有 AST 节点类型；`<set>` / `<vector>` / `<string>` 需在 ASTWalker.h 顶部补充 include（当前未包含）
-
----
-
-## 4. 风险与缓解
-
-| 风险 | 严重度 | 缓解 |
-|:---|:---:|:---|
-| visit 方法复制时打错字 | 🔴 高 | 每 step 编译 + 跑一个闭包示例验证 |
-| 漏复制某个 visit 方法导致 ASTWalker 编译失败 | 🟡 中 | 编译器会立即报错（ASTWalker 模板要求所有节点类型都有 visit） |
-| `static scan` 入口的 `for` 循环与原代码行为不一致 | 🟡 中 | 原代码就是 `for (auto& s : body.stmts) if (s && detector.scanStmt(*s)) { ...; break; }`，static 入口完全等价 |
-| `anyMatch` 的短路行为与原嵌套循环不一致 | 🟢 低 | 原代码外层 `for (cap)` 找到即 `break`，内层 `for (s)` 找到即 `break`，等价于 `anyMatch` 立即返回 true |
-
----
-
-## 5. 验证步骤
-
-### 5.1 每 step 完成后的最小验证
-
-```cmd
-cd d:\you\Aura
-build.cmd
+    // 4. 紧凑 + 页回收（原有逻辑）
+    // ...
+}
 ```
 
-期望：编译无错误、无新增警告。
+**验收**：构造弱引用 → 强引用置 null → GC → 弱引用 `valid()` 返回 false。
 
-### 5.2 行为不变性专项验证
+---
 
-准备测试文件 `samples/closure_test.aura`：
+### Phase 5：§七 Finalizer（独立，但需注意 GcObject 布局变更）
+
+#### Step 5.1：GcObject 加 finalized 字段
+
+**改动**：[types.h](file:///d:/you/Aura/runtime/types.h) `GcObject` 结构追加：
+
+```cpp
+struct GcObject {
+    const TypeDescriptor* desc       = nullptr;
+    GcObject*             next       = nullptr;
+    bool                  marked     = false;
+    uint8_t               generation = 0;
+    bool                  finalized = false;   // 新增：避免重复调用 finalizer
+};
+```
+
+**注意**：新增 1 字节（实际可能因对齐占 4-8 字节）。所有 GC 对象的 `desc->size` 在 `gc_alloc` 时已固定，此变更需要重新编译所有依赖 `GcObject` 的代码。
+
+#### Step 5.2：TypeDescriptor 加 finalizer 函数指针
+
+**改动**：[types.h](file:///d:/you/Aura/runtime/types.h) `TypeDescriptor` 结构追加：
+
+```cpp
+struct TypeDescriptor {
+    size_t              size;
+    size_t              ptrFieldCount;
+    const size_t*       ptrFieldOffsets;
+    size_t              inlineArrayFieldCount;
+    const InlineArrayField* inlineArrayFields;
+
+    // 新增：finalizer 函数指针（nullptr 表示无 finalizer）
+    void (*finalizer)(GcObject* self) = nullptr;
+};
+```
+
+**关键**：默认 `nullptr`，所以现有所有 `static const TypeDescriptor d = {...}` 仍能编译（C++ 允许聚合初始化省略尾部字段，但需要 `= nullptr` 默认值 — 上面已写）。
+
+**风险点**：[array.h:381-396](file:///d:/you/Aura/runtime/builtin/array.h#L381) 等现有 `TypeDescriptor` 用聚合初始化 `{ size, 2, ptrOffsets, 0, nullptr }`，**5 字段全填**。新增 finalizer 后变成 6 字段，旧代码仍能编译（聚合初始化会默认初始化剩余字段），但需要在头文件加 `= nullptr` 默认值。
+
+#### Step 5.3：sweepPhase 调用 finalizer
+
+**改动**：[gc.cpp:341-353](file:///d:/you/Aura/runtime/gc.cpp#L341) `sweepPhaseYoung` 在清除前调 finalizer：
+
+```cpp
+void GcHeap::sweepPhaseYoung() {
+    // 1. 清空弱引用（Phase 4 已加）
+    // ...
+
+    // 2. 调用 finalizer（新增）
+    for (auto* obj : youngObjects_) {
+        if (!obj->marked && !obj->finalized) {
+            if (obj->desc && obj->desc->finalizer) {
+                obj->desc->finalizer(obj);
+                obj->finalized = true;
+            }
+        }
+    }
+
+    // 3. 晋升 + 清除（原有逻辑）
+    // ...
+}
+```
+
+**改动**：[gc.cpp:368-412](file:///d:/you/Aura/runtime/gc.cpp#L368) `sweepPhaseAll` 同样在清除前调 finalizer：
+
+```cpp
+void GcHeap::sweepPhaseAll() {
+    // 1. 统计存活对象（原有）
+    // ...
+
+    // 2. 清空弱引用（Phase 4 已加）
+    // ...
+
+    // 3. 调用 finalizer（新增）
+    bool inFinalizer = true;  // 防止 finalizer 中触发 GC
+    for (auto* obj : youngObjects_) {
+        if (!obj->marked && !obj->finalized) {
+            if (obj->desc && obj->desc->finalizer) {
+                obj->desc->finalizer(obj);
+                obj->finalized = true;
+            }
+        }
+    }
+    for (auto* obj : oldObjects_) {
+        if (!obj->marked && !obj->finalized) {
+            if (obj->desc && obj->desc->finalizer) {
+                obj->desc->finalizer(obj);
+                obj->finalized = true;
+            }
+        }
+    }
+    inFinalizer = false;
+
+    // 4. 更新对象列表 + 字节统计（原有）
+    // ...
+}
+```
+
+#### Step 5.4：防递归 GC
+
+**问题**：finalizer 中可能调用 `make_string` 等 GC 分配，触发递归 GC。
+
+**应对**：[gc.h](file:///d:/you/Aura/runtime/gc.h) `GcHeap` 加 `inFinalizer_` 标志，`tryAlloc` 检查：
+
+```cpp
+class GcHeap {
+private:
+    bool inFinalizer_ = false;
+};
+
+// tryAlloc 中：
+GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
+    // ...（原有逻辑）
+    if (youngBytes_ >= kYoungThreshold && !inFinalizer_) {
+        minorGc();
+        // ...
+    }
+    // ...
+}
+```
+
+**简化方案**：本 plan 不实现防递归（保留为风险），由 finalizer 实现者自己保证不在 finalizer 中触发 GC。理由：Aura 当前无 finalizer 使用方，未来真要用时再加保护。
+
+**验收**：
+- 编译通过，所有现有 `TypeDescriptor` 初始化不报错
+- 构造一个带 finalizer 的类型 → GC 时 finalizer 被调用
+- finalizer 未设置时（默认 nullptr）行为不变
+
+---
+
+## 五、可能的风险与应对方案
+
+### 5.1 风险一：STW 死锁
+
+**问题**：[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) `safepoint` 中，若 GC 执行者线程在等 `all_stopped_cv_` 时崩溃或被取消，其他线程永远阻塞。
+
+**应对**：
+- ✅ `safepoint` 不在 try/catch 中调用，异常会传播到调用方
+- 🟡 远期改进：加超时机制，但 Aura 当前不需要
+
+### 5.2 风险二：线程注册时序
+
+**问题**：[task.cpp:13-30](file:///d:/you/Aura/runtime/task.cpp#L13) `run_event_loop` 注册主线程前，GC 可能已被触发（如 `ensureOomError` 中 `make_string` 触发 GC）。
+
+**应对**：
+- ✅ `safepoint` 中 `registered_threads_.size() <= 1` 走单线程路径
+- ✅ 未注册线程时 `threadCount = 0`，也走单线程路径
+- ✅ `registerThread` 在 `mainTask.handle()` 之前调用，确保 GC 触发时主线程已注册
+
+### 5.3 风险三：GcObject 布局变更破坏 ABI
+
+**问题**：§七 在 `GcObject` 加 `finalized` 字段，所有依赖 `sizeof(GcObject)` 的代码受影响。
+
+**应对**：
+- ✅ Aura 是单二进制项目，无外部 ABI 依赖
+- ✅ `gc_alloc<T>` 用 `sizeof(T)` 分配，T 继承 GcObject，会自动适应新布局
+- 🟡 风险：若有外部代码假设 `sizeof(GcObject) == 8/16`，需重编
+
+### 5.4 风险四：TypeDescriptor 默认初始化
+
+**问题**：§七 在 `TypeDescriptor` 加 `finalizer` 字段，现有聚合初始化 `{ size, 2, ptrOffsets, 0, nullptr }` 是 5 字段，新增字段后变成 6 字段。
+
+**应对**：
+- ✅ C++ 聚合初始化允许省略尾部字段，省略的字段被值初始化（`nullptr`）
+- ✅ 头文件中加 `= nullptr` 默认值，进一步保证
+- ✅ [array.h:381-411](file:///d:/you/Aura/runtime/builtin/array.h#L381) 等所有现有 `TypeDescriptor` 初始化不报错
+
+### 5.5 风险五：弱引用并发清空
+
+**问题**：§六 `sweepPhase` 持有 `weakHandles_m_` 锁清空弱引用时，用户线程可能正在调 `wh->get()` 读 `ptr_`。
+
+**应对**：
+- ⚠️ 这是一个 race condition，但 `ptr_` 是裸指针，读写是原子的
+- ✅ 最坏情况是用户读到旧值（已 free 的指针），但下一秒访问就 crash
+- 🟡 完整方案：用 `std::atomic<GcObject*>` 替换 `GcObject* ptr_`，但本 plan 不做（增加复杂度，且 Aura 当前无弱引用使用方）
+
+### 5.6 风险六：forceGc 在多线程下重复设置 gc_pending_
+
+**问题**：[gc.cpp:196-199](file:///d:/you/Aura/runtime/gc.cpp#L196) 改造后 `forceGc` 设置 `gc_pending_ = true` 后调 `safepoint()`，但 `safepoint` 内部会重置 `gc_pending_ = false`。
+
+**应对**：
+- ✅ 这是预期行为：`forceGc` 触发一次 GC，由 safepoint 处理
+- ✅ `forceGc` 不需要单独保护 `gc_pending_`，safepoint 内部的 GC 执行者路径会处理
+
+---
+
+## 六、测试验证方案
+
+### 6.1 Phase 1 STW 验证
+
+```cpp
+// 单线程场景：行为不变
+fun main(io: Io) {
+    let s = "hello"
+    for i in 0..100000 {
+        let tmp = "iter" + i
+    }
+    io.println(s)   // 应仍可用
+}
+```
+
+预期：与改造前一致，无 crash。
+
+### 6.2 Phase 2 forceGc 验证
 
 ```aura
 fun main(io: Io) {
-    // 1. 普通闭包（覆盖捕获分析）
-    let add = fun(x: int) -> int { return x + 1 }
-    io.println(add(10))  // 期望 11
-
-    // 2. 修改捕获变量（覆盖 AssignTargetCollector → mutable）
-    let counter = 0
-    let inc = fun() -> int { counter = counter + 1; return counter }
-    io.println(inc())  // 期望 1
-    io.println(inc())  // 期望 2
-
-    // 3. 调用捕获变量（覆盖 CallTargetScanner → mutable）
-    let f = fun(x: int) -> int { return x * 2 }
-    let caller = fun(n: int) -> int { return f(n) }
-    io.println(caller(5))  // 期望 10
-
-    // 4. 闭包内 io 调用（覆盖 IoDetector → 协程化）
-    let logger = fun(msg: string) {
-        io.println(msg)
-    }
-    logger("hello")
+    let s = "test"
+    gc_force()
+    io.println(s)             // s 仍可用
+    let info = gc_stats()
+    io.println(info)         // 打印 GC 统计
 }
 ```
 
-```cmd
-aura.exe samples/closure_test.aura
+预期输出类似：
+```
+test
+GC: alloc=12KB young=4KB old=8KB gc=1 minor=0 live=42 pages=4
 ```
 
-期望输出：
-```
-11
-1
-2
-10
-hello
-```
+### 6.3 Phase 3 GcGlobalRoot 验证
 
-### 5.3 高阶函数验证（覆盖 CaptureArgScanner → returnOnlyGenerics）
-
-```aura
-type Tree<T> = { value: T, children: [Tree<T>] }
-
-fun make_mapper() -> fun(Tree<int>) -> int {
-    return fun(root: Tree<int>) -> int {
-        return root.value
-    }
+```cpp
+// runtime/builtin/string.cpp 中
+GcString* GcString::empty() {
+    static GcGlobalRoot<GcString> _empty(GcString::make(""));
+    return _empty.get();
 }
 
+// 测试
 fun main(io: Io) {
-    let t = Tree { value: 42, children: [] }
-    let m = make_mapper()
-    io.println(m(t))  // 期望 42
+    let e1 = ""        // 内部调 empty()
+    gc_force()
+    let e2 = ""
+    io.println(e1)     // 仍可用
+    io.println(e2)     // 仍可用
 }
 ```
 
-### 5.4 全部完成后的最终验证
+预期：`e1` 和 `e2` 指向同一全局单例，GC 不回收。
 
-1. `build.cmd` 编译成功
-2. 跑通 READMEs/15-example.md 中所有闭包相关示例
-3. 对比重构前后生成的 .cpp 文件，应当**字符完全一致**（可用 `fc` 或 `diff`）
+### 6.4 Phase 4 GcWeakHandle 验证
 
-### 5.5 一致性终极验证
-
-```cmd
-:: 重构前先生成一份 .cpp
-aura.exe samples/closure_test.aura > before.txt
-
-:: 重构后再生成
-aura.exe samples/closure_test.aura > after.txt
-
-fc before.txt after.txt
+```cpp
+// runtime 内部测试代码（不通过 Aura 暴露）
+GcWeakHandle<GcString> wh(make_string("temp"));
+assert(wh.valid());
+gc_force();  // "temp" 无强引用，应被回收
+assert(!wh.valid());
 ```
 
-期望：`FC: 找不到差异`。若有差异，立即定位是哪个 walker 行为变化。
+### 6.5 Phase 5 Finalizer 验证
+
+```cpp
+// 构造带 finalizer 的类型
+struct FileHandle : GcObject {
+    int fd;
+    static void finalize(GcObject* self) {
+        auto* f = static_cast<FileHandle*>(self);
+        if (f->fd >= 0) ::close(f->fd);
+    }
+    static const TypeDescriptor& desc() {
+        static const TypeDescriptor d = {
+            sizeof(FileHandle), 0, nullptr, 0, nullptr, &finalize
+        };
+        return d;
+    }
+};
+
+// 测试
+{
+    auto* f = gc_alloc<FileHandle>(&FileHandle::desc());
+    f->fd = ::open("test.txt", O_RDONLY);
+}
+gc_force();   // 应调用 finalize，关闭 fd
+```
 
 ---
 
-## 6. 预期收益
+## 七、实施顺序与提交粒度
 
-| 指标 | 重构前 | 重构后 | 改善 |
-|:---|:---:|:---:|:---:|
-| genFunExpr 行数 | 448 | ~290 | -158 行（-35%） |
-| 内联 struct 数量 | 4 | 0 | -4 |
-| cyclomatic complexity（估算） | 90 | ~20 | -78% |
-| ASTWalker.h 新增行数 | 0 | +157 | +157（但可复用） |
-| walker 复用潜力 | 0 | 4 个独立类 | 可被 CoroScanner / Sema / 其他模块复用 |
+| 顺序 | Phase | 提交点 | 依赖 | 估计行数 |
+|:---:|:---|:---|:---|:---:|
+| 1 | Phase 1 | commit: "gc: multi-thread STW safepoint" | 无 | ~80 |
+| 2 | Phase 2 | commit: "gc: expose gc_force/gc_stats to Aura + thread-safe forceGc" | Phase 1 | ~60 |
+| 3 | Phase 3 | commit: "gc: add GcGlobalRoot for runtime caches" | 无（可与 Phase 1/2 并行） | ~50 |
+| 4 | Phase 4 | commit: "gc: add GcWeakHandle with sweep-time clearing" | 无 | ~60 |
+| 5 | Phase 5 | commit: "gc: add finalizer support" | 无 | ~40 |
 
----
+**每个 Phase 独立编译 + 测试，失败可回滚单步。**
 
-## 7. 执行顺序
-
-按风险从低到高（每步独立编译验证）：
-
-1. **Step 0**: 补充 ASTWalker.h 头文件 + 分隔注释（编译验证 — 无功能改动）
-2. **Step 1**: 新增 IoDetector 到 ASTWalker.h（编译验证 — 此时 ExprGen.cpp 还在用内联 struct，应能通过）
-3. **Step 2**: 新增 AssignTargetCollector（同上）
-4. **Step 3**: 新增 CallTargetScanner（同上）
-5. **Step 4**: 新增 CaptureArgScanner（同上）
-6. **Step 5.1**: 替换 IoDetector 使用点（编译 + 跑闭包测试）
-7. **Step 5.2**: 替换 AssignTargetCollector 使用点（编译 + 跑 mutable 测试）
-8. **Step 5.3**: 替换 CallTargetScanner 使用点（编译 + 跑 mutable 测试）
-9. **Step 5.4**: 替换 CaptureArgScanner 使用点（编译 + 跑高阶函数测试）
-
-每步完成后单独 commit，便于回溯。
+**建议并行**：Phase 3/4/5 相互独立，可并行开发。Phase 2 依赖 Phase 1。
 
 ---
 
-## 8. 不在本 plan 范围内（明确排除）
+## 八、不实施的事项（明确排除）
 
-- ❌ genFunExpr 中泛型分析段（L598-659）的任何改动
-- ❌ genFunExpr 中 lambda 生成段（L829-974）的任何改动
-- ❌ Res.md §九 其他 4 项（inferCall 复制粘贴 / matchFuncSig / resolveType 拆分 / parseLetDecl 合并）
-- ❌ 任何性能优化（如缓存 walker 结果）
-- ❌ 任何 API 签名变更
-- ❌ 测试用例新增（除手动验证外）
+| 项 | 原因 |
+|:---|:---|
+| Aura 顶层 `let` 全局变量 | Aura 语言当前不支持，本 plan 只做运行时缓存场景 |
+| `gc_force_minor` 暴露 | 优先级低，先做 `gc_force`（major） |
+| GcStats 返回结构化类型 | 简化为字符串格式化，避免引入新 SemType |
+| 弱引用原子读写 | 当前无使用方，保留为风险，未来按需做 |
+| Finalizer 防递归 GC | 简化方案：由实现者保证，运行时不强制 |
+| GcObject 头部紧凑化 | `finalized` 字段占位，未来可优化为位域，本 plan 不做 |
+| `gc_pending_` 原子化 | 当前用 `bool`，多线程下有轻微竞争但不影响正确性（最坏情况是某次 safepoint 漏掉，下次会补上） |
 
-如需上述任何项，请单独 plan。
+---
+
+## 九、与原 plan 的差异
+
+| 原 plan §描述 | 本 plan 实际 |
+|:---|:---|
+| "§五 全局变量 GC 根注册" 包括 Aura 顶层 let | Aura 不支持顶层 let，仅做运行时缓存场景 |
+| "§十八 forceGc 多线程安全" 独立 | 实际就是 §八 STW 的应用，合并入 Phase 2 |
+| "TypeDescriptor 加 finalizer" 影响所有现有代码 | C++ 聚合初始化允许省略尾部字段，现有代码不报错 |
+| "GcWeakHandle 用 atomic 指针" | 简化为裸指针，当前无使用方 |
+| "finalizer 防递归" | 简化为不强制，由实现者保证 |
+
+---
+
+## 十、总结
+
+### 改动规模
+
+- **新增**：~343 行（gc.h +120 / gc.cpp +180 / types.h +8 / BuiltinRegistry.h +15 / ExprGen.cpp +20）
+- **修改**：0 行（不破坏现有 API）
+
+### 完成后效果
+
+| 功能 | 状态 |
+|:---|:---|
+| 多线程 GC 暂停 | ✅ 可支持 sync thread / 异步 io |
+| `gc_force()` Aura 可调 | ✅ |
+| `gc_stats()` Aura 可调 | ✅ |
+| 运行时缓存 GC 安全 | ✅ |
+| 弱引用 | ✅ |
+| Finalizer | ✅ |
+
+### 后续
+
+完成本 plan 后，[TODO.txt §五](file:///d:/you/Aura/TODO.txt) 的 P1 项可标记为 `[x]`。GC 进入"多线程就绪"状态，可推进：
+- [sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md)
+- [io_coroutine_plan.md](file:///d:/you/Aura/plan/io_coroutine_plan.md)
+- [gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) 第一阶段（依赖 GcGlobalRoot）

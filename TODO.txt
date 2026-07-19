@@ -100,31 +100,6 @@
 [ 五 ] GC（plan/gc_analysis.md, plan/plan3.md, plan/plan4.md）
 ================================================================
 
-[~] P0  GC 实际运行 — 根集合空转问题
-      - 现状更正（2026-07-18 重新核验）：
-        * GC 实现是完整的：markPhase/sweepPhaseYoung/sweepPhaseAll/
-          compactAndReclaim 都在工作，forceGc() 会真正执行 mark+sweep
-        * project_memory 中"完全空转的装饰器"描述已过时
-        * 真正的问题：roots_ 始终为空，因为 CodeGen 不生成 GcRootHandle 包装
-        * 后果：markPhase 从空 roots_ 出发，所有对象被标记为 dead，
-          sweepPhaseAll 会"回收"所有对象，但 compactAndReclaim 因找不到
-          存活对象而 freeAllPages → 实际效果接近"不回收，只清理 youngObjects_"
-      - 缺：CodeGen 在每个 GC 指针局部变量处生成 GcRootHandle 包装
-      - 文件：runtime/gc.h:43-62 (GcRootHandle 已定义),
-              src/CodeGen/ (无生成代码), src/Sema/SemAnalyzer.cpp (无根标记)
-
-[ ] P0  协程帧 GC 根追踪
-      - plan/gc_analysis.md:168-180 指出协程帧中 GC 指针为裸指针
-      - 缺：协程帧本身不在 GC 页上；帧内指针未注册为根
-      - 文件：src/CodeGen/ (无 GcRootHandle 生成代码),
-              runtime/task.cpp (协程帧分配)
-
-[ ] P0  Array<T*> 元素 GC 扫描
-      - plan/gc_analysis.md:54-131 详细分析
-      - 现状：Array<T>::desc() 始终返回 ptrFieldCount=0
-      - 缺：types.h 中数组描述符需根据 T 是否为堆类型动态返回
-      - 文件：runtime/builtin/array.h, runtime/types.h:81-89
-
 [ ] P1  GcString 的 TypeDescriptor ptrFieldCount 应支持 parent 字段
       - 当前 [string.cpp:18-22](runtime/builtin/string.cpp#L18) ptrFieldCount=0
       - 若引入子串共享（parent 字段），需更新为 ptrFieldCount=1

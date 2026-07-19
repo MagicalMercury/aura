@@ -20,10 +20,14 @@
 // ============================================================
 
 #include "types.h"
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <cstddef>
+#include <mutex>
 #include <set>
+#include <thread>
 #include <vector>
 
 namespace aura_rt {
@@ -59,6 +63,56 @@ public:
 private:
     T* ptr_;
     friend class GcHeap;
+};
+
+// ============================================================
+// GcWeakHandle — 弱引用
+//
+// 持有 GC 对象引用但不阻止其被回收。访问前需检查 valid()。
+// sweep 阶段自动清空指向已回收对象的弱引用。
+// ============================================================
+class GcWeakHandleBase {
+public:
+    explicit GcWeakHandleBase(GcObject* obj);
+    ~GcWeakHandleBase();
+    GcWeakHandleBase(const GcWeakHandleBase&) = delete;
+    GcWeakHandleBase& operator=(const GcWeakHandleBase&) = delete;
+
+    GcObject* get() const { return ptr_; }
+    bool valid() const { return ptr_ != nullptr; }
+    void clear() { ptr_ = nullptr; }
+
+private:
+    GcObject* ptr_;
+    friend class GcHeap;
+};
+
+template <typename T>
+class GcWeakHandle : public GcWeakHandleBase {
+public:
+    explicit GcWeakHandle(T* obj) : GcWeakHandleBase(static_cast<GcObject*>(obj)) {}
+    T* get() const { return static_cast<T*>(GcWeakHandleBase::get()); }
+};
+
+// ============================================================
+// GcGlobalRoot — 全局根引用（运行时缓存用）
+//
+// 用于 GcString::empty() / from(bool) / from(int) 等运行时缓存的 GC 单例。
+// 构造时注册为全局根，析构时取消。通常作为 static 局部变量。
+// ============================================================
+template <typename T>
+class GcGlobalRoot {
+public:
+    explicit GcGlobalRoot(T* obj);
+    ~GcGlobalRoot();
+    GcGlobalRoot(const GcGlobalRoot&) = delete;
+    GcGlobalRoot& operator=(const GcGlobalRoot&) = delete;
+
+    T* get() const { return ptr_; }
+    T* operator->() const { return ptr_; }
+
+private:
+    T* ptr_;
 };
 
 // ============================================================
@@ -99,6 +153,22 @@ public:
     // 强制触发一次完整 GC（major GC）
     void forceGc();
 
+    // 多线程：线程注册/注销（用于 GC stop-the-world）
+    void registerThread(std::thread::id id);
+    void unregisterThread(std::thread::id id);
+
+    // GC 统计
+    struct Stats {
+        size_t allocatedBytes;
+        size_t youngBytes;
+        size_t oldBytes;
+        size_t gcCount;
+        size_t minorGcCount;
+        size_t liveObjectCount;
+        size_t pageCount;
+    };
+    Stats getStats() const;
+
     // 根集合管理
     void registerRoot(GcRootHandle<GcObject*>* root);
     void unregisterRoot(GcRootHandle<GcObject*>* root);
@@ -107,6 +177,14 @@ public:
     // 用于协程帧等不便于逐个包装 GcRootHandle 的场景
     void registerStackRoots(void* begin, void* end);
     void unregisterStackRoots(void* begin, void* end);
+
+    // 全局根注册：用于运行时缓存的 GC 对象（如 GcString::empty() 单例）
+    void registerGlobalRoot(GcObject** rootPtr);
+    void unregisterGlobalRoot(GcObject** rootPtr);
+
+    // 弱引用注册：sweep 时清空指向已回收对象的句柄
+    void registerWeak(GcWeakHandleBase* wh);
+    void unregisterWeak(GcWeakHandleBase* wh);
 
     // 统计信息
     size_t allocatedBytes()    const { return allocatedBytes_; }
@@ -176,9 +254,25 @@ private:
     // 记忆集：记录 old→young 引用的 old 对象集合
     std::set<GcObject*> rememberedSet_;
 
+    // 全局根：长期存活的 GC 对象（运行时缓存 / interned 字符串）
+    std::vector<GcObject**> globalRoots_;
+    std::mutex              globalRoots_m_;
+
+    // 弱引用句柄：sweep 时清空指向已回收对象的句柄
+    std::vector<GcWeakHandleBase*> weakHandles_;
+    std::mutex                     weakHandles_m_;
+
     // OOM 错误缓存（GC 启动时预分配，无需额外内存即可抛出）
     Error oomError_;
     bool  oomInit_      = false;  // 防止 ensureOomError → make_string → alloc → ensureOomError 递归
+
+    // --- 多线程 Stop-The-World ---
+    std::mutex                  threads_m_;
+    std::vector<std::thread::id> registered_threads_;
+    std::atomic<bool>           gc_in_progress_{false};
+    std::atomic<int>            stopped_threads_{0};
+    std::condition_variable     all_stopped_cv_;
+    std::mutex                  all_stopped_m_;
 };
 
 // ============================================================
@@ -224,17 +318,46 @@ inline void gc_unregister_stack_roots(void* begin, void* end) {
     GcHeap::instance().unregisterStackRoots(begin, end);
 }
 
+// GC 统计（格式化字符串）
+GcString* gc_stats_string();
+
+// STW 安全 forceGc（供 Aura gc_force() 调用）
+inline void gc_force_major() { GcHeap::instance().forceGc(); }
+
 // ============================================================
 // GcRootHandle 模板方法实现（必须在 GcHeap 定义之后）
 // ============================================================
 template <typename T>
 GcRootHandle<T>::GcRootHandle(T& ref) : ptr_(&ref) {
-    GcHeap::instance().registerRoot(this);
+    GcHeap::instance().registerRoot(
+        reinterpret_cast<GcRootHandle<GcObject*>*>(this));
 }
 
 template <typename T>
 GcRootHandle<T>::~GcRootHandle() {
-    if (ptr_) GcHeap::instance().unregisterRoot(this);
+    if (ptr_) GcHeap::instance().unregisterRoot(
+        reinterpret_cast<GcRootHandle<GcObject*>*>(this));
+}
+
+// GcWeakHandleBase 实现（必须在 GcHeap 定义之后）
+inline GcWeakHandleBase::GcWeakHandleBase(GcObject* obj) : ptr_(obj) {
+    GcHeap::instance().registerWeak(this);
+}
+inline GcWeakHandleBase::~GcWeakHandleBase() {
+    GcHeap::instance().unregisterWeak(this);
+}
+
+// GcGlobalRoot 模板方法实现（必须在 GcHeap 定义之后）
+template <typename T>
+GcGlobalRoot<T>::GcGlobalRoot(T* obj) : ptr_(obj) {
+    GcHeap::instance().registerGlobalRoot(
+        reinterpret_cast<GcObject**>(&ptr_));
+}
+
+template <typename T>
+GcGlobalRoot<T>::~GcGlobalRoot() {
+    GcHeap::instance().unregisterGlobalRoot(
+        reinterpret_cast<GcObject**>(&ptr_));
 }
 
 } // namespace aura_rt

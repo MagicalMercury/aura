@@ -149,17 +149,63 @@ void GcHeap::writeBarrier(GcObject* parent, void* /*fieldAddr*/, GcObject* newVa
 }
 
 // ============================================================
-// 安全点
+// 安全点（多线程 STW）
 // ============================================================
 void GcHeap::safepoint() {
-    if (gcPending_) {
+    if (!gcPending_) return;
+
+    // 单线程场景：直接执行 GC
+    size_t threadCount;
+    {
+        std::lock_guard<std::mutex> lk(threads_m_);
+        threadCount = registered_threads_.size();
+    }
+    if (threadCount <= 1) {
         gcPending_ = false;
-        if (youngBytes_ >= kYoungThreshold / 2) {
-            minorGc();
+        if (youngBytes_ >= kYoungThreshold / 2) minorGc();
+        if (oldBytes_ >= kOldThreshold) majorGc();
+        return;
+    }
+
+    // 多线程场景：本线程尝试成为 GC 执行者
+    if (!gc_in_progress_.exchange(true)) {
+        // 抢到 GC 锁：等待其他线程到达 safepoint
+        {
+            std::unique_lock<std::mutex> lk(all_stopped_m_);
+            all_stopped_cv_.wait(lk, [this, threadCount]{
+                return stopped_threads_.load() >= static_cast<int>(threadCount) - 1;
+            });
         }
-        if (oldBytes_ >= kOldThreshold) {
-            majorGc();
-        }
+        // 所有其他线程已停止，执行 GC
+        gcPending_ = false;
+        if (youngBytes_ >= kYoungThreshold / 2) minorGc();
+        if (oldBytes_ >= kOldThreshold) majorGc();
+
+        // 唤醒所有线程
+        gc_in_progress_ = false;
+        stopped_threads_ = 0;
+        all_stopped_cv_.notify_all();
+    } else {
+        // 其他线程正在执行 GC，本线程停止
+        stopped_threads_++;
+        std::unique_lock<std::mutex> lk(all_stopped_m_);
+        all_stopped_cv_.wait(lk, [this]{ return !gc_in_progress_.load(); });
+    }
+}
+
+// ============================================================
+// 线程注册 / 注销（多线程 STW）
+// ============================================================
+void GcHeap::registerThread(std::thread::id id) {
+    std::lock_guard<std::mutex> lk(threads_m_);
+    registered_threads_.push_back(id);
+}
+
+void GcHeap::unregisterThread(std::thread::id id) {
+    std::lock_guard<std::mutex> lk(threads_m_);
+    auto it = std::find(registered_threads_.begin(), registered_threads_.end(), id);
+    if (it != registered_threads_.end()) {
+        registered_threads_.erase(it);
     }
 }
 
@@ -189,13 +235,75 @@ void GcHeap::unregisterStackRoots(void* begin, void* end) {
     }
 }
 
+void GcHeap::registerGlobalRoot(GcObject** rootPtr) {
+    std::lock_guard<std::mutex> lk(globalRoots_m_);
+    globalRoots_.push_back(rootPtr);
+}
+
+void GcHeap::unregisterGlobalRoot(GcObject** rootPtr) {
+    std::lock_guard<std::mutex> lk(globalRoots_m_);
+    auto it = std::find(globalRoots_.begin(), globalRoots_.end(), rootPtr);
+    if (it != globalRoots_.end()) {
+        globalRoots_.erase(it);
+    }
+}
+
+void GcHeap::registerWeak(GcWeakHandleBase* wh) {
+    std::lock_guard<std::mutex> lk(weakHandles_m_);
+    weakHandles_.push_back(wh);
+}
+
+void GcHeap::unregisterWeak(GcWeakHandleBase* wh) {
+    std::lock_guard<std::mutex> lk(weakHandles_m_);
+    auto it = std::find(weakHandles_.begin(), weakHandles_.end(), wh);
+    if (it != weakHandles_.end()) {
+        weakHandles_.erase(it);
+    }
+}
+
 // ============================================================
 // GC 触发
 // ============================================================
 
 void GcHeap::forceGc() {
-    gcPending_ = false;
-    majorGc();
+    size_t threadCount;
+    {
+        std::lock_guard<std::mutex> lk(threads_m_);
+        threadCount = registered_threads_.size();
+    }
+
+    if (threadCount <= 1) {
+        gcPending_ = false;
+        majorGc();
+        return;
+    }
+
+    // 多线程场景：走 STW
+    gcPending_ = true;
+    safepoint();
+}
+
+GcHeap::Stats GcHeap::getStats() const {
+    Stats s{};
+    s.allocatedBytes  = allocatedBytes_;
+    s.youngBytes      = youngBytes_;
+    s.oldBytes        = oldBytes_;
+    s.gcCount         = gcCount_;
+    s.minorGcCount    = minorGcCount_;
+    s.liveObjectCount = youngObjects_.size() + oldObjects_.size();
+    s.pageCount = 0;
+    for (Page* p = headPage_; p; p = p->next) s.pageCount++;
+    return s;
+}
+
+GcString* gc_stats_string() {
+    auto s = GcHeap::instance().getStats();
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "GC: alloc=%zuKB young=%zuKB old=%zuKB gc=%zu minor=%zu live=%zu pages=%zu",
+        s.allocatedBytes / 1024, s.youngBytes / 1024, s.oldBytes / 1024,
+        s.gcCount, s.minorGcCount, s.liveObjectCount, s.pageCount);
+    return make_string(buf);
 }
 
 // ============================================================
@@ -261,7 +369,17 @@ void GcHeap::markPhase(bool youngOnly) {
         }
     }
 
-    // 3. 若 youngOnly，从记忆集出发标记 old→young 引用
+    // 3. 从全局根出发标记（运行时缓存 / interned 字符串）
+    {
+        std::lock_guard<std::mutex> lk(globalRoots_m_);
+        for (auto* rootPtr : globalRoots_) {
+            if (rootPtr && *rootPtr) {
+                markObject(*rootPtr);
+            }
+        }
+    }
+
+    // 4. 若 youngOnly，从记忆集出发标记 old→young 引用
     if (youngOnly) {
         for (auto* oldObj : rememberedSet_) {
             markFields(oldObj);   // 递归标记 old 对象引用的 young 对象
@@ -339,7 +457,28 @@ void GcHeap::markInlineArrayFields(GcObject* obj) {
 // ============================================================
 
 void GcHeap::sweepPhaseYoung() {
-    // 晋升所有存活对象到老年代，清空新生代列表。
+    // 1. 清空指向未标记对象的弱引用
+    {
+        std::lock_guard<std::mutex> lk(weakHandles_m_);
+        for (auto* wh : weakHandles_) {
+            GcObject* obj = wh->get();
+            if (obj && !obj->marked) {
+                wh->clear();
+            }
+        }
+    }
+
+    // 2. 调用 finalizer（对未标记且未 finalize 的对象）
+    for (auto* obj : youngObjects_) {
+        if (!obj->marked && !obj->finalized) {
+            if (obj->desc && obj->desc->finalizer) {
+                obj->desc->finalizer(obj);
+                obj->finalized = true;
+            }
+        }
+    }
+
+    // 3. 晋升所有存活对象到老年代，清空新生代列表。
     // 存活对象不应留在 youngObjects_ 中，否则下次 minor GC 会重复扫描老年代对象。
     for (auto* obj : youngObjects_) {
         if (obj->marked) {
@@ -387,6 +526,35 @@ void GcHeap::sweepPhaseAll() {
             // 此处的 gen==0 分支不再需要（且 promoteToOld 在迭代 oldObjects_ 时调用会 UB）
             liveOld.push_back(obj);
             liveOldBytes += obj->desc ? obj->desc->size : 0;
+        }
+    }
+
+    // 2. 清空指向死亡对象的弱引用
+    {
+        std::lock_guard<std::mutex> lk(weakHandles_m_);
+        for (auto* wh : weakHandles_) {
+            GcObject* obj = wh->get();
+            if (obj && !obj->marked) {
+                wh->clear();
+            }
+        }
+    }
+
+    // 3. 调用 finalizer（对未标记且未 finalize 的对象）
+    for (auto* obj : youngObjects_) {
+        if (!obj->marked && !obj->finalized) {
+            if (obj->desc && obj->desc->finalizer) {
+                obj->desc->finalizer(obj);
+                obj->finalized = true;
+            }
+        }
+    }
+    for (auto* obj : oldObjects_) {
+        if (!obj->marked && !obj->finalized) {
+            if (obj->desc && obj->desc->finalizer) {
+                obj->desc->finalizer(obj);
+                obj->finalized = true;
+            }
         }
     }
 

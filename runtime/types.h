@@ -86,6 +86,9 @@ struct TypeDescriptor {
     // 内联数组字段 — 用于 ArrayChunk 等将数据紧跟在对象体之后的类型
     size_t              inlineArrayFieldCount = 0;
     const InlineArrayField* inlineArrayFields = nullptr;
+
+    // Finalizer：对象被 GC 回收前调用（nullptr 表示无 finalizer）
+    void (*finalizer)(GcObject* self) = nullptr;
 };
 
 // ============================================================
@@ -111,6 +114,9 @@ struct GcObject {
     // 分代 GC：0 = 新生代（young），1 = 老年代（old）
     uint8_t  generation = 0;
 
+    // Finalizer 已调用标记（防止重复调用）
+    bool     finalized = false;
+
     virtual ~GcObject() = default;
 };
 
@@ -118,31 +124,6 @@ struct GcObject {
 // GcString — 前向声明，完整定义见 builtin/string.h
 // ============================================================
 struct GcString; // 前向声明，Error 等类型中的 GcString* 指针需此声明
-
-/*
-// ── 旧 GcString（已迁移到 builtin/string.h）────────────────────
-struct GcString : GcObject {
-    int32_t length = 0;
-    static const TypeDescriptor _desc;
-    static GcString* make(const char* s);
-    static GcString* make(const char* s, size_t len);
-    static GcString* make(const std::string& s);
-    static GcString* from(const char* s);
-    static GcString* from(const char* s, size_t len);
-    static GcString* from(const std::string& s);
-    static GcString* from(int32_t val);
-    static GcString* from(double val);
-    static GcString* from(bool val);
-    GcString* concat(GcString* other) const;
-    char* data()             { return reinterpret_cast<char*>(this + 1); }
-    const char* data() const { return reinterpret_cast<const char*>(this + 1); }
-    std::string_view view() const { return {data(), static_cast<size_t>(length)}; }
-    bool operator==(const GcString& rhs) const { return view() == rhs.view(); }
-    bool operator!=(const GcString& rhs) const { return view() != rhs.view(); }
-    ~GcString() override = default;
-    int32_t len() const { return length; }
-};
-*/
 
 // ============================================================
 // Error — 内置错误对象
@@ -174,79 +155,5 @@ struct Error : GcObject {
     ~Error() override = default;
 };
 
-// ============================================================
-// Array<T> — 堆分配动态数组（Aura 列表类型）
-//
-// plan §4.1: "[T] 映射为 aura_rt::Array<T>*"
-//
-// 对象和元素缓冲区均通过 GcHeap 分配（bump allocator），
-// 不经过 CRT 堆，避免进程退出时的 debug heap 校验延迟。
-// 对于 T 为指针类型（如 Array<GcString*>），TypeDescriptor 中的
-// arrayPtrFields 会告诉 GC 如何扫描 elements 缓冲区中的 GC 指针。
-// ============================================================
-
-/*
-template <typename T>
-struct Array : GcObject {
-    int32_t length   = 0;
-    int32_t capacity = 0;
-    T*      elements = nullptr;
-
-    ~Array() override = default;
-
-    static const TypeDescriptor& desc() {
-        if constexpr (std::is_pointer_v<T>) {
-            // elements 指向 GC 指针数组，需 GC 扫描
-            static const ArrayPtrField arrFields[] = {
-                { offsetof(Array<T>, elements), offsetof(Array<T>, length) }
-            };
-            static const TypeDescriptor d = {
-                sizeof(Array<T>),
-                0,          // 无普通指针字段（elements 由数组指针字段处理）
-                nullptr,
-                1,          // 一个数组指针字段
-                arrFields
-            };
-            return d;
-        } else {
-            // 非指针元素（如 Array<int32_t>），无 GC 指针
-            static const TypeDescriptor d = { sizeof(Array<T>), 0, nullptr };
-            return d;
-        }
-    }
-
-    // make / push 实现在 gc.h 末尾（需要 gc_alloc / GcHeap 完整定义）
-    static Array<T>* make(int32_t initialCapacity = 4);
-    void push(const T& value);
-
-    T& operator[](int32_t idx)       { return elements[idx]; }
-    const T& operator[](int32_t idx) const { return elements[idx]; }
-
-    // 范围遍历支持 — plan2 §4.11: for item in list → for (auto& item : *list)
-    T* begin() { return elements; }
-    const T* begin() const { return elements; }
-    T* end() { return elements + length; }
-    const T* end() const { return elements + length; }
-
-    int32_t len() const { return length; }
-};
-
-*/
-
-// ── 旧版便捷工厂（已迁移到 builtin/string.h）────────────────────
-/*
-// ============================================================
-// 便捷工厂 & 字符串工具声明（实现在 types.cpp）
-// ============================================================
-GcString* make_string(const char* s);
-GcString* make_string(const std::string& s);
-
-// 字符串值比较（内联，简单）
-inline bool string_eq(GcString* a, GcString* b) {
-    if (a == b) return true;
-    if (!a || !b) return false;
-    return *a == *b;
-}
-*/
 
 } // namespace aura_rt

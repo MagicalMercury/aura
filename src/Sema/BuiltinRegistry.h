@@ -259,6 +259,9 @@ private:
             // path.new / path.join 不再硬编码，由 builtins/path.aurai 按需加载
             // channel 构造函数
             {"channel", {{"cap", "int"}},  ReturnTypeInfo::Named("channel")},
+            // GC 内建函数
+            {"gc_force", {}, ReturnTypeInfo::None()},
+            {"gc_stats", {}, ReturnTypeInfo::Named("string")},
         };
     }
 

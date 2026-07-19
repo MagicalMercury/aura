@@ -29,6 +29,15 @@ bool CodeGenerator::isHeapType(const std::string& auraName) const {
     return it->second;
 }
 
+bool CodeGenerator::isGcPointerType(const std::string& cppType) const {
+    if (cppType.empty() || cppType.back() != '*') return false;
+    if (cppType == "int32_t*" || cppType == "double*" || cppType == "bool*")
+        return false;
+    if (cppType == "const char*") return false;
+    if (cppType == "auto") return false;
+    return true;
+}
+
 // ============================================================
 // 类型映射（plan §4.1）
 // ============================================================

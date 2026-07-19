@@ -11,8 +11,14 @@
 namespace aura_rt {
 
 void run_event_loop(task<void>& mainTask) {
+    auto& gc = GcHeap::instance();
+    gc.registerThread(std::this_thread::get_id());
+
     auto handle = mainTask.handle();
-    if (!handle) return;
+    if (!handle) {
+        gc.unregisterThread(std::this_thread::get_id());
+        return;
+    }
 
     // 将协程帧注册为 GC 保守栈根，使 GC 能发现帧内的 GC 对象。
     // 由于帧通过 GC bump allocator 分配在 OS 页上，
@@ -27,6 +33,7 @@ void run_event_loop(task<void>& mainTask) {
     handle.resume();
 
     gc_unregister_stack_roots(framePtr, static_cast<char*>(framePtr) + scanSize);
+    gc.unregisterThread(std::this_thread::get_id());
 }
 
 } // namespace aura_rt

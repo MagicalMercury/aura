@@ -77,7 +77,15 @@ std::string CodeGenerator::genIdentifier(const Identifier& e) {
     // 方法/构造函数体内的接收者名（如 self, p）映射为 C++ 的 this
     if (!currentReceiverName_.empty() && e.name == currentReceiverName_)
         return "this";
-    return safeName(e.name);
+
+    std::string name = safeName(e.name);
+
+    // 已注册为 GcRootHandle 的变量 → 生成 .get() 解引用
+    if (gcRootVarNames_.count(name)) {
+        return name + ".get()";
+    }
+
+    return name;
 }
 
 // ============================================================
@@ -246,9 +254,14 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
                        || right.find("aura_rt::concat") != std::string::npos
                        || right.find("aura_rt::string_concat") != std::string::npos;
 
-        // 也检测已知字符串类型变量
-        if (!leftIsStr && stringVarNames_.count(left)) leftIsStr = true;
-        if (!rightIsStr && stringVarNames_.count(right)) rightIsStr = true;
+        // 也检测已知字符串类型变量（含 GcRootHandle 包装后的 name.get()）
+        auto stripGet = [](const std::string& s) -> std::string {
+            if (s.size() > 5 && s.substr(s.size() - 5) == ".get()")
+                return s.substr(0, s.size() - 5);
+            return s;
+        };
+        if (!leftIsStr && stringVarNames_.count(stripGet(left))) leftIsStr = true;
+        if (!rightIsStr && stringVarNames_.count(stripGet(right))) rightIsStr = true;
 
         if (leftIsStr || rightIsStr) {
             return "aura_rt::concat(" + left + ", " + right + ")";
@@ -298,6 +311,14 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
         std::string targ = expectedTemplateArgs_.empty() ? "int32_t" : expectedTemplateArgs_[0];
         std::string cap = e.args.empty() ? "0" : genExpr(*e.args[0], isCoroutine);
         return "(new aura_rt::Channel<" + targ + ">(" + cap + "))";
+    }
+
+    // GC 内建函数：gc_force() / gc_stats()
+    if (calleeName == "gc_force" && e.args.empty()) {
+        return "aura_rt::gc_force_major()";
+    }
+    if (calleeName == "gc_stats" && e.args.empty()) {
+        return "aura_rt::gc_stats_string()";
     }
 
     bool isCtor = false;

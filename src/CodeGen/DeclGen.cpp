@@ -220,6 +220,7 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
 
     valueTypeVarNames_.clear();
     stringVarNames_.clear();
+    gcRootVarNames_.clear();
     for (auto& p : decl.params) {
         if (p.type && dynamic_cast<const NamedType*>(p.type.get())) {
             auto* nt = dynamic_cast<const NamedType*>(p.type.get());
@@ -269,6 +270,7 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     out << "}\n\n";
     valueTypeVarNames_.clear();
     stringVarNames_.clear();
+    gcRootVarNames_.clear();
 }
 
 std::string CodeGenerator::funSignature(const FunDecl& decl,
@@ -359,6 +361,7 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
 
     valueTypeVarNames_.clear();
     stringVarNames_.clear();
+    gcRootVarNames_.clear();
 
     // 跟踪方法接收者 self 的类型
     if (!decl.receiverTypeArgs.empty() || !registeredTypes_.count(decl.receiverType) || registeredTypes_[decl.receiverType])
@@ -410,9 +413,10 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     out << "}\n\n";
     valueTypeVarNames_.clear();
     stringVarNames_.clear();
+    gcRootVarNames_.clear();
 }
 
-// ============================================================
+// 构造函数 ============================================================
 // 构造函数生成（plan §4.3）
 // ============================================================
 
@@ -458,6 +462,7 @@ void CodeGenerator::genConstructor(std::ostream& cpp, const MethodDecl& decl) {
     out << "}\n\n";
     valueTypeVarNames_.clear();
     stringVarNames_.clear();
+    gcRootVarNames_.clear();
     currentTParams_.clear();
 }
 

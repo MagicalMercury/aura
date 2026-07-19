@@ -233,6 +233,9 @@ private:
     // 检查类型是否是注册的堆对象类型（记录/接口/泛型记录）
     [[nodiscard]] bool isHeapType(const std::string& auraName) const;
 
+    // 判断 C++ 类型字符串是否为 GC 指针类型（如 GcString*, User*, Array<T>*）
+    [[nodiscard]] bool isGcPointerType(const std::string& cppType) const;
+
     // 注册一个用户定义的类型名
     void registerTypeName(const std::string& auraName, bool isHeap);
 
@@ -407,6 +410,10 @@ private:
 
     // 字符串类型变量名集合（用于 genBinaryExpr 检测 string + T 拼接）
     std::set<std::string> stringVarNames_;
+
+    // 当前函数内已注册为 GcRootHandle 的变量名集合
+    // genIdentifier 遇到这些变量名时生成 .get()
+    std::set<std::string> gcRootVarNames_;
 
     // 导入的命名空间名集合（路径名 + 别名，用于 genMethodCall 判断是否用 ::）
     std::set<std::string> importNsNames_;
