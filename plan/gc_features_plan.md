@@ -33,24 +33,31 @@
 
 ### 1.3 未实现清单（本 plan 详细规划）
 
-| 优先级 | 功能 | 章节号 |
-|:---:|:---|:---:|
-| P0 | GC 实际运行（CodeGen 生成 GcRootHandle） | §二 |
-| P0 | 协程帧 GC 根追踪 | §三 |
-| P1 | 全局变量/静态变量的 GC 根注册 | §五 |
-| P1 | 弱引用 GcWeakHandle<T> | §六 |
-| P1 | Finalizer（终结器）支持 | §七 |
-| P1 | 多线程 GC 暂停（stop-the-world） | §八 |
-| P1 | forceGc 暴露给 Aura 语言 + 多线程安全 | §十八 |
-| P2 | 精确栈扫描（替代保守扫描） | §九 |
-| P2 | compactAndReclaim 性能优化 | §十 |
-| P2 | TLAB（Thread-Local Allocation Buffer） | §十一 |
-| P2 | GC 触发策略调优 | §十二 |
-| P2 | 对象可移动性（compacting GC） | §十三 |
-| P3 | 分代年龄记录 | §十四 |
-| P3 | 并发 GC（concurrent marking） | §十五 |
-| P3 | Large Object Space（大对象区） | §十六 |
-| P3 | GC 日志与统计 | §十七 |
+| 优先级 | 功能 | 章节号 | 状态 |
+|:---:|:---|:---:|:---:|
+| P0 | GC 实际运行（CodeGen 生成 GcRootHandle） | §二 | ✅ 已完成 |
+| P0 | 协程帧 GC 根追踪 | §三 | ✅ 已完成 |
+| P1 | 全局变量/静态变量的 GC 根注册 | §五 | ✅ 已完成 |
+| P1 | 弱引用 GcWeakHandle<T> | §六 | ✅ 已完成 |
+| P1 | Finalizer（终结器）支持 | §七 | ✅ 已完成 |
+| P1 | 多线程 GC 暂停（stop-the-world） | §八 | ✅ 已完成 |
+| P1 | forceGc 暴露给 Aura 语言 + 多线程安全 | §十八 | ✅ 已完成 |
+| P2 | 精确栈扫描（替代保守扫描） | §九 | [-] 暂不实施 |
+| P2 | compactAndReclaim 性能优化 | §十 | 待实施 |
+| P2 | TLAB（Thread-Local Allocation Buffer） | §十一 | [~] 延后 |
+| P2 | GC 触发策略调优 | §十二 | [-] 暂不实施 |
+| P2 | 对象可移动性（compacting GC） | §十三 | [~] 延后 |
+| P3 | 分代年龄记录 | §十四 | 远期 |
+| P3 | 并发 GC（concurrent marking） | §十五 | 远期 |
+| P3 | Large Object Space（大对象区） | §十六 | 远期 |
+| P3 | GC 日志与统计 | §十七 | 远期 |
+
+### 1.4 状态说明（2026-07-18 更新）
+
+- **§九 精确栈扫描**：P0 完成后 GcRootHandle 已精确注册 roots_，stackRoots_ 保守扫描仅作协程帧兜底。实际影响小，暂不实施。
+- **§十一 TLAB**：当前 sync_thread 尚未实施，无多线程分配压力。延后到 sync_thread 完成后再做。
+- **§十二 GC 触发策略调优**：当前无配置系统（ConfigDecl 未实现），环境变量方式价值有限。暂不实施，待配置系统完善后再做。
+- **§十三 对象可移动性**：风险过高（需更新所有引用：roots / stack / fields / array 元素）。compactAndReclaim 已能回收空页，碎片问题不严重。延后到 profiling 显示严重碎片问题再做。
 
 ---
 
@@ -466,7 +473,11 @@ void GcHeap::safepoint() {
 
 ---
 
-## 九、P2 — 精确栈扫描（替代保守扫描）
+## 九、P2 — 精确栈扫描（替代保守扫描）  [-] 暂不实施（2026-07-18）
+
+> **暂不实施原因**：P0 完成后 CodeGen 已为 GC 指针类型的局部变量生成 GcRootHandle 包装（精确注册到 roots_），协程帧也由 GcRootHandle 精确扫描。stackRoots_ 的保守扫描仅作协程帧兜底。实际影响小：协程帧内大部分对齐数据是 GcRootHandle::ptr_ 字段，本来就是 GC 指针；desc/size 验证会跳过非 GC 对象。
+>
+> **远期改进**：若 profiling 显示内存占用过高，再做精确扫描。
 
 ### 9.1 现状
 
@@ -604,7 +615,11 @@ void GcHeap::compactAndReclaim() {
 
 ---
 
-## 十一、P2 — TLAB（Thread-Local Allocation Buffer）
+## 十一、P2 — TLAB（Thread-Local Allocation Buffer）  [~] 延后（2026-07-18）
+
+> **延后原因**：当前 sync_thread_plan.md 尚未实施，无多线程分配压力。bumpAlloc 全局单线程在当前规模下足够用。待 sync_thread 完成后再做。
+>
+> **前置条件**：§八 多线程 GC 暂停（已完成）。
 
 ### 11.1 用途
 
@@ -656,7 +671,11 @@ GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
 
 ---
 
-## 十二、P2 — GC 触发策略调优
+## 十二、P2 — GC 触发策略调优  [-] 暂不实施（2026-07-18）
+
+> **暂不实施原因**：当前 Aura 无配置系统（ConfigDecl 未实现），环境变量方式价值有限。默认阈值（256KB / 1MB）在 Aura 当前规模下足够用。
+>
+> **远期改进**：待 Aura 配置系统完善后再做，通过 `#gc.young_threshold` 等指令配置。
 
 ### 12.1 现状
 
@@ -689,7 +708,11 @@ private:
 
 ---
 
-## 十三、P2 — 对象可移动性（compacting GC）
+## 十三、P2 — 对象可移动性（compacting GC）  [~] 延后（2026-07-18）
+
+> **延后原因**：风险过高（需更新所有引用：roots / stack / fields / array 元素）。compactAndReclaim 已能回收空页，碎片问题不严重。
+>
+> **远期改进**：待 profiling 显示严重碎片问题再做。需要为 GcRootHandle::ptr_ / globalRoots_ / Array<T*> 元素 / 字段引用等所有引用都增加更新逻辑。
 
 ### 13.1 用途
 

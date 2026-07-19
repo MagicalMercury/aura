@@ -1,958 +1,591 @@
-# GC Phase 2 P1 项实现 Plan
+# GcString 优化第一阶段 Step 1-3 实现 Plan
 
-> 对应 [plan/gc_features_plan.md](file:///d:/you/Aura/plan/gc_features_plan.md) §五/§六/§七/§八/§十八
-> 前置：P0 已全部完成（[change.md 上一版本](file:///d:/you/Aura/change.md) 已验收）
-> 日期：2026-07-18
+> 对应 [plan/gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) §一~§A4
+> 前置：GC P0+P1 已全部完成并验收（live=4644→4, pages=188→3）
+> 日期：2026-07-19
 > 状态：草案（待批准）
 
 ---
 
-## 一、深度阅读后的现状修正
+## 一、Summary
 
-### 1.1 §五 全局变量 GC 根注册 — **应用场景澄清**
+基于 GC 系统已真正运行（不再"空转"），推进 GcString 优化的第一阶段（§A1~§A4），通过三项改动显著降低字符串分配压力：
 
-**重要发现**：[CodeGen.cpp:175-198](file:///d:/you/Aura/src/CodeGen/CodeGen.cpp#L175) 的 `genDecl` **仅处理 TypeDecl / InterfaceDecl / FunDecl / MethodDecl**，**Aura 语言当前不支持顶层 `let` 全局变量**。
+1. **Step 1**：空字符串、布尔、小整数（-128~127）字符串缓存为单例，用 `GcGlobalRoot<GcString>` 注册为 GC 全局根
+2. **Step 2**：新增 `concat_multi(std::initializer_list<const GcString*>)` 运行时 API，一次分配完成多串拼接
+3. **Step 3**：CodeGen `genBinaryExpr` 识别链式 `+`，链长 ≥ 3 时脱糖为 `concat_multi` 调用
 
-所以 §五 真正的应用场景不是"Aura 源码中的全局变量"，而是：
+完成后预期收益：
+- `from(bool)` / `from(int32_t)` 在 [-128, 127] 范围内零分配
+- `a + b + c + d` 从 3 次分配 + 2 次中间 memcpy → 1 次分配 + 1 次 memcpy
 
-| 场景 | 描述 | 当前状态 |
-|:---|:---|:---|
-| **A. 运行时缓存** | [gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) 第一阶段规划的 `GcString::empty()` / `from(bool)` / `from(int)` 静态缓存 | 未实现 |
-| **B. interned 字符串** | 属性名 / 关键字 / 错误消息字符串驻留 | 未实现 |
-| **C. OOM 错误缓存** | [gc.cpp:125-135](file:///d:/you/Aura/runtime/gc.cpp#L125) 已有 `oomError_`，但通过 `if (oomError_.kind) markObject(...)` 特例处理 | 已实现，但用特例而非通用机制 |
-| **D. Aura 全局 let** | Aura 语言层面支持 `let x = ...` 在模块顶层 | **不支持，本 plan 不实现** |
+---
 
-**结论**：§五 实际只需要做 A/B 场景的 `GcGlobalRoot<T>` 模板，让运行时缓存的字符串等能正确注册为 GC 根。
+## 二、Current State Analysis
 
-### 1.2 §六 弱引用 — 设计可行，无修正
-
-[gc.h](file:///d:/you/Aura/runtime/gc.h) 无 `GcWeakHandle`，[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 无 `weakHandles_`。需要新增。
-
-### 1.3 §七 Finalizer — 设计可行，需补充
-
-[types.h](file:///d:/you/Aura/runtime/types.h) 中 `TypeDescriptor` 已有 `ptrFieldOffsets` / `inlineArrayFields` 等，但**无 `finalizer` 函数指针**。`GcObject` 也**无 `finalized` 字段**。
-
-需要新增字段。但要注意：`GcObject` 头部布局的修改会影响所有 GC 对象（[gc.h:73](file:///d:/you/Aura/runtime/gc.h#L73)）。
-
-### 1.4 §八 多线程 STW — 关键依赖项
-
-当前 [gc.cpp:154-164](file:///d:/you/Aura/runtime/gc.cpp#L154) `safepoint()` 是单线程实现：
+### 2.1 GcString 结构现状（[string.h:26-64](file:///d:/you/Aura/runtime/builtin/string.h#L26)）
 
 ```cpp
-void GcHeap::safepoint() {
-    if (gc_pending_) {
-        gc_pending_ = false;
-        if (youngBytes_ >= kYoungThreshold / 2) minorGc();
-        if (oldBytes_ >= kOldThreshold) majorGc();
-    }
-}
-```
-
-无 `std::mutex` / `std::thread` / `std::condition_variable` 引入（[Grep `std::mutex|std::thread` runtime/](file:///d:/you/Aura/runtime) 无匹配）。
-
-[sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md) 和 [io_coroutine_plan.md](file:///d:/you/Aura/plan/io_coroutine_plan.md) 都依赖此项。
-
-### 1.5 §十八 forceGc 暴露 + 多线程安全 — 简化
-
-[BuiltinRegistry.h:255-262](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L255) `functions_` 表只有 `range` 和 `channel`，无 GC 函数注册。
-
-[gc.h:215-217](file:///d:/you/Aura/runtime/gc.h#L215) 已有 `inline void force_gc()` C++ API，[gc.cpp:196-199](file:///d:/you/Aura/runtime/gc.cpp#L196) 的 `forceGc()` 单线程直接调 `majorGc()`，**多线程下不安全**。
-
-但 §十八的"多线程安全改造"实际就是依赖 §八 STW 机制 — 可合并入 §八 一起做，避免重复设计。
-
----
-
-## 二、修改目标与原因
-
-### 2.1 目标
-
-实现 GC Phase 2 五项 P1 功能：
-
-1. **§八 多线程 STW**（最基础，其他几项都依赖）
-2. **§十八 forceGc 暴露**（依赖 §八）
-3. **§五 GcGlobalRoot<T>**（独立，运行时缓存场景）
-4. **§六 GcWeakHandle<T>**（独立，未来 interning / Map 场景）
-5. **§七 Finalizer**（独立，资源句柄场景）
-
-### 2.2 原因
-
-- P0 完成后 GC 已能工作，但单线程限制阻塞了 [sync_thread_plan](file:///d:/you/Aura/plan/sync_thread_plan.md) 和 [io_coroutine_plan](file:///d:/you/Aura/plan/io_coroutine_plan.md)
-- 当前 `forceGc()` 多线程下不安全
-- 运行时缓存字符串（[gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md)）需要全局根支持
-- 资源句柄（文件 / 锁 / 套接字）的清理需要 Finalizer
-
----
-
-## 三、受影响的文件和模块
-
-| 文件 | 改动内容 | 行数估计 |
-|:---|:---|:---:|
-| [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) | 新增 `GcGlobalRoot<T>` / `GcWeakHandle<T>` 模板，`GcHeap` 加 `globalRoots_` / `weakHandles_` / `threads_m_` 等成员 | +120 |
-| [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | safepoint 改造为 STW、register/unregister API 实现、markPhase 扫描 globalRoots、sweepPhase 清空弱引用 + 调 finalizer、forceGc 走 STW | +180 |
-| [runtime/types.h](file:///d:/you/Aura/runtime/types.h) | `GcObject` 加 `finalized` 字段，`TypeDescriptor` 加 `finalizer` 函数指针 | +8 |
-| [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) | 注册 `gc_force` / `gc_stats` 全局函数 | +15 |
-| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genCallExpr` 识别 `gc_force()` / `gc_stats()` 生成对应 C++ 调用 | +20 |
-| **总计** | | **~343 行** |
-
----
-
-## 四、修改步骤（按依赖顺序，每步独立 commit）
-
-### Phase 1：§八 多线程 STW（基础，最先做）
-
-#### Step 1.1：GcHeap 加线程管理成员
-
-**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) 在 `GcHeap` private 区追加：
-
-```cpp
-#include <atomic>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
-
-class GcHeap {
-public:
-    // 线程注册（用于 GC stop-the-world）
-    void registerThread(std::thread::id id);
-    void unregisterThread(std::thread::id id);
-
-private:
-    // --- 多线程 STW ---
-    std::mutex             threads_m_;
-    std::vector<std::thread::id> registered_threads_;
-    std::atomic<bool>      gc_in_progress_{false};
-    std::atomic<int>       stopped_threads_{0};
-    std::condition_variable all_stopped_cv_;
-    std::mutex             all_stopped_m_;
+struct GcString : GcObject {
+    int32_t length = 0;
+    static const TypeDescriptor _desc;  // ptrFieldCount = 0
+    static GcString* make(const char* s);
+    static GcString* make(const char* s, size_t len);
+    static GcString* make(const std::string& s);
+    static GcString* from(const char* s);
+    static GcString* from(const char* s, size_t len);
+    static GcString* from(const std::string& s);
+    static GcString* from(int32_t val);
+    static GcString* from(double val);
+    static GcString* from(bool val);
+    GcString* concat(const GcString& other) const;
+    char* data() { return reinterpret_cast<char*>(this + 1); }
+    // ...
 };
 ```
 
-**关键**：`registered_threads_` 在 `registerThread`/`unregisterThread` 中用 `threads_m_` 保护，但在 `safepoint` 中只读不需要锁（容忍短暂数据竞争，最坏情况是某线程未注册但被忽略）。
-
-#### Step 1.2：registerThread / unregisterThread 实现
-
-**改动**：[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 新增：
+### 2.2 工厂方法每次都分配（[string.cpp:47-61](file:///d:/you/Aura/runtime/builtin/string.cpp#L47)）
 
 ```cpp
-void GcHeap::registerThread(std::thread::id id) {
-    std::lock_guard<std::mutex> lk(threads_m_);
-    registered_threads_.push_back(id);
+GcString* GcString::from(int32_t val) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%d", val);
+    return make(buf, static_cast<size_t>(len));  // 每次都 alloc
 }
-
-void GcHeap::unregisterThread(std::thread::id id) {
-    std::lock_guard<std::mutex> lk(threads_m_);
-    auto it = std::find(registered_threads_.begin(), registered_threads_.end(), id);
-    if (it != registered_threads_.end()) {
-        registered_threads_.erase(it);
-    }
+GcString* GcString::from(bool val) {
+    return make(val ? "true" : "false");  // 每次都 alloc
 }
 ```
 
-#### Step 1.3：safepoint 改造为 STW
+### 2.3 链式拼接代价（[ExprGen.cpp:238-269](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L238)）
 
-**改动**：[gc.cpp:154-164](file:///d:/you/Aura/runtime/gc.cpp#L154) 替换为：
+当前 `genBinaryExpr` 生成嵌套 `aura_rt::concat`：
 
 ```cpp
-void GcHeap::safepoint() {
-    if (!gc_pending_) return;
+// a + b + c + d 生成：
+aura_rt::concat(aura_rt::concat(aura_rt::concat(a, b), c), d)
+```
 
-    // 单线程场景：直接执行 GC
-    size_t threadCount;
-    {
-        std::lock_guard<std::mutex> lk(threads_m_);
-        threadCount = registered_threads_.size();
-    }
-    if (threadCount <= 1) {
-        gc_pending_ = false;
-        if (youngBytes_ >= kYoungThreshold / 2) minorGc();
-        if (oldBytes_ >= kOldThreshold) majorGc();
-        return;
-    }
+- 3 次 `GcHeap::alloc` + 3 次对象构造
+- 中间 `concat(a, b)`（长度 a+b）被 memcpy 2 次
 
-    // 多线程场景：本线程成为 GC 执行者
-    if (!gc_in_progress_.exchange(true)) {
-        // 抢到 GC 锁：等待其他线程到达 safepoint
-        {
-            std::unique_lock<std::mutex> lk(all_stopped_m_);
-            all_stopped_cv_.wait(lk, [this, &threadCount]{
-                return stopped_threads_.load() >= static_cast<int>(threadCount) - 1;
-            });
+### 2.4 GC 全局根支持已就绪
+
+- ✅ [gc.h:103-116](file:///d:/you/Aura/runtime/gc.h#L103) `GcGlobalRoot<T>` 模板可用
+- ✅ [gc.h:108-109](file:///d:/you/Aura/runtime/gc.h#L108) 拷贝构造与拷贝赋值均已 `= delete`
+- ✅ [gc.cpp:240-251](file:///d:/you/Aura/runtime/gc.cpp#L240) `registerGlobalRoot` / `unregisterGlobalRoot` 已实现
+- ✅ [gc.cpp:375-382](file:///d:/you/Aura/runtime/gc.cpp#L375) `markPhase` 已遍历 `globalRoots_` 并标记
+- ✅ `GcHeap::instance()` 是 Meyers singleton，与静态局部变量同生命周期
+
+### 2.5 CodeGen 关键字段（[CodeGen.h:411-412](file:///d:/you/Aura/src/CodeGen/CodeGen.h#L411)）
+
+```cpp
+std::set<std::string> stringVarNames_;  // 已知 string 类型变量名集合
+```
+
+`genBinaryExpr` 已通过此集合识别 string 变量（含 `GcRootHandle` 包装后的 `name.get()`）。
+
+---
+
+## 三、Proposed Changes
+
+### Step 1：空字符串 + 布尔 + 小整数字符串缓存
+
+**改动文件**：
+- [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h)
+- [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp)
+
+#### 3.1.1 string.h 新增声明（在 `from(bool)` 声明后插入）
+
+```cpp
+// 空字符串单例（替代 make("", 0) 重复分配）
+static GcString* empty();
+```
+
+#### 3.1.2 string.cpp 改造 `from(bool)` + 新增 `empty()`
+
+**替换** [string.cpp:59-61](file:///d:/you/Aura/runtime/builtin/string.cpp#L59)：
+
+```cpp
+GcString* GcString::empty() {
+    static GcGlobalRoot<GcString> _e{make("", 0)};
+    return _e.get();
+}
+
+GcString* GcString::from(bool val) {
+    static GcGlobalRoot<GcString> _t{make("true")};
+    static GcGlobalRoot<GcString> _f{make("false")};
+    return val ? _t.get() : _f.get();
+}
+```
+
+**关键设计**：
+- `GcGlobalRoot<GcString>` 构造时调 `registerGlobalRoot(&obj->...)`，major GC 不会回收
+- 静态局部变量初始化 C++11 起线程安全（magic statics）
+- 单例内存从 `youngObjects_` 晋升到 `oldObjects_` 后稳定存在，零分配
+- `GcHeap::instance()` Meyers singleton 与静态局部变量同生命周期，析构顺序正确
+
+#### 3.1.3 string.cpp 改造 `from(int32_t)` 加 [-128, 127] 缓存
+
+**替换** [string.cpp:47-51](file:///d:/you/Aura/runtime/builtin/string.cpp#L47)：
+
+```cpp
+GcString* GcString::from(int32_t val) {
+    // [-128, 127] 缓存（裸指针数组 + lazy init）
+    // 用裸指针是因为 GcGlobalRoot 拷贝赋值已 = delete，
+    // 不能用 static GcGlobalRoot<GcString> _cache[256] 的赋值语法
+    static GcGlobalRoot<GcString>* _cache[256] = {};
+    if (val >= -128 && val <= 127) {
+        auto& slot = _cache[val + 128];
+        if (!slot) {
+            char buf[32];
+            int len = snprintf(buf, sizeof(buf), "%d", val);
+            slot = new GcGlobalRoot<GcString>(make(buf, static_cast<size_t>(len)));
         }
-        // 所有其他线程已停止，执行 GC
-        gc_pending_ = false;
-        if (youngBytes_ >= kYoungThreshold / 2) minorGc();
-        if (oldBytes_ >= kOldThreshold) majorGc();
-
-        // 唤醒所有线程
-        gc_in_progress_ = false;
-        stopped_threads_ = 0;
-        all_stopped_cv_.notify_all();
-    } else {
-        // 其他线程正在执行 GC，本线程停止
-        stopped_threads_++;
-        std::unique_lock<std::mutex> lk(all_stopped_m_);
-        all_stopped_cv_.wait(lk, [this]{ return !gc_in_progress_.load(); });
-        // 注意：lk 析构时才释放锁，但 wait 已释放
+        return slot->get();
     }
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%d", val);
+    return make(buf, static_cast<size_t>(len));
 }
 ```
 
-**注意点**：
-- 第一个进入的线程成为 GC 执行者，其他线程阻塞
-- `gc_in_progress_.exchange(true)` 用原子操作避免竞争
-- `stopped_threads_` 计数器用于判断是否所有非 GC 线程都已到达 safepoint
-- 完成后 `notify_all` 唤醒所有阻塞线程
+**关键约束**：
+- ⚠️ 256 个 `GcGlobalRoot` 实例增加 `globalRoots_` 大小（markPhase 遍历成本 +~1KB），可接受
+- ⚠️ 静态局部 `_cache` 数组裸指针在进程退出时不会自动析构 `GcGlobalRoot` 实例 — 但 `GcHeap` 析构也不释放页（[gc.cpp:31-36](file:///d:/you/Aura/runtime/gc.cpp#L31)），与现有"进程退出由 OS 回收"策略一致
+- ✅ `lazy init` 确保首次调用才分配，未触发缓存的整数（超出 [-128, 127]）走 fallback 路径
 
-#### Step 1.4：run_event_loop 注册主线程
+#### 3.1.4 行数估计
 
-**改动**：[task.cpp:13-30](file:///d:/you/Aura/runtime/task.cpp#L13) 在 `run_event_loop` 入口注册主线程：
-
-```cpp
-void run_event_loop(task<void>& mainTask) {
-    auto& gc = GcHeap::instance();
-    gc.registerThread(std::this_thread::get_id());
-
-    auto handle = mainTask.handle();
-    if (!handle) {
-        gc.unregisterThread(std::this_thread::get_id());
-        return;
-    }
-    // ...（原有逻辑保持不变）
-    gc_unregister_stack_roots(framePtr, ...);
-
-    gc.unregisterThread(std::this_thread::get_id());
-}
-```
-
-**验收**：编译通过，单线程场景行为不变（threadCount <= 1 走原逻辑）。
+| 文件 | 改动 | 行数 |
+|:---|:---|:---:|
+| string.h | +1 行声明 | +1 |
+| string.cpp | 改造 + 新增 | +20 / -3 |
+| **合计** | | ~+18 净增 |
 
 ---
 
-### Phase 2：§十八 forceGc 暴露 + 多线程安全（依赖 Phase 1）
+### Step 2：`concat_multi` 运行时 API
 
-#### Step 2.1：forceGc 改造为走 STW
+**改动文件**：
+- [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h)
+- [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp)
 
-**改动**：[gc.cpp:196-199](file:///d:/you/Aura/runtime/gc.cpp#L196) 替换为：
+#### 3.2.1 string.h 新增声明（在 `concat` 方法声明后插入）
 
 ```cpp
-void GcHeap::forceGc() {
-    // 多线程场景：设置 gc_pending_，等待 safepoint 处理
-    size_t threadCount;
-    {
-        std::lock_guard<std::mutex> lk(threads_m_);
-        threadCount = registered_threads_.size();
-    }
+// 多串拼接：一次分配 + 一次 memcpy，避免链式 concat 的中间对象
+// 用于 CodeGen 生成的 concat_multi({a, b, c, ...}) 调用
+GcString* concat_multi(std::initializer_list<const GcString*> parts);
+```
 
-    if (threadCount <= 1) {
-        // 单线程场景：直接执行
-        gcPending_ = false;
-        majorGc();
-        return;
-    }
+注意：这是 `aura_rt` 命名空间下的自由函数，不是 `GcString` 的成员。
 
-    // 多线程场景：设置 gc_pending_，由各线程 safepoint 触发
-    gc_pending_ = true;
-    // 本线程也走到 safepoint
-    safepoint();
+#### 3.2.2 string.cpp 新增实现（在 `concat` 实现后追加）
+
+```cpp
+GcString* concat_multi(std::initializer_list<const GcString*> parts) {
+    int32_t total = 0;
+    for (auto* p : parts) {
+        if (p) total += p->length;
+    }
+    size_t objSize = sizeof(GcString) + total + 1;
+    auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
+    r->length = total;
+    char* p = r->data();
+    for (auto* s : parts) {
+        if (!s) continue;
+        std::memcpy(p, s->data(), s->length);
+        p += s->length;
+    }
+    *p = '\0';
+    return r;
 }
 ```
 
-**关键**：`forceGc()` 不再直接调 `majorGc()`，而是设置 `gc_pending_ = true` 后调 `safepoint()`，由 STW 机制保证安全。
+**关键设计**：
+- 与 `concat` 一致的内存布局：`sizeof(GcString) + length + 1`
+- `parts` 用 `std::initializer_list<const GcString*>` 接收 brace-enclosed list，CodeGen 生成 `aura_rt::concat_multi({a, b, c, d})`
+- 空指针保护：`if (!p) continue`，允许上游传 `nullptr` 而不 crash
+- TypeDescriptor 复用 `GcString::_desc`（无 GC 指针字段）
 
-#### Step 2.2：新增 GcStats 结构 + getStats()
+#### 3.2.3 行数估计
 
-**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) 新增：
+| 文件 | 改动 | 行数 |
+|:---|:---|:---:|
+| string.h | +2 行声明 + 注释 | +3 |
+| string.cpp | +15 行实现 | +15 |
+| **合计** | | ~+18 净增 |
+
+---
+
+### Step 3：CodeGen `genBinaryExpr` 改造识别链式 `+`
+
+**改动文件**：
+- [src/CodeGen/CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h)
+- [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp)
+
+#### 3.3.1 CodeGen.h 新增私有方法声明（在 `genBinaryExpr` 声明后插入）
 
 ```cpp
-struct GcStats {
-    size_t allocatedBytes;
-    size_t youngBytes;
-    size_t oldBytes;
-    size_t gcCount;
-    size_t minorGcCount;
-    size_t liveObjectCount;     // youngObjects_.size() + oldObjects_.size()
-    size_t pageCount;           // 遍历 headPage_ 计数
-};
-
-class GcHeap {
-public:
-    GcStats getStats() const;
-};
+// 收集 BinaryExpr(+, left, right) 的所有 string 操作数
+// 返回空 vector 表示：非链式 / 链中含非 string 节点
+// 仅当返回 vector size >= 3 时调用方才使用 concat_multi
+[[nodiscard]] std::vector<std::string> collectStringChain(const BinaryExpr& e,
+                                                          bool isCoroutine);
 ```
 
-**改动**：[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 新增：
+注意：作为 `CodeGenerator` 的私有成员方法，可访问 `stringVarNames_` 等内部状态，避免自由函数需要 `gen` 参数。
+
+#### 3.3.2 ExprGen.cpp 新增 `collectStringChain` 实现（在 `genBinaryExpr` 之前插入）
 
 ```cpp
-GcStats GcHeap::getStats() const {
-    GcStats s;
-    s.allocatedBytes  = allocatedBytes_;
-    s.youngBytes      = youngBytes_;
-    s.oldBytes        = oldBytes_;
-    s.gcCount         = gcCount_;
-    s.minorGcCount    = minorGcCount_;
-    s.liveObjectCount = youngObjects_.size() + oldObjects_.size();
-    s.pageCount = 0;
-    for (Page* p = headPage_; p; p = p->next) s.pageCount++;
-    return s;
-}
-```
+// 递归收集 BinaryExpr(+, left, right) 的所有 string 操作数
+// 返回空 vector 表示：左子树非全 string 链 / 链中存在非 string 节点
+std::vector<std::string> CodeGenerator::collectStringChain(const BinaryExpr& e,
+                                                          bool isCoroutine) {
+    std::vector<std::string> parts;
 
-**新增便捷 C++ API**（[gc.h](file:///d:/you/Aura/runtime/gc.h) 末尾）：
-
-```cpp
-inline void gc_force_major() { GcHeap::instance().forceGc(); }
-inline GcStats gc_get_stats() { return GcHeap::instance().getStats(); }
-```
-
-#### Step 2.3：BuiltinRegistry 注册 gc_force / gc_stats
-
-**改动**：[BuiltinRegistry.h:255-262](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L255) `functions_` 表追加：
-
-```cpp
-{
-    "gc_force", {}, ReturnTypeInfo::None()
-},
-{
-    "gc_stats", {}, ReturnTypeInfo::Named("string")
-},
-```
-
-**注意**：`gc_stats` 返回 `string`，但实际 C++ 返回 `GcStats` 结构。需要在 CodeGen 中特殊处理 — 把 `GcStats` 格式化为字符串。
-
-**简化方案**：让 `gc_stats()` 在 C++ 端直接返回 `GcString*`，内部格式化：
-
-```cpp
-// runtime/gc.cpp 新增
-GcString* gc_stats_string() {
-    auto s = GcHeap::instance().getStats();
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
-        "GC: alloc=%zuKB young=%zuKB old=%zuKB gc=%zu minor=%zu live=%zu pages=%zu",
-        s.allocatedBytes / 1024, s.youngBytes / 1024, s.oldBytes / 1024,
-        s.gcCount, s.minorGcCount, s.liveObjectCount, s.pageCount);
-    return make_string(buf);
-}
-```
-
-#### Step 2.4：CodeGen 识别 gc_force / gc_stats
-
-**改动**：[ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) 的 `genCallExpr` 中（在 `range` 处理之后）追加：
-
-```cpp
-// 识别 gc_force() / gc_stats() 等内置 GC 函数
-if (auto* id = dynamic_cast<const Identifier*>(e.callee.get())) {
-    if (id->name == "gc_force" && e.args.empty()) {
-        return "aura_rt::gc_force_major()";
+    // 递归左子树：仅当左子是 BinaryExpr(+) 时尝试收集
+    if (auto* leftBin = dynamic_cast<const BinaryExpr*>(e.left.get())) {
+        if (leftBin->op == "+") {
+            auto sub = collectStringChain(*leftBin, isCoroutine);
+            if (sub.empty()) {
+                // 左子树非全 string 链 — 整链退化为嵌套 concat
+                return {};
+            }
+            parts.insert(parts.end(), sub.begin(), sub.end());
+        } else {
+            // 左子是其他运算符 — 不能进入 concat_multi
+            return {};
+        }
+    } else {
+        // 左子是叶子节点 — 生成代码
+        parts.push_back(genExpr(*e.left, isCoroutine));
     }
-    if (id->name == "gc_stats" && e.args.empty()) {
-        return "aura_rt::gc_stats_string()";
+
+    // 右子节点：直接生成代码（链式 + 的右结合已由递归处理）
+    std::string right = genExpr(*e.right, isCoroutine);
+
+    // 验证右子也是 string（用与 genBinaryExpr 相同的判定逻辑）
+    auto isStringExpr = [this](const std::string& s) -> bool {
+        if (s.find("aura_rt::make_string") != std::string::npos
+            || s.find("->to_string") != std::string::npos
+            || s.find(".to_string") != std::string::npos
+            || s.find("aura_rt::concat") != std::string::npos
+            || s.find("aura_rt::string_concat") != std::string::npos
+            || s.find("aura_rt::concat_multi") != std::string::npos) {
+            return true;
+        }
+        // 检测 string 类型变量（含 GcRootHandle 包装后的 name.get()）
+        auto stripGet = [](const std::string& in) -> std::string {
+            if (in.size() > 5 && in.substr(in.size() - 5) == ".get()")
+                return in.substr(0, in.size() - 5);
+            return in;
+        };
+        return stringVarNames_.count(stripGet(s)) > 0;
+    };
+
+    if (!isStringExpr(right)) {
+        return {};  // 链中含非 string 节点，退化为嵌套 concat
+    }
+    parts.push_back(right);
+
+    return parts;
+}
+```
+
+#### 3.3.3 ExprGen.cpp 改造 `genBinaryExpr`（[L245-269](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L245)）
+
+**在原 `if (e.op == "+") { ... }` 块的开头插入链式收集逻辑**：
+
+```cpp
+if (e.op == "+") {
+    bool leftIsStr  = left.find("aura_rt::make_string") != std::string::npos
+                   || left.find("->to_string") != std::string::npos
+                   || left.find(".to_string") != std::string::npos
+                   || left.find("aura_rt::concat") != std::string::npos
+                   || left.find("aura_rt::string_concat") != std::string::npos;
+    bool rightIsStr = right.find("aura_rt::make_string") != std::string::npos
+                   || right.find("->to_string") != std::string::npos
+                   || right.find(".to_string") != std::string::npos
+                   || right.find("aura_rt::concat") != std::string::npos
+                   || right.find("aura_rt::string_concat") != std::string::npos;
+
+    auto stripGet = [](const std::string& s) -> std::string {
+        if (s.size() > 5 && s.substr(s.size() - 5) == ".get()")
+            return s.substr(0, s.size() - 5);
+        return s;
+    };
+    if (!leftIsStr && stringVarNames_.count(stripGet(left))) leftIsStr = true;
+    if (!rightIsStr && stringVarNames_.count(stripGet(right))) rightIsStr = true;
+
+    // === 新增：链式 + 脱糖为 concat_multi ===
+    // 仅当左右都是 string 时才尝试收集整条链
+    if (leftIsStr && rightIsStr) {
+        auto chain = collectStringChain(e, isCoroutine);
+        if (chain.size() >= 3) {
+            std::string result = "aura_rt::concat_multi({";
+            for (size_t i = 0; i < chain.size(); ++i) {
+                if (i) result += ", ";
+                result += chain[i];
+            }
+            result += "})";
+            return result;
+        }
+    }
+    // === 新增结束 ===
+
+    if (leftIsStr || rightIsStr) {
+        return "aura_rt::concat(" + left + ", " + right + ")";
     }
 }
 ```
 
-**Aura 使用方式**：
+**关键设计**：
+- **仅当链长 ≥ 3 时才用 `concat_multi`** — 链长 2 时 `concat` 已足够
+- **必须验证所有链节点都是 string** — 中间有非 string 节点（如 `s + 42 + n` 中 n 是 int）会破坏类型
+- **混合类型链退化为嵌套 concat** — `s + 42` 用 `concat(s, 42)` 重载，结果再 concat 下一个
+- **递归只走左子树**：`+` 是左结合的，AST 中 `a + b + c` 解析为 `((a + b) + c)`，左递归收集即可覆盖整链
+
+#### 3.3.4 行数估计
+
+| 文件 | 改动 | 行数 |
+|:---|:---|:---:|
+| CodeGen.h | +4 行声明 + 注释 | +5 |
+| ExprGen.cpp | 新增 collectStringChain | +50 |
+| ExprGen.cpp | genBinaryExpr 插入链式收集块 | +12 |
+| **合计** | | ~+67 净增 |
+
+---
+
+## 四、Assumptions & Decisions
+
+### 4.1 关键假设
+
+1. **GC 全局根机制可靠**：`GcGlobalRoot<T>` 构造时 `registerGlobalRoot`，析构时 `unregisterGlobalRoot`，major GC 会遍历 `globalRoots_` 标记存活。已在 [gc.cpp:375-382](file:///d:/you/Aura/runtime/gc.cpp#L375) 验证。
+2. **Meyers singleton 与静态局部变量生命周期匹配**：`GcHeap::instance()` 是函数内 static，与 `string.cpp` 中 `static GcGlobalRoot<GcString>` 同生命周期，析构顺序正确（后构造先析构，GcHeap 析构不释放页）。
+3. **AST 中 `+` 运算符左结合**：`a + b + c` 解析为 `BinaryExpr(+, BinaryExpr(+, a, b), c)`，左递归收集即可。
+4. **`std::initializer_list<const GcString*>` 接收 brace-init-list**：CodeGen 生成 `aura_rt::concat_multi({a, b, c, d})`，C++ 编译器会自动转换为 `initializer_list`。
+
+### 4.2 关键决策
+
+| 决策 | 选择 | 理由 |
+|:---|:---|:---|
+| A1 缓存机制 | `GcGlobalRoot<GcString>` 静态局部变量 | 注册为 GC 全局根，major GC 不回收 |
+| A2 小整数缓存 | 裸指针数组 + lazy init（`new GcGlobalRoot<...>`） | `GcGlobalRoot` 拷贝赋值已 `= delete`，无法用 `_cache[i] = ...` 语法 |
+| A2 缓存范围 | [-128, 127]（256 槽位） | 与 Java `IntegerCache` 范围一致，覆盖循环计数器等高频场景 |
+| A3 `concat_multi` 入参类型 | `std::initializer_list<const GcString*>` | 直接接收 brace-init-list，CodeGen 生成简洁 |
+| A3 `nullptr` 处理 | 跳过（`if (!p) continue`） | 允许上游传 nullptr，避免 CodeGen 端做额外空检查 |
+| A4 链长阈值 | ≥ 3 才用 `concat_multi` | 链长 2 时 `concat` 与 `concat_multi` 性能等价，无须额外开销 |
+| A4 递归方向 | 只递归左子树 | `+` 左结合，AST 中 `a+b+c` = `((a+b)+c)`，左递归覆盖整链 |
+| A4 混合类型链 | 退化为嵌套 `concat` | `s + 42` 仍走 `concat(s, 42)` 重载，类型安全 |
+| A4 `collectStringChain` 位置 | `CodeGenerator` 私有方法 | 可访问 `stringVarNames_` 等内部状态，无需传 `gen` 参数 |
+
+### 4.3 已确认不破坏现有功能
+
+- ✅ `from(int32_t)` / `from(bool)` 改造后签名不变，调用方无感知
+- ✅ `concat_multi` 是新增自由函数，不影响现有 `concat` 重载
+- ✅ `genBinaryExpr` 改造在原逻辑之前插入"链式收集"分支，链长 < 3 或非全 string 时走原逻辑
+- ✅ `string_eq` / `operator+` 重载 / `make_string` 等兼容别名均不受影响
+
+---
+
+## 五、Verification Steps
+
+### 5.1 Step 1 验证：缓存单例 + major GC 存活
+
+**测试代码**（Aura）：
 
 ```aura
 fun main(io: Io) {
-    let s = "hello"
-    gc_force()              // 触发 GC
-    io.println(s)           // s 仍可用
+    let b1 = true
+    let b2 = false
+    io.println("true is " + b1 + ", false is " + b2)
+
+    for i in 0..200 {
+        let s = "i=" + i
+    }
+
+    gc_force()  // 强制 major GC
+    let info = gc_stats()
+    io.println(info)  // 确认 live 数量小（缓存单例未丢失）
+}
+```
+
+**预期结果**：
+- `gc_force()` 后 `live` 数量应包含 `empty` / `true` / `false` / 256 个小整数缓存单例（约 260 个）
+- 不应出现 crash 或 use-after-free
+
+### 5.2 Step 2 验证：`concat_multi` 一次分配
+
+**测试代码**（C++ 单元测试，可直接在 `runtime/builtin/` 加 `string_test.cpp` 或在 Aura 测试中观察 GC 统计）：
+
+```cpp
+// 直接 C++ 测试
+auto* a = aura_rt::GcString::from("Hello");
+auto* b = aura_rt::GcString::from(", ");
+auto* c = aura_rt::GcString::from("World");
+auto* d = aura_rt::GcString::from("!");
+
+auto* result = aura_rt::concat_multi({a, b, c, d});
+assert(result->length == 13);
+assert(std::string_view(result->data(), result->length) == "Hello, World!");
+```
+
+### 5.3 Step 3 验证：链式 + 脱糖为 `concat_multi`
+
+**测试代码**（Aura）：
+
+```aura
+fun main(io: Io) {
+    let a = "Hello"
+    let b = ", "
+    let c = "World"
+    let d = "!"
+    let s = a + b + c + d  // 4 节点链 → 应生成 concat_multi({a, b, c, d})
+    io.println(s)
+
+    let s2 = a + b  // 2 节点链 → 应仍用 concat(a, b)
+    io.println(s2)
+
+    let s3 = a + 42 + c  // 混合类型链 → 应退化为 concat(concat(a, 42), c)
+    io.println(s3)
+}
+```
+
+**验证方法**：
+1. 检查 CodeGen 生成的 C++ 文件，确认 `a + b + c + d` 生成 `aura_rt::concat_multi({a, b, c, d})`
+2. 确认 `a + b` 仍生成 `aura_rt::concat(a, b)`
+3. 确认 `a + 42 + c` 退化为嵌套 `concat`
+
+### 5.4 综合性能验证
+
+**测试代码**（Aura）：
+
+```aura
+fun main(io: Io) {
+    for i in 0..5000 {
+        let s = "iter " + i + " step " + i + " done"
+    }
     let info = gc_stats()
     io.println(info)
 }
 ```
 
-**验收**：
-- 单线程下 `gc_force()` 直接执行 GC
-- 多线程下 `gc_force()` 走 STW 流程
-- `gc_stats()` 返回正确的格式化字符串
+**预期结果**（对比改造前）：
+- 改造前：3 节点链 × 5000 次 = 15000 次分配，~2 次 minor GC，~700KB
+- 改造后：1 次 `concat_multi` × 5000 次 = 5000 次分配 + 5000 次小整数缓存命中（零分配），预计 minor GC 次数减半，分配字节降 ~3 倍
+
+### 5.5 回归测试
+
+运行 [TODO.txt](file:///d:/you/Aura/TODO.txt) 中提到的所有现有 Aura 测试，确认：
+- 字符串拼接行为不变（值相等性、`io.println` 输出）
+- GC 行为不变（`gc_force` 后 live 数量合理）
+- 无 crash / 无内存错误
 
 ---
 
-### Phase 3：§五 GcGlobalRoot<T>（独立，可与 Phase 2 并行）
+## 六、实施顺序与提交粒度
 
-#### Step 3.1：GcHeap 加 globalRoots_
-
-**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) `GcHeap` private 区追加：
-
-```cpp
-// 全局根：长期存活的对象（运行时缓存 / interned 字符串等）
-// 不像 GcRootHandle 那样自动析构取消注册，需手动 register/unregister
-std::vector<GcObject**> globalRoots_;
-std::mutex globalRoots_m_;
-```
-
-```cpp
-public:
-    void registerGlobalRoot(GcObject** rootPtr);
-    void unregisterGlobalRoot(GcObject** rootPtr);
-```
-
-#### Step 3.2：register/unregister 实现
-
-**改动**：[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 新增：
-
-```cpp
-void GcHeap::registerGlobalRoot(GcObject** rootPtr) {
-    std::lock_guard<std::mutex> lk(globalRoots_m_);
-    globalRoots_.push_back(rootPtr);
-}
-
-void GcHeap::unregisterGlobalRoot(GcObject** rootPtr) {
-    std::lock_guard<std::mutex> lk(globalRoots_m_);
-    auto it = std::find(globalRoots_.begin(), globalRoots_.end(), rootPtr);
-    if (it != globalRoots_.end()) {
-        globalRoots_.erase(it);
-    }
-}
-```
-
-#### Step 3.3：markPhase 扫描 globalRoots_
-
-**改动**：[gc.cpp:235-285](file:///d:/you/Aura/runtime/gc.cpp#L235) `markPhase` 入口追加（在 roots_ 扫描之后）：
-
-```cpp
-// 3. 从全局根出发标记（运行时缓存 / interned 字符串）
-{
-    std::lock_guard<std::mutex> lk(globalRoots_m_);
-    for (auto* rootPtr : globalRoots_) {
-        if (rootPtr && *rootPtr) {
-            markObject(*rootPtr);
-        }
-    }
-}
-```
-
-#### Step 3.4：GcGlobalRoot<T> 模板
-
-**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) 在 GcRootHandle 之后追加：
-
-```cpp
-// 全局根句柄：用于运行时缓存的 GC 对象（如 GcString::empty() 单例）
-// 构造时注册，析构时取消。常用于 static 局部变量。
-template <typename T>
-class GcGlobalRoot {
-public:
-    explicit GcGlobalRoot(T* obj) : ptr_(obj) {
-        GcHeap::instance().registerGlobalRoot(
-            reinterpret_cast<GcObject**>(&ptr_));
-    }
-    ~GcGlobalRoot() {
-        GcHeap::instance().unregisterGlobalRoot(
-            reinterpret_cast<GcObject**>(&ptr_));
-    }
-    GcGlobalRoot(const GcGlobalRoot&) = delete;
-    GcGlobalRoot& operator=(const GcGlobalRoot&) = delete;
-
-    T* get() const { return ptr_; }
-    T* operator->() const { return ptr_; }
-
-private:
-    T* ptr_;
-};
-```
-
-**关键约束**：
-- `T` 必须继承 `GcObject`（保证 `reinterpret_cast<GcObject**>` 合法）
-- `&ptr_` 是 `T**`，重解释为 `GcObject**` 后，`*ptr` 读取的是 `T*` 的值（指针值），类型重解释为 `GcObject*` — 与 `GcRootHandle` 同样的 reinterpret_cast 模式
-- `ptr_` 字段地址在对象生命周期内不变，所以 `&ptr_` 注册一次即可
-
-#### Step 3.5：应用 — 替换 OOM 错误特例
-
-**改动**：[gc.h:179-181](file:///d:/you/Aura/runtime/gc.h#L179) `oomError_` 字段改造为 `GcGlobalRoot`：
-
-```cpp
-// 改动前：
-Error oomError_;
-bool  oomInit_ = false;
-
-// 改动后（保持向后兼容，渐进迁移）：
-Error oomError_;
-bool  oomInit_ = false;
-// 在 ensureOomError 中使用 GcGlobalRoot 包装（可选优化，本 plan 不强制）
-```
-
-**实际不强制改 oomError_**：[gc.cpp:283-284](file:///d:/you/Aura/runtime/gc.cpp#L283) 已通过 `if (oomError_.kind) markObject(oomError_.kind)` 特例处理，行为正确。`GcGlobalRoot` 主要为 [gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) 的 `GcString::empty()` 等新缓存服务。
-
-**验收**：
-- 编译通过
-- 简单测试：在 `GcString::empty()` 实现中用 `static GcGlobalRoot<GcString> _empty(GcString::make(""));` 验证 GC 后仍可用
-
----
-
-### Phase 4：§六 GcWeakHandle<T>（独立）
-
-#### Step 4.1：GcHeap 加 weakHandles_
-
-**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) `GcHeap` private 区追加：
-
-```cpp
-// 弱引用句柄：sweep 时清空指向已回收对象的句柄
-std::vector<GcWeakHandleBase*> weakHandles_;
-std::mutex weakHandles_m_;
-```
-
-```cpp
-public:
-    void registerWeak(GcWeakHandleBase* wh);
-    void unregisterWeak(GcWeakHandleBase* wh);
-```
-
-#### Step 4.2：GcWeakHandleBase / GcWeakHandle<T> 模板
-
-**改动**：[gc.h](file:///d:/you/Aura/runtime/gc.h) 在 GcRootHandle 之后、GcHeap 之前追加：
-
-```cpp
-// 弱引用基类：通过基类指针统一管理不同 T 的弱引用
-class GcWeakHandleBase {
-public:
-    explicit GcWeakHandleBase(GcObject* obj) : ptr_(obj) {
-        GcHeap::instance().registerWeak(this);
-    }
-    ~GcWeakHandleBase() {
-        GcHeap::instance().unregisterWeak(this);
-    }
-    GcWeakHandleBase(const GcWeakHandleBase&) = delete;
-    GcWeakHandleBase& operator=(const GcWeakHandleBase&) = delete;
-
-    GcObject* get() const { return ptr_; }
-    bool valid() const { return ptr_ != nullptr; }
-    void clear() { ptr_ = nullptr; }   // 仅 GC 在 sweep 时调用
-
-private:
-    GcObject* ptr_;
-    friend class GcHeap;
-};
-
-template <typename T>
-class GcWeakHandle : public GcWeakHandleBase {
-public:
-    explicit GcWeakHandle(T* obj) : GcWeakHandleBase(static_cast<GcObject*>(obj)) {}
-    T* get() const { return static_cast<T*>(GcWeakHandleBase::get()); }
-};
-```
-
-#### Step 4.3：register/unregister 实现
-
-**改动**：[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 新增：
-
-```cpp
-void GcHeap::registerWeak(GcWeakHandleBase* wh) {
-    std::lock_guard<std::mutex> lk(weakHandles_m_);
-    weakHandles_.push_back(wh);
-}
-
-void GcHeap::unregisterWeak(GcWeakHandleBase* wh) {
-    std::lock_guard<std::mutex> lk(weakHandles_m_);
-    auto it = std::find(weakHandles_.begin(), weakHandles_.end(), wh);
-    if (it != weakHandles_.end()) {
-        weakHandles_.erase(it);
-    }
-}
-```
-
-#### Step 4.4：sweep 时清空无效弱引用
-
-**改动**：[gc.cpp:341-353](file:///d:/you/Aura/runtime/gc.cpp#L341) `sweepPhaseYoung` 在清除前先清空弱引用：
-
-```cpp
-void GcHeap::sweepPhaseYoung() {
-    // 1. 清空指向未标记对象的弱引用
-    {
-        std::lock_guard<std::mutex> lk(weakHandles_m_);
-        for (auto* wh : weakHandles_) {
-            GcObject* obj = wh->get();
-            if (obj && !obj->marked) {
-                wh->clear();
-            }
-        }
-    }
-
-    // 2. 晋升 + 清除（原有逻辑保持不变）
-    for (auto* obj : youngObjects_) {
-        if (obj->marked) {
-            promoteToOld(obj);
-            obj->marked = false;
-        }
-    }
-    youngBytes_ = 0;
-    youngObjects_.clear();
-}
-```
-
-**改动**：[gc.cpp:368-412](file:///d:/you/Aura/runtime/gc.cpp#L368) `sweepPhaseAll` 同样在清除前先清空弱引用（在统计 liveYoung/liveOld 之后、compactAndReclaim 之前）：
-
-```cpp
-void GcHeap::sweepPhaseAll() {
-    // 1. 统计存活对象（原有逻辑）
-    // ...
-
-    // 2. 清空指向死亡对象的弱引用
-    {
-        std::lock_guard<std::mutex> lk(weakHandles_m_);
-        for (auto* wh : weakHandles_) {
-            GcObject* obj = wh->get();
-            if (obj && !obj->marked) {
-                wh->clear();
-            }
-        }
-    }
-
-    // 3. 更新对象列表 + 字节统计（原有逻辑）
-    // ...
-
-    // 4. 紧凑 + 页回收（原有逻辑）
-    // ...
-}
-```
-
-**验收**：构造弱引用 → 强引用置 null → GC → 弱引用 `valid()` 返回 false。
-
----
-
-### Phase 5：§七 Finalizer（独立，但需注意 GcObject 布局变更）
-
-#### Step 5.1：GcObject 加 finalized 字段
-
-**改动**：[types.h](file:///d:/you/Aura/runtime/types.h) `GcObject` 结构追加：
-
-```cpp
-struct GcObject {
-    const TypeDescriptor* desc       = nullptr;
-    GcObject*             next       = nullptr;
-    bool                  marked     = false;
-    uint8_t               generation = 0;
-    bool                  finalized = false;   // 新增：避免重复调用 finalizer
-};
-```
-
-**注意**：新增 1 字节（实际可能因对齐占 4-8 字节）。所有 GC 对象的 `desc->size` 在 `gc_alloc` 时已固定，此变更需要重新编译所有依赖 `GcObject` 的代码。
-
-#### Step 5.2：TypeDescriptor 加 finalizer 函数指针
-
-**改动**：[types.h](file:///d:/you/Aura/runtime/types.h) `TypeDescriptor` 结构追加：
-
-```cpp
-struct TypeDescriptor {
-    size_t              size;
-    size_t              ptrFieldCount;
-    const size_t*       ptrFieldOffsets;
-    size_t              inlineArrayFieldCount;
-    const InlineArrayField* inlineArrayFields;
-
-    // 新增：finalizer 函数指针（nullptr 表示无 finalizer）
-    void (*finalizer)(GcObject* self) = nullptr;
-};
-```
-
-**关键**：默认 `nullptr`，所以现有所有 `static const TypeDescriptor d = {...}` 仍能编译（C++ 允许聚合初始化省略尾部字段，但需要 `= nullptr` 默认值 — 上面已写）。
-
-**风险点**：[array.h:381-396](file:///d:/you/Aura/runtime/builtin/array.h#L381) 等现有 `TypeDescriptor` 用聚合初始化 `{ size, 2, ptrOffsets, 0, nullptr }`，**5 字段全填**。新增 finalizer 后变成 6 字段，旧代码仍能编译（聚合初始化会默认初始化剩余字段），但需要在头文件加 `= nullptr` 默认值。
-
-#### Step 5.3：sweepPhase 调用 finalizer
-
-**改动**：[gc.cpp:341-353](file:///d:/you/Aura/runtime/gc.cpp#L341) `sweepPhaseYoung` 在清除前调 finalizer：
-
-```cpp
-void GcHeap::sweepPhaseYoung() {
-    // 1. 清空弱引用（Phase 4 已加）
-    // ...
-
-    // 2. 调用 finalizer（新增）
-    for (auto* obj : youngObjects_) {
-        if (!obj->marked && !obj->finalized) {
-            if (obj->desc && obj->desc->finalizer) {
-                obj->desc->finalizer(obj);
-                obj->finalized = true;
-            }
-        }
-    }
-
-    // 3. 晋升 + 清除（原有逻辑）
-    // ...
-}
-```
-
-**改动**：[gc.cpp:368-412](file:///d:/you/Aura/runtime/gc.cpp#L368) `sweepPhaseAll` 同样在清除前调 finalizer：
-
-```cpp
-void GcHeap::sweepPhaseAll() {
-    // 1. 统计存活对象（原有）
-    // ...
-
-    // 2. 清空弱引用（Phase 4 已加）
-    // ...
-
-    // 3. 调用 finalizer（新增）
-    bool inFinalizer = true;  // 防止 finalizer 中触发 GC
-    for (auto* obj : youngObjects_) {
-        if (!obj->marked && !obj->finalized) {
-            if (obj->desc && obj->desc->finalizer) {
-                obj->desc->finalizer(obj);
-                obj->finalized = true;
-            }
-        }
-    }
-    for (auto* obj : oldObjects_) {
-        if (!obj->marked && !obj->finalized) {
-            if (obj->desc && obj->desc->finalizer) {
-                obj->desc->finalizer(obj);
-                obj->finalized = true;
-            }
-        }
-    }
-    inFinalizer = false;
-
-    // 4. 更新对象列表 + 字节统计（原有）
-    // ...
-}
-```
-
-#### Step 5.4：防递归 GC
-
-**问题**：finalizer 中可能调用 `make_string` 等 GC 分配，触发递归 GC。
-
-**应对**：[gc.h](file:///d:/you/Aura/runtime/gc.h) `GcHeap` 加 `inFinalizer_` 标志，`tryAlloc` 检查：
-
-```cpp
-class GcHeap {
-private:
-    bool inFinalizer_ = false;
-};
-
-// tryAlloc 中：
-GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
-    // ...（原有逻辑）
-    if (youngBytes_ >= kYoungThreshold && !inFinalizer_) {
-        minorGc();
-        // ...
-    }
-    // ...
-}
-```
-
-**简化方案**：本 plan 不实现防递归（保留为风险），由 finalizer 实现者自己保证不在 finalizer 中触发 GC。理由：Aura 当前无 finalizer 使用方，未来真要用时再加保护。
-
-**验收**：
-- 编译通过，所有现有 `TypeDescriptor` 初始化不报错
-- 构造一个带 finalizer 的类型 → GC 时 finalizer 被调用
-- finalizer 未设置时（默认 nullptr）行为不变
-
----
-
-## 五、可能的风险与应对方案
-
-### 5.1 风险一：STW 死锁
-
-**问题**：[gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) `safepoint` 中，若 GC 执行者线程在等 `all_stopped_cv_` 时崩溃或被取消，其他线程永远阻塞。
-
-**应对**：
-- ✅ `safepoint` 不在 try/catch 中调用，异常会传播到调用方
-- 🟡 远期改进：加超时机制，但 Aura 当前不需要
-
-### 5.2 风险二：线程注册时序
-
-**问题**：[task.cpp:13-30](file:///d:/you/Aura/runtime/task.cpp#L13) `run_event_loop` 注册主线程前，GC 可能已被触发（如 `ensureOomError` 中 `make_string` 触发 GC）。
-
-**应对**：
-- ✅ `safepoint` 中 `registered_threads_.size() <= 1` 走单线程路径
-- ✅ 未注册线程时 `threadCount = 0`，也走单线程路径
-- ✅ `registerThread` 在 `mainTask.handle()` 之前调用，确保 GC 触发时主线程已注册
-
-### 5.3 风险三：GcObject 布局变更破坏 ABI
-
-**问题**：§七 在 `GcObject` 加 `finalized` 字段，所有依赖 `sizeof(GcObject)` 的代码受影响。
-
-**应对**：
-- ✅ Aura 是单二进制项目，无外部 ABI 依赖
-- ✅ `gc_alloc<T>` 用 `sizeof(T)` 分配，T 继承 GcObject，会自动适应新布局
-- 🟡 风险：若有外部代码假设 `sizeof(GcObject) == 8/16`，需重编
-
-### 5.4 风险四：TypeDescriptor 默认初始化
-
-**问题**：§七 在 `TypeDescriptor` 加 `finalizer` 字段，现有聚合初始化 `{ size, 2, ptrOffsets, 0, nullptr }` 是 5 字段，新增字段后变成 6 字段。
-
-**应对**：
-- ✅ C++ 聚合初始化允许省略尾部字段，省略的字段被值初始化（`nullptr`）
-- ✅ 头文件中加 `= nullptr` 默认值，进一步保证
-- ✅ [array.h:381-411](file:///d:/you/Aura/runtime/builtin/array.h#L381) 等所有现有 `TypeDescriptor` 初始化不报错
-
-### 5.5 风险五：弱引用并发清空
-
-**问题**：§六 `sweepPhase` 持有 `weakHandles_m_` 锁清空弱引用时，用户线程可能正在调 `wh->get()` 读 `ptr_`。
-
-**应对**：
-- ⚠️ 这是一个 race condition，但 `ptr_` 是裸指针，读写是原子的
-- ✅ 最坏情况是用户读到旧值（已 free 的指针），但下一秒访问就 crash
-- 🟡 完整方案：用 `std::atomic<GcObject*>` 替换 `GcObject* ptr_`，但本 plan 不做（增加复杂度，且 Aura 当前无弱引用使用方）
-
-### 5.6 风险六：forceGc 在多线程下重复设置 gc_pending_
-
-**问题**：[gc.cpp:196-199](file:///d:/you/Aura/runtime/gc.cpp#L196) 改造后 `forceGc` 设置 `gc_pending_ = true` 后调 `safepoint()`，但 `safepoint` 内部会重置 `gc_pending_ = false`。
-
-**应对**：
-- ✅ 这是预期行为：`forceGc` 触发一次 GC，由 safepoint 处理
-- ✅ `forceGc` 不需要单独保护 `gc_pending_`，safepoint 内部的 GC 执行者路径会处理
-
----
-
-## 六、测试验证方案
-
-### 6.1 Phase 1 STW 验证
-
-```cpp
-// 单线程场景：行为不变
-fun main(io: Io) {
-    let s = "hello"
-    for i in 0..100000 {
-        let tmp = "iter" + i
-    }
-    io.println(s)   // 应仍可用
-}
-```
-
-预期：与改造前一致，无 crash。
-
-### 6.2 Phase 2 forceGc 验证
-
-```aura
-fun main(io: Io) {
-    let s = "test"
-    gc_force()
-    io.println(s)             // s 仍可用
-    let info = gc_stats()
-    io.println(info)         // 打印 GC 统计
-}
-```
-
-预期输出类似：
-```
-test
-GC: alloc=12KB young=4KB old=8KB gc=1 minor=0 live=42 pages=4
-```
-
-### 6.3 Phase 3 GcGlobalRoot 验证
-
-```cpp
-// runtime/builtin/string.cpp 中
-GcString* GcString::empty() {
-    static GcGlobalRoot<GcString> _empty(GcString::make(""));
-    return _empty.get();
-}
-
-// 测试
-fun main(io: Io) {
-    let e1 = ""        // 内部调 empty()
-    gc_force()
-    let e2 = ""
-    io.println(e1)     // 仍可用
-    io.println(e2)     // 仍可用
-}
-```
-
-预期：`e1` 和 `e2` 指向同一全局单例，GC 不回收。
-
-### 6.4 Phase 4 GcWeakHandle 验证
-
-```cpp
-// runtime 内部测试代码（不通过 Aura 暴露）
-GcWeakHandle<GcString> wh(make_string("temp"));
-assert(wh.valid());
-gc_force();  // "temp" 无强引用，应被回收
-assert(!wh.valid());
-```
-
-### 6.5 Phase 5 Finalizer 验证
-
-```cpp
-// 构造带 finalizer 的类型
-struct FileHandle : GcObject {
-    int fd;
-    static void finalize(GcObject* self) {
-        auto* f = static_cast<FileHandle*>(self);
-        if (f->fd >= 0) ::close(f->fd);
-    }
-    static const TypeDescriptor& desc() {
-        static const TypeDescriptor d = {
-            sizeof(FileHandle), 0, nullptr, 0, nullptr, &finalize
-        };
-        return d;
-    }
-};
-
-// 测试
-{
-    auto* f = gc_alloc<FileHandle>(&FileHandle::desc());
-    f->fd = ::open("test.txt", O_RDONLY);
-}
-gc_force();   // 应调用 finalize，关闭 fd
-```
-
----
-
-## 七、实施顺序与提交粒度
-
-| 顺序 | Phase | 提交点 | 依赖 | 估计行数 |
+| 顺序 | Step | 提交点 | 依赖 | 行数估计 |
 |:---:|:---|:---|:---|:---:|
-| 1 | Phase 1 | commit: "gc: multi-thread STW safepoint" | 无 | ~80 |
-| 2 | Phase 2 | commit: "gc: expose gc_force/gc_stats to Aura + thread-safe forceGc" | Phase 1 | ~60 |
-| 3 | Phase 3 | commit: "gc: add GcGlobalRoot for runtime caches" | 无（可与 Phase 1/2 并行） | ~50 |
-| 4 | Phase 4 | commit: "gc: add GcWeakHandle with sweep-time clearing" | 无 | ~60 |
-| 5 | Phase 5 | commit: "gc: add finalizer support" | 无 | ~40 |
+| 1 | Step 1 | commit: "string: cache empty/bool/small-int singletons via GcGlobalRoot" | 无 | +18 |
+| 2 | Step 2 | commit: "string: add concat_multi for one-shot multi-string concat" | 无 | +18 |
+| 3 | Step 3 | commit: "codegen: desugar chain of string + to concat_multi" | Step 2 | +67 |
 
-**每个 Phase 独立编译 + 测试，失败可回滚单步。**
+**每个 Step 独立编译 + 测试，失败可回滚。Step 1 和 Step 2 互不依赖，可并行实施；Step 3 依赖 Step 2 的 `concat_multi` API。**
 
-**建议并行**：Phase 3/4/5 相互独立，可并行开发。Phase 2 依赖 Phase 1。
+---
+
+## 七、可能的风险与应对方案
+
+### 7.1 风险一：静态局部变量析构顺序
+
+**问题**：`string.cpp` 中的 `static GcGlobalRoot<GcString>` 在进程退出时析构，需调用 `unregisterGlobalRoot`，此时 `GcHeap::instance()` 是否仍存活？
+
+**应对**：
+- ✅ `GcHeap::instance()` 是 Meyers singleton（函数内 static），与 `string.cpp` 的静态局部变量同处于"静态初始化后的线程安全析构"序列
+- ✅ C++ 标准：同一翻译单元内静态变量按声明逆序析构；跨翻译单元顺序未定义，但 `GcHeap` 不依赖 `GcString` 的静态变量
+- ✅ `GcHeap::~GcHeap()` 不释放页（[gc.cpp:31-36](file:///d:/you/Aura/runtime/gc.cpp#L31)），即使 `GcGlobalRoot` 析构时 `GcHeap` 已析构，也只是 `unregisterGlobalRoot` 操作无效化，不会 crash
+
+### 7.2 风险二：256 个 GcGlobalRoot 增加 markPhase 成本
+
+**问题**：`globalRoots_` 从 ~5 个增加到 ~260 个，`markPhase` 遍历成本上升 ~1KB。
+
+**应对**：
+- ✅ markPhase 是 O(roots) 线性遍历，~260 个根 ≈ 几微秒，相对 GC 总成本可忽略
+- ✅ 收益（5000 次循环零分配）远大于成本（每次 GC 多 ~1KB 遍历）
+
+### 7.3 风险三：`collectStringChain` 递归深度
+
+**问题**：超长链（如 `a + b + c + ... + z` 26 节点）递归调用深度 25 层。
+
+**应对**：
+- ✅ 实际场景中链长通常 ≤ 5，递归深度 ≤ 5
+- ✅ 即使链长 100，递归深度 100 仍在栈容量内（每层 ~100 字节，总 10KB）
+- 🟡 如有需求可后续改为迭代版本（栈模拟），当前不必
+
+### 7.4 风险四：`concat_multi` 接收 `nullptr`
+
+**问题**：若 CodeGen 错误地将非 string 节点（已 cast 为 GcString*）传入 `concat_multi`，可能 crash。
+
+**应对**：
+- ✅ `collectStringChain` 已用 `isStringExpr` 验证每个节点，非 string 节点会返回空 vector
+- ✅ `concat_multi` 内部 `if (!p) continue` 保护 nullptr
+- ⚠️ 若 CodeGen 上游 bug 传入悬空指针（非 nullptr 但已回收），无法保护 — 但这不是本 plan 的问题
+
+### 7.5 风险五：AST 节点类型判断
+
+**问题**：`dynamic_cast<const BinaryExpr*>(e.left.get())` 依赖 RTTI，性能略低。
+
+**应对**：
+- ✅ 仅在 `+` 表达式中调用，非热路径
+- ✅ CodeGen 本身已大量使用 `dynamic_cast`（如 `genCallExpr` 中 `dynamic_cast<const Identifier*>`），保持一致
+- 🟡 如需优化可后续加 `ASTType` 枚举字段快速判断（属另一项重构，不在本 plan 范围）
 
 ---
 
 ## 八、不实施的事项（明确排除）
 
-| 项 | 原因 |
-|:---|:---|
-| Aura 顶层 `let` 全局变量 | Aura 语言当前不支持，本 plan 只做运行时缓存场景 |
-| `gc_force_minor` 暴露 | 优先级低，先做 `gc_force`（major） |
-| GcStats 返回结构化类型 | 简化为字符串格式化，避免引入新 SemType |
-| 弱引用原子读写 | 当前无使用方，保留为风险，未来按需做 |
-| Finalizer 防递归 GC | 简化方案：由实现者保证，运行时不强制 |
-| GcObject 头部紧凑化 | `finalized` 字段占位，未来可优化为位域，本 plan 不做 |
-| `gc_pending_` 原子化 | 当前用 `bool`，多线程下有轻微竞争但不影响正确性（最坏情况是某次 safepoint 漏掉，下次会补上） |
+| 项 | 状态 | 原因 |
+|:---|:---:|:---|
+| §B1 `capacity` + `reserve` API | [~] 延后 | 第二阶段，依赖第一步的 GC 集成稳定 |
+| §B2 子串共享（零拷贝 slice） | [~] 延后 | 第二阶段，需引入 `parent` GC 指针字段 |
+| §B3 哈希缓存 | [-] 不实施 | BuiltinRegistry 未注册 `Map<K,V>`，收益为 0 |
+| §C1 Rope 表示 | [~] 延后 | 第三阶段架构级重构，需 profiling 证据 |
+| 修改 `from(double)` 加缓存 | [-] 不实施 | 浮点数取值空间无限，无法有效缓存 |
+| 修改 `from(const char*)` 加 intern | [-] 不实施 | intern 表需要额外数据结构，本阶段不引入 |
 
 ---
 
-## 九、与原 plan 的差异
+## 九、改动规模总览
+
+| 文件 | 改动 | 净增行数 |
+|:---|:---|:---:|
+| [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) | + `empty()` 声明 + `concat_multi` 声明 | +4 |
+| [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) | 改造 `from(bool)` / `from(int32_t)` + 新增 `empty()` / `concat_multi` | +35 |
+| [src/CodeGen/CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) | + `collectStringChain` 私有方法声明 | +5 |
+| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | 新增 `collectStringChain` + 改造 `genBinaryExpr` | +62 |
+| **合计** | | **~+106 净增** |
+
+---
+
+## 十、与原 plan 的差异
 
 | 原 plan §描述 | 本 plan 实际 |
 |:---|:---|
-| "§五 全局变量 GC 根注册" 包括 Aura 顶层 let | Aura 不支持顶层 let，仅做运行时缓存场景 |
-| "§十八 forceGc 多线程安全" 独立 | 实际就是 §八 STW 的应用，合并入 Phase 2 |
-| "TypeDescriptor 加 finalizer" 影响所有现有代码 | C++ 聚合初始化允许省略尾部字段，现有代码不报错 |
-| "GcWeakHandle 用 atomic 指针" | 简化为裸指针，当前无使用方 |
-| "finalizer 防递归" | 简化为不强制，由实现者保证 |
+| §A1 用 `GcGlobalRoot<GcString>` 静态局部变量 | ✅ 完全采纳 |
+| §A2 用 `static GcGlobalRoot<GcString> _cache[256]` | ❌ 不可行（拷贝赋值 `= delete`），改用裸指针数组 + lazy init |
+| §A3 `concat_multi(std::initializer_list<const GcString*>)` | ✅ 完全采纳 |
+| §A4 `collectStringChain` 作为自由函数 | ❌ 改为 `CodeGenerator` 私有方法（可访问 `stringVarNames_`） |
+| §A4 AST 节点类型判断 `e.left->type == ASTType::BinaryExpr` | ❌ 改用 `dynamic_cast<const BinaryExpr*>`，与现有 CodeGen 风格一致 |
 
 ---
 
-## 十、总结
+## 十一、后续
 
-### 改动规模
-
-- **新增**：~343 行（gc.h +120 / gc.cpp +180 / types.h +8 / BuiltinRegistry.h +15 / ExprGen.cpp +20）
-- **修改**：0 行（不破坏现有 API）
-
-### 完成后效果
-
-| 功能 | 状态 |
-|:---|:---|
-| 多线程 GC 暂停 | ✅ 可支持 sync thread / 异步 io |
-| `gc_force()` Aura 可调 | ✅ |
-| `gc_stats()` Aura 可调 | ✅ |
-| 运行时缓存 GC 安全 | ✅ |
-| 弱引用 | ✅ |
-| Finalizer | ✅ |
-
-### 后续
-
-完成本 plan 后，[TODO.txt §五](file:///d:/you/Aura/TODO.txt) 的 P1 项可标记为 `[x]`。GC 进入"多线程就绪"状态，可推进：
-- [sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md)
-- [io_coroutine_plan.md](file:///d:/you/Aura/plan/io_coroutine_plan.md)
-- [gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) 第一阶段（依赖 GcGlobalRoot）
+完成本 plan 后：
+- [TODO.txt](file:///d:/you/Aura/TODO.txt) 中 GcString 优化第一阶段 Step 1-3 标记 `[x]`
+- [plan/gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) §A1~§A4 标记"已实施"
+- 推进第二阶段（B1 capacity + reserve / B2 子串共享）作为下一步目标，但需先观察第一阶段效果

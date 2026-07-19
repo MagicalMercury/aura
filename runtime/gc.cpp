@@ -9,6 +9,8 @@
 #include "builtin/string.h"
 #include <algorithm>
 #include <cstring>
+#include <map>
+#include <unordered_map>
 
 #ifdef _WIN32
   #include <windows.h>
@@ -593,24 +595,34 @@ void GcHeap::compactAndReclaim() {
         return;
     }
 
-    // 有存活对象：遍历页链表，释放不含任何存活对象的页
+    // 建立 page.data → page 的有序索引（O(n log n)）
+    std::map<const char*, Page*> pageByData;
+    for (Page* page = headPage_; page; page = page->next) {
+        pageByData[page->data] = page;
+    }
+
+    // 分桶：标记每个 page 是否有存活对象（O(m log n)）
+    std::unordered_map<Page*, bool> hasLive;
+    hasLive.reserve(pageByData.size());
+    for (auto* obj : allLive) {
+        const char* objPtr = reinterpret_cast<const char*>(obj);
+        auto it = pageByData.upper_bound(objPtr);
+        if (it == pageByData.begin()) continue;
+        --it;
+        Page* page = it->second;
+        if (objPtr >= page->data && objPtr < page->data + kPageSize) {
+            hasLive[page] = true;
+        }
+    }
+
+    // 一次遍历 pages 回收空页（O(n)）
     Page* page = headPage_;
     Page* newHead = nullptr;
     Page* newTail = nullptr;
 
     while (page) {
         Page* next = page->next;
-        bool hasLive = false;
-        for (auto* obj : allLive) {
-            char* objPtr = reinterpret_cast<char*>(obj);
-            if (objPtr >= page->data && objPtr < page->data + kPageSize) {
-                hasLive = true;
-                break;
-            }
-        }
-
-        if (hasLive) {
-            // 保留此页，插入新链表
+        if (hasLive.count(page)) {
             page->next = nullptr;
             if (!newHead) {
                 newHead = page;
@@ -620,7 +632,6 @@ void GcHeap::compactAndReclaim() {
                 newTail = page;
             }
         } else {
-            // 释放完全空闲的页
 #ifdef _WIN32
             VirtualFree(page, 0, MEM_RELEASE);
 #else

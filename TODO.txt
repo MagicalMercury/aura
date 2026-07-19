@@ -109,59 +109,44 @@
 GC 缺失功能清单（基于 2026-07-18 重新核验 runtime/gc.h + gc.cpp）
 ----------------------------------------------------------------
 
-[ ] P1  全局变量 / 静态变量的 GC 根注册
-      - 现状：roots_ 仅含 GcRootHandle（栈局部变量），但全局/静态的 GC 指针
-        （如 GcString::from(true) 缓存、单例）无法被 markPhase 发现
-      - 缺：注册全局根的 API（registerGlobalRoot）或在 GcHeap::instance()
-        初始化时扫描静态区
-      - 影响：GC 一旦启用，所有静态缓存的字符串会被错误回收
-
-[ ] P1  弱引用 GcWeakHandle<T>
-      - 现状：只有强引用 GcRootHandle
-      - 缺：弱引用类型，用于缓存场景（如字符串驻留表、Map 缓存）
-      - 设计：弱引用不阻止 GC 回收，访问前需检查 valid()
-
-[ ] P1  Finalizer（终结器）支持
-      - 现状：sweepPhaseYoung/sweepPhaseAll 直接回收，无回调
-      - 缺：GcObject 虚函数 finalize()，sweep 前调用
-      - 用途：资源句柄（文件、socket）在 GC 时关闭
-      - 风险：finalizer 中再分配会触发递归 GC
-
-[ ] P1  多线程 GC 暂停（stop-the-world）
-      - 现状：GC 单线程运行，无 safepoint 同步机制
-      - 缺：其他线程在 GC 期间需要暂停（mutator 暂停）
-      - 设计：safepoint() 检查 gcPending_ 时进入等待状态
-      - 影响：当前 Aura 协程模型是单线程协作式，暂可接受，但 sync 块并发后必加
-
-[ ] P2  精确栈扫描（替代保守扫描）
+[-] P2  精确栈扫描（替代保守扫描）  [2026-07-18 暂不实施]
       - 现状：[gc.cpp:243-262](runtime/gc.cpp#L243) markPhase 中 stackRoots_
         采用"保守扫描"——按 sizeof(void*) 对齐扫描栈内存，把候选指针
         当作 GcObject* 检查是否在 page 范围
-      - 缺：精确栈扫描（编译器生成栈帧描述符，告诉 GC 哪些栈槽是 GC 指针）
-      - 影响：保守扫描会"过度保留"对象（把整数误认为指针），导致内存泄漏
-      - 缓解：当前 GcRootHandle 是精确的，stackRoots_ 只是兜底，可逐步迁移
+      - 暂不实施原因：P0 完成后 CodeGen 已为 GC 指针类型的局部变量生成
+        GcRootHandle 包装（精确注册到 roots_），协程帧也由 GcRootHandle
+        精确扫描。stackRoots_ 的保守扫描仅作协程帧兜底（GcRootHandle 在
+        协程挂起期间的行为依赖协程实现细节，保守扫描是安全网）。
+        实际影响小：协程帧内大部分对齐数据是 GcRootHandle::ptr_ 字段，
+        本来就是 GC 指针；desc/size 验证会跳过非 GC 对象。
+      - 远期改进：若 profiling 显示内存占用过高，再做精确扫描
 
-[ ] P2  compactAndReclaim 的存活检测性能优化
-      - 现状：[gc.cpp:414-467](runtime/gc.cpp#L414) compactAndReclaim 用
-        O(n×m) 双重循环判断每个 page 是否有存活对象（n=pages, m=live objects）
-      - 缺：先按 page 地址对所有存活对象分桶（O(m log m) 排序），
-        再一次遍历 pages
-      - 影响：对象数大时 GC 暂停时间长
+[x] P2  compactAndReclaim 的存活检测性能优化  [2026-07-18 完成]
+      - 改造：用 std::map<const char*, Page*> 建立 page.data 有序索引，
+        upper_bound 二分查找归属 page，O((n+m) log n)
+      - 文件：runtime/gc.cpp:584-646
+      - 验收：5000 次迭代压力测试通过，GC 无 crash
 
-[ ] P2  TLAB（Thread-Local Allocation Buffer）
+[~] P2  TLAB（Thread-Local Allocation Buffer）  [2026-07-18 延后]
       - 现状：bumpAlloc 是全局单线程的（currentPage_ + bumpOffset）
       - 缺：多线程并发分配需要每线程独立 TLAB，避免锁竞争
-      - 前置：先实现多线程 GC 暂停
+      - 延后原因：当前 sync_thread_plan.md 尚未实施，无多线程分配压力。
+        待 sync_thread 完成后再做
+      - 前置：先实现多线程 GC 暂停（已完成 P1 §八）
 
-[ ] P2  GC 触发策略调优
+[-] P2  GC 触发策略调优  [2026-07-18 暂不实施]
       - 现状：kYoungThreshold=256KB, kOldThreshold=1MB（写死）
-      - 缺：根据运行时负载动态调整阈值，或通过 #gc.young_threshold 配置
+      - 暂不实施原因：当前无配置系统（ConfigDecl 未实现），环境变量方式
+        价值有限。默认阈值在 Aura 当前规模下足够用
+      - 远期改进：待 Aura 配置系统完善后再做
       - 设计：参考 plan/plan-syncmode.md 的 ConfigDecl 机制
 
-[ ] P2  对象可移动性（compacting GC）
+[~] P2  对象可移动性（compacting GC）  [2026-07-18 延后]
       - 现状：compactAndReclaim 只回收整页，不搬运对象
       - 缺：mark-compact 算法，存活对象拷贝到新页，消除碎片
       - 影响：实现后需要转发指针（forwarding pointer）+ 更新所有引用
+      - 延后原因：风险过高（需更新所有引用：roots / stack / fields /
+        array 元素），compactAndReclaim 已能回收空页，碎片问题不严重
       - 风险：高复杂度，涉及 GcRootHandle / stackRoots 的更新
 
 [ ] P3  分代年龄记录
