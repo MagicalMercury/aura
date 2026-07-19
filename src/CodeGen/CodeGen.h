@@ -335,6 +335,17 @@ private:
     // --- 闭包 ---
     [[nodiscard]] std::string genFunExpr(const FunExpr& e, bool isCoroutine);
 
+    // 收集 BinaryExpr(+, left, right) 的所有 string 操作数，链长 ≥ 3 时用于 concat_multi
+    [[nodiscard]] std::vector<std::string> collectStringChain(const BinaryExpr& e,
+                                                              bool isCoroutine);
+
+    // 写屏障辅助：检测赋值目标是否为 GC 对象字段（obj.get()->field 或 this->field）
+    [[nodiscard]] bool isGcFieldAssignment(const std::string& target) const;
+
+    // 写屏障辅助：将 "obj.get()->field" 分解为 (parentObj="obj.get()", fieldAddr="&(obj.get()->field)")
+    [[nodiscard]] std::pair<std::string, std::string>
+    decomposeFieldAccess(const std::string& target) const;
+
     // ============================================================
     // 协程判定辅助
     // ============================================================

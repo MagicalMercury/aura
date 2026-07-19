@@ -564,6 +564,15 @@ fun main(io: Io) {
 - `a + b + c + d` 从 3 次分配 → 1 次分配
 - 中间对象 memcpy 从 6 次 → 0 次
 
+**实施状态**（2026-07-19）：
+- ✅ 纯 string 链（如 `a + b + c + d`，所有节点都是 string 变量/字面量）已生效
+- ❌ 混合类型链（如 `"iter " + i + " step " + i + " done"`，含 int 节点）当前 fallback 到嵌套 `concat`，未触发 `concat_multi` 路径
+- 原因：`collectStringChain` 的 `isStringExpr` 判定要求所有链节点都是 string；遇到非 string 节点（int/bool/float）时返回空 vector，整链退化
+- 测试现象：5000 次循环 5 节点混合链未体现 `concat_multi` 收益（`young=63KB` / `live=1336` 主要来自 Step 1 小整数缓存）
+- 改进方向（未实施）：
+  - A. 扩展 `concat_multi` 重载接收混合类型，自动调 `to_string` 转换
+  - B. CodeGen 在收集时为非 string 节点插入显式 `to_string` 转换
+
 ---
 
 ### 第二阶段（GC 已就绪，~200 行改动）

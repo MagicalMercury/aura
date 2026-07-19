@@ -45,6 +45,17 @@ GcString* GcString::make(const std::string& s) {
 // GcString::from — 从值类型创建字符串
 // ============================================================
 GcString* GcString::from(int32_t val) {
+    // [-128, 127] 缓存（裸指针数组 + lazy init）
+    static GcGlobalRoot<GcString>* _cache[256] = {};
+    if (val >= -128 && val <= 127) {
+        auto& slot = _cache[val + 128];
+        if (!slot) {
+            char buf[32];
+            int len = snprintf(buf, sizeof(buf), "%d", val);
+            slot = new GcGlobalRoot<GcString>(make(buf, static_cast<size_t>(len)));
+        }
+        return slot->get();
+    }
     char buf[32];
     int len = snprintf(buf, sizeof(buf), "%d", val);
     return make(buf, static_cast<size_t>(len));
@@ -57,7 +68,14 @@ GcString* GcString::from(double val) {
 }
 
 GcString* GcString::from(bool val) {
-    return make(val ? "true" : "false");
+    static GcGlobalRoot<GcString> _t{make("true")};
+    static GcGlobalRoot<GcString> _f{make("false")};
+    return val ? _t.get() : _f.get();
+}
+
+GcString* GcString::empty() {
+    static GcGlobalRoot<GcString> _e{make("", 0)};
+    return _e.get();
 }
 
 // ============================================================
@@ -72,6 +90,24 @@ GcString* GcString::concat(const GcString& other) const {
     std::memcpy(result->data() + length, other.data(), other.length);
     result->data()[total] = '\0';
     return result;
+}
+
+GcString* concat_multi(std::initializer_list<const GcString*> parts) {
+    int32_t total = 0;
+    for (auto* p : parts) {
+        if (p) total += p->length;
+    }
+    size_t objSize = sizeof(GcString) + total + 1;
+    auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
+    r->length = total;
+    char* dst = r->data();
+    for (auto* s : parts) {
+        if (!s) continue;
+        std::memcpy(dst, s->data(), s->length);
+        dst += s->length;
+    }
+    *dst = '\0';
+    return r;
 }
 
 } // namespace aura_rt

@@ -42,6 +42,9 @@ struct GcString : GcObject {
     static GcString* from(double val);
     static GcString* from(bool val);
 
+    // 空字符串单例（替代 make("", 0) 重复分配）
+    static GcString* empty();
+
     // 拼接（在 string.cpp 实现）
     GcString* concat(const GcString& other) const;
 
@@ -158,5 +161,8 @@ inline bool string_eq(GcString* a, GcString* b) {
     if (!a || !b) return false;
     return *a == *b;
 }
+
+// 多串拼接：一次分配 + 一次 memcpy，避免链式 concat 的中间对象
+GcString* concat_multi(std::initializer_list<const GcString*> parts);
 
 } // namespace aura_rt

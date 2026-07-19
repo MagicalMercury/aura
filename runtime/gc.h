@@ -58,7 +58,8 @@ public:
 
     T& operator*()  const { return *ptr_; }
     T* operator->() const { return ptr_; }
-    T  get()        const { return *ptr_; }
+    T& get()              { return *ptr_; }  // 非 const：返回引用，可作赋值左侧
+    T  get()        const { return *ptr_; }  // const：返回值，兼容读取场景
 
 private:
     T* ptr_;
@@ -197,9 +198,10 @@ private:
     GcHeap() = default;
 
     // 分配器内部结构
-    static constexpr size_t kPageSize        = 4096;
-    static constexpr size_t kYoungThreshold  = 256 * 1024;  // 256 KB → minor GC
-    static constexpr size_t kOldThreshold    = 1024 * 1024; // 1 MB → major GC
+    static constexpr size_t  kPageSize        = 4096;
+    static constexpr size_t  kYoungThreshold  = 256 * 1024;  // 256 KB → minor GC
+    static constexpr size_t  kOldThreshold    = 1024 * 1024; // 1 MB → major GC
+    static constexpr uint8_t kPromotionAge    = 2;           // 经历 2 次 minor GC 后晋升
 
     struct Page {
         char   data[kPageSize];

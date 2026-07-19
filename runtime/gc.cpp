@@ -76,6 +76,8 @@ GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
     obj->marked     = false;
     obj->next       = nullptr;
     obj->generation = 0;  // 新生代
+    obj->finalized  = false;
+    obj->allocSize  = size;
 
     youngObjects_.push_back(obj);
     youngBytes_ += size;
@@ -298,12 +300,27 @@ GcHeap::Stats GcHeap::getStats() const {
     return s;
 }
 
+// 自适配格式化字节大小：<1KB 用 B，<1MB 用 KB，≥1MB 用 MB
+static const char* fmtBytes(size_t bytes, char* buf, size_t bufSize) {
+    if (bytes < 1024) {
+        std::snprintf(buf, bufSize, "%zuB", bytes);
+    } else if (bytes < 1024 * 1024) {
+        std::snprintf(buf, bufSize, "%.1fKB", bytes / 1024.0);
+    } else {
+        std::snprintf(buf, bufSize, "%.1fMB", bytes / (1024.0 * 1024.0));
+    }
+    return buf;
+}
+
 GcString* gc_stats_string() {
     auto s = GcHeap::instance().getStats();
+    char abuf[32], ybuf[32], obuf[32];
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-        "GC: alloc=%zuKB young=%zuKB old=%zuKB gc=%zu minor=%zu live=%zu pages=%zu",
-        s.allocatedBytes / 1024, s.youngBytes / 1024, s.oldBytes / 1024,
+        "GC: alloc=%s young=%s old=%s gc=%zu minor=%zu live=%zu pages=%zu",
+        fmtBytes(s.allocatedBytes, abuf, sizeof(abuf)),
+        fmtBytes(s.youngBytes,     ybuf, sizeof(ybuf)),
+        fmtBytes(s.oldBytes,       obuf, sizeof(obuf)),
         s.gcCount, s.minorGcCount, s.liveObjectCount, s.pageCount);
     return make_string(buf);
 }
@@ -363,7 +380,7 @@ void GcHeap::markPhase(bool youngOnly) {
                     GcObject* obj = static_cast<GcObject*>(candidate);
                     // 验证是否为有效的 GC 对象再读取字段
                     if (!obj->desc || obj->desc->size == 0) break;
-                    if (youngOnly && obj->generation == 1) break;
+                    // 始终标记：markObject 有 marked 守卫，old 对象不会重复扫描
                     markObject(obj);
                     break;
                 }
@@ -480,23 +497,34 @@ void GcHeap::sweepPhaseYoung() {
         }
     }
 
-    // 3. 晋升所有存活对象到老年代，清空新生代列表。
-    // 存活对象不应留在 youngObjects_ 中，否则下次 minor GC 会重复扫描老年代对象。
+    // 3. 按年龄门槛晋升：age >= kPromotionAge 的存活对象晋升到老年代，
+    // 其余存活对象 age++ 留在新生代；未标记对象被丢弃。
+    std::vector<GcObject*> survivors;
     for (auto* obj : youngObjects_) {
         if (obj->marked) {
-            promoteToOld(obj);
-            obj->marked = false;
+            obj->age++;
+            if (obj->age >= kPromotionAge) {
+                promoteToOld(obj);
+                obj->marked = false;
+            } else {
+                survivors.push_back(obj);
+                obj->marked = false;
+            }
         }
     }
 
+    // 更新 youngBytes_ 为存活对象总大小
     youngBytes_ = 0;
-    youngObjects_.clear();
+    for (auto* obj : survivors) {
+        youngBytes_ += obj->allocSize;
+    }
+    youngObjects_ = std::move(survivors);
 }
 
 void GcHeap::promoteToOld(GcObject* obj) {
     obj->generation = 1;
     oldObjects_.push_back(obj);
-    oldBytes_ += obj->desc ? obj->desc->size : 0;
+    oldBytes_ += obj->allocSize;
     if (oldBytes_ >= kOldThreshold) {
         gcPending_ = true;
     }
@@ -517,7 +545,7 @@ void GcHeap::sweepPhaseAll() {
         if (obj->marked) {
             obj->marked = false;
             liveYoung.push_back(obj);
-            liveYoungBytes += obj->desc ? obj->desc->size : 0;
+            liveYoungBytes += obj->allocSize;
         }
     }
 
@@ -527,7 +555,7 @@ void GcHeap::sweepPhaseAll() {
             // sweepePhaseYoung 已将晋升对象的 generation 设为 1，
             // 此处的 gen==0 分支不再需要（且 promoteToOld 在迭代 oldObjects_ 时调用会 UB）
             liveOld.push_back(obj);
-            liveOldBytes += obj->desc ? obj->desc->size : 0;
+            liveOldBytes += obj->allocSize;
         }
     }
 

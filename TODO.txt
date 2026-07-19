@@ -7,7 +7,7 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-07-18（重核 GC 实际状态 + 加入 GcString 优化清单）
+# 最近更新：2026-07-19（GC 晋升机制修复 + GcRootHandle 赋值 bug 修复）
 
 ================================================================
 [ 一 ] 内置 API 与模块（plan/plan11.md）
@@ -97,7 +97,7 @@
       - 缺：Sema 层路径参数类型检查
 
 ================================================================
-[ 五 ] GC（plan/gc_analysis.md, plan/plan3.md, plan/plan4.md）
+[ 五 ] GC（plan/gc_features_plan.md, plan/gc_promotion_issues.md）
 ================================================================
 
 [ ] P1  GcString 的 TypeDescriptor ptrFieldCount 应支持 parent 字段
@@ -106,7 +106,43 @@
       - 前置：先完成 Array<T*> 元素扫描同类的 ptrFields 机制
 
 ----------------------------------------------------------------
-GC 缺失功能清单（基于 2026-07-18 重新核验 runtime/gc.h + gc.cpp）
+GC 晋升机制缺陷修复（基于 plan/gc_promotion_issues.md，2026-07-19）
+----------------------------------------------------------------
+
+[x] P1  缺陷 1：oldBytes_ 用 allocSize 替代 desc->size  [2026-07-19 完成]
+      - 改动：GcObject 加 size_t allocSize 字段；tryAlloc 记录实际分配大小；
+        promoteToOld 改用 obj->allocSize；sweepPhaseAll 同步修正
+      - 文件：runtime/types.h, runtime/gc.cpp
+      - 详见：change.md §三 Phase 1 Step 1.1
+
+[x] P1  缺陷 3：栈根扫描跳过 old 对象问题  [2026-07-19 完成]
+      - 改动：移除 markPhase 中 `if (youngOnly && obj->generation == 1) break;`
+        始终调用 markObject（marked 守卫避免重复扫描）
+      - 文件：runtime/gc.cpp
+      - 详见：change.md §三 Phase 1 Step 1.2
+
+[x] P2  缺陷 4：引入年龄门槛（kPromotionAge=2）  [2026-07-19 完成]
+      - 改动：GcObject 加 uint8_t age 字段；gc.h 加 kPromotionAge=2 常量；
+        sweepPhaseYoung 改为按年龄晋升，survivors 留在 young
+      - 文件：runtime/types.h, runtime/gc.h, runtime/gc.cpp
+      - 详见：change.md §三 Phase 2 Step 2.1
+      - 对应：plan/gc_features_plan.md §十四 ✅ 已完成
+
+[x] P1  缺陷 2：CodeGen 接入写屏障  [2026-07-19 完成]
+      - 改动：genAssignExpr 对 obj.field = newVal 形式生成 gc_write_barrier 调用；
+        新增 isGcFieldAssignment + decomposeFieldAccess 私有方法
+      - 文件：src/CodeGen/CodeGen.h, src/CodeGen/ExprGen.cpp
+      - 详见：change.md §三 Phase 2 Step 2.2
+      - 备注：rememberedSet_ 现已真正生效，minor GC 不再扫描整个 oldObjects_
+
+[ ] P3  缺陷 5：old/young 混布 page（compacting GC）
+      - 现状：晋升不移动对象内存，old/young 混布同一 page
+      - 缺：compacting GC 或分离 young/old page 分配器
+      - 风险：高（架构级重构，需更新所有引用）
+      - 延后：对应 plan/gc_features_plan.md §十三 [~] 延后
+
+----------------------------------------------------------------
+GC 其他功能清单（基于 2026-07-19 重新核验）
 ----------------------------------------------------------------
 
 [-] P2  精确栈扫描（替代保守扫描）  [2026-07-18 暂不实施]
@@ -115,10 +151,7 @@ GC 缺失功能清单（基于 2026-07-18 重新核验 runtime/gc.h + gc.cpp）
         当作 GcObject* 检查是否在 page 范围
       - 暂不实施原因：P0 完成后 CodeGen 已为 GC 指针类型的局部变量生成
         GcRootHandle 包装（精确注册到 roots_），协程帧也由 GcRootHandle
-        精确扫描。stackRoots_ 的保守扫描仅作协程帧兜底（GcRootHandle 在
-        协程挂起期间的行为依赖协程实现细节，保守扫描是安全网）。
-        实际影响小：协程帧内大部分对齐数据是 GcRootHandle::ptr_ 字段，
-        本来就是 GC 指针；desc/size 验证会跳过非 GC 对象。
+        精确扫描。stackRoots_ 的保守扫描仅作协程帧兜底。
       - 远期改进：若 profiling 显示内存占用过高，再做精确扫描
 
 [x] P2  compactAndReclaim 的存活检测性能优化  [2026-07-18 完成]
@@ -130,29 +163,19 @@ GC 缺失功能清单（基于 2026-07-18 重新核验 runtime/gc.h + gc.cpp）
 [~] P2  TLAB（Thread-Local Allocation Buffer）  [2026-07-18 延后]
       - 现状：bumpAlloc 是全局单线程的（currentPage_ + bumpOffset）
       - 缺：多线程并发分配需要每线程独立 TLAB，避免锁竞争
-      - 延后原因：当前 sync_thread_plan.md 尚未实施，无多线程分配压力。
-        待 sync_thread 完成后再做
+      - 延后原因：当前 sync_thread_plan.md 尚未实施，无多线程分配压力
       - 前置：先实现多线程 GC 暂停（已完成 P1 §八）
 
 [-] P2  GC 触发策略调优  [2026-07-18 暂不实施]
       - 现状：kYoungThreshold=256KB, kOldThreshold=1MB（写死）
-      - 暂不实施原因：当前无配置系统（ConfigDecl 未实现），环境变量方式
-        价值有限。默认阈值在 Aura 当前规模下足够用
+      - 暂不实施原因：当前无配置系统（ConfigDecl 未实现）
       - 远期改进：待 Aura 配置系统完善后再做
-      - 设计：参考 plan/plan-syncmode.md 的 ConfigDecl 机制
 
 [~] P2  对象可移动性（compacting GC）  [2026-07-18 延后]
       - 现状：compactAndReclaim 只回收整页，不搬运对象
       - 缺：mark-compact 算法，存活对象拷贝到新页，消除碎片
-      - 影响：实现后需要转发指针（forwarding pointer）+ 更新所有引用
-      - 延后原因：风险过高（需更新所有引用：roots / stack / fields /
-        array 元素），compactAndReclaim 已能回收空页，碎片问题不严重
-      - 风险：高复杂度，涉及 GcRootHandle / stackRoots 的更新
-
-[ ] P3  分代年龄记录
-      - 现状：promoteToOld 一次晋升到老年代
-      - 缺：对象年龄（survival count），多次 minor GC 后才晋升
-      - 设计：GcObject 加 uint8_t age 字段，默认 age=2 晋升
+      - 延后原因：风险过高（需更新所有引用）
+      - 与缺陷 5 合并处理
 
 [ ] P3  并发 GC（concurrent marking）
       - 现状：GC 全程 stop-the-world
@@ -164,45 +187,59 @@ GC 缺失功能清单（基于 2026-07-18 重新核验 runtime/gc.h + gc.cpp）
       - 缺：大对象独立分配，避免 page 碎片
       - 设计：> 32KB 的对象直接从 OS 分配，独立追踪
 
-[ ] P3  GC 日志与统计
-      - 现状：gcCount/minorGcCount 已记录但无输出
-      - 缺：GC 事件日志（暂停时间、回收字节、晋升数量），
-        可通过 #gc.verbose = true 开启
+[~] P3  GC 日志与统计  [部分完成]
+      - ✅ 已完成：gc_stats_string() 返回格式化字符串 + Aura gc_stats() 内置函数
+        （runtime/gc.cpp:301-309, BuiltinRegistry 注册）
+      - ❌ 未实施：verbose_ 开关 + logGcEvent 事件级日志
+        （每次 GC 触发时机、耗时、回收字节数）
+      - 剩余工作：通过 #gc.verbose = true 配置开启事件日志
+      - 对应：plan/gc_features_plan.md §十七 ⚠️ 部分完成
 
+----------------------------------------------------------------
+GcRootHandle 赋值 bug 修复（2026-07-19）
+----------------------------------------------------------------
+
+[x] P0  GcRootHandle::get() 返回值类型导致赋值编译失败  [2026-07-19 完成]
+      - Bug 现象：s = s + a + b + c 生成 s.get() = value，rvalue 不能作左值
+      - 修复：gc.h:61 加非 const get() 重载返回引用
+      - 文件：runtime/gc.h:59-62
+      - 详见：原 change.md（已被 GC 晋升 plan 覆盖，但 bug 已修复）
+      - 影响：解除 GC 指针变量重新赋值编译阻断
 
 ================================================================
 [ 六 ] 运行时库改进（plan/gcstring_optimization.md, plan/plan13.md）
 ================================================================
 
 ----------------------------------------------------------------
-GcString 优化（基于 plan/gcstring_optimization.md，2026-07-18 评估）
-分阶段：第一阶段不依赖 GC，可立即做；第二阶段需 GC 真正运行
+GcString 优化（基于 plan/gcstring_optimization.md，2026-07-19 更新）
+分阶段：第一阶段 Step 1-3 已实施，第二阶段待启动
 ----------------------------------------------------------------
 
-[ ] P1  GcString::empty() / from(bool) / from(int) 静态缓存  [第一阶段]
-      - 现状：每次 from(bool) 都分配 5 字节字符串；from(int) 每次 snprintf+alloc
-      - 缺：empty() 返回全局单例；from(bool) 返回 "true"/"false" 单例；
-        from(int) 缓存 -128~127
-      - 风险：静态局部变量线程安全（C++11 起保证，但 Aura 协程模型需确认）
+[x] P1  GcString::empty() / from(bool) / from(int) 静态缓存  [第一阶段] [2026-07-19 完成]
+      - 实现：empty() 返回全局单例（GcGlobalRoot<GcString>）；from(bool) 返回
+        "true"/"false" 单例；from(int) lazy init 缓存 [-128, 127]
       - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
-      - 详见：plan/gcstring_optimization.md §三 Step 1
+      - 详见：plan/gcstring_optimization.md §三 Step 1 / change.md Step 1
 
-[ ] P1  concat_multi 运行时支持  [第一阶段]
-      - 现状：[string.cpp:66-75](runtime/builtin/string.cpp#L66) concat 每次分配+memcpy
-      - 缺：新增 concat_multi(initializer_list<const GcString*>) 一次性分配
+[x] P1  concat_multi 运行时支持  [第一阶段] [2026-07-19 完成]
+      - 实现：concat_multi(std::initializer_list<const GcString*>) 一次分配完成多串拼接
       - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
-      - 详见：plan/gcstring_optimization.md §三 Step 2
+      - 详见：plan/gcstring_optimization.md §三 Step 2 / change.md Step 2
 
-[ ] P1  CodeGen 识别链式 string + string 脱糖为 concat_multi  [第一阶段]
-      - 现状：[ExprGen.cpp:254](src/CodeGen/ExprGen.cpp#L254) 生成
-        aura_rt::concat(aura_rt::concat(aura_rt::concat(a, b), c), d)
-        3 次分配 + 中间对象 memcpy 2 次
-      - 缺：genBinaryExpr 检测 BinaryExpr(Plus, ...) 链，≥3 个操作数时
-        脱糖为 aura_rt::concat_multi({a, b, c, d})
-      - 风险：链中混入非 string 类型（s + 42 + t）需 fallback 到 concat
-      - 文件：src/CodeGen/ExprGen.cpp:235-265
-      - 详见：plan/gcstring_optimization.md §三 Step 3
-      - 收益：a+b+c+d 从 3 次分配+6 次 memcpy → 1 次分配+1 次 memcpy
+[~] P1  CodeGen 识别链式 string + string 脱糖为 concat_multi  [第一阶段] [2026-07-19 部分完成]
+      - 已实现：collectStringChain 递归收集 BinaryExpr(+) 链，≥3 全 string 节点时
+        生成 concat_multi({...})；纯 string 链生效
+      - 未完成：混合类型链（如 "iter " + i + " step " + i + " done"）当前
+        fallback 到嵌套 concat，未触发 concat_multi 路径
+      - 原因：collectStringChain 的 isStringExpr 判定要求所有链节点都是 string，
+        遇到 int/bool/float 节点时返回空 vector，整链退化
+      - 影响：测试代码 5000 次循环 5 节点混合链未体现 concat_multi 收益
+        （young=63KB / live=1336 改善主要来自 Step 1 小整数缓存，而非 concat_multi）
+      - 改进方向（未实施）：
+          A. 扩展 concat_multi 重载接收混合类型，自动调 to_string 转换
+          B. CodeGen 在收集时为非 string 节点插入显式 to_string 转换
+      - 文件：src/CodeGen/CodeGen.h:338-340, src/CodeGen/ExprGen.cpp:238-279, 313-325
+      - 详见：plan/gcstring_optimization.md §三 Step 3 / change.md Step 3
 
 [ ] P2  GcString 加 capacity 字段 + reserve/make_with_capacity API  [第二阶段]
       - 前置：先做 GcStringBuilder 类型
@@ -233,13 +270,13 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-18 评估）
       - 当前收益：0（无 Map 类型）
       - 文件：runtime/builtin/string.h
 
-[ ] P3  GcString Rope 表示  [远期]
+[ ] P3  GcString Rope 表示  [必要，架构级升级]
       - 前置：profiling 显示拼接是热点
       - 缺：树形节点（left/right GC 指针 + length）；
         c_str() 时扁平化；== 比较需重写
       - 风险：架构级重构，影响所有 string 操作
       - 文件：runtime/builtin/string.h
-      - 详见：plan/gcstring_optimization.md §二 C1
+      - 详见：plan/gcstring_optimization.md §三 C1（已改为"必要"）
 
 [-] P3  GC 暂停期 interning  [不可行]
       - 前置：GC 真正运行 + mark 阶段可遍历所有对象
@@ -271,7 +308,7 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-18 评估）
       - 文件：src/main.cpp:112-117
 
 ================================================================
-[ 九 ] 代码质量 / 重构（Res.md 屎山报告）
+[ 八 ] 代码质量 / 重构（Res.md 屎山报告）
 ================================================================
 
 [x] P1  genFunExpr 抽 4 个内联 walker 到 ASTWalker.h (2026-07-18)

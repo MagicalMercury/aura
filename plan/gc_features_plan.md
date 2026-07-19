@@ -47,17 +47,21 @@
 | P2 | TLAB（Thread-Local Allocation Buffer） | §十一 | [~] 延后 |
 | P2 | GC 触发策略调优 | §十二 | [-] 暂不实施 |
 | P2 | 对象可移动性（compacting GC） | §十三 | [~] 延后 |
-| P3 | 分代年龄记录 | §十四 | 远期 |
+| P3 | 分代年龄记录 | §十四 | ✅ 已完成 |
 | P3 | 并发 GC（concurrent marking） | §十五 | 远期 |
 | P3 | Large Object Space（大对象区） | §十六 | 远期 |
-| P3 | GC 日志与统计 | §十七 | 远期 |
+| P3 | GC 日志与统计 | §十七 | ⚠️ 部分完成（`gc_stats_string` 已有，`verbose_` 开关 + `logGcEvent` 未实施） |
 
-### 1.4 状态说明（2026-07-18 更新）
+### 1.4 状态说明（2026-07-19 更新）
 
 - **§九 精确栈扫描**：P0 完成后 GcRootHandle 已精确注册 roots_，stackRoots_ 保守扫描仅作协程帧兜底。实际影响小，暂不实施。
 - **§十一 TLAB**：当前 sync_thread 尚未实施，无多线程分配压力。延后到 sync_thread 完成后再做。
 - **§十二 GC 触发策略调优**：当前无配置系统（ConfigDecl 未实现），环境变量方式价值有限。暂不实施，待配置系统完善后再做。
 - **§十三 对象可移动性**：风险过高（需更新所有引用：roots / stack / fields / array 元素）。compactAndReclaim 已能回收空页，碎片问题不严重。延后到 profiling 显示严重碎片问题再做。
+- **§十四 分代年龄记录**：✅ 已完成（2026-07-19）。作为 [change.md GC 晋升机制缺陷修复 Plan](file:///d:/you/Aura/change.md) Phase 2 Step 2.1 实施，引入 `GcObject::age` 字段 + `kPromotionAge = 2` 阈值。
+- **§十五 并发 GC**：风险极高（需读屏障 + 三色标记 invariant），留待远期。
+- **§十六 Large Object Space**：当前无大对象压力，留待远期。
+- **§十七 GC 日志与统计**：⚠️ 部分完成。`gc_stats_string()` + Aura `gc_stats()` 已实现，但 `verbose_` 开关 + `logGcEvent` 事件日志未实施。
 
 ---
 
@@ -769,7 +773,14 @@ void GcHeap::compact() {
 
 ---
 
-## 十四、P3 — 分代年龄记录
+## 十四、P3 — 分代年龄记录  ✅ 已完成（2026-07-19）
+
+> **实施状态**：作为 [change.md GC 晋升机制缺陷修复 Plan](file:///d:/you/Aura/change.md) Phase 2 Step 2.1 已落地。
+>
+> **实施证据**：
+> - [runtime/types.h:126](file:///d:/you/Aura/runtime/types.h#L126) `GcObject::age` 字段
+> - [runtime/gc.h:204](file:///d:/you/Aura/runtime/gc.h#L204) `kPromotionAge = 2` 常量
+> - [runtime/gc.cpp:500-506](file:///d:/you/Aura/runtime/gc.cpp#L500) `sweepPhaseYoung` 按年龄晋升逻辑
 
 ### 14.1 设计
 
@@ -830,7 +841,14 @@ GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
 
 ---
 
-## 十七、P3 — GC 日志与统计
+## 十七、P3 — GC 日志与统计  ⚠️ 部分完成（2026-07-19）
+
+> **实施状态**：
+> - ✅ `gc_stats_string()` 已实现（[gc.cpp:301-309](file:///d:/you/Aura/runtime/gc.cpp#L301)）— 返回 `GC: alloc=...KB young=...KB old=...KB gc=... minor=... live=... pages=...` 格式字符串
+> - ✅ Aura 语言已通过 `gc_stats()` 内置函数暴露（见 [BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h)）
+> - ❌ `verbose_` 开关 + `logGcEvent` 未实施 — 缺少 GC 事件级别日志（每次 GC 触发时机、耗时、回收字节数）
+>
+> **剩余工作**：若需 GC 事件级日志（如 `[GC] minor: 2ms, freed 256KB`），需新增 `verbose_` 字段 + `logGcEvent` 方法，并通过 `#gc.verbose = true` 配置开启
 
 ### 17.1 设计
 

@@ -1,9 +1,29 @@
 #include "CodeGen.h"
 #include "../Sema/BuiltinRegistry.h"
+#include "../Sema/SemType.h"
 #include <cctype>
 #include <sstream>
 
 namespace Aura {
+
+// ============================================================
+// 写屏障辅助：判断 SemType 是否对应 GC 堆对象指针
+// ============================================================
+static bool isHeapSemType(const SemType* type) {
+    if (!type) return false;
+    if (auto* p = dynamic_cast<const PrimSemType*>(type))
+        return p->kind == PrimSemType::String;
+    if (dynamic_cast<const NoneSemType*>(type)) return false;
+    if (dynamic_cast<const ErrorSemType*>(type)) return false;
+    // Union：任一 variant 是 heap 则认为是 heap（对应 variant<Ptr*, NoneType>）
+    if (auto* u = dynamic_cast<const UnionSemType*>(type)) {
+        for (auto& v : u->variants)
+            if (isHeapSemType(v.get())) return true;
+        return false;
+    }
+    // Record, List, Interface, Func, Iter, Generic → heap
+    return true;
+}
 
 // ============================================================
 // 表达式总调度
@@ -232,6 +252,53 @@ std::string CodeGenerator::genRecordExpr(const RecordExpr& e, bool isCoroutine) 
 }
 
 // ============================================================
+// 链式 + 收集 → concat_multi 脱糖
+// ============================================================
+
+std::vector<std::string> CodeGenerator::collectStringChain(const BinaryExpr& e,
+                                                           bool isCoroutine) {
+    std::vector<std::string> parts;
+
+    // 递归左子树：仅当左子是 BinaryExpr(+) 时尝试收集
+    if (auto* leftBin = dynamic_cast<const BinaryExpr*>(e.left.get())) {
+        if (leftBin->op == "+") {
+            auto sub = collectStringChain(*leftBin, isCoroutine);
+            if (sub.empty()) return {};
+            parts.insert(parts.end(), sub.begin(), sub.end());
+        } else {
+            return {};
+        }
+    } else {
+        parts.push_back(genExpr(*e.left, isCoroutine));
+    }
+
+    // 右子节点
+    std::string right = genExpr(*e.right, isCoroutine);
+
+    // 验证右子也是 string 表达式
+    auto isStringExpr = [this](const std::string& s) -> bool {
+        if (s.find("aura_rt::make_string") != std::string::npos
+            || s.find("->to_string") != std::string::npos
+            || s.find(".to_string") != std::string::npos
+            || s.find("aura_rt::concat") != std::string::npos
+            || s.find("aura_rt::string_concat") != std::string::npos
+            || s.find("aura_rt::concat_multi") != std::string::npos) {
+            return true;
+        }
+        auto stripGet = [](const std::string& in) -> std::string {
+            if (in.size() > 6 && in.substr(in.size() - 6) == ".get()")
+                return in.substr(0, in.size() - 6);
+            return in;
+        };
+        return stringVarNames_.count(stripGet(s)) > 0;
+    };
+
+    if (!isStringExpr(right)) return {};
+    parts.push_back(right);
+    return parts;
+}
+
+// ============================================================
 // 二元 / 一元
 // ============================================================
 
@@ -256,12 +323,26 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
 
         // 也检测已知字符串类型变量（含 GcRootHandle 包装后的 name.get()）
         auto stripGet = [](const std::string& s) -> std::string {
-            if (s.size() > 5 && s.substr(s.size() - 5) == ".get()")
-                return s.substr(0, s.size() - 5);
+            if (s.size() > 6 && s.substr(s.size() - 6) == ".get()")
+                return s.substr(0, s.size() - 6);
             return s;
         };
         if (!leftIsStr && stringVarNames_.count(stripGet(left))) leftIsStr = true;
         if (!rightIsStr && stringVarNames_.count(stripGet(right))) rightIsStr = true;
+
+        // 链式 + 脱糖为 concat_multi（链长 ≥ 3 时）
+        if (leftIsStr && rightIsStr) {
+            auto chain = collectStringChain(e, isCoroutine);
+            if (chain.size() >= 3) {
+                std::string result = "aura_rt::concat_multi({";
+                for (size_t i = 0; i < chain.size(); ++i) {
+                    if (i) result += ", ";
+                    result += chain[i];
+                }
+                result += "})";
+                return result;
+            }
+        }
 
         if (leftIsStr || rightIsStr) {
             return "aura_rt::concat(" + left + ", " + right + ")";
@@ -520,7 +601,38 @@ std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) 
         stringVarNames_.insert(target);
     }
 
+    // 写屏障：GC 对象字段赋值（如 obj.field = newVal）时，
+    // 记录 old→young 跨代引用到记忆集
+    if (isGcFieldAssignment(target) && isHeapSemType(e.value->inferredType)) {
+        auto [parentObj, fieldAddr] = decomposeFieldAccess(target);
+        return target + " = " + value + ";\n" + indentStr()
+             + "aura_rt::gc_write_barrier(" + parentObj
+             + ", " + fieldAddr
+             + ", static_cast<aura_rt::GcObject*>(" + value + "))";
+    }
+
     return target + " = " + value;
+}
+
+// ============================================================
+// 写屏障辅助方法
+// ============================================================
+
+bool CodeGenerator::isGcFieldAssignment(const std::string& target) const {
+    // GC 对象字段访问使用 ->（如 obj.get()->field 或 this->field）
+    // 局部变量和值类型访问使用 . 或不含 ->，不需要写屏障
+    return target.find("->") != std::string::npos;
+}
+
+std::pair<std::string, std::string>
+CodeGenerator::decomposeFieldAccess(const std::string& target) const {
+    auto arrowPos = target.rfind("->");
+    if (arrowPos == std::string::npos) {
+        return {target, "&(" + target + ")"};
+    }
+    std::string parentObj = target.substr(0, arrowPos);
+    std::string fieldAddr = "&(" + target + ")";
+    return {parentObj, fieldAddr};
 }
 
 // ============================================================

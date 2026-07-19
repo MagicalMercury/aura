@@ -117,6 +117,14 @@ struct GcObject {
     // Finalizer 已调用标记（防止重复调用）
     bool     finalized = false;
 
+    // 实际分配字节数（含对象头 + 内联数据 + 对齐填充）
+    // GC 分配时记录，promoteToOld 用于准确累加 oldBytes_
+    size_t   allocSize = 0;
+
+    // 对象存活年龄（经历 minor GC 的次数）
+    // 达到 kPromotionAge 后晋升到老年代
+    uint8_t  age = 0;
+
     virtual ~GcObject() = default;
 };
 
