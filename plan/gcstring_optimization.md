@@ -706,3 +706,365 @@ fun main(io: Io) {
 **推荐立即执行**：第一阶段 Step 1-3，~120 行代码改动，行为零变化，ROI 最高。
 
 第二阶段 Step 4-5 可在第一阶段验证后立即推进，无需等待其他 plan。
+
+---
+
+## 七、第四阶段：Intern 池（对象池）— 新增 2026-07-19
+
+### 7.0 背景：测试观察到的瓶颈
+
+**测试代码**（[example/test.aura](file:///d:/you/Aura/example/test.aura)）：
+
+```aura
+for i in range(0, 5000) {
+    let s = "iter " + i + " step " + i + " done"
+}
+```
+
+**Step 1-3 完成后实测**：`alloc=1950KB young=193KB old=8KB minor=7 live=3038 pages=497`
+
+**生成代码分析**（[example/test.cpp:10](file:///d:/you/Aura/example/test.cpp#L10)）：
+
+```cpp
+aura_rt::GcString* s_raw = aura_rt::concat_multi({
+    aura_rt::make_string("iter "),       // ← 5000 次分配
+    aura_rt::GcString::from(i),          // ← 97% 命中失败（i 超出 [-128, 127]）
+    aura_rt::make_string(" step "),      // ← 5000 次分配
+    aura_rt::GcString::from(i),          // ← 97% 命中失败
+    aura_rt::make_string(" done")        // ← 5000 次分配
+});
+```
+
+**瓶颈定位**：
+
+| 项 | 分配次数 | 占比 |
+|:---|:---:|:---:|
+| 字符串字面量 `make_string("literal")` | 15000（3 × 5000） | 60% |
+| `GcString::from(i)` 临时对象 | ~9700（97% 未命中缓存） | 39% |
+| `concat_multi` 结果 | 5000 | 1% |
+| **合计** | ~29700 | 100% |
+
+**结论**：`concat_multi` 已生效（5 节点链 → 1 次 concat_multi 调用），但**字面量重复分配**和**小整数缓存范围不足**是主要瓶颈。
+
+**解决方向**：引入 Intern 池（对象池），按内容去重，相同内容只分配一次。
+
+---
+
+### 7.1 D1. 字符串字面量自动 intern
+
+**改动文件**：[runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) + [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) + [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp)
+
+**核心设计**：
+
+```cpp
+// runtime/builtin/string.h 新增声明
+GcString* intern_string(const char* s);
+GcString* intern_string(const char* s, size_t len);
+
+// runtime/builtin/string.cpp 新增实现
+namespace {
+    // Intern 池：内容 → GcGlobalRoot 包装的 GcString
+    // 用 GcGlobalRoot 确保池中对象注册为 GC 全局根，永不被回收
+    std::unordered_map<std::string_view, std::unique_ptr<GcGlobalRoot<GcString>>> g_internPool;
+    std::shared_mutex g_internMutex;  // 读写锁，读多写少
+}
+
+GcString* intern_string(const char* s, size_t len) {
+    std::string_view key(s, len);
+    {
+        std::shared_lock lk(g_internMutex);
+        auto it = g_internPool.find(key);
+        if (it != g_internPool.end()) return it->second->get();
+    }
+    {
+        std::unique_lock lk(g_internMutex);
+        // double-check（可能在等锁期间被其他线程插入）
+        auto it = g_internPool.find(key);
+        if (it != g_internPool.end()) return it->second->get();
+        // 首次访问：分配 + 注册全局根
+        auto root = std::make_unique<GcGlobalRoot<GcString>>(GcString::make(s, len));
+        GcString* result = root->get();
+        // 注意：key 需要拷贝，因为 s 可能是临时缓冲区
+        g_internPool.emplace(std::string(key), std::move(root));
+        return result;
+    }
+}
+
+GcString* intern_string(const char* s) {
+    return intern_string(s, std::strlen(s));
+}
+```
+
+**CodeGen 改造**：
+
+[src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) 中所有生成 `aura_rt::make_string("literal")` 的地方，改为 `aura_rt::intern_string("literal")`。
+
+**关键变更点**：
+- 字符串字面量节点（AST `StringLiteral`）→ `intern_string`
+- `genBinaryExpr` 中拼接生成的中间字面量 → `intern_string`
+- 闭包捕获、函数参数传递等场景的字面量 → `intern_string`
+- 动态字符串（如 `GcString::from(int)` 内部 `make(buf, len)`）→ 保持 `make_string`，不 intern
+
+**收益**：
+
+| 场景 | 改造前 | 改造后 |
+|:---|:---|:---|
+| `let s = "hello"` | 每次 `make_string("hello")` 分配 | 首次 intern，后续直接返回 |
+| 循环内 `let s = "iter " + i + ...` | 3 个字面量 × 5000 = 15000 次分配 | 3 次分配（首次访问） |
+| 相同字面量重复出现 | 每次都分配 | 首次后零分配 |
+| `==` 比较 | O(n) 逐字符比较 | 可优化为 O(1) 指针比较（相同内容同指针） |
+
+**预期测试效果**（针对 [example/test.aura](file:///d:/you/Aura/example/test.aura)）：
+
+- `alloc` 从 1950KB → 预计 ~450KB（字面量从 15000 次分配降到 3 次）
+- `young` 从 193KB → 预计 ~50KB（无字面量中间对象）
+- `live` 从 3038 → 预计 ~5000（仅 final 字符串 + from(i) 临时对象）
+
+---
+
+### 7.2 D2. 扩展小整数缓存范围
+
+**改动文件**：[runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp)
+
+**当前状态**：`GcString::from(int32_t)` 缓存 [-128, 127]，256 个槽位（[string.cpp:47-51](file:///d:/you/Aura/runtime/builtin/string.cpp#L47)）
+
+**方案 A（推荐）：静态扩展到 [-1024, 1023]**
+
+```cpp
+GcString* GcString::from(int32_t val) {
+    static GcGlobalRoot<GcString>* _cache[2048] = {};  // -1024 ~ 1023
+    if (val >= -1024 && val <= 1023) {
+        auto& slot = _cache[val + 1024];
+        if (!slot) {
+            char buf[32];
+            int len = snprintf(buf, sizeof(buf), "%d", val);
+            slot = new GcGlobalRoot<GcString>(make(buf, static_cast<size_t>(len)));
+        }
+        return slot->get();
+    }
+    // 超出范围：动态分配（不缓存）
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%d", val);
+    return make(buf, static_cast<size_t>(len));
+}
+```
+
+**内存开销**：2048 × `sizeof(GcGlobalRoot<GcString>)` ≈ 2048 × 8B = 16KB（裸指针数组）+ 实际分配的 GcString 数量
+
+**覆盖率**：常见循环计数器、数组索引、配置值等多在 [-1024, 1023] 范围
+
+**方案 B（备选）：动态 LRU 缓存**
+
+```cpp
+GcString* GcString::from(int32_t val) {
+    static std::unordered_map<int32_t, std::unique_ptr<GcGlobalRoot<GcString>>> _cache;
+    static std::mutex _mtx;
+    static constexpr size_t kMaxCacheSize = 4096;
+    
+    {
+        std::lock_guard lk(_mtx);
+        auto it = _cache.find(val);
+        if (it != _cache.end()) return it->second->get();
+        
+        if (_cache.size() >= kMaxCacheSize) {
+            // 简单 LRU：随机淘汰一个（或用 std::list 实现 LRU）
+            _cache.erase(_cache.begin());
+        }
+        
+        char buf[32];
+        int len = snprintf(buf, sizeof(buf), "%d", val);
+        auto root = std::make_unique<GcGlobalRoot<GcString>>(make(buf, static_cast<size_t>(len)));
+        GcString* result = root->get();
+        _cache[val] = std::move(root);
+        return result;
+    }
+}
+```
+
+**对比**：
+
+| 项 | 方案 A（静态扩展） | 方案 B（动态 LRU） |
+|:---|:---|:---:|
+| 复杂度 | 简单 | 中等 |
+| 内存占用 | 固定 16KB | 动态，上限可控 |
+| 覆盖率 | [-1024, 1023] 固定 | 任意值，但 LRU 可能淘汰热点 |
+| 线程安全 | 无需加锁（静态初始化线程安全） | 需 mutex |
+| 命中率 | 范围内 100% | 取决于访问模式 |
+
+**推荐**：方案 A（静态扩展到 [-1024, 1023]），简单可靠。
+
+**收益**（针对 [example/test.aura](file:///d:/you/Aura/example/test.aura) 中 `i` 在 [0, 5000]）：
+
+| 范围 | 命中率 | 命中次数（5000 次循环 × 2 次 from(i)） |
+|:---|:---:|:---:|
+| [-128, 127]（当前） | 2.6% | ~260 |
+| [-1024, 1023]（方案 A） | 20.5% | ~2050 |
+| 动态 LRU 4096 | ~80% | ~8000 |
+
+**注意**：方案 A 对 [0, 5000] 的覆盖率仍只有 20%，因为 i 超出 1023 后全部 miss。**真正的根治方案是 D3 的动态 intern**。
+
+---
+
+### 7.3 D3. 动态字符串 intern（显式 API）
+
+**改动文件**：[runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) + [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp)
+
+**API**：
+
+```cpp
+// 显式 intern 任意 GcString（含动态生成的）
+// 相同内容返回同一指针
+GcString* GcString::intern(const GcString* s);
+```
+
+**实现**：
+
+```cpp
+GcString* GcString::intern(const GcString* s) {
+    if (!s) return nullptr;
+    std::string_view key(s->data(), s->length);
+    {
+        std::shared_lock lk(g_internMutex);  // 复用 D1 的池和锁
+        auto it = g_internPool.find(key);
+        if (it != g_internPool.end()) return it->second->get();
+    }
+    {
+        std::unique_lock lk(g_internMutex);
+        auto it = g_internPool.find(key);
+        if (it != g_internPool.end()) return it->second->get();
+        // 将 s 的内容复制到新 GcString 并入池
+        auto root = std::make_unique<GcGlobalRoot<GcString>>(make(s->data(), s->length));
+        GcString* result = root->get();
+        g_internPool.emplace(std::string(key), std::move(root));
+        return result;
+    }
+}
+```
+
+**使用场景**：
+
+```aura
+// 用户显式 intern 热点字符串
+let key = intern("user_" + id + "_config")
+// 多次查询同一 key 时零分配
+```
+
+**BuiltinRegistry 注册**：在 [BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) 注册 `intern` 全局函数。
+
+**风险**：
+- ⚠️ 内存膨胀：动态 intern 的字符串永不回收
+- ⚠️ 缓解：未来引入弱引用版本 `intern_weak`，GC 时回收未被外部引用的 intern 字符串
+
+---
+
+### 7.4 D4. `from(int32_t)` 改用 intern 池（长期统一）
+
+**目标**：将 D2 的小整数缓存统一到 D1/D3 的 intern 池中，避免两套缓存机制。
+
+**改造**：
+
+```cpp
+GcString* GcString::from(int32_t val) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%d", val);
+    // 直接调用 intern_string，自动去重
+    return intern_string(buf, static_cast<size_t>(len));
+}
+```
+
+**优势**：
+- 统一缓存机制（一套 intern 池覆盖所有场景）
+- 无需固定范围限制（任意 int32_t 都能去重）
+- 代码简洁
+
+**劣势**：
+- intern 池增长（所有 int 都入池）
+- 需要弱引用版本才能避免内存膨胀
+
+**建议**：D4 推迟到弱引用 intern 机制成熟后再做。短期用 D2 静态扩展。
+
+---
+
+### 7.5 风险与缓解
+
+| 风险 | 严重度 | 缓解 |
+|:---|:---:|:---|
+| Intern 池内存膨胀 | 🟡 中 | 字面量数量有限（通常 < 1000），可控；动态 intern 需弱引用版本（D3 风险） |
+| GC 全局根列表增长 | 🟡 中 | 字面量晋升到 old 后，minor GC 不扫描；major GC 扫描成本可接受（< 1000 个根） |
+| 线程安全 | 🟢 低 | 读写锁保护，读多写少 |
+| 与 Rope 的关系 | 🟢 低 | 互补：Rope 解决大字符串拼接，Intern 解决小字符串去重 |
+| `==` 语义变化 | 🟡 中 | intern 后相同内容同指针，`==` 可优化为指针比较，但需确保所有 string 都走 intern 路径 |
+
+---
+
+### 7.6 实施优先级
+
+**建议在 Rope 之前实施 D1 + D2**：
+
+| 项 | 改动量 | 预期收益 | 优先级 |
+|:---|:---:|:---|:---:|
+| D1 字面量 intern | ~80 行 | 字面量零分配（最大收益） | 🔴 高 |
+| D2 小整数扩展到 [-1024, 1023] | ~5 行 | int 转 string 缓存命中率提升 | 🟡 中 |
+| D3 动态 intern API | ~50 行 | 用户可显式去重 | 🟢 低（可选） |
+| D4 from(int) 统一到 intern | ~5 行 | 代码简化 | 🟢 低（长期） |
+
+**推荐执行顺序**：
+
+1. **D1（字面量 intern）**：最大收益，~80 行改动
+2. **D2（小整数扩展）**：简单改动，配合 D1 提升覆盖率
+3. **D3（动态 intern）**：可选，用户有需求时再做
+4. **D4（统一缓存）**：长期目标，需弱引用机制
+
+---
+
+### 7.7 与现有 plan 的关系
+
+| 现有 plan 项 | 状态 | 与 Intern 池的关系 |
+|:---|:---:|:---|
+| 第一阶段 A1 空串 + bool 缓存 | ✅ 已完成 | 保留，与 intern 池互补（特殊单例） |
+| 第一阶段 A2 小整数缓存 [-128, 127] | ✅ 已完成 | D2 扩展范围，D4 长期统一 |
+| 第一阶段 A3 concat_multi | ✅ 已完成 | 独立，无影响 |
+| 第二阶段 B1 capacity + Builder | 未实施 | 独立，无影响 |
+| 第二阶段 B2 子串共享 slice | 未实施 | 独立，无影响 |
+| 第三阶段 C1 Rope | 未实施 | 互补：Rope 大字符串，Intern 小字符串 |
+| C2 GC 暂停期 interning | 推迟 | D3 是其前置，可分阶段实施 |
+
+---
+
+### 7.8 验证预期
+
+**测试用例**（[example/test.aura](file:///d:/you/Aura/example/test.aura)）：
+
+```aura
+for i in range(0, 5000) {
+    let s = "iter " + i + " step " + i + " done"
+}
+```
+
+**D1 + D2 实施后预期**：
+
+| 指标 | 当前（Step 1-3 完成） | D1 + D2 后预期 | 变化 |
+|:---|:---:|:---:|:---:|
+| `alloc` | 1950 KB | ~450 KB | ↓ 77% |
+| `young` | 193 KB | ~50 KB | ↓ 74% |
+| `old` | 8 KB | ~20 KB | ↑（字面量 + 小整数晋升） |
+| `minor` | 7 | ~3 | ↓ 57% |
+| `live` | 3038 | ~5000 | ↑（仅 final 字符串 + 未命中缓存的 from(i)） |
+| `pages` | 497 | ~120 | ↓ 76% |
+
+**说明**：
+- `alloc` 大幅下降：字面量从 15000 次分配 → 3 次
+- `young` 大幅下降：无字面量中间对象
+- `old` 上升：3 个字面量 + 2048 个小整数缓存晋升到 old
+- `live` 上升：5000 个 final 字符串（每条 ~30B）+ 未命中缓存的 from(i) 临时对象（i > 1023 时 ~4000 个）
+
+**根治方案**：D3 动态 intern + 弱引用回收，让 from(i) 也入池且可回收。
+
+---
+
+## 八、更新：不在本草案范围内
+
+- ❌ ~~GC 暂停期 interning（收益不确定，改造 markPhase 复杂）~~ → 已移入第四阶段 D3
+- ❌ 单引用原地修改（需引用计数，破坏 GC 简单性）
+- ✅ Rope 表示**已移入第三阶段必要项**（见 C1）
+- ✅ **Intern 池（对象池）已移入第四阶段**（见 §七 D1-D4）

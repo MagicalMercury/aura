@@ -259,7 +259,7 @@ std::vector<std::string> CodeGenerator::collectStringChain(const BinaryExpr& e,
                                                            bool isCoroutine) {
     std::vector<std::string> parts;
 
-    // 递归左子树：仅当左子是 BinaryExpr(+) 时尝试收集
+    // 递归左子树：仅当左子是 BinaryExpr(+) 时继续收集
     if (auto* leftBin = dynamic_cast<const BinaryExpr*>(e.left.get())) {
         if (leftBin->op == "+") {
             auto sub = collectStringChain(*leftBin, isCoroutine);
@@ -269,33 +269,31 @@ std::vector<std::string> CodeGenerator::collectStringChain(const BinaryExpr& e,
             return {};
         }
     } else {
+        // 叶子节点：直接收集（不验证类型）
         parts.push_back(genExpr(*e.left, isCoroutine));
     }
 
-    // 右子节点
-    std::string right = genExpr(*e.right, isCoroutine);
-
-    // 验证右子也是 string 表达式
-    auto isStringExpr = [this](const std::string& s) -> bool {
-        if (s.find("aura_rt::make_string") != std::string::npos
-            || s.find("->to_string") != std::string::npos
-            || s.find(".to_string") != std::string::npos
-            || s.find("aura_rt::concat") != std::string::npos
-            || s.find("aura_rt::string_concat") != std::string::npos
-            || s.find("aura_rt::concat_multi") != std::string::npos) {
-            return true;
-        }
-        auto stripGet = [](const std::string& in) -> std::string {
-            if (in.size() > 6 && in.substr(in.size() - 6) == ".get()")
-                return in.substr(0, in.size() - 6);
-            return in;
-        };
-        return stringVarNames_.count(stripGet(s)) > 0;
-    };
-
-    if (!isStringExpr(right)) return {};
-    parts.push_back(right);
+    // 右子节点：直接收集（不验证类型）
+    // 类型判定延迟到 genBinaryExpr 生成 concat_multi 时处理
+    parts.push_back(genExpr(*e.right, isCoroutine));
     return parts;
+}
+
+bool CodeGenerator::isStringExprInChain(const std::string& s) const {
+    if (s.find("aura_rt::make_string") != std::string::npos
+        || s.find("->to_string") != std::string::npos
+        || s.find(".to_string") != std::string::npos
+        || s.find("aura_rt::concat") != std::string::npos
+        || s.find("aura_rt::string_concat") != std::string::npos
+        || s.find("aura_rt::concat_multi") != std::string::npos) {
+        return true;
+    }
+    auto stripGet = [](const std::string& in) -> std::string {
+        if (in.size() > 6 && in.substr(in.size() - 6) == ".get()")
+            return in.substr(0, in.size() - 6);
+        return in;
+    };
+    return stringVarNames_.count(stripGet(s)) > 0;
 }
 
 // ============================================================
@@ -330,14 +328,20 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
         if (!leftIsStr && stringVarNames_.count(stripGet(left))) leftIsStr = true;
         if (!rightIsStr && stringVarNames_.count(stripGet(right))) rightIsStr = true;
 
-        // 链式 + 脱糖为 concat_multi（链长 ≥ 3 时）
-        if (leftIsStr && rightIsStr) {
+        // 链式 + 脱糖为 concat_multi（链长 ≥ 3 且链根为 string 时）
+        // 放宽触发条件：leftIsStr || rightIsStr（链中可含 int/bool/double）
+        // 非 string 节点用 GcString::from 包装
+        if (leftIsStr || rightIsStr) {
             auto chain = collectStringChain(e, isCoroutine);
-            if (chain.size() >= 3) {
+            if (chain.size() >= 3 && isStringExprInChain(chain[0])) {
                 std::string result = "aura_rt::concat_multi({";
                 for (size_t i = 0; i < chain.size(); ++i) {
                     if (i) result += ", ";
-                    result += chain[i];
+                    if (isStringExprInChain(chain[i])) {
+                        result += chain[i];
+                    } else {
+                        result += "aura_rt::GcString::from(" + chain[i] + ")";
+                    }
                 }
                 result += "})";
                 return result;

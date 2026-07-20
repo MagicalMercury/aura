@@ -1,105 +1,131 @@
-# GcSharedRoot 闭包 GC 根方案 Plan
+# 混合类型链 concat_multi 修复 Plan
 
-> Bug 来源：[example/test.aura](file:///d:/you/Aura/example/test.aura) `test_basic_closure` 编译失败，见 [example/output.txt](file:///d:/you/Aura/example/output.txt)
+> Bug 来源：[TODO.txt §六](file:///d:/you/Aura/TODO.txt#L229) GcString 优化 Step 3 遗留
 > 日期：2026-07-19
 > 状态：草案（待批准）
-> 修复方案：方案 D（新增 `GcSharedRoot<T>` 模板类）
+> 修复方案：放宽 `collectStringChain` 中间节点判定 + CodeGen 对非 string 节点插入 `GcString::from` 转换
 
 ---
 
 ## 一、Summary
 
-新增 `GcSharedRoot<T>` 模板类，专为闭包捕获 GC 指针变量设计。与 `GcRootHandle<T>` 互补：
+修复混合类型链（如 `"iter " + i + " step " + i + " done"`）当前退化为嵌套 `concat` 的问题，使其能触发 `concat_multi` 一次分配完成。
 
-- `GcRootHandle<T>`：栈上变量包装，**不可拷贝**，仅用于局部变量生命周期管理
-- `GcSharedRoot<T>`：堆上独立存值，**可拷贝**，专为闭包捕获场景设计
-
-修复后 [example/test.aura](file:///d:/you/Aura/example/test.aura) 所有闭包场景编译通过，并完整支持"返回闭包捕获 GC 变量"场景。
+同时审查普通 `string + 其它类型` 相加的支持情况，确认 `concat` 路径已正确处理。
 
 ---
 
 ## 二、Current State Analysis
 
-### 2.1 Bug 现象
+### 2.1 问题现象
 
-**测试代码** [example/test.aura:7-13](file:///d:/you/Aura/example/test.aura#L7)：
+**测试代码**：
 
 ```aura
-fun test_basic_closure(io: Io) {
-    let greeting = "Hello"
-    let say_hello = fun() {
-        io.println(greeting + " from closure!")  // 捕获 greeting
-    }
-    say_hello()
+for i in range(0, 5000) {
+    let s = "iter " + i + " step " + i + " done"
 }
 ```
 
-**生成的 C++** [example/test.cpp:34-43](file:///d:/you/Aura/example/test.cpp#L34)：
+**当前生成 C++**（5 节点混合链退化为 4 次嵌套 concat）：
 
 ```cpp
-aura_rt::task<void> test_basic_closure(aura_rt::Io io) {
-    aura_rt::GcString* greeting_raw = aura_rt::make_string("Hello");
-    aura_rt::GcRootHandle<aura_rt::GcString*> greeting(greeting_raw);
-    auto say_hello = [greeting, io]() -> aura_rt::task<void> {  // ❌ 拷贝已 delete
-        co_await io.println(aura_rt::concat(greeting.get(), aura_rt::make_string(" from closure!")));
-        co_return;
-    };
-    co_await say_hello();
-    co_return;
-}
+aura_rt::concat(
+    aura_rt::concat(
+        aura_rt::concat(
+            aura_rt::concat(
+                aura_rt::make_string("iter "), i
+            ),
+            aura_rt::make_string(" step ")
+        ), i
+    ),
+    aura_rt::make_string(" done")
+);
 ```
 
-**编译错误** [example/output.txt](file:///d:/you/Aura/example/output.txt)：
+**期望生成**（1 次 concat_multi 调用）：
 
-```
-example/test.cpp:37:18: error: use of deleted function
-  'aura_rt::GcRootHandle<T>::GcRootHandle(const aura_rt::GcRootHandle<T>&)
-  [with T = aura_rt::GcString*]'
-  37 | auto say_hello = [greeting, io]() -> aura_rt::task<void> {
+```cpp
+aura_rt::concat_multi({
+    aura_rt::make_string("iter "),
+    aura_rt::GcString::from(i),
+    aura_rt::make_string(" step "),
+    aura_rt::GcString::from(i),
+    aura_rt::make_string(" done")
+});
 ```
 
 ### 2.2 根因
 
-[runtime/gc.h:47-67](file:///d:/you/Aura/runtime/gc.h#L47) 当前 `GcRootHandle`：
+[ExprGen.cpp:258-299](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L258) `collectStringChain` 的 `isStringExpr` 判定过严：
 
 ```cpp
-template <typename T>
-class GcRootHandle {
-public:
-    GcRootHandle(T& ref);
-    ~GcRootHandle();
-    GcRootHandle(const GcRootHandle&) = delete;          // ← 拷贝 delete
-    GcRootHandle& operator=(const GcRootHandle&) = delete;
-    void rebind(T& ref) { ptr_ = &ref; }
-    T& operator*()  const { return *ptr_; }
-    T* operator->() const { return ptr_; }
-    T  get()        const { return *ptr_; }
-private:
-    T* ptr_;   // ← 指向栈上变量
-    friend class GcHeap;
+auto isStringExpr = [this](const std::string& s) -> bool {
+    if (s.find("aura_rt::make_string") != std::string::npos
+        || s.find("->to_string") != std::string::npos
+        || s.find(".to_string") != std::string::npos
+        || s.find("aura_rt::concat") != std::string::npos
+        || s.find("aura_rt::string_concat") != std::string::npos
+        || s.find("aura_rt::concat_multi") != std::string::npos) {
+        return true;
+    }
+    auto stripGet = [](const std::string& in) -> std::string { ... };
+    return stringVarNames_.count(stripGet(s)) > 0;
 };
+
+if (!isStringExpr(right)) return {};   // ← 遇到 int/bool 节点直接放弃整链
 ```
 
-**问题**：
-- `GcRootHandle` 设计为栈上包装，`ptr_` 指向栈上变量
-- 拷贝 delete 防止双 `unregisterRoot`
-- 但 lambda 按值捕获需要拷贝构造 → 编译失败
+**问题**：链中遇到 `int32_t` / `bool` / `double` 节点时，`isStringExpr` 返回 false，整个链退化为空 vector。
 
-### 2.3 影响范围
+### 2.3 普通 `string + 其它类型` 相加的审查结果
 
-任何闭包捕获 GC 指针类型变量（`GcString*` / `Array<T>*` / 用户记录类型指针）的场景都编译失败。
+**审查结论：✅ 已正确支持**
 
-**已知受影响场景**：
-- 同步闭包（如 `test_basic_closure`）— 当前 test.aura 全部是这种
-- 返回闭包（如 `make_greeting(prefix: string) -> fun() -> string`）— 未来场景
+[string.h:103-137](file:///d:/you/Aura/runtime/builtin/string.h#L103) 已提供完整 `operator+` 重载矩阵：
 
-### 2.4 为何不用方案 A/B/C
-
-| 方案 | 缺陷 |
+| 表达式 | 重载 |
 |:---|:---|
-| A. 闭包按引用捕获 `[&name]` | 返回闭包场景悬空引用 |
-| B. 改造 `GcRootHandle` 存值 | 影响所有栈上变量路径，改动大风险高 |
-| C. `GcRootHandle` 加移动构造 | 解决不了返回闭包场景（栈帧销毁后 `ptr_` 悬空） |
+| `GcString + GcString` | `operator+(const GcString&, const GcString&)` |
+| `GcString + int32_t` | `operator+(const GcString&, int32_t)` |
+| `int32_t + GcString` | `operator+(int32_t, const GcString&)` |
+| `GcString + double` | `operator+(const GcString&, double)` |
+| `double + GcString` | `operator+(double, const GcString&)` |
+| `GcString + bool` | `operator+(const GcString&, bool)` |
+| `bool + GcString` | `operator+(bool, const GcString&)` |
+| `GcString + ToString` | 模板 `operator+(const GcString&, const T&)` |
+
+[string.h:150-156](file:///d:/you/Aura/runtime/builtin/string.h#L150) `concat` 函数的别名重载也完整覆盖所有组合。
+
+[ExprGen.cpp:347-349](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L347) CodeGen 路径：
+
+```cpp
+if (leftIsStr || rightIsStr) {
+    return "aura_rt::concat(" + left + ", " + right + ")";
+}
+```
+
+**只要 left 或 right 有一方是 string**，就生成 `aura_rt::concat(left, right)`，由 C++ 重载决议选择正确的 `concat` 重载。
+
+**已验证场景**：
+- `let s = "iter " + i`（string + int）→ `concat(make_string("iter "), i)` ✅
+- `let s = i + " step"`（int + string）→ `concat(i, make_string(" step"))` ✅
+- `let s = greeting + 42`（string 变量 + int）→ `concat(greeting.get(), 42)` ✅
+- `let s = 3.14 + greeting`（float + string 变量）→ `concat(3.14, greeting.get())` ✅
+
+**结论**：普通 `string + 其它类型` 相加**已正确支持**，无需修改。
+
+**唯一缺陷**：混合类型链不触发 `concat_multi`，本 plan 解决此问题。
+
+### 2.4 影响范围
+
+| 场景 | 当前行为 | 修复后 |
+|:---|:---|:---|
+| 纯 string 链（`a + b + c + d`） | ✅ 触发 `concat_multi` | ✅ 不变 |
+| 混合类型链（`"iter " + i + " step"`） | ❌ 退化为嵌套 concat | ✅ 触发 `concat_multi` |
+| 2 节点链（`"iter " + i`） | ✅ 用 `concat` | ✅ 不变（链长 < 3） |
+| 纯数值链（`1 + 2 + 3`） | ✅ 用 `+`（数值加法） | ✅ 不变（链根非 string） |
+| 含自定义 `ToString` 类型的链 | ✅ 触发 `concat_multi` | ✅ 不变 |
 
 ---
 
@@ -109,198 +135,210 @@ private:
 
 | 文件 | 改动 | 行数 |
 |:---|:---|:---:|
-| [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) | 新增 `GcSharedRoot<T>` 模板类 | +45 |
-| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genFunExpr` 捕获列表改用 init-capture | +15 |
-| **合计** | | **+60** |
+| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `collectStringChain` 放宽中间节点判定 + `genBinaryExpr` 对非 string 节点插入 `GcString::from` 转换 | +20 / -5 |
+| **合计** | | **+20** |
 
 ### 3.2 具体修改
 
-#### 3.2.1 新增 `GcSharedRoot<T>` 模板类
+#### 3.2.1 `collectStringChain` 放宽中间节点判定
 
-[runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) 在 `GcRootHandle` 定义之后插入：
+[ExprGen.cpp:258-299](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L258) 当前：
 
 ```cpp
-// ============================================================
-// GcSharedRoot<T> — 闭包捕获 GC 根的共享所有权版本
-//
-// 与 GcRootHandle<T> 互补：
-// - GcRootHandle：栈上包装，不可拷贝，ptr_ 指向栈变量
-// - GcSharedRoot：堆上独立存值，可拷贝，专为闭包捕获设计
-//
-// 使用场景：闭包 lambda 按值捕获 GC 指针类型变量时，
-// 用 GcSharedRoot 包装，每个 lambda 副本独立持有 GC 根。
-// ============================================================
-template <typename T>
-class GcSharedRoot {
-public:
-    explicit GcSharedRoot(T val) : ptr_(new T(val)) {
-        GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
-    }
+std::vector<std::string> CodeGenerator::collectStringChain(const BinaryExpr& e,
+                                                           bool isCoroutine) {
+    std::vector<std::string> parts;
 
-    ~GcSharedRoot() {
-        if (ptr_) {
-            GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
-            delete ptr_;
-            ptr_ = nullptr;
+    if (auto* leftBin = dynamic_cast<const BinaryExpr*>(e.left.get())) {
+        if (leftBin->op == "+") {
+            auto sub = collectStringChain(*leftBin, isCoroutine);
+            if (sub.empty()) return {};
+            parts.insert(parts.end(), sub.begin(), sub.end());
+        } else {
+            return {};
         }
+    } else {
+        parts.push_back(genExpr(*e.left, isCoroutine));
     }
 
-    // 拷贝构造：新对象独立堆分配 + 独立 register
-    GcSharedRoot(const GcSharedRoot& other) : ptr_(new T(*other.ptr_)) {
-        GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
-    }
+    std::string right = genExpr(*e.right, isCoroutine);
 
-    // 拷贝赋值：先 unregister 旧值，再分配新值
-    GcSharedRoot& operator=(const GcSharedRoot& other) {
-        if (this != &other) {
-            GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
-            delete ptr_;
-            ptr_ = new T(*other.ptr_);
-            GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
-        }
-        return *this;
-    }
+    // 验证右子也是 string 表达式 ← 问题所在
+    auto isStringExpr = [this](const std::string& s) -> bool { ... };
+    if (!isStringExpr(right)) return {};   // ← 遇到非 string 节点放弃整链
 
-    // 移动构造（C++17 起编译器为优化 lambda 捕获会用）
-    GcSharedRoot(GcSharedRoot&& other) noexcept : ptr_(other.ptr_) {
-        other.ptr_ = nullptr;
-    }
-
-    GcSharedRoot& operator=(GcSharedRoot&& other) noexcept {
-        if (this != &other) {
-            if (ptr_) {
-                GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
-                delete ptr_;
-            }
-            ptr_ = other.ptr_;
-            other.ptr_ = nullptr;
-        }
-        return *this;
-    }
-
-    // 读取值（与 GcRootHandle::get() 兼容）
-    T get() const { return *ptr_; }
-
-    // 非 const 版本：返回引用，支持 `s.get() = value` 赋值
-    T& get() { return *ptr_; }
-
-    // 显式 set
-    void set(T val) { *ptr_ = val; }
-
-private:
-    T* ptr_;  // 堆上持有值，独立于栈帧生命周期
-};
-```
-
-**关键设计**：
-- **堆上存值**：`ptr_ = new T(val)`，与栈帧无关
-- **拷贝即独立根**：每个副本独立 register/unregister，无别名
-- **复用 `registerGlobalRoot`**：与 `GcGlobalRoot` 机制相同
-- **提供 `get()` 非 const 重载**：与已修复的 `GcRootHandle::get()` 保持一致，支持 `s.get() = value`
-
-#### 3.2.2 CodeGen `genFunExpr` 改造（init-capture 方案）
-
-[src/CodeGen/ExprGen.cpp:527+](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L527) `genFunExpr` 闭包捕获列表生成路径：
-
-**当前**（伪代码）：
-```cpp
-auto lambda = [var1, var2, ...]() -> ... { ... }
-```
-
-**改造后**（C++14 init-capture）：
-```cpp
-// GC 类型变量用 init-capture 创建 GcSharedRoot 副本，名字不变
-// 非 GC 类型变量保持原样
-auto lambda = [greeting = aura_rt::GcSharedRoot<GcString*>(greeting.get()),
-              numbers  = aura_rt::GcSharedRoot<Array<int32_t>*>(numbers.get()),
-              var3, ...]() -> ... {
-    // 闭包体完全不变！内部 greeting.get() 调用 GcSharedRoot::get()
-    ...
+    parts.push_back(right);
+    return parts;
 }
 ```
 
-**关键设计**：
-- **init-capture 名字与外层变量同名** — 内部 `greeting` 遮蔽外层，但 `get()` 返回类型一致
-- **闭包体完全不改** — `greeting.get()` 调用从 `GcRootHandle::get()` 变为 `GcSharedRoot::get()`，返回类型相同
-- **仅 GC 类型变量改写** — 非 GC 类型变量（`int32_t` / `double` / `bool`）保持按值捕获
-
-**具体步骤**：
-
-1. 在 `CaptureArgScanner` 扫描出捕获列表后，对每个 GC 类型捕获变量改写捕获形式
-2. 闭包体生成逻辑**完全不变**
-
-**判定变量是否为 GC 指针类型**：
-- 复用现有的 `gcRootVarNames_` 集合（已在变量声明时注册）
-- 若变量名在 `gcRootVarNames_` 中，则改写为 `[name = aura_rt::GcSharedRoot<T>(name.get())]`
-
-**需注意的变量类型推导**：
-CodeGen 已在变量声明时知道其 C++ 类型（如 `GcString*` / `Array<T>*`），生成 init-capture 时直接拼接：
+**改为**（放宽中间节点判定，不验证类型）：
 
 ```cpp
-[name = aura_rt::GcSharedRoot<CPP_TYPE>(name.get())]
-```
+std::vector<std::string> CodeGenerator::collectStringChain(const BinaryExpr& e,
+                                                           bool isCoroutine) {
+    std::vector<std::string> parts;
 
-### 3.4 生成的 C++ 示例
+    // 递归左子树：仅当左子是 BinaryExpr(+) 时继续收集
+    if (auto* leftBin = dynamic_cast<const BinaryExpr*>(e.left.get())) {
+        if (leftBin->op == "+") {
+            auto sub = collectStringChain(*leftBin, isCoroutine);
+            if (sub.empty()) return {};
+            parts.insert(parts.end(), sub.begin(), sub.end());
+        } else {
+            return {};
+        }
+    } else {
+        // 叶子节点：直接收集（不验证类型）
+        parts.push_back(genExpr(*e.left, isCoroutine));
+    }
 
-[test.cpp:34-43](file:///d:/you/Aura/example/test.cpp#L34) `test_basic_closure` 改造后：
-
-```cpp
-aura_rt::task<void> test_basic_closure(aura_rt::Io io) {
-    aura_rt::GcString* greeting_raw = aura_rt::make_string("Hello");
-    aura_rt::GcRootHandle<aura_rt::GcString*> greeting(greeting_raw);
-
-    // init-capture：闭包内 greeting 是 GcSharedRoot<GcString*>，遮蔽外层
-    auto say_hello = [greeting = aura_rt::GcSharedRoot<aura_rt::GcString*>(greeting.get()), io]() -> aura_rt::task<void> {
-        // 闭包体完全不变！greeting.get() 调用 GcSharedRoot::get()
-        co_await io.println(aura_rt::concat(greeting.get(), aura_rt::make_string(" from closure!")));
-        co_return;
-    };
-    co_await say_hello();
-    co_return;
+    // 右子节点：直接收集（不验证类型）
+    // 类型判定延迟到 genBinaryExpr 生成 concat_multi 时处理
+    parts.push_back(genExpr(*e.right, isCoroutine));
+    return parts;
 }
 ```
 
 **关键变化**：
-- lambda 捕获列表中 `greeting` 改为 init-capture：`greeting = aura_rt::GcSharedRoot<...>(greeting.get())`
-- 闭包体内 `greeting.get()` 调用**完全不变**（内部 `greeting` 类型变了，但 `get()` 返回类型一致）
-- 无需新增 `_shared` 后缀变量，无需修改闭包体引用
+- 删除 `isStringExpr` lambda + `if (!isStringExpr(right)) return {};` 判定
+- 中间节点可以是任意类型（int / bool / double / string / ToString）
+- 类型判定延迟到 `genBinaryExpr` 生成 `concat_multi` 时处理
 
-### 3.5 返回闭包场景验证
+#### 3.2.2 `genBinaryExpr` 对非 string 节点插入 `GcString::from` 转换
 
-未来场景（当前 test.aura 未覆盖，但方案 D 支持）：
-
-```aura
-fun make_greeting(prefix: string) -> fun() -> string {
-    return fun() -> string { return prefix }
-}
-
-fun main() {
-    let g = make_greeting("Hi")
-    io.println(g())  // 输出 "Hi"
-}
-```
-
-**生成的 C++**（init-capture 形式）：
+[ExprGen.cpp:333-345](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L333) 当前：
 
 ```cpp
-std::function<aura_rt::GcString*()> make_greeting(aura_rt::GcString* prefix_raw) {
-    aura_rt::GcRootHandle<aura_rt::GcString*> prefix(prefix_raw);
-
-    // init-capture：prefix 在闭包内是 GcSharedRoot，移动到返回 lambda
-    return [prefix = aura_rt::GcSharedRoot<aura_rt::GcString*>(prefix.get())]() -> aura_rt::GcString* {
-        return prefix.get();
-    };
-    // prefix 析构（unregisterRoot）
-    // init-capture 创建的 GcSharedRoot 移动到返回的 lambda 中，仍存活
-}
-
-void main() {
-    auto g = make_greeting(make_string("Hi"));
-    io.println(g());  // 闭包内 GcSharedRoot 仍存活，调用安全
+if (leftIsStr && rightIsStr) {
+    auto chain = collectStringChain(e, isCoroutine);
+    if (chain.size() >= 3) {
+        std::string result = "aura_rt::concat_multi({";
+        for (size_t i = 0; i < chain.size(); ++i) {
+            if (i) result += ", ";
+            result += chain[i];
+        }
+        result += "})";
+        return result;
+    }
 }
 ```
 
-**关键**：init-capture 创建的 `GcSharedRoot` 通过移动构造转移到返回的 lambda，独立于 `make_greeting` 的栈帧。
+**改为**（放宽触发条件 + 对非 string 节点用 `GcString::from` 包装）：
+
+```cpp
+// 链式 + 脱糖为 concat_multi（链长 ≥ 3 且链根为 string 时）
+// 链中可包含非 string 节点（int/bool/double），用 GcString::from 包装
+if (leftIsStr || rightIsStr) {
+    auto chain = collectStringChain(e, isCoroutine);
+    if (chain.size() >= 3 && isStringExprInChain(chain[0])) {
+        // 链根是 string，触发 concat_multi
+        std::string result = "aura_rt::concat_multi({";
+        for (size_t i = 0; i < chain.size(); ++i) {
+            if (i) result += ", ";
+            if (isStringExprInChain(chain[i])) {
+                result += chain[i];
+            } else {
+                // 非 string 节点（int/bool/double）用 GcString::from 包装
+                result += "aura_rt::GcString::from(" + chain[i] + ")";
+            }
+        }
+        result += "})";
+        return result;
+    }
+}
+
+if (leftIsStr || rightIsStr) {
+    return "aura_rt::concat(" + left + ", " + right + ")";
+}
+```
+
+**关键变化**：
+1. 触发条件从 `leftIsStr && rightIsStr` 放宽到 `leftIsStr || rightIsStr`
+2. 新增 `isStringExprInChain` 辅助函数判定单个节点是否为 string
+3. 链根（chain[0]）必须是 string（否则整链是数值加法，不应触发 concat_multi）
+4. 中间节点非 string 时用 `aura_rt::GcString::from(expr)` 包装
+
+#### 3.2.3 新增 `isStringExprInChain` 辅助函数
+
+`isStringExprInChain` 复用原 `collectStringChain` 中的 `isStringExpr` 逻辑，提取为成员函数：
+
+[CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) 新增私有方法声明：
+
+```cpp
+// 判定生成的 C++ 表达式是否为 GcString* 类型
+// 用于 collectStringChain 中识别 string 节点
+bool isStringExprInChain(const std::string& s) const;
+```
+
+[ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) 新增实现：
+
+```cpp
+bool CodeGenerator::isStringExprInChain(const std::string& s) const {
+    if (s.find("aura_rt::make_string") != std::string::npos
+        || s.find("->to_string") != std::string::npos
+        || s.find(".to_string") != std::string::npos
+        || s.find("aura_rt::concat") != std::string::npos
+        || s.find("aura_rt::string_concat") != std::string::npos
+        || s.find("aura_rt::concat_multi") != std::string::npos) {
+        return true;
+    }
+    // 检查已知 string 变量（含 GcRootHandle 包装后的 name.get()）
+    auto stripGet = [](const std::string& in) -> std::string {
+        if (in.size() > 6 && in.substr(in.size() - 6) == ".get()")
+            return in.substr(0, in.size() - 6);
+        return in;
+    };
+    return stringVarNames_.count(stripGet(s)) > 0;
+}
+```
+
+### 3.3 生成的 C++ 示例
+
+**测试代码** [example/test.aura](file:///d:/you/Aura/example/test.aura)（重写测试用例）：
+
+```aura
+fun main(io: Io) {
+    for i in range(0, 5000) {
+        let s = "iter " + i + " step " + i + " done"
+    }
+    let info = gc_stats()
+    io.println(info)
+}
+```
+
+**修复后生成 C++**：
+
+```cpp
+for (auto i : std::views::iota(0, 5000)) {
+    aura_rt::GcString* s_raw = aura_rt::concat_multi({
+        aura_rt::make_string("iter "),
+        aura_rt::GcString::from(i),
+        aura_rt::make_string(" step "),
+        aura_rt::GcString::from(i),
+        aura_rt::make_string(" done")
+    });
+    aura_rt::GcRootHandle<aura_rt::GcString*> s(s_raw);
+}
+```
+
+**关键变化**：
+- 5 节点链从 4 次嵌套 `concat` → 1 次 `concat_multi`
+- `int32_t i` 节点用 `aura_rt::GcString::from(i)` 包装为 `GcString*`
+- 1 次 GC 分配替代 4 次，预计 `alloc` / `young` 大幅下降
+
+### 3.4 各种场景的生成结果
+
+| Aura 表达式 | 修复前 | 修复后 |
+|:---|:---|:---|
+| `a + b + c + d`（全 string 变量） | `concat_multi({a, b, c, d})` | 不变 |
+| `"x" + 42 + "y"` | `concat(concat(make_string("x"), 42), make_string("y"))` | `concat_multi({make_string("x"), GcString::from(42), make_string("y")})` |
+| `"x" + 1 + 2 + "y"` | 嵌套 concat | `concat_multi({make_string("x"), GcString::from(1), GcString::from(2), make_string("y")})` |
+| `"x" + 3.14 + "y"` | 嵌套 concat | `concat_multi({make_string("x"), GcString::from(3.14), make_string("y")})` |
+| `"x" + flag + "y"`（flag: bool） | 嵌套 concat | `concat_multi({make_string("x"), GcString::from(flag), make_string("y")})` |
+| `1 + 2 + 3`（纯数值） | `1 + 2 + 3`（C++ 数值加法） | 不变（链根非 string，不触发） |
+| `"x" + 42`（2 节点） | `concat(make_string("x"), 42)` | 不变（链长 < 3） |
+| `"x" + obj`（obj 是 ToString 类型） | `concat_multi({make_string("x"), obj})` | 不变（obj.to_string 已是 GcString*） |
 
 ---
 
@@ -308,29 +346,43 @@ void main() {
 
 ### 4.1 关键假设
 
-1. **`registerGlobalRoot` 机制稳定**：已被 `GcGlobalRoot<GcString>`（empty/true/false 单例、小整数缓存）验证过
-2. **`GcObject**` 转型安全**：`T` 是 `GcString*` / `Array<T>*` 等 GC 指针类型，转型为 `GcObject**` 后 `[ptr_]` 即 `GcObject*`
-3. **闭包捕获数量有限**：通常 1-3 个 GC 变量，`globalRoots_` 增长可控
+1. **`GcString::from(int32_t/double/bool)` 已存在**：[string.h:41-43](file:///d:/you/Aura/runtime/builtin/string.h#L41) + [string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 已实现
+2. **链根判定足够**：只要链根是 string，整链结果必为 string（因 `string + T` 始终返回 `GcString*`）
+3. **`isStringExprInChain` 准确率**：复用现有 `isStringExpr` 逻辑，已验证可识别 `make_string` / `concat` / `to_string` / `stringVarNames_` 中的变量
 
 ### 4.2 决策
 
 | 决策 | 选择 | 理由 |
 |:---|:---|:---|
-| 新增类 vs 改造 `GcRootHandle` | 新增 `GcSharedRoot` | 不破坏现有 `GcRootHandle` 语义，零迁移成本 |
-| 堆分配 vs 栈分配 | 堆分配 | 闭包可能逃逸出栈帧，必须堆分配 |
-| `registerGlobalRoot` vs `registerRoot` | `registerGlobalRoot` | 与 `GcGlobalRoot` 一致，独立于 `roots_` |
-| 拷贝 vs 移动 | 同时提供 | 拷贝支持 lambda 副本，移动支持 lambda 返回 |
-| lambda 捕获形式 | **C++14 init-capture** | 闭包体无需修改，名字遮蔽语义清晰 |
-| 不选 `_shared` 后缀方案 | 命名冗余，需维护映射 | init-capture 名字相同更简洁 |
+| 触发条件 | `leftIsStr \|\| rightIsStr` 且链根是 string | 链根是 string 即可保证整链结果为 string |
+| 非 string 节点转换 | `aura_rt::GcString::from(expr)` | 复用已有 API，支持 int/double/bool |
+| 不扩展 `concat_multi` 运行时 API | 保持 `initializer_list<const GcString*>` | 简单，无需新增 variant 重载 |
+| 链长阈值 | `>= 3` 不变 | 链长 2 用 `concat` 已足够 |
+| 不支持自定义类型转换 | 仅支持 int/double/bool | 自定义 `ToString` 类型已被 `isStringExprInChain` 识别为 string，无需转换 |
 
-### 4.3 不破坏现有功能验证
+### 4.3 链根为何必须是 string
 
-| 现有调用点 | 是否受影响 | 说明 |
+**反例**：`1 + 2 + "x"`（链根是 int）
+
+如果放宽到链根非 string 也触发 `concat_multi`：
+```cpp
+concat_multi({1, 2, make_string("x")})  // ❌ 1+2 应是数值加法
+```
+
+但 `1 + 2 + "x"` 实际语义是 `(1 + 2) + "x"` = `int + string` = `GcString*`，可以触发 `concat_multi`。
+
+但 CodeGen 难以静态判定 `1 + 2` 的结果类型（数值加法 vs 字符串拼接）。保守策略：**链根必须是 string 才触发 concat_multi**，避免误判数值加法。
+
+如果用户写 `1 + 2 + "x"`，退化为 `concat(concat(1, 2), make_string("x"))` — `concat(1, 2)` 会编译失败（无 `concat(int, int)` 重载）。**这是 Aura 语义限制**：`1 + 2 + "x"` 在 Aura 中是非法的（应改为 `(1 + 2) + "x"` 或 `"" + 1 + 2 + "x"`）。
+
+### 4.4 不破坏现有功能验证
+
+| 现有场景 | 是否受影响 | 说明 |
 |:---|:---:|:---|
-| [StmtGen.cpp:165-169](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L165) `GcRootHandle<T> name(raw)` | ❌ | 仍用 `GcRootHandle` |
-| [ExprGen.cpp:84-86](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L84) `name + ".get()"` | ❌ | `GcRootHandle` 不变 |
-| [gc.cpp:347-350](file:///d:/you/Aura/runtime/gc.cpp#L347) `rootHandle->get()` | ❌ | `GcRootHandle` 不变 |
-| 闭包捕获 GC 变量 | ✅ 改造 | 改用 `GcSharedRoot` |
+| 纯 string 链（`a + b + c + d`） | ❌ | 链根 string + 全 string 节点，生成不变 |
+| 2 节点 string + T | ❌ | 链长 < 3，仍用 `concat` |
+| 数值加法（`1 + 2 + 3`） | ❌ | 链根非 string，不触发 |
+| 含 `to_string()` 节点 | ❌ | `to_string` 被 `isStringExprInChain` 识别为 string，不转换 |
 
 ---
 
@@ -338,112 +390,124 @@ void main() {
 
 ### 5.1 编译验证
 
-1. 修改 [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) 新增 `GcSharedRoot<T>`
-2. 修改 [src/CodeGen/CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) + [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp)
-3. 重新编译 [example/test.cpp](file:///d:/you/Aura/example/test.cpp)
-4. 确认无 `use of deleted function` 错误
+1. 修改 [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp)
+2. 修改 [src/CodeGen/CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) 加 `isStringExprInChain` 声明
+3. 重新生成 [example/test.cpp](file:///d:/you/Aura/example/test.cpp)
+4. 检查生成的 C++ 中是否出现 `concat_multi({..., GcString::from(i), ...})`
+5. 编译通过
 
 ### 5.2 运行时验证
 
-运行 [example/test.aura](file:///d:/you/Aura/example/test.aura) 全部 9 个测试用例：
-
-| 测试 | 预期输出 |
-|:---|:---|
-| 1. `test_basic_closure` | `Hello from closure!` |
-| 2. `test_math_closure` | `Square of 5: 25` |
-| 3. `test_higher_order` | `Apply twice double(10): 40` |
-| 4. `test_closure_factory` | `Triple 7: 21` |
-| 5. `test_generic_mapper` | `Doubled list: 2,4,6` + `Lengths: 1,2,3` |
-| 6. `test_nested_closure` | `Nested closure compute: 7` |
-| 7. `test_closure_exception` | `10 / 2 = 5` + `Caught: division by zero` |
-| 8. `test_recursive_closure` | `Factorial 5 = 120` |
-| 9. `main` | `=== All closure tests passed ===` + `gc_stats` |
-
-### 5.3 GC 行为验证
-
-**关键验证点**：
-- init-capture 创建的 `GcSharedRoot` 在 lambda 析构时调 `unregisterGlobalRoot` + `delete ptr_`
-- 闭包执行期间 `GcSharedRoot` 内的 `GcString*` 不会被 GC 回收
-- `gc_stats` 输出合理（无内存泄漏，`live` 数量稳定）
-
-### 5.4 返回闭包场景验证（可选，未来扩展）
-
-构造测试用例验证返回闭包捕获 GC 变量：
+**测试 1：混合类型链**
 
 ```aura
-fun make_greeting(prefix: string) -> fun() -> string {
-    return fun() -> string { return prefix }
-}
-
 fun main(io: Io) {
-    let g = make_greeting("Hi")
-    io.println(g())  // 输出 "Hi"
+    for i in range(0, 5000) {
+        let s = "iter " + i + " step " + i + " done"
+    }
+    let info = gc_stats()
+    io.println(info)
 }
 ```
 
-**预期**：编译通过 + 运行正确（init-capture 创建的 `GcSharedRoot` 通过移动构造转移到返回 lambda，独立于 `make_greeting` 栈帧）。
+**预期 GC 统计**：
+- `alloc` 大幅下降（从 4 次分配 → 1 次分配）
+- `young` 大幅下降（无中间 concat 对象）
+- `live` 大幅下降（无中间对象）
 
-### 5.5 回归测试
+**对比之前测试结果**（`alloc=2367KB young=63KB live=1336`）：
+- `alloc` 预计降到 ~600KB（1/4）
+- `young` 预计降到 ~20KB
+- `live` 预计降到 ~5000（仅 final 字符串）
 
-运行 [TODO.txt](file:///d:/you/Aura/TODO.txt) 中提到的所有现有测试，确认：
+**测试 2：纯 string 链**
+
+```aura
+fun main(io: Io) {
+    let a = "a"
+    let b = "b"
+    let c = "c"
+    let d = "d"
+    for i in range(0, 5000) {
+        let s = a + b + c + d
+    }
+    let info = gc_stats()
+    io.println(info)
+}
+```
+
+**预期**：行为不变（纯 string 链已正确触发 `concat_multi`）
+
+**测试 3：链根非 string**
+
+```aura
+fun main(io: Io) {
+    for i in range(0, 100) {
+        let s = 1 + 2 + "x"   // ← 应编译失败或运行错误
+    }
+}
+```
+
+**预期**：CodeGen 不触发 `concat_multi`（链根非 string），fallback 到嵌套 `concat`，`concat(1, 2)` 无匹配重载，编译失败 — 这是 Aura 语义限制，预期行为。
+
+### 5.3 回归测试
+
+运行 [example/test.aura](file:///d:/you/Aura/example/test.aura)（含闭包测试用例）和所有现有测试，确认：
 - 字符串拼接行为不变
 - GC 行为不变
-- 无 crash / 无内存错误
-- 现有 `let s = <init>` 直接初始化的测试仍通过
-- GcString 优化 Step 1-3 测试仍通过
+- 纯 string 链仍触发 `concat_multi`
+- 2 节点链仍用 `concat`
+
+### 5.4 边界场景验证
+
+| 场景 | 测试代码 | 预期 |
+|:---|:---|:---|
+| 3 节点全 string | `a + b + c` | `concat_multi({a, b, c})` |
+| 3 节点含 int | `"x" + i + "y"` | `concat_multi({make_string("x"), GcString::from(i), make_string("y")})` |
+| 5 节点混合 | `"x" + i + "y" + flag + "z"` | `concat_multi({..., GcString::from(i), ..., GcString::from(flag), ...})` |
+| 2 节点 | `"x" + i` | `concat(make_string("x"), i)` |
+| 链根 int | `1 + "x"` | `concat(1, make_string("x"))` |
+| 链根 int + 链长 3 | `1 + 2 + "x"` | 编译失败（Aura 语义限制） |
 
 ---
 
 ## 六、可能的风险与应对方案
 
-### 6.1 风险一：`registerGlobalRoot` 在 `GcSharedRoot` 构造前被调用
+### 6.1 风险一：链根判定错误
 
-**问题**：`GcSharedRoot<T>` 构造时，`T val` 参数可能是 GC 分配的新对象，若 GC 在构造中途触发，`ptr_` 尚未初始化。
-
-**应对**：
-- ✅ `ptr_ = new T(val)` 在 `registerGlobalRoot` 之前完成
-- ✅ 构造顺序：先 `new T(val)` → 再 `registerGlobalRoot` → GC 触发时 `ptr_` 已指向有效对象
-- ✅ 已在代码中按此顺序实现
-
-### 6.2 风险二：`globalRoots_` 列表膨胀
-
-**问题**：每个闭包捕获的 GC 变量都注册到 `globalRoots_`，可能导致 markPhase 遍历成本上升。
+**问题**：`isStringExprInChain(chain[0])` 误判，导致数值加法链被错误触发 `concat_multi`。
 
 **应对**：
-- ✅ 闭包通常少量捕获（1-3 个变量）
-- ✅ 闭包作用域结束时 `GcSharedRoot` 析构，自动 unregister
-- ⚠️ 若闭包长期存活（如存储到 `Array<fun()>`），`globalRoots_` 会持续增长 — 这是预期行为，闭包持有的 GC 根必须存活
+- ✅ `isStringExprInChain` 复用经验证的 `isStringExpr` 逻辑
+- ✅ 数值表达式（`1`、`i`、`a + b`）不会被识别为 string
+- ✅ 即使误判，C++ 编译会失败（`GcString::from` 不接受任意类型），不会运行时错误
 
-### 6.3 风险三：`reinterpret_cast<GcObject**>(ptr_)` 类型安全
+### 6.2 风险二：`GcString::from` 不支持自定义类型
 
-**问题**：`ptr_` 是 `T*`（如 `GcString**`），转型为 `GcObject**` 是否安全。
-
-**应对**：
-- ✅ `GcString` 继承自 `GcObject`（[string.h:9](file:///d:/you/Aura/runtime/builtin/string.h#L9) `struct GcString : GcObject`）
-- ✅ `GcString*` 可安全 `reinterpret_cast` 为 `GcObject*`（首地址相同）
-- ✅ `GcString**` 转 `GcObject**` 安全：指向指针的指针，指针本身大小相同
-- ✅ `GcGlobalRoot<T>` 已用此模式验证（[gc.h:120-126](file:///d:/you/Aura/runtime/gc.h#L120)）
-
-### 6.4 风险四：移动构造后原对象 `ptr_` 为 nullptr
-
-**问题**：移动构造后原对象的 `ptr_` 被置为 `nullptr`，若原对象析构时调 `unregisterGlobalRoot(nullptr)` 是否安全。
+**问题**：链中含自定义 `ToString` 类型时，`GcString::from(obj)` 编译失败（无此重载）。
 
 **应对**：
-- ✅ 析构函数已检查 `if (ptr_)`，nullptr 时不调 `unregisterGlobalRoot`
-- ✅ 移动赋值也检查 `if (ptr_)` 后再 unregister 旧值
+- ✅ 自定义 `ToString` 类型已被 `isStringExprInChain` 识别为 string（通过 `.to_string` / `->to_string` 检测）
+- ✅ 不会进入 `GcString::from` 转换分支
+- ⚠️ 极端情况：用户类型未实现 `to_string` 但希望参与拼接 — 当前 Aura 语义不支持，需先实现 `to_string` 方法
 
-### 6.5 风险五：init-capture 类型推导与名字遮蔽
+### 6.3 风险三：链中含 GcString 字面量以外的 string 表达式
 
-**问题**：
-1. init-capture 名字与外层变量同名，编译器是否正确处理遮蔽？
-2. init-capture 的 `GcSharedRoot` 临时对象生命周期是否正确？
+**问题**：链中含 `arr[0]`（数组元素为 string）或 `obj.field`（字段为 string）时，`isStringExprInChain` 可能不识别。
 
 **应对**：
-- ✅ C++14 标准明确允许 init-capture 名字与外层同名（[expr.prim.lambda.capture]）
-- ✅ 内部 `greeting` 类型为 `GcSharedRoot<GcString*>`，遮蔽外层 `GcRootHandle<GcString*>`
-- ✅ init-capture 的临时对象在 lambda 构造时创建，生命周期与 lambda 相同
-- ✅ lambda 拷贝/移动时 `GcSharedRoot` 的拷贝/移动构造被调用（已实现）
-- ⚠️ 闭包体内若取 `auto& ref = greeting`（非 const 引用），引用的是内部 `GcSharedRoot` — 这是预期行为
+- ⚠️ 当前 `isStringExprInChain` 仅识别 `make_string` / `concat` / `to_string` / `stringVarNames_` 中的变量
+- ⚠️ `arr[0]` / `obj.field` 会被识别为非 string，触发 `GcString::from(arr[0])` — 编译失败
+- ✅ 缓解：用户可先 `let s = arr[0]` 提取为变量（被加入 `stringVarNames_`），再参与拼接
+- 🟡 未来改进：Sema 提供表达式类型信息，CodeGen 直接查询而非字符串匹配
+
+### 6.4 风险四：`isStringExprInChain` 性能
+
+**问题**：每个节点调用 `isStringExprInChain`（含多次 `std::string::find`），链长 N 时复杂度 O(N × 字符串长度)。
+
+**应对**：
+- ✅ 链长通常 < 10，字符串长度 < 100，性能可忽略
+- ✅ 仅在 `+` 表达式中触发，非热点路径
 
 ---
 
@@ -451,11 +515,11 @@ fun main(io: Io) {
 
 | 步骤 | 操作 | 验证 | 可回滚 |
 |:---:|:---|:---|:---:|
-| 1 | [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) 新增 `GcSharedRoot<T>` 模板类 | 编译通过（独立编译单元） | ✅ |
-| 2 | [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) `genFunExpr` 捕获列表改用 init-capture | 重新生成 [test.cpp](file:///d:/you/Aura/example/test.cpp) | ✅ |
-| 3 | 重新编译 [example/test.cpp](file:///d:/you/Aura/example/test.cpp) | 无 `use of deleted function` 错误 | ✅ |
-| 4 | 运行 [example/test.aura](file:///d:/you/Aura/example/test.aura) | 9 个测试用例全部通过 | ✅ |
-| 5 | 回归测试 | 现有测试不破坏 | ✅ |
+| 1 | [src/CodeGen/CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) 加 `isStringExprInChain` 声明 | 编译通过 | ✅ |
+| 2 | [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) 加 `isStringExprInChain` 实现 + 重构 `collectStringChain` | 编译通过 | ✅ |
+| 3 | [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) 改造 `genBinaryExpr` 触发条件 + 节点转换 | 重新生成 [test.cpp](file:///d:/you/Aura/example/test.cpp) | ✅ |
+| 4 | 编译 + 运行 [example/test.aura](file:///d:/you/Aura/example/test.aura) | GC 统计改善 | ✅ |
+| 5 | 回归测试 | 现有功能不破坏 | ✅ |
 
 **每步独立编译 + 测试，失败可立即回滚。**
 
@@ -465,9 +529,9 @@ fun main(io: Io) {
 
 | 文件 | 改动 | 净增行数 |
 |:---|:---|:---:|
-| [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) | `GcSharedRoot<T>` 模板类 | +45 |
-| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genFunExpr` 捕获列表改用 init-capture | +15 |
-| **合计** | | **+60** |
+| [src/CodeGen/CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) | `isStringExprInChain` 声明 | +2 |
+| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | 重构 `collectStringChain` + 改造 `genBinaryExpr` + 新增 `isStringExprInChain` 实现 | +18 / -5 |
+| **合计** | | **+20** |
 
 ---
 
@@ -475,14 +539,13 @@ fun main(io: Io) {
 
 完成本修复后：
 
-- [example/test.aura](file:///d:/you/Aura/example/test.aura) 9 个闭包测试用例编译运行通过
-- 闭包捕获 GC 指针变量场景完整支持（同步调用 + 返回闭包）
-- `GcRootHandle`（栈上）与 `GcSharedRoot`（堆上）分工明确：
-  - `GcRootHandle`：局部变量 GC 根，不可拷贝，零开销
-  - `GcSharedRoot`：闭包捕获 GC 根，可拷贝，堆分配
+- [example/test.aura](file:///d:/you/Aura/example/test.aura) `let s = "iter " + i + " step " + i + " done"` 触发 `concat_multi`
+- GcString 优化 Step 3 完整支持混合类型链，标记为 ✅ 已完成
+- [TODO.txt §六](file:///d:/you/Aura/TODO.txt#L229) Step 3 状态从 `[~]` 改为 `[x]`
 - 未来可考虑：
-  - 若性能 profiling 显示 `GcSharedRoot` 堆分配是热点，可引入 small-object pool 优化
-  - 若需更复杂所有权（多闭包共享同一 GC 根），可引入 `std::shared_ptr<GcSharedRoot<T>>` 模式
+  - Sema 提供表达式类型信息，CodeGen 直接查询（替代字符串匹配）
+  - 扩展 `concat_multi` 支持 `ToString` 自定义类型（虽然当前 `to_string` 已识别为 string）
+  - GcString 优化第二阶段（capacity + Builder + slice）
 
 ---
 
@@ -490,6 +553,53 @@ fun main(io: Io) {
 
 | 现有 plan 项 | 状态 | 关系 |
 |:---|:---:|:---|
-| [TODO.txt GcRootHandle 赋值 bug](file:///d:/you/Aura/TODO.txt) | ✅ 已完成 | 同源问题，本 plan 是其延伸 |
-| [plan/gc_promotion_issues.md 缺陷 2 写屏障](file:///d:/you/Aura/plan/gc_promotion_issues.md) | ✅ 已完成 | 写屏障针对字段赋值，与本 plan 独立 |
-| [plan/gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) | 进行中 | GcString 优化不受本 plan 影响 |
+| [TODO.txt §六 Step 3](file:///d:/you/Aura/TODO.txt#L229) | `[~]` 部分完成 | 本 plan 完成后改为 `[x]` |
+| [plan/gcstring_optimization.md §A4](file:///d:/you/Aura/plan/gcstring_optimization.md) | 进行中 | 本 plan 完成 §A4 的混合类型链支持 |
+| [plan/gc_promotion_issues.md](file:///d:/you/Aura/plan/gc_promotion_issues.md) | ✅ 已完成 | 独立，无影响 |
+| GcSharedRoot 闭包 GC 根 | ✅ 已完成 | 独立，无影响 |
+
+---
+
+## 十一、附录：普通 `string + 其它类型` 相加的完整支持矩阵
+
+### 11.1 `operator+` 重载（[string.h:103-137](file:///d:/you/Aura/runtime/builtin/string.h#L103)）
+
+| 表达式 | C++ 重载 | 已支持 |
+|:---|:---|:---:|
+| `GcString + GcString` | `operator+(const GcString&, const GcString&)` | ✅ |
+| `GcString + int32_t` | `operator+(const GcString&, int32_t)` | ✅ |
+| `int32_t + GcString` | `operator+(int32_t, const GcString&)` | ✅ |
+| `GcString + double` | `operator+(const GcString&, double)` | ✅ |
+| `double + GcString` | `operator+(double, const GcString&)` | ✅ |
+| `GcString + bool` | `operator+(const GcString&, bool)` | ✅ |
+| `bool + GcString` | `operator+(bool, const GcString&)` | ✅ |
+| `GcString + ToString` | 模板 `operator+(const GcString&, const T&)` | ✅ |
+| `ToString + GcString` | 模板 `operator+(const T&, const GcString&)` | ✅ |
+
+### 11.2 `concat` 函数别名（[string.h:150-156](file:///d:/you/Aura/runtime/builtin/string.h#L150)）
+
+| 函数签名 | 已支持 |
+|:---|:---:|
+| `concat(GcString*, GcString*)` | ✅ |
+| `concat(GcString*, int32_t)` | ✅ |
+| `concat(int32_t, GcString*)` | ✅ |
+| `concat(GcString*, double)` | ✅ |
+| `concat(double, GcString*)` | ✅ |
+| `concat(GcString*, bool)` | ✅ |
+| `concat(bool, GcString*)` | ✅ |
+
+### 11.3 CodeGen 生成路径
+
+[ExprGen.cpp:347-349](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L347):
+
+```cpp
+if (leftIsStr || rightIsStr) {
+    return "aura_rt::concat(" + left + ", " + right + ")";
+}
+```
+
+**只要 left 或 right 有一方是 string**，就生成 `aura_rt::concat(left, right)`，由 C++ 重载决议选择正确重载。
+
+### 11.4 结论
+
+**普通 `string + 其它类型` 相加已完整支持，无需修改。** 本 plan 仅修复混合类型链的 `concat_multi` 触发问题。

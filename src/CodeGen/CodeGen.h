@@ -339,6 +339,9 @@ private:
     [[nodiscard]] std::vector<std::string> collectStringChain(const BinaryExpr& e,
                                                               bool isCoroutine);
 
+    // 判定生成的 C++ 表达式是否为 GcString* 类型（用于 concat_multi 的 GcString::from 转换）
+    [[nodiscard]] bool isStringExprInChain(const std::string& s) const;
+
     // 写屏障辅助：检测赋值目标是否为 GC 对象字段（obj.get()->field 或 this->field）
     [[nodiscard]] bool isGcFieldAssignment(const std::string& target) const;
 
