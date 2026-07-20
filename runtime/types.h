@@ -103,39 +103,41 @@ struct TypeDescriptor {
 // next 用于空闲链表或标记队列（由 gc.h 实现细节决定）。
 // ============================================================
 struct GcObject {
-    // vptr 自动生成（offset 0-7）
-    const TypeDescriptor* desc = nullptr;  // offset 8-15
-    GcObject* next = nullptr;              // offset 16-23
-    uint32_t allocSize_ = 0;               // offset 24-27  (单对象 < 4GB)
-    uint8_t  flags_ = 0;                    // offset 28
-        // bit 0: marked | bit 1: generation | bit 2: finalized | bit 3-7: age
+    const TypeDescriptor* desc = nullptr;  // 8  offset 0
+    uint32_t allocSize_ = 0;               // 4  offset 8
+    uint8_t  flags_ = 0;                   // 1  offset 12  bit-packed 标记
+    // padding: 3 bytes                    //    offset 13-15
+    // 总计 16 字节
 
-    virtual ~GcObject() = default;
+    ~GcObject() = default;  // 非虚：GC 不通过基类 delete，finalizer 走 desc->finalizer
 
-    // ---- marked ----
-    bool marked() const { return flags_ & 0x01; }
-    void setMarked(bool v) { if (v) flags_ |= 0x01; else flags_ &= ~0x01; }
+    // ---- marked (bit 0) ----
+    bool marked() const         { return flags_ & kMarkedBit; }
+    void setMarked(bool v)      { flags_ = (flags_ & ~kMarkedBit) | (v ? kMarkedBit : 0); }
 
-    // ---- generation ----
-    uint8_t generation() const { return (flags_ >> 1) & 0x01; }
-    void setGeneration(uint8_t g) {
-        if (g & 0x01) flags_ |= 0x02; else flags_ &= ~0x02;
-    }
+    // ---- generation (bit 1) ----
+    uint8_t generation() const  { return (flags_ & kGenMask) >> kGenShift; }
+    void setGeneration(uint8_t g) { flags_ = (flags_ & ~kGenMask) | ((g << kGenShift) & kGenMask); }
 
-    // ---- finalized ----
-    bool finalized() const { return flags_ & 0x04; }
-    void setFinalized(bool v) { if (v) flags_ |= 0x04; else flags_ &= ~0x04; }
+    // ---- finalized (bit 2) ----
+    bool finalized() const      { return flags_ & kFinalizedBit; }
+    void setFinalized(bool v)   { flags_ = (flags_ & ~kFinalizedBit) | (v ? kFinalizedBit : 0); }
 
-    // ---- age ----
-    uint8_t age() const { return (flags_ >> 3) & 0x1F; }
-    void setAge(uint8_t a) {
-        flags_ = (flags_ & ~0xF8) | ((a & 0x1F) << 3);
-    }
-    void incAge() { setAge(age() + 1); }
+    // ---- age (bit 3-7, max 31) ----
+    uint8_t age() const         { return (flags_ & kAgeMask) >> kAgeShift; }
+    void incAge()              { flags_ += (1 << kAgeShift); }
 
     // ---- allocSize ----
-    size_t allocSize() const { return allocSize_; }
+    size_t allocSize() const   { return allocSize_; }
     void  setAllocSize(size_t s) { allocSize_ = static_cast<uint32_t>(s); }
+
+private:
+    static constexpr uint8_t kMarkedBit    = 0x01;  // bit 0
+    static constexpr uint8_t kGenMask      = 0x02;  // bit 1
+    static constexpr uint8_t kGenShift     = 1;
+    static constexpr uint8_t kFinalizedBit = 0x04;  // bit 2
+    static constexpr uint8_t kAgeMask      = 0xF8;  // bit 3-7
+    static constexpr uint8_t kAgeShift     = 3;
 };
 
 // ============================================================
@@ -170,7 +172,7 @@ struct Error : GcObject {
         : kind(k), message(m), extra(e) {}
     Error() = default;
 
-    ~Error() override = default;
+    ~Error() = default;
 };
 
 

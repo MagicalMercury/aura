@@ -575,11 +575,11 @@ fun main(io: Io) {
 
 ---
 
-### 第二阶段（GC 已就绪，~260 行改动，详见 [change.md](file:///d:/you/Aura/change.md) v3 plan）
+### 第二阶段（GC 已就绪，~260 行改动，详见 [change.md](file:///d:/you/Aura/change.md) v3 plan）— ✅ 已完成 [2026-07-20]
 
 **v3 重新设计**：整合 GcObject 头部压缩 + GcString 字段 union + string 自身可变方法 + concat_multi A 优化。
 
-#### Step 4a: GcObject 头部压缩（Part A）
+#### Step 4a: GcObject 头部压缩（Part A） — ✅ 已完成
 
 **改动文件**：[runtime/types.h](file:///d:/you/Aura/runtime/types.h) + [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp)
 
@@ -595,7 +595,7 @@ fun main(io: Io) {
 
 ---
 
-#### Step 4b: GcString 字段 union（Part B）
+#### Step 4b: GcString 字段 union（Part B） — ✅ 已完成
 
 **改动文件**：[runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h)
 
@@ -611,7 +611,7 @@ fun main(io: Io) {
 
 ---
 
-#### Step 4: capacity + append + CodeGen 优化 + concat_multi A（Part C）
+#### Step 4: capacity + append + CodeGen 优化 + concat_multi A（Part C） — ✅ 已完成
 
 **改动文件**：[runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) + [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) + [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp)
 
@@ -647,7 +647,7 @@ fun main(io: Io) {
 
 ---
 
-#### Step 5: 子串共享
+#### Step 5: 子串共享 — ✅ 已完成
 
 **改动文件**：[runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) + [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) + [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h)
 
@@ -719,13 +719,23 @@ fun main(io: Io) {
 
 ## 五、与 TODO.txt 的关系
 
-本草案完成后，[TODO.txt §六 运行时库改进](file:///d:/you/Aura/TODO.txt) 中的 `StringBuilder 类型` 项应更新为：
+本草案完成后，[TODO.txt §六 运行时库改进](file:///d:/you/Aura/TODO.txt) 中的相关项应更新为：
 
 ```
-[~] P2  StringBuilder 类型
-      - 现状：已新增 concat_multi + bool/int 缓存（第一阶段完成）
-      - 缺：GcStringBuilder 类型（需 capacity 字段，第二阶段）
-      - 文件：runtime/builtin/string.h, src/CodeGen/ExprGen.cpp
+[x] P2  GcString 加 capacity 字段 + make_with_capacity API  [第二阶段] [2026-07-20 完成]
+      - 实现：union { capacity; offset } 共用槽位（Flat/Slice 模式互斥）
+      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
+      - 详见：§三 Step 4b
+
+[-] P2  GcStringBuilder 类型  [2026-07-20 决策不实施]
+      - v2/v3 决策：StringBuilder 不独立，append 注册给 string 类型
+      - 替代方案：string 自身可变方法 + CodeGen 自动优化 s = s + x
+      - 详见：§三 Step 4
+
+[x] P2  GcString 子串共享（零拷贝 slice）  [第二阶段] [2026-07-20 完成]
+      - 实现：parent + offset 字段 + slice(start, len) 方法
+      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
+      - 详见：§三 Step 5
 ```
 
 ---
@@ -745,23 +755,23 @@ fun main(io: Io) {
 
 | 优化 | 当前可行性 | 备注 |
 |:---:|:---:|:---|
-| 空串/布尔/小整数缓存 | ✅ 立即做 | 用 GcGlobalRoot 包装，零 GC 压力 |
-| GcObject 头部压缩 + GcString union | ✅ 立即做 | 56→32 / 56→48 字节（详见 v3 plan Part A/B） |
-| `string.append` + CodeGen 优化 `s = s + x` | ✅ 立即做 | ROI 最高，行为零变化（详见 v3 plan Part C） |
-| 子串共享 | ✅ 可做 | GC 真正运行，parent 保活有效 |
+| 空串/布尔/小整数缓存 | ✅ 已完成 | 用 GcGlobalRoot 包装，零 GC 压力 |
+| GcObject 头部压缩 + GcString union | ✅ 已完成 | 56→32 / 56→48 字节（v3 plan Part A/B） |
+| `string.append` + CodeGen 优化 `s = s + x` | ✅ 已完成 | ROI 最高，行为零变化（v3 plan Part C） |
+| 子串共享 | ✅ 已完成 | GC 真正运行，parent 保活有效（v3 plan Part D） |
 | **Rope 表示** | **🔴 必要** | **架构级升级，解决循环累加 O(n²) 问题** |
 | 哈希缓存 | ⚠️ 推迟 | 需 Map<K,V> 类型 |
 | GC 暂停期 interning | ❌ 推迟 | 收益不确定 |
 | 单引用原地修改 | ❌ 放弃 | 需引用计数 |
 
 **推荐执行顺序**：
-1. **第一阶段** Step 1-3（~120 行）— 立即做，行为零变化
-2. **第二阶段** Step 4a/4b/4/5（~260 行）— GC 已就绪：GcObject 头部压缩 + GcString 字段 union + string 自身可变（不引入 Builder）+ 子串共享
+1. **第一阶段** Step 1-3（~120 行）— ✅ 已完成，行为零变化
+2. **第二阶段** Step 4a/4b/4/5（~260 行）— ✅ 已完成：GcObject 头部压缩 + GcString 字段 union + string 自身可变（不引入 Builder）+ 子串共享
 3. **第三阶段** Step 7（~300 行）— Rope 架构升级，解决大规模拼接性能问题
 
-**推荐立即执行**：第一阶段 Step 1-3，~120 行代码改动，行为零变化，ROI 最高。
+**推荐立即执行**：第一阶段 Step 1-3，~120 行代码改动，行为零变化，ROI 最高（✅ 已完成）。
 
-第二阶段 Step 4-5 可在第一阶段验证后立即推进，无需等待其他 plan。
+第二阶段 Step 4-5 可在第一阶段验证后立即推进，无需等待其他 plan（✅ 已完成 2026-07-20）。
 
 ---
 
@@ -1080,8 +1090,9 @@ GcString* GcString::from(int32_t val) {
 | 第一阶段 A1 空串 + bool 缓存 | ✅ 已完成 | 保留，与 intern 池互补（特殊单例） |
 | 第一阶段 A2 小整数缓存 [-128, 127] | ✅ 已完成 | D2 扩展范围，D4 长期统一 |
 | 第一阶段 A3 concat_multi | ✅ 已完成 | 独立，无影响 |
-| 第二阶段 B1 capacity + Builder | 未实施 | 独立，无影响 |
-| 第二阶段 B2 子串共享 slice | 未实施 | 独立，无影响 |
+| 第二阶段 B1 capacity + string.append | ✅ 已完成 | 2026-07-20 完成，详见 v3 plan Part C |
+| 第二阶段 B2 子串共享 slice | ✅ 已完成 | 2026-07-20 完成，详见 v3 plan Part D |
+| 第二阶段 B3 GcObject 头部压缩 + GcString union | ✅ 已完成 | 2026-07-20 完成，详见 v3 plan Part A/B |
 | 第三阶段 C1 Rope | 未实施 | 互补：Rope 大字符串，Intern 小字符串 |
 | C2 GC 暂停期 interning | 推迟 | D3 是其前置，可分阶段实施 |
 

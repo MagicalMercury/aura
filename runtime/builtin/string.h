@@ -81,7 +81,7 @@ struct GcString : GcObject {
     bool operator==(const GcString& rhs) const { return view() == rhs.view(); }
     bool operator!=(const GcString& rhs) const { return view() != rhs.view(); }
 
-    ~GcString() override = default;
+    ~GcString() = default;
 
     int32_t len() const { return length; }
 };

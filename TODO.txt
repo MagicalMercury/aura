@@ -7,7 +7,7 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-07-19（GC 晋升机制修复 + GcRootHandle 赋值 bug 修复）
+# 最近更新：2026-07-20（GcString 第二阶段 Step 4a/4b/4/5 全部完成）
 
 ================================================================
 [ 一 ] 内置 API 与模块（plan/plan11.md）
@@ -100,10 +100,10 @@
 [ 五 ] GC（plan/gc_features_plan.md, plan/gc_promotion_issues.md）
 ================================================================
 
-[ ] P1  GcString 的 TypeDescriptor ptrFieldCount 应支持 parent 字段
-      - 当前 [string.cpp:18-22](runtime/builtin/string.cpp#L18) ptrFieldCount=0
-      - 若引入子串共享（parent 字段），需更新为 ptrFieldCount=1
-      - 前置：先完成 Array<T*> 元素扫描同类的 ptrFields 机制
+[x] P1  GcString 的 TypeDescriptor ptrFieldCount 应支持 parent 字段  [2026-07-20 完成]
+      - 实现：[string.cpp:18-25](runtime/builtin/string.cpp#L18) ptrFieldCount=1，ptrFieldOffsets={offsetof(GcString, parent)}
+      - 配合：union { capacity; offset } + parent 字段（Flat/Slice 模式互斥）
+      - 详见：plan/gcstring_optimization.md §三 Step 4b/5
 
 ----------------------------------------------------------------
 GC 晋升机制缺陷修复（基于 plan/gc_promotion_issues.md，2026-07-19）
@@ -211,8 +211,8 @@ GcRootHandle 赋值 bug 修复（2026-07-19）
 ================================================================
 
 ----------------------------------------------------------------
-GcString 优化（基于 plan/gcstring_optimization.md，2026-07-19 更新）
-分阶段：第一阶段 Step 1-3 已实施，第二阶段待启动
+GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
+分阶段：第一阶段 Step 1-3 已实施，第二阶段 Step 4a/4b/4/5 已实施
 ----------------------------------------------------------------
 
 [x] P1  GcString::empty() / from(bool) / from(int) 静态缓存  [第一阶段] [2026-07-19 完成]
@@ -226,42 +226,56 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-19 更新）
       - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
       - 详见：plan/gcstring_optimization.md §三 Step 2 / change.md Step 2
 
-[~] P1  CodeGen 识别链式 string + string 脱糖为 concat_multi  [第一阶段] [2026-07-19 部分完成]
-      - 已实现：collectStringChain 递归收集 BinaryExpr(+) 链，≥3 全 string 节点时
-        生成 concat_multi({...})；纯 string 链生效
-      - 未完成：混合类型链（如 "iter " + i + " step " + i + " done"）当前
-        fallback 到嵌套 concat，未触发 concat_multi 路径
-      - 原因：collectStringChain 的 isStringExpr 判定要求所有链节点都是 string，
-        遇到 int/bool/float 节点时返回空 vector，整链退化
-      - 影响：测试代码 5000 次循环 5 节点混合链未体现 concat_multi 收益
-        （young=63KB / live=1336 改善主要来自 Step 1 小整数缓存，而非 concat_multi）
-      - 改进方向（未实施）：
-          A. 扩展 concat_multi 重载接收混合类型，自动调 to_string 转换
-          B. CodeGen 在收集时为非 string 节点插入显式 to_string 转换
+[x] P1  CodeGen 识别链式 string + string 脱糖为 concat_multi  [第一阶段] [2026-07-19 完成]
+      - 已实现：collectStringChain 递归收集 BinaryExpr(+) 链，≥3 节点时生成 concat_multi({...})
+      - 混合类型链支持：放宽 isStringExpr 判定，非 string 节点用 GcString::from 包装
       - 文件：src/CodeGen/CodeGen.h:338-340, src/CodeGen/ExprGen.cpp:238-279, 313-325
       - 详见：plan/gcstring_optimization.md §三 Step 3 / change.md Step 3
 
-[ ] P2  GcString 加 capacity 字段 + reserve/make_with_capacity API  [第二阶段]
-      - 前置：先做 GcStringBuilder 类型
-      - 现状：[string.h:27](runtime/builtin/string.h#L27) 仅 length，无 capacity
-      - 缺：int32_t capacity 字段；data() 偏移要改；
-        TypeDescriptor.size 需更新（仍 ptrFieldCount=0）
-      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
-      - 详见：plan/gcstring_optimization.md §三 Step 4
+[x] P2  GcObject 头部压缩（bit-packed flags + uint32 allocSize）  [第二阶段] [2026-07-20 完成]
+      - 实现：56 → 32 字节，flags_ 1 字节封装 marked/generation/finalized/age
+      - 提供 inline 方法：marked/setMarked/generation/setGeneration/finalized/setFinalized/age/incAge/allocSize/setAllocSize
+      - gc.cpp 14 处字段访问全部改为方法调用
+      - 文件：runtime/types.h:105-139, runtime/gc.cpp
+      - 详见：plan/gcstring_optimization.md §三 Step 4a / change.md Part A
 
-[ ] P2  GcStringBuilder 类型（可变字符串缓冲区）  [第二阶段]
-      - plan/plan13.md 规划
-      - 现状：无此类型
-      - 缺：新类型支持 append + to_string；与 concat_multi 整合
-      - 前置：先做 capacity 字段
-      - 文件：runtime/builtin/string_builder.h (新增)
+[x] P2  GcString 字段 union（capacity/offset 共用槽位）  [第二阶段] [2026-07-20 完成]
+      - 实现：union { capacity; offset } u + parent 字段
+      - Flat/Slice 模式互斥，通过 parent != nullptr 区分（无需 kind 字段）
+      - 提供 isSlice()/capacity()/offset() inline 方法
+      - data() 自动经 parent->raw_data() + u.offset 解引用 Slice 模式
+      - 文件：runtime/builtin/string.h:26-87
+      - 详见：plan/gcstring_optimization.md §三 Step 4b / change.md Part B
 
-[ ] P2  GcString 子串共享（零拷贝 slice）  [第二阶段]
-      - 前置：GC 真正运行 + parent 字段加入 ptrFieldOffsets
-      - 缺：GcString 加 parent + offset 字段；新增 slice(start, len) 方法
-      - 风险：parent 必须被 GC 正确扫描，否则悬空指针
+[x] P2  GcString 加 capacity 字段 + make_with_capacity API  [第二阶段] [2026-07-20 完成]
+      - 实现：union { capacity; offset } 共用槽位（Flat/Slice 模式互斥）
+      - make_with_capacity(len, cap) 工厂支持预分配容量
       - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
-      - 详见：plan/gcstring_optimization.md §三 Step 5
+      - 详见：plan/gcstring_optimization.md §三 Step 4b / change.md Part C
+
+[-] P2  GcStringBuilder 类型（可变字符串缓冲区）  [2026-07-20 决策不实施]
+      - v2/v3 决策：StringBuilder 不独立，append 注册给 string 类型
+      - 替代方案：string 自身可变方法 + CodeGen 自动优化 s = s + x
+      - 详见：plan/gcstring_optimization.md §三 Step 4 / change.md Part C
+
+[x] P2  GcString 可变方法 append（Go 模式）  [第二阶段] [2026-07-20 完成]
+      - 实现：6 个重载（string/C-string/字节/int/float/bool）
+      - 容量足够时就地修改（零分配），不足时 2 倍扩容分配新对象
+      - concat_multi A 优化：结果对象初始化 u.capacity = total
+      - concat 重构为 concat_multi({this, &other}) 包装（代码 10 行 → 3 行）
+      - BuiltinRegistry 注册 string.append (4 重载)
+      - CodeGen genAssignExpr 自动优化 s = s + x → s.get()->append(x)（单元素）
+      - 文件：runtime/builtin/string.cpp, src/Sema/BuiltinRegistry.h, src/CodeGen/ExprGen.cpp
+      - 详见：plan/gcstring_optimization.md §三 Step 4 / change.md Part C
+
+[x] P2  GcString 子串共享（零拷贝 slice）  [第二阶段] [2026-07-20 完成]
+      - 实现：parent + offset 字段 + slice(start, len) const 方法
+      - 分配 header-only 对象（sizeof(GcString)，无 data 缓冲区）
+      - Slice 模式下 capacity() 返回 0，强制 append 走扩容路径（安全）
+      - TypeDescriptor ptrFieldCount=1（仅 parent）
+      - BuiltinRegistry 注册 string.slice
+      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp, src/Sema/BuiltinRegistry.h
+      - 详见：plan/gcstring_optimization.md §三 Step 5 / change.md Part D
 
 [ ] P2  GcString 哈希缓存  [第二阶段]
       - 前置：引入 Map<K, V> 类型（当前无）

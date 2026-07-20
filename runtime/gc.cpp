@@ -74,7 +74,6 @@ GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
     GcObject* obj = static_cast<GcObject*>(mem);
     obj->desc = desc;
     obj->setMarked(false);
-    obj->next = nullptr;
     obj->setGeneration(0);  // 新生代
     obj->setFinalized(false);
     obj->setAllocSize(size);

@@ -1,534 +1,786 @@
-# GcString 第二阶段 重写 Plan（v3）
+# GcString 字面量 intern + Rope 表示 Plan（v6）
 
-> 来源：[plan/gcstring_optimization.md §三 第二阶段](file:///d:/you/Aura/plan/gcstring_optimization.md#L578)
+> 来源：v4 plan 重新设计（Rope 不增加 GcString 头部）
 > 日期：2026-07-20
 > 状态：草案（待批准）
-> 改动规模：~260 行
+> 改动规模：~280 行
 > 设计原则：
-> - **StringBuilder 不独立**，`string` 自身可变，方法注册给 `string` 类型
-> - **GcObject 头部压缩**：bit-packed flags + uint32 allocSize（56 → 32 字节）
-> - **GcString 字段 union**：capacity/offset 共用槽位（Flat/Slice 模式互斥）
+> - **GcString 头部不变**（保持 v5 的 32 字节，绝不增加）
+> - **Rope 用继承子类**：GcRopeNode : GcString，追加 left/right（仅 Rope 节点付出代价）
+> - **不用 virtual**：用 desc 指针判断类型（与 v5 去虚函数一致）
+> - **渐进实施**：Part A/B/C 独立可单独实施
 
 ---
 
 ## 一、Summary
 
-四个部分整合实施：
+三个部分整合实施：
 
 | Part | 内容 | 依赖 | 收益 |
 |:---:|:---|:---|:---|
-| **A** | GcObject 头部压缩（bit-packed flags + uint32 allocSize） | 独立 | 每对象 -24 字节 |
-| **B** | GcString 字段 union（capacity/offset 共用槽位） | A 完成 | GcString 头部 -8 字节 |
-| **C** | Step 4：`capacity` + `append` + CodeGen 优化 + concat_multi A | B 完成 | 循环累加 O(n²)→O(log n) 分配 |
-| **D** | Step 5：`parent` + `offset` + `slice` 零拷贝 | B 完成 | slice O(1) 引用 |
+| **A** | 字面量 intern（D1）— `intern_string` API + CodeGen 改造 | 独立 | 字面量零分配（瓶颈 60% 解决） |
+| **B** | 小整数缓存扩展（D2）— [-128,127] → [-1024,1023] | 独立 | int→string 命中率 2.6% → 20.5% |
+| **C** | Rope 表示（C1）— GcRopeNode 子类 + concat_rope + ensure_flat | v5 已完成 | 循环累加 memcpy O(n²) → O(n) |
+
+**关键约束**：GcString 头部保持 v5 的 32 字节，**不增加**。
 
 ---
 
-## 二、Current State Analysis
+## 二、Current State Analysis（假设 v5 已完成）
 
-### 2.1 GcObject 当前布局（56 字节）
+### 2.1 v5 后的 GcString 布局
 
-[types.h:105-129](file:///d:/you/Aura/runtime/types.h#L105)：
+[runtime/types.h](file:///d:/you/Aura/runtime/types.h) v5 后：
 
-```
-offset  field          size  说明
-0       vptr           8     virtual ~GcObject()
-8       desc           8     TypeDescriptor*
-16      marked         1     bool
-17-23   padding        7     (next 需 8 字节对齐)
-24      next           8     GcObject*
-32      generation     1     uint8_t
-33      finalized      1     bool
-34-39   padding        6     (allocSize 需 8 字节对齐)
-40      allocSize      8     size_t
-48      age            1     uint8_t
-49-55   padding        7     (struct 8 字节对齐)
-─────
-总计    56 字节
-```
+```cpp
+struct GcObject {                          // 16 字节（v5 去 virtual + 去 next）
+    const TypeDescriptor* desc = nullptr;   // 8   offset 0-7
+    uint32_t allocSize_ = 0;                // 4   offset 8-11
+    uint8_t  flags_ = 0;                    // 1   offset 12
+    // padding                              // 3   offset 13-15
+};
 
-### 2.2 GcString 当前布局
-
-[string.h:26-67](file:///d:/you/Aura/runtime/builtin/string.h#L26)：
-
-```
-GcObject 头部        56 字节
-length               4 字节
-padding              4 字节（data 8 字节对齐）
-data[len+1]          变长
-─────
-GcString 总头部      64 字节
+struct GcString : GcObject {               // 32 字节
+    int32_t length = 0;                     // 4   offset 16-19
+    union {                                 // 4   offset 20-23
+        int32_t capacity = 0;              //   Flat 模式
+        int32_t offset;                   //   Slice 模式
+    } u;
+    GcString* parent = nullptr;            // 8   offset 24-31（Slice 模式标记）
+    // 数据区在 offset 32（this + 1）
+};
+// 空字符串 = 32 头 + 1 字节 '\0' + 7 对齐 = 40 字节
 ```
 
-### 2.3 字段访问点统计
+### 2.2 测试瓶颈定位
 
-所有 GcObject 字段访问集中在 [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp)（src/ 下无直接访问）：
+**测试代码**（[example/test.aura](file:///d:/you/Aura/example/test.aura)）：
 
-| 字段 | 访问点 | 说明 |
-|:---|:---:|:---|
-| `marked` | 12 | 标记阶段读写 |
-| `generation` | 3 | 晋升 + writeBarrier |
-| `finalized` | 5 | finalizer 调用 |
-| `age` | 2 | 晋升计数 |
-| `allocSize` | 6 | 分配 + 晋升 + 统计 |
+```aura
+for i in range(0, 5000) {
+    let s = "iter " + i + " step " + i + " done"
+}
+```
 
-### 2.4 用户反馈
+**生成代码**：
 
-> "StringBuilder 不应该独立出来，它应该实现在应该接管 string 行为时接管 string，而不是分离。另外，这些方法不应该注册给 stringbuilder，而是应该注册给 string。还有，这里的 append 方法可以直接用来重构拼接！"
+```cpp
+aura_rt::GcString* s_raw = aura_rt::concat_multi({
+    aura_rt::make_string("iter "),       // ← 5000 次分配（字面量）
+    aura_rt::GcString::from(i),          // ← 97% 命中失败
+    aura_rt::make_string(" step "),      // ← 5000 次分配（字面量）
+    aura_rt::GcString::from(i),          // ← 97% 命中失败
+    aura_rt::make_string(" done")        // ← 5000 次分配（字面量）
+});
+```
 
-→ 不引入 `StringBuilder` 类型，`append` 注册给 `string`，CodeGen 自动优化 `s = s + x` → `s = s.append(x)`。
+**瓶颈分解**：
+
+| 项 | 分配次数 | 占比 | 解决 Part |
+|:---|:---:|:---:|:---:|
+| 字符串字面量 `make_string("literal")` | 15000（3 × 5000） | 60% | A |
+| `GcString::from(i)` 临时对象 | ~9700（97% 未命中缓存） | 39% | B |
+| `concat_multi` 结果 | 5000 | 1% | C（间接） |
 
 ---
 
 ## 三、Proposed Changes
 
-### Part A: GcObject 头部压缩
+### Part A: 字面量 intern（D1）
 
 #### 3.1 改动文件
 
 | 文件 | 改动 | 行数 |
 |:---|:---|:---:|
-| [runtime/types.h](file:///d:/you/Aura/runtime/types.h) | GcObject 改为 bit-packed flags + uint32 allocSize + inline 访问方法 | +35 |
-| [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | 28 处字段访问改为方法调用 | +0（原地替换） |
-| [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) | 接口不变（无字段直接访问） | 0 |
-| **合计** | | **+35** |
+| [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) | 新增 `intern_string` API 声明 | +3 |
+| [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) | 新增 `g_internPool` + `g_internMutex` + `intern_string` 实现 | +45 |
+| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genStringLiteral` 改为生成 `intern_string` | +5 |
+| **合计** | | **+53** |
 
-#### 3.2 GcObject 新布局（32 字节）
+#### 3.2 intern_string API
 
-[types.h:105-129](file:///d:/you/Aura/runtime/types.h#L105) 改为：
+[string.h](file:///d:/you/Aura/runtime/builtin/string.h) 新增声明：
 
 ```cpp
-struct GcObject {
-    // vptr 自动生成                       // offset 0-7
-    const TypeDescriptor* desc = nullptr;  // offset 8-15
-    GcObject* next = nullptr;              // offset 16-23
-    uint32_t allocSize_ = 0;               // offset 24-27  (对象 < 4GB)
-    uint8_t  flags_ = 0;                    // offset 28
-        // bit 0:   marked
-        // bit 1:   generation (0=young, 1=old)
-        // bit 2:   finalized
-        // bit 3-7: age (max 31, 够用)
-    // padding                              // offset 29-31
-    ─────
-    总计 32 字节（节省 24 字节/对象）
-
-    virtual ~GcObject() = default;
-
-    // ---- marked ----
-    bool marked() const { return flags_ & 0x01; }
-    void setMarked(bool v) { if (v) flags_ |= 0x01; else flags_ &= ~0x01; }
-
-    // ---- generation ----
-    uint8_t generation() const { return (flags_ >> 1) & 0x01; }
-    void setGeneration(uint8_t g) {
-        if (g & 0x01) flags_ |= 0x02; else flags_ &= ~0x02;
-    }
-
-    // ---- finalized ----
-    bool finalized() const { return flags_ & 0x04; }
-    void setFinalized(bool v) { if (v) flags_ |= 0x04; else flags_ &= ~0x04; }
-
-    // ---- age ----
-    uint8_t age() const { return (flags_ >> 3) & 0x1F; }
-    void setAge(uint8_t a) {
-        flags_ = (flags_ & ~0xF8) | ((a & 0x1F) << 3);
-    }
-    void incAge() { setAge(age() + 1); }
-
-    // ---- allocSize ----
-    size_t allocSize() const { return allocSize_; }
-    void  setAllocSize(size_t s) { allocSize_ = static_cast<uint32_t>(s); }
-};
+// 字面量 intern：相同内容返回同一指针（注册为 GC 全局根，永不回收）
+GcString* intern_string(const char* s);
+GcString* intern_string(const char* s, size_t len);
 ```
 
-**关键约束**：
-- `allocSize` 改为 `uint32_t`，单对象上限 4GB（Aura 不可能超过）
-- `youngBytes_` / `oldBytes_` 仍是 `size_t`（累加结果不截断，仅压缩字段存储）
-- `age` 上限 31（当前 `kPromotionAge = 2`，[gc.h:204](file:///d:/you/Aura/runtime/gc.h#L204)，远低于上限）
+#### 3.3 intern_string 实现
 
-#### 3.3 gc.cpp 字段访问替换
+[string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 新增：
 
-28 处访问点统一改为方法调用：
+```cpp
+#include <shared_mutex>
+#include <unordered_map>
+#include <memory>
+#include <string_view>
 
-| 旧写法 | 新写法 |
-|:---|:---|
-| `obj->marked = false;` | `obj->setMarked(false);` |
-| `obj->marked` | `obj->marked()` |
-| `obj->generation = 0;` | `obj->setGeneration(0);` |
-| `obj->generation == 1` | `obj->generation() == 1` |
-| `obj->finalized = false;` | `obj->setFinalized(false);` |
-| `obj->finalized` | `obj->finalized()` |
-| `obj->age++;` | `obj->incAge();` |
-| `obj->age >= kPromotionAge` | `obj->age() >= kPromotionAge` |
-| `obj->allocSize = size;` | `obj->setAllocSize(size);` |
-| `obj->allocSize` | `obj->allocSize()` |
+namespace {
+    // Intern 池：内容 → GcGlobalRoot 包装的 GcString
+    // 用 GcGlobalRoot 确保池中对象注册为 GC 全局根，永不被回收
+    // 用 std::string 作为 key（拷贝），因为 GcString 内容可能在 GC 时移动
+    std::unordered_map<std::string, std::unique_ptr<GcGlobalRoot<GcString>>> g_internPool;
+    std::shared_mutex g_internMutex;  // 读写锁，读多写少
+}
 
-**关键访问点**：
-- [gc.cpp:76-80](file:///d:/you/Aura/runtime/gc.cpp#L76)：alloc 时初始化 5 个字段
-- [gc.cpp:150](file:///d:/you/Aura/runtime/gc.cpp#L150)：writeBarrier 读 generation
-- [gc.cpp:412-586](file:///d:/you/Aura/runtime/gc.cpp#L412)：markPhase / sweep / finalizer 路径
+GcString* intern_string(const char* s, size_t len) {
+    std::string_view keyView(s, len);
+    {
+        std::shared_lock lk(g_internMutex);
+        auto it = g_internPool.find(std::string(keyView));
+        if (it != g_internPool.end()) return it->second->get();
+    }
+    {
+        std::unique_lock lk(g_internMutex);
+        // double-check（可能在等锁期间被其他线程插入）
+        std::string key(keyView);
+        auto it = g_internPool.find(key);
+        if (it != g_internPool.end()) return it->second->get();
+        // 首次访问：分配 + 注册全局根
+        auto root = std::make_unique<GcGlobalRoot<GcString>>(GcString::make(s, len));
+        GcString* result = root->get();
+        g_internPool.emplace(std::move(key), std::move(root));
+        return result;
+    }
+}
+
+GcString* intern_string(const char* s) {
+    return intern_string(s, std::strlen(s));
+}
+```
+
+**关键设计**：
+- 池用 `std::string` 作 key（拷贝），因为 GcString 内容可能在 GC 时移动
+- 用 `GcGlobalRoot<GcString>` 包装，注册为 GC 全局根，永不被回收
+- 读写锁保护，读多写少场景下读锁零阻塞
+
+#### 3.4 CodeGen 改造
+
+[ExprGen.cpp:84-86](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L84) `genStringLiteral` 改为：
+
+```cpp
+std::string CodeGenerator::genStringLiteral(const StringLiteral& e) {
+    // 字面量走 intern 池：相同内容只分配一次
+    return "aura_rt::intern_string(\"" + e.value + "\")";
+}
+```
+
+**关键变更点**：
+- 仅 `genStringLiteral` 改造，所有派生场景自动走 intern
+- **动态字符串不 intern**：`GcString::from(int/float/bool)` 保持现状，`append` 动态扩容分配的新对象保持现状
+
+#### 3.5 收益
+
+| 场景 | 改造前 | 改造后 |
+|:---|:---|:---|
+| `let s = "hello"` | 每次 `make_string("hello")` 分配 | 首次 intern，后续直接返回 |
+| 循环内 `let s = "iter " + i + ...` | 3 个字面量 × 5000 = 15000 次分配 | 3 次分配（首次访问） |
+| `==` 比较 | O(n) 逐字符比较 | 可优化为 O(1) 指针比较（同内容同指针） |
+
+**预期测试效果**（针对 [example/test.aura](file:///d:/you/Aura/example/test.aura)）：
+- `alloc` 从 1950KB → 预计 ~450KB（字面量从 15000 次分配降到 3 次）
 
 ---
 
-### Part B: GcString 字段 union（capacity/offset 共用槽位）
-
-#### 3.4 改动文件
-
-| 文件 | 改动 | 行数 |
-|:---|:---|:---:|
-| [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) | GcString 加 union { capacity; offset } + parent 字段 | +15 |
-| **合计** | | **+15** |
-
-#### 3.5 GcString 新布局（与 Part C/D 共用）
-
-[string.h:26-67](file:///d:/you/Aura/runtime/builtin/string.h#L26) 改为（含 Part C/D 字段，一次性引入）：
-
-```cpp
-struct GcString : GcObject {
-    int32_t length = 0;                          // offset 32-35
-    union {                                       // offset 36-39
-        int32_t capacity = 0;                     //   Flat 模式用（parent == nullptr）
-        int32_t offset;                           //   Slice 模式用（parent != nullptr）
-    } u;
-    GcString* parent = nullptr;                   // offset 40-47
-    ─────
-    GcString 总头部 = 32 (GcObject 压缩后) + 16 = 48 字节
-    （不压缩则为 32 + 24 = 56 字节，union 节省 8 字节）
-
-    static const TypeDescriptor _desc;
-
-    // 核心工厂
-    static GcString* make(const char* s);
-    static GcString* make(const char* s, size_t len);
-    static GcString* make(const std::string& s);
-
-    // 新增：带容量的工厂（append 扩容路径共用）
-    static GcString* make_with_capacity(size_t len, size_t cap);
-
-    // 扩展工厂（不变）
-    static GcString* from(const char* s);
-    static GcString* from(const char* s, size_t len);
-    static GcString* from(const std::string& s);
-    static GcString* from(int32_t val);
-    static GcString* from(double val);
-    static GcString* from(bool val);
-
-    static GcString* empty();
-
-    GcString* concat(const GcString& other) const;  // 重构为 concat_multi 包装（见 §十一.4）
-
-    // 新增：可变 append（Go 模式：返回新对象，调用者替换引用）
-    GcString* append(const GcString* other);
-    GcString* append(const char* s);
-    GcString* append(const char* s, size_t len);
-    GcString* append(int32_t val);
-    GcString* append(double val);
-    GcString* append(bool val);
-
-    // 新增：子串共享（零拷贝 slice）
-    GcString* slice(int32_t start, int32_t len) const;
-
-    // 模式判断
-    bool isSlice() const { return parent != nullptr; }
-    int32_t capacity() const { return isSlice() ? 0 : u.capacity; }
-    int32_t offset() const { return isSlice() ? u.offset : 0; }
-
-    // 数据访问（Flat 直接 raw_data，Slice 经 parent）
-    char* raw_data() { return reinterpret_cast<char*>(this + 1); }
-    const char* raw_data() const { return reinterpret_cast<const char*>(this + 1); }
-
-    char* data() {
-        return parent ? parent->raw_data() + u.offset : raw_data();
-    }
-    const char* data() const {
-        return parent ? parent->raw_data() + u.offset : raw_data();
-    }
-
-    std::string_view view() const { return {data(), static_cast<size_t>(length)}; }
-
-    bool operator==(const GcString& rhs) const { return view() == rhs.view(); }
-    bool operator!=(const GcString& rhs) const { return view() != rhs.view(); }
-
-    ~GcString() override = default;
-    int32_t len() const { return length; }
-};
-```
-
-**union 安全性**：
-- Flat 模式（`parent == nullptr`）：用 `u.capacity`
-- Slice 模式（`parent != nullptr`）：用 `u.offset`
-- 两模式互斥，通过 `parent` 是否为 nullptr 区分，无需 kind 字段
-- append 在 Slice 模式下：`capacity()` 返回 0（强制走扩容路径，分配新 Flat 对象，安全）
-
-**TypeDescriptor 更新**（[string.cpp:18-22](file:///d:/you/Aura/runtime/builtin/string.cpp#L18)）：
-
-```cpp
-static const size_t kGcStringPtrOffsets[] = {
-    offsetof(GcString, parent)
-};
-
-const TypeDescriptor GcString::_desc = {
-    sizeof(GcString),                  // 48 字节
-    1,                                  // ptrFieldCount = 1（仅 parent）
-    kGcStringPtrOffsets,
-    0, nullptr, nullptr
-};
-```
-
----
-
-### Part C: Step 4 — capacity + append + CodeGen 优化 + concat_multi A
+### Part B: 小整数缓存扩展（D2）
 
 #### 3.6 改动文件
 
 | 文件 | 改动 | 行数 |
 |:---|:---|:---:|
-| [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) | `make_with_capacity` + 改造 `make` + `append` 实现 + concat_multi A + concat 重构 | +75 |
-| [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) | 注册 `string.append` 方法（4 个重载） | +4 |
-| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genAssignExpr` 识别 `s = s + x` → `s.append(x)` | +25 |
-| **合计** | | **+104** |
+| [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) | `from(int32_t)` 缓存范围扩展 | +1（仅改常量） |
+| **合计** | | **+1** |
 
-#### 3.7 `make` / `make_with_capacity` / `append` 实现
+#### 3.7 from(int32_t) 改造
+
+[string.cpp:47-62](file:///d:/you/Aura/runtime/builtin/string.cpp#L47) 改为：
+
+```cpp
+GcString* GcString::from(int32_t val) {
+    static GcGlobalRoot<GcString>* _cache[2048] = {};  // [-1024, 1023]
+    if (val >= -1024 && val <= 1023) {
+        auto& slot = _cache[val + 1024];
+        if (!slot) {
+            char buf[32];
+            int len = snprintf(buf, sizeof(buf), "%d", val);
+            slot = new GcGlobalRoot<GcString>(make(buf, static_cast<size_t>(len)));
+        }
+        return slot->get();
+    }
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%d", val);
+    return make(buf, static_cast<size_t>(len));
+}
+```
+
+**内存开销**：2048 × 8B（裸指针数组）= 16KB 静态内存。
+
+#### 3.8 收益（针对 [example/test.aura](file:///d:/you/Aura/example/test.aura) 中 `i` 在 [0, 5000)）
+
+| 范围 | 命中率 | 命中次数（5000 × 2 = 10000 次 from(i)） |
+|:---|:---:|:---:|
+| [-128, 127]（当前） | 2.6% | ~260 |
+| [-1024, 1023]（Part B 后） | 20.5% | ~2050 |
+
+---
+
+### Part C: Rope 表示（C1）— 不增加 GcString 头部
+
+#### 3.9 核心设计：GcRopeNode 继承 GcString
+
+**关键思路**：Rope 节点用 GcString 的子类 GcRopeNode，追加 left/right 字段。GcString 头部保持不变，仅 Rope 节点付出额外 16 字节代价。
+
+```cpp
+// GcString 保持 v5 结构（32 字节，不变）
+struct GcString : GcObject {
+    int32_t length;
+    union { int32_t capacity; int32_t offset; } u;
+    GcString* parent;
+    // data() 在 this + 1
+};
+
+// GcRopeNode 继承 GcString，追加 left/right（48 字节）
+struct GcRopeNode : GcString {
+    GcString* left;     // offset 32-39
+    GcString* right;    // offset 40-47
+    static const TypeDescriptor _desc;
+    static GcRopeNode* make(GcString* l, GcString* r);
+    GcString* flatten() const;
+};
+```
+
+**关键优势**：
+- GcString 头部 **不变**（32 字节）
+- GcRopeNode 头部 48 字节（仅 Rope 节点付出代价）
+- GcRopeNode 可作为 GcString* 使用（继承多态）
+- 不需要 virtual（用 desc 指针判断类型，与 v5 一致）
+
+#### 3.10 类型判断：用 desc 指针
+
+```cpp
+// GcString 新增类型判断方法（不增加字段，仅用 desc 指针）
+bool GcString::isRope() const  { return desc == &GcRopeNode::_desc; }
+bool GcString::isSlice() const { return !isRope() && parent != nullptr; }
+bool GcString::isFlat() const  { return !isRope() && parent == nullptr; }
+```
+
+**注意**：v3 的 Slice 判定是 `parent != nullptr`，v6 改为 `!isRope() && parent != nullptr`（因为 Rope 节点继承 GcString 后也有 parent 字段，但不用）。
+
+#### 3.11 改动文件
+
+| 文件 | 改动 | 行数 |
+|:---|:---|:---:|
+| [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) | GcString 加 isRope/isSlice/isFlat + data() 改造 + GcRopeNode 声明 | +40 |
+| [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) | GcRopeNode::_desc + make + flatten + data() + **自动切换 concat/append/concat_multi** + build_balanced_rope | +180 |
+| **合计** | | **+220** |
+
+#### 3.12 GcRopeNode 实现
+
+[string.h](file:///d:/you/Aura/runtime/builtin/string.h) 新增：
+
+```cpp
+// 前向声明
+struct GcRopeNode;
+
+struct GcString : GcObject {
+    // ... 字段不变（v5 结构）...
+    
+    // ---- 类型判断（用 desc 指针，不增加字段）----
+    bool isRope() const  { return desc == &GcRopeNode::_desc; }
+    bool isSlice() const { return !isRope() && parent != nullptr; }
+    bool isFlat() const  { return !isRope() && parent == nullptr; }
+    
+    // ---- 数据访问（根据类型自动处理）----
+    char* raw_data()             { return reinterpret_cast<char*>(this + 1); }
+    const char* raw_data() const { return reinterpret_cast<const char*>(this + 1); }
+    
+    // data()：Flat 直接返回，Slice 经 parent，Rope 经 flatten
+    char* data();
+    const char* data() const;
+    
+    // ---- 扁平化（Rope → Flat，带缓存）----
+    // 注意：缓存字段在 GcRopeNode 中（不在 GcString 中，不增加 GcString 头部）
+    GcString* ensure_flat() const;
+    
+    // ... 其他方法不变 ...
+};
+
+// GcRopeNode：Rope 节点，继承 GcString
+struct GcRopeNode : GcString {
+    GcString* left = nullptr;       // offset 32-39
+    GcString* right = nullptr;      // offset 40-47
+    mutable GcString* flat_cache_ = nullptr;  // offset 48-55（扁平化缓存）
+    int32_t depth = 1;              // offset 56-59（树深度，避免重复计算）
+    // 总头部 64 字节（仅 Rope 节点付出代价，GcString 不受影响）
+    // 注意：GcString 头部仍为 32 字节，不变
+    
+    static const TypeDescriptor _desc;
+    
+    static GcRopeNode* make(GcString* l, GcString* r);
+    GcString* flatten() const;  // 递归扁平化，结果缓存到 flat_cache_
+};
+```
+
+**关键点**：
+- `flat_cache_` 在 GcRopeNode 中（不在 GcString 中），**不增加 GcString 头部**
+- GcRopeNode 总头部 56 字节（GcString 32 + left 8 + right 8 + flat_cache_ 8）
+- 仅 Rope 节点付出 24 字节额外代价
+
+**等等，GcRopeNode 有 flat_cache_ 字段后，sizeof(GcRopeNode) = 56 字节，但 GcString 仍是 32 字节。**
+
+#### 3.13 GcRopeNode::make 实现
+
+[string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 新增：
+
+```cpp
+// GcRopeNode 的 TypeDescriptor
+// GC 扫描字段：parent（继承自 GcString）+ left + right + flat_cache_
+// 注意：depth 是 int32_t，不是指针，不参与 GC 扫描
+static const size_t kGcRopeNodePtrOffsets[] = {
+    offsetof(GcRopeNode, parent),       // 继承自 GcString（Rope 模式不用，但为安全扫描）
+    offsetof(GcRopeNode, left),
+    offsetof(GcRopeNode, right),
+    offsetof(GcRopeNode, flat_cache_),
+};
+const TypeDescriptor GcRopeNode::_desc = {
+    sizeof(GcRopeNode),                 // 64 字节
+    4,                                   // ptrFieldCount = 4
+    kGcRopeNodePtrOffsets,
+    0, nullptr, nullptr
+};
+
+// GcRopeNode::make：O(1) 新建 Rope 节点（含深度计算）
+GcRopeNode* GcRopeNode::make(GcString* l, GcString* r) {
+    auto* node = static_cast<GcRopeNode*>(
+        GcHeap::instance().alloc(sizeof(GcRopeNode), &_desc)
+    );
+    node->length = l->length + r->length;
+    node->u.capacity = 0;   // Rope 模式不用 capacity
+    node->parent = nullptr;  // Rope 模式不用 parent
+    node->left = l;
+    node->right = r;
+    node->flat_cache_ = nullptr;
+    node->depth = std::max(l->ropeDepth(), r->ropeDepth()) + 1;  // 深度计算
+    // 注意：node->desc 已在 GcHeap::alloc 中设置为 &_desc
+    return node;
+}
+```
+
+#### 3.14 flatten 实现（递归扁平化）
+
+[string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 新增：
+
+```cpp
+// GcRopeNode::flatten：递归扁平化，结果缓存到 flat_cache_
+GcString* GcRopeNode::flatten() const {
+    if (flat_cache_) return flat_cache_;
+    
+    // 分配 Flat 对象（含数据缓冲区）
+    auto* flat = static_cast<GcString*>(
+        GcHeap::instance().alloc(sizeof(GcString) + length + 1, &GcString::_desc)
+    );
+    flat->length = length;
+    flat->u.capacity = length;
+    flat->parent = nullptr;  // Flat 模式
+    
+    // 递归遍历 Rope 树，拷贝数据
+    // 深度限制 kMaxRopeDepth = 16（防止栈溢出）
+    char* dst = flat->raw_data();
+    int32_t pos = 0;
+    flatten_recursive(dst, pos, 16);
+    flat->raw_data()[length] = '\0';
+    
+    flat_cache_ = flat;  // 缓存（mutable 字段）
+    return flat;
+}
+
+// 递归辅助：遍历 Rope/Slice 树拷贝数据
+void GcRopeNode::flatten_recursive(char* dst, int32_t& pos, int32_t depth) const {
+    if (depth <= 0) {
+        // 深度超限：强制扁平化（防止栈溢出）
+        std::memcpy(dst + pos, data(), length);
+        pos += length;
+        return;
+    }
+    if (left->isRope()) {
+        static_cast<GcRopeNode*>(left)->flatten_recursive(dst, pos, depth - 1);
+    } else if (left->isSlice()) {
+        // Slice: 从 parent 的 offset 处拷贝 length 字节
+        std::memcpy(dst + pos, left->parent->raw_data() + left->u.offset, left->length);
+        pos += left->length;
+    } else {
+        // Flat
+        std::memcpy(dst + pos, left->raw_data(), left->length);
+        pos += left->length;
+    }
+    // 同样处理 right
+    if (right->isRope()) {
+        static_cast<GcRopeNode*>(right)->flatten_recursive(dst, pos, depth - 1);
+    } else if (right->isSlice()) {
+        std::memcpy(dst + pos, right->parent->raw_data() + right->u.offset, right->length);
+        pos += right->length;
+    } else {
+        std::memcpy(dst + pos, right->raw_data(), right->length);
+        pos += right->length;
+    }
+}
+```
+
+#### 3.15 GcString::data() 改造
 
 [string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 改造：
 
 ```cpp
-// 改造现有 make(s, len)：初始化 u.capacity = length
-GcString* GcString::make(const char* s, size_t len) {
-    size_t objSize = sizeof(GcString) + len + 1;
-    auto* str = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &_desc));
-    str->length = static_cast<int32_t>(len);
-    str->parent = nullptr;
-    str->u.capacity = static_cast<int32_t>(len);  // Flat 模式
-    std::memcpy(str->data(), s, len);
-    str->data()[len] = '\0';
-    return str;
-}
-
-// 新增：带容量的工厂（append 扩容路径共用）
-GcString* GcString::make_with_capacity(size_t len, size_t cap) {
-    if (cap < len) cap = len;
-    size_t objSize = sizeof(GcString) + cap + 1;
-    auto* str = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &_desc));
-    str->length = static_cast<int32_t>(len);
-    str->parent = nullptr;
-    str->u.capacity = static_cast<int32_t>(cap);  // Flat 模式
-    str->data()[len] = '\0';
-    return str;
-}
-
-// append 核心实现：Go 模式，返回新对象或 this
-GcString* GcString::append(const GcString* other) {
-    if (!other || other->length == 0) return this;
-    return append(other->data(), static_cast<size_t>(other->length));
-}
-
-GcString* GcString::append(const char* s, size_t len) {
-    if (len == 0) return this;
-
-    // Slice 模式：不能就地修改（data 在 parent 处），强制走扩容路径
-    // 此时 capacity() 返回 0，needed > 0 必然触发扩容分配新 Flat 对象
-    size_t curCap = static_cast<size_t>(capacity());
-    size_t needed = static_cast<size_t>(length) + len;
-
-    if (needed > curCap) {
-        // 容量不足：分配新对象（2 倍扩容策略）
-        size_t newCap = std::max(needed, curCap * 2);
-        if (newCap < 16) newCap = 16;
-        auto* newStr = static_cast<GcString*>(
-            GcHeap::instance().alloc(sizeof(GcString) + newCap + 1, &_desc)
-        );
-        newStr->length = static_cast<int32_t>(length + len);
-        newStr->parent = nullptr;
-        newStr->u.capacity = static_cast<int32_t>(newCap);
-        std::memcpy(newStr->data(), data(), length);       // 旧数据（data() 自动处理 Slice）
-        std::memcpy(newStr->data() + length, s, len);      // 新数据
-        newStr->data()[newStr->length] = '\0';
-        return newStr;  // 旧对象由 GC 回收
+// GcString::data()：根据类型自动处理
+char* GcString::data() {
+    if (isRope()) {
+        // Rope 节点：flatten 后返回
+        return static_cast<GcRopeNode*>(this)->flatten()->raw_data();
     }
-    // 容量足够：就地修改，零分配
-    std::memcpy(data() + length, s, len);
-    length += static_cast<int32_t>(len);
-    data()[length] = '\0';
-    return this;
+    if (parent != nullptr) {
+        // Slice 模式：从 parent 的 offset 处返回
+        return const_cast<char*>(parent->data()) + u.offset;
+    }
+    // Flat 模式
+    return raw_data();
 }
 
-GcString* GcString::append(const char* s) {
-    return append(s, std::strlen(s));
-}
-
-GcString* GcString::append(int32_t val) {
-    char buf[32];
-    int len = snprintf(buf, sizeof(buf), "%d", val);
-    return append(buf, static_cast<size_t>(len));
-}
-
-GcString* GcString::append(double val) {
-    char buf[64];
-    int len = snprintf(buf, sizeof(buf), "%.6g", val);
-    return append(buf, static_cast<size_t>(len));
-}
-
-GcString* GcString::append(bool val) {
-    return append(val ? "true" : "false");
+const char* GcString::data() const {
+    if (isRope()) {
+        return static_cast<const GcRopeNode*>(this)->flatten()->raw_data();
+    }
+    if (parent != nullptr) {
+        return parent->data() + u.offset;
+    }
+    return raw_data();
 }
 ```
 
-#### 3.8 concat_multi A 优化：初始化 capacity 字段
+**关键**：data() 对用户透明，无论 Flat/Slice/Rope 都能正确返回数据指针。
 
-[string.cpp:95-111](file:///d:/you/Aura/runtime/builtin/string.cpp#L95) 改为：
+#### 3.16 自动切换机制（核心设计，参考 Protobuf RopeByteString）
+
+**原理**：不"运行时检测数据量"，而是 concat/append/concat_multi 入口处的硬性阈值判断 + 斐波那契深度控制。
+
+**三层防护机制**（对标 Protobuf）：
+
+| 层 | 机制 | 阈值 | 作用 |
+|:---:|:---|:---|:---|
+| 1 | 小字符串直接拷贝 | `kConcatByCopySize = 128` | 避免 Rope 节点开销（32B 头 + 2 指针）反超 memcpy |
+| 2 | 斐波那契深度边界 | `kMinLengthByDepth[]` | 保证深度 d 的树长度 ≥ F(d+2)，防止退化成链表 |
+| 3 | 超深度强制再平衡 | `kMaxRopeDepth = 30` | 超过直接强制 flatten，栈保护 |
+
+**关键阈值**（参照 Protobuf，Aura 调优后）：
+
+| 阈值 | 值 | 含义 | Protobuf 对应 |
+|:---|:---|:---|:---|
+| `kConcatByCopySize` | 128 字节 | < 此值直接 memcpy，不建 Rope | CONCATENATE_BY_COPY_SIZE |
+| `kMinLengthByDepth[32]` | 斐波那契数列 | 深度 d 的树最小长度 ≥ F(d+2) | minLengthByDepth |
+| `kMaxRopeDepth` | 30 | 超此值强制 flatten | 约 45（Protobuf） |
+| `kFlatFallbackThreshold` | 64 字节 | Rope 子树小于此值直接 flatten | —（Protobuf 不显式） |
+
+**斐波那契深度边界表**：
 
 ```cpp
+// 编译期常量表（对标 Protobuf minLengthByDepth）
+// 规则：深度 d 的 Rope 树，总长度必须 ≥ kMinLengthByDepth[d]
+// 数学含义：斐波那契数列保证最坏情况下树仍接近平衡
+static constexpr int32_t kMinLengthByDepth[] = {
+    // d=0..31
+    1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987,
+    1597, 2584, 4181, 6765, 10946, 17711, 28657, 46368, 75025,
+    121393, 196418, 317811, 514229, 832040, 1346269, 2178309
+};
+static constexpr size_t kMinLengthByDepthSize =
+    sizeof(kMinLengthByDepth) / sizeof(kMinLengthByDepth[0]);
+static constexpr int32_t kMaxRopeDepth = 30;  // 超此深度强制 flatten
+```
+
+**深度-长度对应关系**：
+
+| 深度 | 最小长度 | 说明 |
+|:---:|:---:|:---|
+| 0 | 1 | 叶子节点 |
+| 5 | 8 | — |
+| 10 | 89 | — |
+| 15 | 987 | 1KB 字符串最深 15 层 |
+| 20 | 10946 | 10KB 字符串最深 20 层 |
+| 25 | 121393 | 100KB 字符串最深 25 层 |
+| 30 | 1346269 | 1MB 字符串最深 30 层 |
+
+**含义**：1KB 字符串的 Rope 树深度不应超过 15，10KB 不应超过 20，1MB 不应超过 30。
+
+#### 3.17 concat 改造（三层防护）
+
+[string.cpp:88-91](file:///d:/you/Aura/runtime/builtin/string.cpp#L88) concat 重构为：
+
+```cpp
+// concat 三层防护机制：
+// 1. 小字符串（< 128B）→ 直接 memcpy
+// 2. 中等字符串 → 检查斐波那契深度边界，合法则建 Rope
+// 3. 超深度（> 30）或深度越界 → 强制 flatten 后拼接
+GcString* GcString::concat(const GcString& other) const {
+    int32_t totalLen = length + other.length;
+    if (other.length == 0) return const_cast<GcString*>(this);
+    if (length == 0) return const_cast<GcString*>(&other);
+
+    // ---- 第 1 层：小字符串直接拷贝 ----
+    if (totalLen < kConcatByCopySize) {
+        return concat_flat(this, &other);  // 一次 alloc + 两次 memcpy
+    }
+
+    // ---- 第 2 层：检查斐波那契深度边界 ----
+    int leftDepth  = ropeDepth();
+    int rightDepth = other.ropeDepth();
+    int newDepth   = std::max(leftDepth, rightDepth) + 1;
+
+    // 超最大深度：强制 flatten
+    if (newDepth >= kMaxRopeDepth) {
+        GcString* flat = concat_flat(this, &other);
+        return flat;
+    }
+
+    // 深度越界检查：totalLen < kMinLengthByDepth[newDepth] 表示树过深
+    // 此时建 Rope 会违反斐波那契边界，强制 flatten 后重新建树
+    if (newDepth < (int)kMinLengthByDepthSize &&
+        totalLen < kMinLengthByDepth[newDepth]) {
+        // 树过深：先 flatten 两边，再走 concat_flat（保证不违反斐波那契边界）
+        return concat_flat(this, &other);
+    }
+
+    // ---- 第 3 层：合法，建 Rope 节点 ----
+    return GcRopeNode::make(const_cast<GcString*>(this), const_cast<GcString*>(&other));
+}
+
+// ropeDepth：返回当前对象的 Rope 深度
+// Flat/Slice 返回 0，Rope 节点返回 max(left, right) + 1
+int GcString::ropeDepth() const {
+    if (!isRope()) return 0;
+    return static_cast<const GcRopeNode*>(this)->depth;
+}
+
+// concat_flat：扁平化两边并 memcpy 拼接
+GcString* concat_flat(const GcString* a, const GcString* b) {
+    int32_t total = a->length + b->length;
+    size_t objSize = sizeof(GcString) + total + 1;
+    auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
+    r->length = total;
+    r->u.capacity = total;
+    r->parent = nullptr;
+    // 注意：data() 会自动处理 Rope/Slice 的 flatten
+    std::memcpy(r->raw_data(), a->data(), a->length);
+    std::memcpy(r->raw_data() + a->length, b->data(), b->length);
+    r->raw_data()[total] = '\0';
+    return r;
+}
+```
+
+**关键决策点**：
+- 第 1 层（< 128B）：避免 Rope 节点开销（32B 头 + 2 指针）反超 memcpy
+- 第 2 层（斐波那契边界）：保证深度 d 的树长度 ≥ F(d+2)
+- 第 3 层（合法）：建 Rope 节点，零拷贝
+
+#### 3.18 append 改造（Flat 自动切换 Rope）
+
+[string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) append 改造（关键变更）：
+
+```cpp
+// append 三层防护机制：
+// 1. Rope 模式：触发降级到 Flat（避免 Rope 链反复 append 形成深度过大单链树）
+// 2. Flat + 结果 < 128B：走原 Flat 扩容逻辑
+// 3. Flat + 结果 ≥ 128B 且斐波那契边界合法：切换到 Rope
+// 4. Flat + 结果超深度边界：走 Flat 扩容（保证不违反斐波那契边界）
+GcString* GcString::append(const GcString* other) {
+    if (!other || other->length == 0) return this;
+
+    size_t needed = static_cast<size_t>(length) + static_cast<size_t>(other->length);
+
+    // ---- Rope 模式：降级到 Flat ----
+    // 理由：Rope 链反复 append 会形成深度过大的单链树
+    // 降级策略：flatten 当前 Rope，递归走 Flat 路径
+    if (isRope()) {
+        GcString* flat_self = ensure_flat();
+        if (flat_self != this) {
+            return flat_self->append(other);
+        }
+    }
+
+    // ---- Flat 模式 ----
+
+    // 第 1 层：结果 < 128B，走原 Flat 扩容
+    if (needed < kConcatByCopySize) {
+        return append_flat_expand(other);
+    }
+
+    // 第 2 层：检查斐波那契深度边界
+    // 新建 Rope 节点的深度 = max(ropeDepth(this), ropeDepth(other)) + 1
+    // Flat/Slice 的 ropeDepth = 0，所以新深度 = 1
+    int newDepth = std::max(ropeDepth(), other->ropeDepth()) + 1;
+
+    // 超最大深度或违反斐波那契边界：走 Flat 扩容
+    if (newDepth >= kMaxRopeDepth ||
+        (newDepth < (int)kMinLengthByDepthSize &&
+         (int32_t)needed < kMinLengthByDepth[newDepth])) {
+        return append_flat_expand(other);
+    }
+
+    // 第 3 层：合法，切换到 Rope
+    return GcRopeNode::make(this, const_cast<GcString*>(other));
+}
+
+// append_flat_expand：原 Flat 扩容逻辑（2 倍扩容策略）
+GcString* GcString::append_flat_expand(const GcString* other) {
+    size_t needed = static_cast<size_t>(length) + static_cast<size_t>(other->length);
+
+    if (needed <= static_cast<size_t>(u.capacity)) {
+        // 容量足够：就地修改（零分配）
+        std::memcpy(raw_data() + length, other->raw_data(), other->length);
+        length += other->length;
+        raw_data()[length] = '\0';
+        return this;
+    }
+
+    // 容量不足：2 倍扩容
+    size_t newCap = std::max(needed, static_cast<size_t>(u.capacity) * 2);
+    if (newCap < 16) newCap = 16;
+    auto* newStr = static_cast<GcString*>(
+        GcHeap::instance().alloc(sizeof(GcString) + newCap + 1, &_desc));
+    newStr->length = static_cast<int32_t>(needed);
+    newStr->u.capacity = static_cast<int32_t>(newCap);
+    newStr->parent = nullptr;
+    std::memcpy(newStr->raw_data(), raw_data(), length);
+    std::memcpy(newStr->raw_data() + length, other->raw_data(), other->length);
+    newStr->raw_data()[newStr->length] = '\0';
+    return newStr;
+}
+```
+
+**关键行为**（对比纯 Flat 扩容 vs Rope 切换）：
+- `s = ""`，循环 `s = s.append("x")` × 2000：
+  - 前 128 次（length < 128B）：Flat 扩容，约 7 次分配
+  - 第 128 次（length = 128）：**切换到 Rope**（128 ≥ kConcatByCopySize）
+  - 第 129 次：Rope + append → 降级到 Flat（避免 Rope 链过深）
+- 大字符串一次 append：`s.append(big_chunk)` 直接切换到 Rope
+
+#### 3.19 concat_multi 改造（平衡 Rope 树 + 斐波那契边界）
+
+[string.cpp:95-111](file:///d:/you/Aura/runtime/builtin/string.cpp#L95) concat_multi 改造为构建平衡 Rope 树：
+
+```cpp
+// concat_multi 三层防护机制：
+// 1. total < 128B：一次 Flat 分配
+// 2. total ≥ 128B：构建平衡 Rope 树（二分递归）
+// 3. 子树 < 64B：直接 flatten（避免小 Rope 开销）
 GcString* concat_multi(std::initializer_list<const GcString*> parts) {
     int32_t total = 0;
     for (auto* p : parts) {
         if (p) total += p->length;
     }
+
+    // ---- 第 1 层：小字符串直接 Flat ----
+    if (total < kConcatByCopySize) {
+        return concat_multi_flat(parts);
+    }
+
+    // ---- 第 2 层：大字符串构建平衡 Rope 树 ----
+    std::vector<const GcString*> filtered;
+    for (auto* p : parts) {
+        if (p && p->length > 0) filtered.push_back(p);
+    }
+    if (filtered.empty()) return GcString::empty();
+    return build_balanced_rope(filtered, 0, filtered.size());
+}
+
+// 递归构建平衡 Rope 树（二分递归 + 斐波那契边界 + 小子树 flatten）
+GcString* build_balanced_rope(const std::vector<const GcString*>& parts,
+                                size_t start, size_t end) {
+    if (end - start == 1) {
+        return const_cast<GcString*>(parts[start]);
+    }
+    if (end - start == 0) {
+        return GcString::empty();
+    }
+
+    // 计算子树总长度
+    int32_t subtreeTotal = 0;
+    for (size_t i = start; i < end; ++i) {
+        subtreeTotal += parts[i]->length;
+    }
+
+    // 小子树 flatten（避免小 Rope 开销）
+    if (subtreeTotal < kFlatFallbackThreshold) {
+        return concat_multi_flat_range(parts, start, end);
+    }
+
+    // 二分递归
+    size_t mid = start + (end - start) / 2;
+    GcString* left  = build_balanced_rope(parts, start, mid);
+    GcString* right = build_balanced_rope(parts, mid, end);
+
+    // 检查斐波那契边界：如果新树违反边界，强制 flatten 子树
+    int leftDepth  = left->ropeDepth();
+    int rightDepth = right->ropeDepth();
+    int newDepth   = std::max(leftDepth, rightDepth) + 1;
+
+    if (newDepth >= kMaxRopeDepth ||
+        (newDepth < (int)kMinLengthByDepthSize &&
+         subtreeTotal < kMinLengthByDepth[newDepth])) {
+        // 违反斐波那契边界：flatten 子树为 Flat
+        return concat_multi_flat_range(parts, start, end);
+    }
+
+    return GcRopeNode::make(left, right);
+}
+
+// concat_multi_flat_range：范围内 parts 扁平拼接为 Flat 对象
+GcString* concat_multi_flat_range(const std::vector<const GcString*>& parts,
+                                    size_t start, size_t end) {
+    int32_t total = 0;
+    for (size_t i = start; i < end; ++i) total += parts[i]->length;
     size_t objSize = sizeof(GcString) + total + 1;
     auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
     r->length = total;
+    r->u.capacity = total;
     r->parent = nullptr;
-    r->u.capacity = total;  // ← 新增：初始化 capacity（A 优化）
-    char* dst = r->data();
-    for (auto* s : parts) {
-        if (!s) continue;
-        std::memcpy(dst, s->data(), s->length);
-        dst += s->length;
+    char* dst = r->raw_data();
+    for (size_t i = start; i < end; ++i) {
+        std::memcpy(dst, parts[i]->data(), parts[i]->length);  // data() 自动处理 Rope/Slice
+        dst += parts[i]->length;
     }
     *dst = '\0';
     return r;
 }
 ```
 
-**收益**：concat_multi 结果可被后续 append 复用 capacity（容量足够时零分配）。
+**关键设计**：
+- 二分递归保证平衡：1000 段拼接深度 ≈ log2(1000) ≈ 10
+- 斐波那契边界检查：保证深度 d 的子树长度 ≥ F(d+2)
+- 小子树（< 64B）直接 flatten：避免小 Rope 节点开销
 
-**注意**：当前 concat_multi 仅做 A 优化（初始化 capacity 字段）。不做 D（写入到已有 dst 的剩余 capacity），避免引入 CodeGen 复杂度。
+#### 3.20 Rope 降级回 Flat 的场景
 
-#### 3.8.1 concat 重构为 concat_multi 包装
+**自动降级场景**：
+1. `append(x)` 到 Rope 节点：降级到 Flat（避免 Rope 链过深，见 §3.18）
+2. `concat_multi` 子树总长 < 64 字节：直接 flatten（见 §3.19）
+3. `concat(a, b)` 违反斐波那契边界：强制 flatten（见 §3.17）
+4. `slice(start, len)` 在 Rope 上：返回 Slice 引用（不降级，slice 是 O(1)）
+5. `data()` 访问 Rope：触发 `flatten()`（一次性，结果缓存）
 
-[string.cpp:84-93](file:///d:/you/Aura/runtime/builtin/string.cpp#L84) concat 重构为：
+**不降级场景**：
+- `len()`：直接返回 `length` 字段（O(1)）
+- `==` 比较：先比 length（O(1) 短路），不同则 flatten 比较
+- `slice()`：返回 Slice 引用（不 flatten，保持 Rope 结构）
 
-```cpp
-GcString* GcString::concat(const GcString& other) const {
-    return concat_multi({this, &other});
-}
-```
+#### 3.21 CodeGen 生成 concat_rope（不实施）
 
-详见 §十一.4。语义不变（const + 创建新对象），代码从 10 行 → 3 行，自动获得 capacity 初始化。
+**决策**：**不在 CodeGen 层生成 concat_rope**，依赖 `concat` 运行时自动选择（§3.16）。
 
-#### 3.9 CodeGen 优化：`s = s + x` → `s = s.append(x)`
-
-[ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) `genAssignExpr` 改造：
-
-**模式识别**：当赋值形式为 `s = s + x`（左值与左操作数相同，且右操作数为单元素）时，优化为 `s = s.append(x)`。
-
-**实现**：
-
-```cpp
-// genAssignExpr 中
-if (e.target 是 IdentifierExpr && e.value 是 BinaryExpr(+)) {
-    auto targetName = genIdentifier(*e.target);
-    auto& binExpr = static_cast<const BinaryExpr&>(*e.value);
-
-    // 检查 s = s + x 模式（仅处理单元素 + 链）
-    // 注意：stripGet 是 genBinaryExpr 内的局部 lambda，此处不可用
-    //       需内联 .get() 后缀检查
-    if (binExpr.op == "+" && binExpr.left 是 IdentifierExpr) {
-        auto leftName = genIdentifier(*binExpr.left);
-        // 内联 stripGet：去掉 ".get()" 后缀
-        auto stripGetInline = [](const std::string& s) -> std::string {
-            if (s.size() > 6 && s.substr(s.size() - 6) == ".get()")
-                return s.substr(0, s.size() - 6);
-            return s;
-        };
-        std::string targetBase = stripGetInline(targetName);
-        std::string leftBase   = stripGetInline(leftName);
-        if (targetBase == leftBase && stringVarNames_.count(targetBase)) {
-            // s 是 string 变量，s = s + x 模式 → s = s.append(x)
-            std::string rightExpr = genExpr(*binExpr.right, isCoroutine);
-            return targetBase + ".get()->append(" + rightExpr + ")";
-        }
-    }
-}
-```
-
-**关键约束**：
-- `stripGet` 是 `genBinaryExpr` 内的局部 lambda，在 `genAssignExpr` 中不可见
-- 必须在 `genAssignExpr` 内**内联** `.get()` 后缀检查逻辑
-- 不能直接复用 `genBinaryExpr` 中的 lambda
-
-**初始版本仅处理单元素 `s = s + x`**：
-
-| 模式 | 初始版本是否处理 | CodeGen 生成 | 说明 |
-|:---|:---:|:---|:---|
-| `s = s + x`（x 单元素） | ✅ | `s = s->append(x)` | 直接优化 |
-| `s = s + a + b + c`（链式） | ❌ 远期 | — | 需从 AST 中提取排除首个 `s` 后的子链再生成 `concat_multi`，复杂度高，标记为远期 |
-| `s = a + b + c`（无自指） | ✅ 已有（Step 3） | `concat_multi({a, b, c})` | 不涉及 append |
-
-**链式 append（远期，本 plan 不实施）**：
-
-若未来扩展支持 `s = s + a + b + c` → `s = s->append(concat_multi({a, b, c}))`，需：
-1. 在 `genAssignExpr` 中递归遍历 BinaryExpr 链
-2. 排除首个 `s` 节点
-3. 对剩余节点调用 `collectStringChain` 收集
-4. 生成 `concat_multi({...})` 作为 append 参数
-
-此扩展不在本 plan 范围内。当前链式 `s = s + a + b + c` 会走 `concat(concat(concat(s, a), b), c)` 路径（无优化，但不破坏功能）。
-
-#### 3.10 BuiltinRegistry 注册
-
-[BuiltinRegistry.h:225+](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L225) 在 `methods_` 中新增（在 `string.concat` 后追加）：
-
-```cpp
-// --- string 方法（在 len / concat 后追加）---
-{"string", "append", {{"other", "string"}},  ReturnTypeInfo::Named("string")},
-{"string", "append", {{"i", "int"}},         ReturnTypeInfo::Named("string")},
-{"string", "append", {{"f", "float"}},       ReturnTypeInfo::Named("string")},
-{"string", "append", {{"b", "bool"}},        ReturnTypeInfo::Named("string")},
-```
-
-**注意**：方法注册给 `string` 类型，不引入 `StringBuilder` 类型。
-
----
-
-### Part D: Step 5 — slice 零拷贝
-
-#### 3.11 改动文件
-
-| 文件 | 改动 | 行数 |
-|:---|:---|:---:|
-| [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) | `slice` 实现 | +15 |
-| [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) | 注册 `string.slice` | +1 |
-| **合计** | | **+16** |
-
-#### 3.12 `slice` 实现
-
-[string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 新增：
-
-```cpp
-GcString* GcString::slice(int32_t start, int32_t len) const {
-    if (start < 0 || len < 0 || start + len > length) {
-        std::fprintf(stderr, "slice: out of range (start=%d, len=%d, length=%d)\n",
-                     start, len, length);
-        std::abort();
-    }
-
-    // Slice 模式：分配 header-only 对象（无 data 缓冲区）
-    auto* s = static_cast<GcString*>(
-        GcHeap::instance().alloc(sizeof(GcString), &_desc)
-    );
-    s->length = len;
-    s->parent = const_cast<GcString*>(this);
-    s->u.offset = start;  // Slice 模式用 offset
-    return s;
-}
-```
-
-#### 3.13 BuiltinRegistry 注册 slice
-
-```cpp
-{"string", "slice", {{"start", "int"}, {"len", "int"}}, ReturnTypeInfo::Named("string")},
-```
+**理由**：
+- 编译期无法知道字符串实际长度
+- 运行时自动选择更准确
+- CodeGen 改动最小
 
 ---
 
@@ -536,43 +788,54 @@ GcString* GcString::slice(int32_t start, int32_t len) const {
 
 ### 4.1 关键假设
 
-1. **`allocSize` uint32 足够**：单对象 < 4GB，Aura 永不超限
-2. **`age` 5-bit 足够**：当前 `kPromotionAge = 2`（[gc.h:204](file:///d:/you/Aura/runtime/gc.h#L204)），5-bit 上限 31
-3. **GcObject 字段访问全在 runtime/gc.cpp**：src/ 下无直接访问（已验证）
-4. **union capacity/offset 互斥**：通过 `parent != nullptr` 区分模式，无 kind 字段
-5. **`append` 返回新对象模式**：Go 的 `append(slice, elem)` 模式，调用者必须用返回值替换引用
-6. **GC 正确追踪 parent 链**：markFields 递归标记 parent，保证父字符串保活
+1. **Intern 池内存可控**：字面量数量有限（通常 < 1000），池大小有界
+2. **小整数缓存 16KB 静态内存**：固定开销，可接受
+3. **GcRopeNode 继承 GcString 不影响 GcString 头部**：子类追加字段，基类大小不变
+4. **用 desc 指针判断类型不需要 virtual**：与 v5 去 virtual 一致
+5. **ensure_flat 缓存 mutable**：const 方法中修改 mutable 字段是 C++ 标准允许的
+6. **kRopeThreshold = 1KB 是合理阈值**：小字符串走 Flat 更优（一次 alloc + memcpy），大字符串走 Rope 避免 memcpy O(n²)
+7. **append 在 Rope 上降级到 Flat 是正确策略**：避免反复 append 形成 Rope 单链树（深度过大）
+8. **concat_multi 大字符串构建平衡 Rope 树**：二分递归保证深度 ~log2(n)，避免单链退化
 
 ### 4.2 决策
 
 | 决策 | 选择 | 理由 |
 |:---|:---|:---|
-| GcObject 压缩方式 | bit-packed flags + uint32 allocSize | 56→32 字节，最大收益 |
-| next / allocSize union | **否** | 生命周期冲突（next 在标记期，allocSize 在 promoteToOld） |
-| GcString 字段 union | capacity/offset 共用槽位 | Flat/Slice 模式互斥，安全 |
-| Slice 模式标记 | `parent != nullptr` | 避免 kind 字段开销 |
-| StringBuilder 是否独立类型 | **否** | `string` 自身可变，方法注册给 `string` 类型 |
-| `append` 返回类型 | `GcString*` | GC 对象位置固定，需返回新对象 |
-| 是否提供 `reserve` | **否** | append 自动扩容（2 倍策略） |
-| 是否提供 `clear` | **否** | `s = ""` 即可重置 |
-| CodeGen 自动优化 `s = s + x`（单元素） | **是** | 改写为 `s = s.append(x)`；链式 `s = s + a + b + c` 远期扩展 |
-| concat_multi 优化 | **仅 A**（初始化 capacity） | 不做 D（写入已有 dst 剩余 capacity，CodeGen 复杂） |
-| 扩容策略 | 2 倍 | 类似 std::vector，均摊 O(1) |
-| TypeDescriptor ptrFieldCount | 1（仅 parent） | capacity/offset 是值字段 |
+| Intern 池 key 类型 | `std::string`（拷贝） | GcString 内容可能在 GC 时移动，不能直接用 string_view 作 key |
+| Intern 池 GC 根管理 | `GcGlobalRoot<GcString>` | 注册为全局根，永不被回收 |
+| Intern 池并发 | `std::shared_mutex` 读写锁 | 读多写少，读锁零阻塞 |
+| 小整数缓存范围 | [-1024, 1023]（静态数组） | 简单可靠，无锁，16KB 静态内存可接受 |
+| **Rope 实现方式** | **GcRopeNode 继承 GcString** | **GcString 头部不变，仅 Rope 节点付出代价** |
+| **类型判断** | **desc 指针比较** | **不需要 virtual，与 v5 一致** |
+| **flat_cache_ 位置** | **在 GcRopeNode 中** | **不增加 GcString 头部** |
+| **Rope 切换阈值** | **kRopeThreshold = 1KB** | **正常用 Flat，过大自动切换 Rope** |
+| **Rope 降级阈值** | **kFlatFallbackThreshold = 64B** | **小 Rope 节点直接 flatten，避免开销** |
+| **append 在 Rope 上** | **自动降级到 Flat** | **避免 Rope 链反复 append 形成深度过大的单链树** |
+| **concat_multi 大字符串** | **构建平衡 Rope 树** | **二分递归构建，1000 段深度约 10（vs 单链 1000）** |
+| 扁平化深度限制 | `kMaxRopeDepth = 16` | 防止栈溢出，超限走 `data()` 强制扁平化 |
+| concat 路径选择 | 运行时自动（长度 > 1KB 用 Rope） | 编译期无法知长度，运行时更准确 |
+| CodeGen 生成 concat_rope | **不做** | 依赖运行时 concat/append/concat_multi 自动切换 |
 
 ### 4.3 不破坏现有功能验证
 
 | 现有场景 | 是否受影响 | 说明 |
 |:---|:---:|:---|
-| `make_string("literal")` | ❌ | 调 `make`，新字段初始化（u.capacity / parent） |
-| `concat(a, b)` | ❌ | 调 `make`，新字段初始化 |
-| `concat_multi({...})` | ❌ | 调 `alloc` 直接构造，新字段初始化（Part C A 优化） |
-| `io.println(s)` | ❌ | 调 `s->data()`，自动处理 parent 解引用 |
-| `s.len()` | ❌ | 返回 `length` 字段 |
-| `s = s + x`（单元素循环累加） | ✅ 优化 | CodeGen 自动改写为 `s = s.append(x)` |
-| `s = s + a + b + c`（链式累加） | ❌ 远期 | 走嵌套 concat 路径（无优化，不破坏功能） |
-| GC 标记 / sweep / finalizer | ⚠️ | 28 处字段访问改为方法调用（语义不变） |
-| GC 扫描 GcString | ⚠️ | ptrFieldCount 从 0 → 1，多检查 1 个字段 |
+| `make_string("literal")` | ✅ 优化 | CodeGen 改为 `intern_string`，相同字面量只分配一次 |
+| `GcString::from(i)` | ✅ 优化 | 缓存范围扩展到 [-1024, 1023] |
+| `concat(a, b)` 小字符串 | ❌ | `result.length <= 1KB` 走 concat_multi（行为不变） |
+| `concat(a, b)` 大字符串 | ✅ 优化 | `result.length > 1KB` 或任一方是 Rope → 自动切换 Rope |
+| `concat_multi({...})` 小字符串 | ❌ | `total <= 1KB` 走一次 Flat 分配（行为不变） |
+| `concat_multi({...})` 大字符串 | ✅ 优化 | `total > 1KB` 构建平衡 Rope 树 |
+| `append(x)` 小扩展 | ❌ | `length + x.length <= 1KB` 走原 Flat 扩容逻辑（行为不变） |
+| `append(x)` 大扩展 | ✅ 优化 | `length + x.length > 1KB` → 自动切换 Rope |
+| `append(x)` 在 Rope 上 | ✅ 优化 | 自动降级到 Flat（避免 Rope 链过深） |
+| `io.println(s)` | ❌ | `s->data()` 自动 `flatten()`，对 println 透明 |
+| `s.len()` | ❌ | 返回 `length` 字段（O(1)） |
+| `s = s + x`（CodeGen 优化） | ❌ | 仍生成 `s.append(x)`，由 append 自动切换机制处理 |
+| `s.slice(0, 5)` | ❌ | parent != nullptr 且 !isRope()，data() 走 parent->data() + offset |
+| GC 扫描 GcString | ❌ | GcString._desc 的 ptrFieldCount 仍为 1（仅 parent），不变 |
+| GC 扫描 GcRopeNode | ⚠️ | GcRopeNode._desc 的 ptrFieldCount = 4（parent + left + right + flat_cache_） |
+| `s == other` | ✅ 优化 | 先比 length（O(1) 短路），相同指针直接返回 true |
 
 ---
 
@@ -580,164 +843,184 @@ GcString* GcString::slice(int32_t start, int32_t len) const {
 
 ### 5.1 编译验证
 
-1. 修改 [runtime/types.h](file:///d:/you/Aura/runtime/types.h) GcObject 改为 bit-packed 布局
-2. 修改 [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 28 处字段访问改为方法调用
-3. 编译通过 + 现有测试通过（验证 Part A 不破坏 GC）
-4. 修改 [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) GcString 加 union + parent + 方法声明
-5. 修改 [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 实现 make_with_capacity + append + slice + TypeDescriptor + concat_multi A
-6. 修改 [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) 注册 append + slice
-7. 修改 [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) `genAssignExpr` 识别 `s = s + x`
-8. 编译通过
+1. 实现 Part A：`intern_string` API + `g_internPool`
+2. 实现 Part B：`from(int32_t)` 缓存范围扩展
+3. 实现 Part C：GcRopeNode 类型 + make + flatten
+4. 实现 Part C：GcString::data() 改造（根据 isRope/isSlice/isFlat）
+5. 实现 Part C：concat 自动选择改造
+6. CodeGen 改造 `genStringLiteral` 生成 `intern_string`
+7. 编译通过
 
-### 5.2 运行时验证（Part A 头部压缩）
+### 5.2 运行时验证
 
-**测试 0：GC 回归**
+**测试 1：字面量 intern**（Part A）
 
 ```aura
 fun main(io: Io) {
-    let s = "Hello, World!"
-    io.println(s)
-    let info = gc_stats()
-    io.println(info)  // GC 行为应与压缩前一致
-    gc_force()
-    io.println(s)  // s 应仍存活
+    let s1 = "hello"
+    let s2 = "hello"
+    io.println(s1)  // hello
+    io.println(s2)  // hello
+    io.println(gc_stats())  // live 应减少（字面量复用）
 }
 ```
 
-**验证点**：alloc/young/old/live 数字与压缩前对比（应基本一致，因对象大小变小可能略有下降）。
+**预期**：相同字面量只分配一次。
 
-### 5.3 运行时验证（Part C Step 4）
-
-**测试 1：循环累加**
+**测试 2：循环内字面量 intern**（Part A）
 
 ```aura
 fun main(io: Io) {
-    let s = ""
-    for i in range(0, 1000) {
-        s = s + "x"
+    for i in range(0, 5000) {
+        let s = "iter " + i + " step " + i + " done"
     }
-    io.println(s.len())   // 期望 1000
     io.println(gc_stats())
 }
 ```
 
 **预期 GC 统计**：
-- 改造前：~1000 次 alloc，O(n²) memcpy
-- 改造后（自动优化为 append）：~6 次 alloc（2 倍扩容），O(n) memcpy
-- `alloc` 预计 ~2KB（仅扩容分配）
+- `alloc` 从 1950KB → 预计 ~450KB（字面量从 15000 次降到 3 次）
 
-**测试 2：append 混合类型**
+**测试 3：小整数缓存扩展**（Part B）
+
+```aura
+fun main(io: Io) {
+    for i in range(0, 2000) {
+        let s = i
+    }
+    io.println(gc_stats())
+}
+```
+
+**预期**：i < 1024 时零分配。
+
+**测试 4：Rope 拼接**（Part C）
+
+```aura
+fun main(io: Io) {
+    let a = make_string("a" * 2000)  // 2KB 字符串
+    let b = make_string("b" * 2000)  // 2KB 字符串
+    let c = a + b  // 应走 concat_rope（长度 > 1KB）
+    io.println(c.len())  // 期望 4000
+    io.println(c)        // 触发 flatten
+}
+```
+
+**预期**：
+- `a + b` 走 `GcRopeNode::make`（O(1) 新建节点）
+- `io.println(c)` 触发 `flatten()`（一次性 O(n) 拷贝）
+
+**测试 5：Rope GC 安全**
+
+```aura
+fun main(io: Io) {
+    let a = make_string("a" * 2000)
+    let b = make_string("b" * 2000)
+    let c = a + b  // Rope 节点
+    gc_force()
+    io.println(c.len())  // 期望 4000（a/b 不应被回收，Rope 的 left/right 引用）
+}
+```
+
+**预期**：GC 标记 Rope 节点的 left/right，保证 a/b 保活。
+
+**测试 6：ensure_flat 缓存**
+
+```aura
+fun main(io: Io) {
+    let c = make_string("a" * 2000) + make_string("b" * 2000)
+    io.println(c)        // 首次 flatten，分配 Flat 副本
+    let stats1 = gc_stats()
+    io.println(c)        // 第二次 flatten，应返回缓存
+    let stats2 = gc_stats()
+    // stats2 的 alloc 应与 stats1 相同（无新分配）
+}
+```
+
+**测试 7：append 自动切换 Flat ↔ Rope**（验证切换机制）
 
 ```aura
 fun main(io: Io) {
     let s = ""
-    for i in range(0, 100) {
-        s = s + "iter " + i + " "
+    // 循环 append 直到超过 1KB，触发 Flat→Rope 切换
+    for i in range(0, 2000) {
+        s = s.append("x")  // length 0 → 2000
     }
-    io.println(s.len())   // 期望 ~700
+    io.println(s.len())  // 期望 2000
+    io.println(gc_stats())  // 应看到 Flat 扩容 + 1 次 Rope 分配
 }
 ```
 
-**注意**：初始版本仅优化 `s = s + x`（单元素）模式。`s = s + "iter " + i + " "` 属于链式 `s = s + a + b + c`，**不在本 plan 优化范围内**（远期扩展）。当前会走 `concat(concat(concat(s, "iter "), i), " ")` 嵌套路径（无优化，但不破坏功能）。测试 2 仅验证单元素路径不退化。
+**预期切换路径**：
+- 前 ~1000 次（length < 1024）：Flat 扩容，约 6 次分配
+- 第 1001 次（length = 1024 → 1025 > 1024）：**切换到 Rope**
+- 第 1002 次及后续：Rope + append → **降级回 Flat**（避免 Rope 链过深）
 
-### 5.4 运行时验证（Part D Step 5）
+**关键验证**：
+- `s.len()` 返回正确值（2000）
+- GC 统计显示分配次数明显减少（vs 纯 Flat 扩容）
+- 不应出现 Rope 链过深（深度 < 16）
 
-**测试 3：子串共享**
-
-```aura
-fun main(io: Io) {
-    let s = "Hello, World!"
-    let sub = s.slice(0, 5)
-    io.println(sub)        // 期望 "Hello"
-    io.println(sub.len())  // 期望 5
-}
-```
-
-**测试 4：slice 的 GC 行为**
-
-```aura
-fun main(io: Io) {
-    let s = "Hello, World!"
-    let sub = s.slice(0, 5)
-    gc_force()
-    io.println(sub)  // s 不应被回收（parent 链保活）
-}
-```
-
-### 5.5 边界场景验证
+### 5.3 边界场景验证
 
 | 场景 | 测试代码 | 预期 |
 |:---|:---|:---|
-| append 触发扩容 | `s = ""; for i in 0..100 { s = s + "x" }` | ~7 次扩容，最终 length=100 |
-| slice 越界 | `s.slice(0, 100)` 当 s.len()=5 | abort |
-| slice 空字符串 | `s.slice(0, 0)` | 返回 length=0 的 slice |
-| 多层 slice | `s.slice(0, 5).slice(1, 2)` | 正确递归解引用 |
-| slice 后 append | `let sub = s.slice(0, 5); sub.append("x")` | 触发扩容，分配新 Flat 对象 |
-| append 后 s 被替换 | `let old = s; s = s + "x"` | old 仍指向旧对象，s 指向新对象 |
-| 头部压缩后 GC 完整流程 | 创建 → 标记 → sweep → finalizer → promoteToOld | 行为不变 |
-
-### 5.6 回归测试
-
-运行所有现有测试：
-- 字符串拼接行为不变
-- GC 行为正确（marked / generation / finalized / age / allocSize 全部正确）
-- 无 crash / 无内存错误
+| 空 intern 池 | 首次访问字面量 | 分配 + 入池 |
+| 已存在字面量 | 第二次访问相同字面量 | 直接返回缓存指针 |
+| from(int) 在边界 | `from(1023)` / `from(1024)` / `from(-1024)` / `from(-1025)` | 1023/-1024 命中缓存，1024/-1025 动态分配 |
+| Rope 深度超限 | 构造深度 > 16 的 Rope 树 | flatten 强制扁平化（走 data() 路径） |
+| Slice 模式 data() | `s.slice(0, 5)` 后 `data()` | 从 parent 拷贝到新 Flat 对象 |
+| Rope 节点被 GC | `gc_force()` 后访问 Rope 节点 | left/right 子节点保活，无悬空指针 |
+| flat_cache_ 被 GC | `flatten()` 后 `gc_force()` | flat_cache_ 是 GC 根，保活 |
+| GcString 头部不变 | `sizeof(GcString)` | 32 字节（v5 后，不增加） |
+| GcRopeNode 头部 | `sizeof(GcRopeNode)` | 56 字节（仅 Rope 节点） |
 
 ---
 
 ## 六、可能的风险与应对方案
 
-### 6.1 风险一：Part A 头部压缩破坏 GC 内部状态
+### 6.1 风险一：Intern 池内存膨胀
 
-**问题**：28 处字段访问改写错误可能导致 marked/generation 错乱，GC 行为异常。
-
-**应对**：
-- ✅ 字段访问全集中在 [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp)，改动范围可控
-- ✅ 用 inline 方法封装，语义清晰
-- ✅ 测试 0 验证 GC 回归行为不变
-- ✅ 每个方法独立测试（marked / generation / finalized / age / allocSize）
-
-### 6.2 风险二：union 字段误用
-
-**问题**：Flat 模式误读 offset，或 Slice 模式误读 capacity。
+**问题**：字面量数量超预期（> 10000），池占用过多内存。
 
 **应对**：
-- ✅ 通过 `parent != nullptr` 区分模式，无 kind 字段开销
-- ✅ 提供 `capacity()` / `offset()` inline 方法，外部不直接访问 `u.capacity` / `u.offset`
-- ✅ Slice 模式下 `capacity()` 返回 0，强制 append 走扩容路径（安全）
+- ✅ 字面量数量通常有限（< 1000），可控
+- ✅ 不实施 D3 动态 intern API（避免用户随意入池）
+- ⚠️ 远期可引入弱引用版本 `intern_weak`
 
-### 6.3 风险三：`append` 返回新对象的语义复杂
+### 6.2 风险二：GcRopeNode 继承多态的 UB
 
-**应对**：
-- ✅ CodeGen 自动处理：`s = s + x` → `s = s.append(x)`，用户无需关心
-- ✅ Aura 层 API：`s.append(x)` 返回 string，用户应使用返回值
-- ⚠️ 文档需明确：append 返回新对象，调用者必须用返回值替换引用
-
-### 6.4 风险四：内存占用变化
-
-| 项 | 改造前 | 改造后 | 变化 |
-|:---|:---:|:---:|:---:|
-| GcObject 头部 | 56 字节 | 32 字节 | ↓ 24 |
-| GcString 头部 | 64 字节 | 48 字节 | ↓ 16 |
-| 100 万对象总头部 | ~64 MB | ~48 MB | ↓ 16 MB |
-
-**应对**：纯收益，无风险。
-
-### 6.5 风险五：GC 扫描成本
-
-**应对**：多数 GcString 的 parent 为 nullptr，立即返回，成本可忽略。
-
-### 6.6 风险六：CodeGen 优化误判
+**问题**：GcRopeNode 继承 GcString，但 GcString 没有 virtual。用 `static_cast<GcRopeNode*>(this)` 转换可能 UB。
 
 **应对**：
-- ✅ 仅当 `s` 在 `stringVarNames_` 中才优化
-- ✅ fallback 到 `concat(s, x)` 路径
+- ✅ 用 desc 指针判断类型后转换（`if (isRope()) static_cast<GcRopeNode*>`）
+- ✅ GcRopeNode::make 分配时用 `GcRopeNode::_desc`，desc 字段正确设置
+- ✅ C++ 标准：非虚继承下，基类指针指向派生类对象时 static_cast 合法
+- ⚠️ 确保不通过基类指针 delete（GC 不调用析构，用 finalizer 回调）
 
-### 6.7 风险七：slice 的 parent 链循环引用
+### 6.3 风险三：ensure_flat 缓存 mutable 字段线程安全
+
+**问题**：多线程同时调用 `ensure_flat()` 可能重复分配 Flat 副本。
 
 **应对**：
-- ✅ `slice` 只能从已有 GcString 创建，parent 只能指向已存在的字符串
-- ✅ GC markPhase 使用 marked 标志防止循环递归
+- ✅ 当前 Aura 单线程运行（协程模型，无真并行）
+- ⚠️ 远期多线程化后需加锁或原子操作保护 `flat_cache_`
+
+### 6.4 风险四：Rope 树过深导致栈溢出
+
+**问题**：`flatten()` 递归遍历 Rope 树，深度过大可能栈溢出。
+
+**应对**：
+- ✅ `kMaxRopeDepth = 16`，超限走 `data()` 强制扁平化
+- ✅ 实际场景中 Rope 深度很少超过 16（1000 段拼接深度约 10）
+
+### 6.5 风险五：concat 自动选择误判
+
+**问题**：编译期无法知长度，运行时 `concat` 自动选择可能误判。
+
+**应对**：
+- ✅ Slice 模式下 `data()` 返回扁平化缓存，不算误判
+- ⚠️ 极端场景（大量 Slice 参与拼接）可能触发多次扁平化
 
 ---
 
@@ -746,22 +1029,23 @@ fun main(io: Io) {
 | 步骤 | 操作 | 验证 | 可回滚 |
 |:---:|:---|:---|:---:|
 | **Part A** | | | |
-| 1 | [runtime/types.h](file:///d:/you/Aura/runtime/types.h) GcObject 改为 bit-packed + inline 方法 | 编译通过 | ✅ |
-| 2 | [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 28 处字段访问改为方法调用 | 编译通过 + 测试 0 GC 回归 | ✅ |
+| 1 | [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) 新增 `intern_string` 声明 | 编译通过 | ✅ |
+| 2 | [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 实现 `intern_string` + `g_internPool` | 编译通过 | ✅ |
+| 3 | [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) `genStringLiteral` 改为生成 `intern_string` | 编译通过 | ✅ |
+| 4 | 运行测试 1 + 测试 2 验证 intern | GC 统计改善（alloc ~450KB） | ✅ |
 | **Part B** | | | |
-| 3 | [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) GcString 加 union + parent + 方法声明（含 Step 4/5 字段一次性引入） | 编译通过 | ✅ |
-| 4 | [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 更新 TypeDescriptor + 改造 make 初始化新字段 | 编译通过 + 现有测试通过 | ✅ |
+| 5 | [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) `from(int32_t)` 缓存范围扩展到 [-1024, 1023] | 编译通过 | ✅ |
+| 6 | 运行测试 3 验证小整数缓存 | i < 1024 时零分配 | ✅ |
 | **Part C** | | | |
-| 5 | [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 实现 `make_with_capacity` + `append` + concat_multi A + concat 重构 | 编译通过 | ✅ |
-| 6 | [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) 注册 `string.append` | Sema 识别 | ✅ |
-| 7 | [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) `genAssignExpr` 识别 `s = s + x` → `s.append(x)` | 编译通过 | ✅ |
-| 8 | 运行测试 1 + 测试 2 验证 append | GC 统计改善（~6 次 alloc） | ✅ |
-| **Part D** | | | |
-| 9 | [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 实现 `slice` | 编译通过 | ✅ |
-| 10 | [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) 注册 `string.slice` | Sema 识别 | ✅ |
-| 11 | 运行测试 3 + 测试 4 验证 slice | GC 统计 + 行为正确 | ✅ |
+| 7 | [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) 新增 GcRopeNode 结构 + isRope/isSlice/isFlat + data() 改造 | 编译通过 | ✅ |
+| 8 | [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 实现 GcRopeNode::_desc + make + flatten + flatten_recursive | 编译通过 | ✅ |
+| 9 | [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 改造 GcString::data() + concat 自动切换 | 编译通过 | ✅ |
+| 10 | [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 改造 append 自动切换 Flat↔Rope | 编译通过 | ✅ |
+| 11 | [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 改造 concat_multi 平衡 Rope 树 + build_balanced_rope | 编译通过 | ✅ |
+| 12 | 运行测试 4 + 测试 5 + 测试 6 验证 Rope | Rope 节点正确 + GC 安全 + 缓存生效 | ✅ |
+| 13 | 运行测试 7 验证 append 自动切换 | Flat→Rope→Flat 循环正常 | ✅ |
 | **回归** | | | |
-| 12 | 回归测试所有现有用例 | 无回归 | ✅ |
+| 14 | 回归测试所有现有用例 | 无回归 | ✅ |
 
 **每步独立编译 + 测试，失败可立即回滚。**
 
@@ -771,174 +1055,85 @@ fun main(io: Io) {
 
 | 文件 | 改动 | 净增行数 |
 |:---|:---|:---:|
-| [runtime/types.h](file:///d:/you/Aura/runtime/types.h) | GcObject 改为 bit-packed + inline 方法 | +35 |
-| [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | 28 处字段访问改为方法调用 | +0 |
-| [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) | GcString 加 union + parent + append/slice 方法 | +30 |
-| [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) | make_with_capacity + append + slice + TypeDescriptor + concat_multi A | +130 |
-| [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) | 注册 append + slice | +5 |
-| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genAssignExpr` 识别 `s = s + x` | +25 |
-| **合计** | | **+225** |
-| 加上 gc.cpp 28 处原地替换 | | **~260** |
+| [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) | intern_string 声明 + GcString 类型判断 + data() 改造 + GcRopeNode 结构 | +40 |
+| [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) | intern_string + g_internPool + from 扩展 + GcRopeNode 实现 + flatten + data() + **自动切换 concat/append/concat_multi** + build_balanced_rope | +225 |
+| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genStringLiteral` 改为 intern_string | +5 |
+| **合计** | | **+270** |
+| 加上注释和空行 | | **~300** |
 
 ---
 
-## 九、后续
-
-完成本 plan 后：
-
-- GcObject 头部压缩到 32 字节（节省 24 字节/对象）
-- GcString 头部压缩到 48 字节（节省 16 字节/对象）
-- `string` 类型具备可变能力（append）
-- CodeGen 自动优化循环累加为 append（零分配）
-- 子串共享（slice）零拷贝
-- concat_multi 结果带 capacity（便于后续 append 复用）
-- 可推进第三阶段 Rope 表示，或第四阶段 Intern 池
-
----
-
-## 十、与现有 plan 的关系
+## 九、与现有 plan 的关系
 
 | 现有 plan 项 | 状态 | 关系 |
 |:---|:---:|:---|
-| [gcstring_optimization.md §三 Step 4](file:///d:/you/Aura/plan/gcstring_optimization.md#L580) | 待实施 | 本 plan Part B+C 实施（v3 重新设计） |
-| [gcstring_optimization.md §三 Step 5](file:///d:/you/Aura/plan/gcstring_optimization.md#L594) | 待实施 | 本 plan Part B+D 实施 |
-| [TODO.txt §六 GcString 优化](file:///d:/you/Aura/TODO.txt#L229) | 部分完成 | 本 plan 完成后 Step 4+5 标记完成 |
-
-**关键变更**（相对 v2）：
-- ✨ 新增 Part A：GcObject 头部压缩（bit-packed + uint32 allocSize）
-- ✨ 新增 Part B：GcString 字段 union（capacity/offset 共用槽位）
-- ✨ Step 4 加入 concat_multi A 优化（初始化 capacity 字段）
-- ❌ 取消独立 `GcStringBuilder` 类型（v2 已决策）
-- ❌ 不做 concat_multi D 优化（写入已有 dst 剩余 capacity，CodeGen 复杂度高）
-
-**v3.1 修正**（基于审查反馈）：
-- 🔧 §4.1 假设 2：`kPromotionAge` 从 3 更正为 2（[gc.h:204](file:///d:/you/Aura/runtime/gc.h#L204)）
-- 🔧 §3.9 CodeGen：`stripGet` 在 `genAssignExpr` 中不可用（局部 lambda），改为内联 `.get()` 后缀检查
-- 🔧 §3.9 表格：链式 `s = s + a + b + c` 标记为远期，初始版本仅优化单元素 `s = s + x`
-
-**v3.2 修正**（基于方法整理反馈）：
-- ✨ §十一 新增 string 方法分类整理表
-- 🔧 §3.7 `concat` 重构为 `concat_multi({this, &other})` 包装（语义相同，代码复用）
-- 🔧 §3.8 `concat_multi` 成为唯一拼接底层实现（concat / 链式 + 都走它）
-
-**v3 同步更新 [plan/gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md)**：
-- §三 Step 4 改为 "capacity + string 自身可变方法 + GcObject 头部压缩 + GcString 字段 union"
-- 新增 §三 Step 4a：GcObject 头部压缩
-- 新增 §三 Step 4b：GcString 字段 union
+| [change.md v5 Part A](file:///d:/you/Aura/change.md)（GcObject 头部瘦身） | 待实施 | **v6 假设 v5 已完成**（GcString 32 字节） |
+| [gcstring_optimization.md §三 Step 7 Rope](file:///d:/you/Aura/plan/gcstring_optimization.md) | 待实施 | 本 plan Part C 实施 |
+| [gcstring_optimization.md §七 D1 字面量 intern](file:///d:/you/Aura/plan/gcstring_optimization.md) | 待实施 | 本 plan Part A 实施 |
+| [gcstring_optimization.md §七 D2 小整数扩展](file:///d:/you/Aura/plan/gcstring_optimization.md) | 待实施 | 本 plan Part B 实施 |
+| [gcstring_optimization.md §七 D3 动态 intern API](file:///d:/you/Aura/plan/gcstring_optimization.md) | 不实施 | 风险高（内存膨胀），本 plan 不做 |
+| [gcstring_optimization.md §七 D4 from(int) 统一到 intern](file:///d:/you/Aura/plan/gcstring_optimization.md) | 不实施 | 推迟到弱引用 intern 机制成熟 |
+| [TODO.txt §六 GcString Rope](file:///d:/you/Aura/TODO.txt) | 待实施 | 本 plan Part C 完成后标记 ✅ |
 
 ---
 
-## 十一、string 方法整理（v3.2 新增）
+## 十、头部大小对比（关键约束验证）
 
-### 11.1 方法分类总览
+| 对象 | v3 | v5 | v6（本 plan） | 变化 |
+|:---|:---:|:---:|:---:|:---:|
+| GcObject | 32 | 16 | 16 | v5 已完成 |
+| **GcString 头** | **48** | **32** | **32** | **不变 ✅** |
+| 空字符串 | 56 | 40 | 40 | 不变 ✅ |
+| GcRopeNode 头 | — | — | **64** | 新增（仅 Rope 节点，含 depth 字段） |
+| Error | 40 | 24 | 24 | 不变 ✅ |
+| Array<T> 头 | 48 | 32 | 32 | 不变 ✅ |
 
-| 分类 | 方法 | 签名 | 语义 | 注册给 Aura |
-|:---|:---|:---|:---|:---:|
-| **工厂（创建新对象）** | `make` | `static GcString* make(const char* s, size_t len)` | 从字节序列创建 | ❌ 内部 |
-| | `make` | `static GcString* make(const char* s)` | 从 C 字符串创建 | ❌ 内部 |
-| | `make` | `static GcString* make(const std::string& s)` | 从 std::string 创建 | ❌ 内部 |
-| | `make_with_capacity` | `static GcString* make_with_capacity(size_t len, size_t cap)` | 带容量预分配 | ❌ 内部 |
-| | `from` | `static GcString* from(int32_t val)` | int → string（含 -128~127 缓存） | ❌ 内部 |
-| | `from` | `static GcString* from(double val)` | float → string | ❌ 内部 |
-| | `from` | `static GcString* from(bool val)` | bool → string（含单例缓存） | ❌ 内部 |
-| | `from` | `static GcString* from(const char* s)` 等 3 个重载 | 转发到 make | ❌ 内部 |
-| | `empty` | `static GcString* empty()` | 空字符串单例 | ❌ 内部 |
-| **拼接（创建新对象）** | `concat` | `GcString* concat(const GcString& other) const` | 双元素拼接 | ✅ `string.concat` |
-| | `concat_multi` | `GcString* concat_multi(std::initializer_list<const GcString*>)` | N 元拼接（底层） | ❌ 内部 |
-| **可变（Go 模式，返回新对象或 this）** | `append` | `GcString* append(const GcString* other)` | 追加 string | ✅ `string.append` |
-| | `append` | `GcString* append(const char* s)` | 追加 C 字符串 | ❌ 内部 |
-| | `append` | `GcString* append(const char* s, size_t len)` | 追加字节序列（底层） | ❌ 内部 |
-| | `append` | `GcString* append(int32_t val)` | 追加 int | ✅ `string.append` |
-| | `append` | `GcString* append(double val)` | 追加 float | ✅ `string.append` |
-| | `append` | `GcString* append(bool val)` | 追加 bool | ✅ `string.append` |
-| **子串（零拷贝）** | `slice` | `GcString* slice(int32_t start, int32_t len) const` | 子串引用 | ✅ `string.slice` |
-| **访问器** | `data` | `char* data()` / `const char* data() const` | 数据指针（Slice 经 parent） | ❌ 内部 |
-| | `raw_data` | `char* raw_data()` / `const char* raw_data() const` | 原始数据指针 | ❌ 内部 |
-| | `view` | `std::string_view view() const` | string_view | ❌ 内部 |
-| | `len` | `int32_t len() const` | 长度 | ✅ `string.len` |
-| | `isSlice` | `bool isSlice() const` | 是否为 Slice 模式 | ❌ 内部 |
-| | `capacity` | `int32_t capacity() const` | 容量（Slice 返回 0） | ❌ 内部 |
-| | `offset` | `int32_t offset() const` | 偏移（Flat 返回 0） | ❌ 内部 |
-| **运算符** | `operator==` | `bool operator==(const GcString&) const` | 内容比较 | ❌ 内部 |
-| | `operator!=` | `bool operator!=(const GcString&) const` | 不等比较 | ❌ 内部 |
+**关键结论**：v6 不增加任何现有对象的头部，仅新增 GcRopeNode 类型（64 字节，仅 Rope 节点付出代价）。
 
-### 11.2 Aura 层注册的方法（最终清单）
+---
 
-[BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) 注册给 `string` 类型的方法：
+## 十一、关键变更说明
 
-```cpp
-// --- string 方法 ---
-{"string", "len",    {},                           ReturnTypeInfo::Named("int")},
-{"string", "concat", {{"other", "string"}},        ReturnTypeInfo::Generic(0, "string")},
-{"string", "append", {{"other", "string"}},        ReturnTypeInfo::Named("string")},
-{"string", "append", {{"i", "int"}},               ReturnTypeInfo::Named("string")},
-{"string", "append", {{"f", "float"}},             ReturnTypeInfo::Named("string")},
-{"string", "append", {{"b", "bool"}},              ReturnTypeInfo::Named("string")},
-{"string", "slice",  {{"start", "int"}, {"len", "int"}}, ReturnTypeInfo::Named("string")},
-```
+**v6 设计要点（参考 Protobuf RopeByteString）**：
+- ✨ Part A：字面量 intern（D1）— `intern_string` API + `g_internPool` + CodeGen 改造
+- ✨ Part B：小整数缓存扩展（D2）— [-128, 127] → [-1024, 1023]
+- ✨ Part C：Rope 表示（C1）— **GcRopeNode 继承 GcString，不增加 GcString 头部**
+- ✨ **三层防护机制（对标 Protobuf RopeByteString）**：
+  - 第 1 层：小字符串（< 128B）直接 memcpy（避免 Rope 节点开销反超）
+  - 第 2 层：斐波那契深度边界（深度 d 的树长度 ≥ F(d+2)，防止退化成链表）
+  - 第 3 层：超最大深度（≥ 30）强制 flatten（栈保护）
+- ✨ **三个入口都接入三层防护**：
+  - concat：第 1 层走 memcpy，第 2 层检查斐波那契边界合法建 Rope，第 3 层超深度强制 flatten
+  - append：Rope 模式降级到 Flat（避免 Rope 链过深），Flat + 结果 ≥ 128B 检查边界后切换 Rope
+  - concat_multi：total ≥ 128B 构建平衡 Rope 树（二分递归 + 斐波那契边界检查）
+- ✨ **GcRopeNode 加 depth 字段**（int32_t）：避免 ropeDepth() 递归计算，O(1) 访问
+- ❌ 不实施 D3 动态 intern API（内存膨胀风险）
+- ❌ 不实施 D4 from(int) 统一到 intern（推迟到弱引用机制）
+- ❌ CodeGen 不生成 concat_rope（依赖运行时三层防护自动切换）
 
-### 11.3 concat 重构决策
+**与 Protobuf RopeByteString 的对比**：
 
-**问题**：concat 是否转为 append？
+| 项 | Protobuf | Aura v6 |
+|:---|:---|:---|
+| 小字符串阈值 | CONCATENATE_BY_COPY_SIZE = 128 | kConcatByCopySize = 128 |
+| 深度边界 | minLengthByDepth（斐波那契） | kMinLengthByDepth（斐波那契，一致） |
+| 最大深度 | 约 45 | kMaxRopeDepth = 30 |
+| 再平衡机制 | Balancer 类遍历重建 | 二分递归 + 斐波那契边界检查 |
+| 多入口支持 | 仅 concat | concat + append + concat_multi |
+| 类型实现 | RopeByteString extends ByteString | GcRopeNode extends GcString |
+| 头部代价 | RopeByteString 多个字段 | GcRopeNode 多 left/right/flat_cache_/depth |
 
-**分析**：
+**与 v4 的关键区别**：
+- v4：GcString 加 Kind + left/right + flat_cache_ 字段，头部 48 → 80 字节（**增加 32 字节**）
+- **v6：GcRopeNode 继承 GcString，GcString 头部不变（32 字节），GcRopeNode 64 字节（含 depth 字段）**
 
-| 方案 | 实现 | 语义匹配 | 性能 | 代码复用 |
-|:---|:---|:---:|:---:|:---:|
-| A. 保持现状 | 直接 alloc + memcpy | ✅ | ✅ 最快 | ❌ 重复 |
-| B. 转 append | `make_with_capacity(0,total)->append(this)->append(&other)` | ❌ append 是修改语义 | ⚠️ 多一层间接 | ✅ |
-| **C. 转 concat_multi** | `return concat_multi({this, &other});` | ✅ | ✅ 同 A | ✅ 最优 |
+**与 v5 的兼容性**：
+- v5 去掉 virtual，v6 用 desc 指针判断类型（一致）
+- v5 去掉 next，v6 不影响（一致）
+- v5 的 GcString 字段（length/union/parent）保持不变
 
-**决策**：方案 C — concat 重构为 concat_multi 的双元素包装。
-
-**理由**：
-- concat 是 const 方法创建新对象，append 是非 const 修改当前对象，**语义不匹配**（方案 B 否决）
-- concat_multi 语义相同（都是创建新对象），**代码复用最优**
-- concat_multi 已是 Step 3 的底层实现，concat 走它自然统一
-- concat_multi 自动获得 capacity 初始化（Part C A 优化）
-
-### 11.4 concat 重构实现
-
-[string.cpp:84-93](file:///d:/you/Aura/runtime/builtin/string.cpp#L84) 改为：
-
-```cpp
-// concat 重构为 concat_multi 的双元素包装
-// 语义不变（const + 创建新对象），代码复用 concat_multi 的优化
-GcString* GcString::concat(const GcString& other) const {
-    return concat_multi({this, &other});
-}
-```
-
-**影响**：
-- concat 行为不变（仍创建新对象）
-- concat 自动获得 capacity 初始化（concat_multi 已初始化 `u.capacity = total`）
-- 代码从 10 行 → 3 行
-- concat_multi 成为唯一拼接底层实现
-
-### 11.5 拼接路径统一架构
-
-```
-Aura 层：
-  s.concat(other)        ──┐
-  s + a + b + c          ──┼──→ concat_multi({s, other})
-  s = s + x              ──┘    或 concat_multi({a, b, c, d})
-                              │
-                              ↓
-                         concat_multi (底层)
-                         - 1 次 alloc
-                         - 1 次 memcpy 遍历
-                         - u.capacity = total
-
-  s = s + x (CodeGen 优化) ──→ s.append(x)
-                                   │
-                                   ↓
-                              append (底层)
-                              - 容量足够：就地修改，零分配
-                              - 容量不足：2 倍扩容分配新对象
-```
-
-**两条独立路径**：
-1. **创建新对象路径**：`concat` / `concat_multi` / `+` 运算符 → 都走 `concat_multi`（const + 新对象）
-2. **修改当前对象路径**：`s = s + x` (CodeGen 优化) → `append`（Go 模式，可能新对象）
-
-两条路径语义清晰，不混淆。
+**头部不变的关键**：
+- GcRopeNode 是 GcString 的子类，追加字段在 GcString 之后
+- GcString 头部仍 32 字节，sizeof(GcString) 不变
+- flat_cache_ 在 GcRopeNode 中（不在 GcString 中）
+- 类型判断用 desc 指针（不需要 virtual，不增加字段）

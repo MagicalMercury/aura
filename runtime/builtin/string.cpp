@@ -15,8 +15,11 @@ namespace aura_rt {
 // ============================================================
 // GcString::_desc — TypeDescriptor
 // ============================================================
+// GcString 布局: GcObject(16) + length(4) + union u(4) → parent at offset 24
+// 避免 offsetof(GcString, parent) 在 non-standard-layout 上的 warning
+static constexpr size_t kGcStringParentOffset = sizeof(GcObject) + sizeof(int32_t) + sizeof(int32_t);
 static const size_t kGcStringPtrOffsets[] = {
-    offsetof(GcString, parent)
+    kGcStringParentOffset
 };
 
 const TypeDescriptor GcString::_desc = {
