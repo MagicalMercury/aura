@@ -575,19 +575,75 @@ fun main(io: Io) {
 
 ---
 
-### 第二阶段（GC 已就绪，~200 行改动）
+### 第二阶段（GC 已就绪，~260 行改动，详见 [change.md](file:///d:/you/Aura/change.md) v3 plan）
 
-#### Step 4: `capacity` 字段 + `GcStringBuilder`
+**v3 重新设计**：整合 GcObject 头部压缩 + GcString 字段 union + string 自身可变方法 + concat_multi A 优化。
 
-**改动文件**：[runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) + [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp)
+#### Step 4a: GcObject 头部压缩（Part A）
+
+**改动文件**：[runtime/types.h](file:///d:/you/Aura/runtime/types.h) + [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp)
 
 **任务**：
-1. GcString 加 `int32_t capacity` 字段
-2. `make` 默认 `capacity = length`
-3. 新增 `GcStringBuilder` 类型（独立类，支持 `append` + `to_string`）
-4. TypeDescriptor 仍 `ptrFieldCount = 0`
+1. GcObject 改为 bit-packed flags + uint32 allocSize（56 → 32 字节）
+2. flags 字段 1 字节封装：marked(1) / generation(1) / finalized(1) / age(5)
+3. 提供 inline 方法：`marked()` / `setMarked()` / `generation()` / `setGeneration()` / `finalized()` / `setFinalized()` / `age()` / `incAge()` / `allocSize()` / `setAllocSize()`
+4. gc.cpp 28 处字段访问改为方法调用
 
-**收益**：Builder 模式让多次 append 零分配
+**关键决策**：next 和 allocSize 不 union（生命周期冲突：next 在标记期，allocSize 在 promoteToOld）。
+
+**收益**：每个 GC 对象节省 24 字节（100 万对象节省 24MB）。
+
+---
+
+#### Step 4b: GcString 字段 union（Part B）
+
+**改动文件**：[runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h)
+
+**任务**：
+1. GcString 加 `union { capacity; offset }`（Flat/Slice 模式共用槽位）
+2. GcString 加 `parent` 字段（Slice 模式用，Flat 为 nullptr）
+3. `parent != nullptr` 作为 Slice 模式标记（无需 kind 字段）
+4. 提供 `isSlice()` / `capacity()` / `offset()` inline 方法
+
+**union 安全性**：Flat 用 `u.capacity`，Slice 用 `u.offset`，两模式互斥。
+
+**收益**：GcString 头部 56 → 48 字节（union 节省 8 字节）。
+
+---
+
+#### Step 4: capacity + append + CodeGen 优化 + concat_multi A（Part C）
+
+**改动文件**：[runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) + [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h) + [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp)
+
+**设计原则**（v2/v3）：**StringBuilder 不独立**，`string` 自身具备可变能力，方法注册给 `string` 类型。
+
+**任务**：
+1. 改造 `make` 初始化 `u.capacity = length`（Flat 模式）
+2. 新增 `make_with_capacity(len, cap)` 工厂
+3. GcString 自身新增 `append` 方法（Go 模式：返回 `GcString*`，可能为新对象，调用者替换引用）
+4. concat_multi A 优化：初始化 `r->u.capacity = total`
+5. concat 重构为 `concat_multi({this, &other})` 包装（语义相同，代码复用，详见 change.md §十一.4）
+6. TypeDescriptor 更新 `ptrFieldCount = 1`（仅 parent）
+7. BuiltinRegistry 注册 `string.append` 方法（string/int/float/bool 4 个重载）
+8. CodeGen `genAssignExpr` 识别 `s = s + x`（单元素）模式，自动优化为 `s = s.append(x)`
+   - 注意：`stripGet` 是 `genBinaryExpr` 内局部 lambda，在 `genAssignExpr` 中需内联 `.get()` 后缀检查
+   - 链式 `s = s + a + b + c` 远期扩展，不在本 plan 范围
+
+**不引入 `StringBuilder` 类型** — `append` 注册给 `string`，避免类型分裂。
+
+**关键设计**（GC 对象位置固定，无法 realloc）：
+- `append` 容量足够时就地修改，返回 `this`（零分配）
+- `append` 容量不足时分配新对象（2 倍扩容），返回新指针，旧对象由 GC 回收
+- Slice 模式下 append：`capacity()` 返回 0，强制走扩容路径（分配新 Flat 对象，安全）
+- 不提供 `reserve` / `clear`：append 自动扩容，`s = ""` 即可重置
+
+**concat_multi A 优化**：结果对象 `u.capacity = total`，便于后续 append 复用（容量足够时零分配）。
+**不做 D 优化**（写入已有 dst 剩余 capacity），避免 CodeGen 复杂度。
+
+**收益**：
+- 循环累加 `s = s + chunk` 从 O(n²) 分配 → O(log n) 次扩容分配
+- 1000 次循环累加：1000 次 alloc → ~6 次 alloc
+- 用户代码零改动（CodeGen 自动优化）
 
 ---
 
@@ -690,8 +746,8 @@ fun main(io: Io) {
 | 优化 | 当前可行性 | 备注 |
 |:---:|:---:|:---|
 | 空串/布尔/小整数缓存 | ✅ 立即做 | 用 GcGlobalRoot 包装，零 GC 压力 |
-| Builder / 链式 `+` 优化 | ✅ 立即做 | ROI 最高，行为零变化 |
-| `capacity` 预留 | ✅ 可做 | GC 已就绪 |
+| GcObject 头部压缩 + GcString union | ✅ 立即做 | 56→32 / 56→48 字节（详见 v3 plan Part A/B） |
+| `string.append` + CodeGen 优化 `s = s + x` | ✅ 立即做 | ROI 最高，行为零变化（详见 v3 plan Part C） |
 | 子串共享 | ✅ 可做 | GC 真正运行，parent 保活有效 |
 | **Rope 表示** | **🔴 必要** | **架构级升级，解决循环累加 O(n²) 问题** |
 | 哈希缓存 | ⚠️ 推迟 | 需 Map<K,V> 类型 |
@@ -700,7 +756,7 @@ fun main(io: Io) {
 
 **推荐执行顺序**：
 1. **第一阶段** Step 1-3（~120 行）— 立即做，行为零变化
-2. **第二阶段** Step 4-5（~200 行）— GC 已就绪，Builder + 子串共享
+2. **第二阶段** Step 4a/4b/4/5（~260 行）— GC 已就绪：GcObject 头部压缩 + GcString 字段 union + string 自身可变（不引入 Builder）+ 子串共享
 3. **第三阶段** Step 7（~300 行）— Rope 架构升级，解决大规模拼接性能问题
 
 **推荐立即执行**：第一阶段 Step 1-3，~120 行代码改动，行为零变化，ROI 最高。

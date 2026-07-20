@@ -226,6 +226,11 @@ private:
             // --- string 方法 ---
             {"string", "len",    {},                           ReturnTypeInfo::Named("int")},
             {"string", "concat", {{"other", "string"}},        ReturnTypeInfo::Generic(0, "string")},
+            {"string", "append", {{"other", "string"}},        ReturnTypeInfo::Named("string")},
+            {"string", "append", {{"i", "int"}},               ReturnTypeInfo::Named("string")},
+            {"string", "append", {{"f", "float"}},             ReturnTypeInfo::Named("string")},
+            {"string", "append", {{"b", "bool"}},              ReturnTypeInfo::Named("string")},
+            {"string", "slice",  {{"start", "int"}, {"len", "int"}}, ReturnTypeInfo::Named("string")},
 
             // --- [T] 方法（13 个）---
             {"[T]", "len",       {},                                ReturnTypeInfo::Named("int")},

@@ -72,12 +72,12 @@ GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
     }
 
     GcObject* obj = static_cast<GcObject*>(mem);
-    obj->desc       = desc;
-    obj->marked     = false;
-    obj->next       = nullptr;
-    obj->generation = 0;  // 新生代
-    obj->finalized  = false;
-    obj->allocSize  = size;
+    obj->desc = desc;
+    obj->setMarked(false);
+    obj->next = nullptr;
+    obj->setGeneration(0);  // 新生代
+    obj->setFinalized(false);
+    obj->setAllocSize(size);
 
     youngObjects_.push_back(obj);
     youngBytes_ += size;
@@ -147,7 +147,7 @@ void GcHeap::throwOutOfMemory() {
 // ============================================================
 void GcHeap::writeBarrier(GcObject* parent, void* /*fieldAddr*/, GcObject* newVal) {
     // 仅当老年代对象写入新生代引用时需要记录
-    if (parent && parent->generation == 1 && newVal && newVal->generation == 0) {
+    if (parent && parent->generation() == 1 && newVal && newVal->generation() == 0) {
         rememberedSet_.insert(parent);
     }
 }
@@ -409,7 +409,7 @@ void GcHeap::markPhase(bool youngOnly) {
     // 4. 若全量扫描，标记所有老年代可达对象
     if (!youngOnly) {
         for (auto* obj : oldObjects_) {
-            if (obj->marked) {
+            if (obj->marked()) {
                 markFields(obj);
                 markInlineArrayFields(obj);
             }
@@ -422,8 +422,8 @@ void GcHeap::markPhase(bool youngOnly) {
 }
 
 void GcHeap::markObject(GcObject* obj) {
-    if (!obj || obj->marked) return;
-    obj->marked = true;
+    if (!obj || obj->marked()) return;
+    obj->setMarked(true);
 
     // 递归标记所有指针字段
     markFields(obj);
@@ -481,7 +481,7 @@ void GcHeap::sweepPhaseYoung() {
         std::lock_guard<std::mutex> lk(weakHandles_m_);
         for (auto* wh : weakHandles_) {
             GcObject* obj = wh->get();
-            if (obj && !obj->marked) {
+            if (obj && !obj->marked()) {
                 wh->clear();
             }
         }
@@ -489,10 +489,10 @@ void GcHeap::sweepPhaseYoung() {
 
     // 2. 调用 finalizer（对未标记且未 finalize 的对象）
     for (auto* obj : youngObjects_) {
-        if (!obj->marked && !obj->finalized) {
+        if (!obj->marked() && !obj->finalized()) {
             if (obj->desc && obj->desc->finalizer) {
                 obj->desc->finalizer(obj);
-                obj->finalized = true;
+                obj->setFinalized(true);
             }
         }
     }
@@ -501,14 +501,14 @@ void GcHeap::sweepPhaseYoung() {
     // 其余存活对象 age++ 留在新生代；未标记对象被丢弃。
     std::vector<GcObject*> survivors;
     for (auto* obj : youngObjects_) {
-        if (obj->marked) {
-            obj->age++;
-            if (obj->age >= kPromotionAge) {
+        if (obj->marked()) {
+            obj->incAge();
+            if (obj->age() >= kPromotionAge) {
                 promoteToOld(obj);
-                obj->marked = false;
+                obj->setMarked(false);
             } else {
                 survivors.push_back(obj);
-                obj->marked = false;
+                obj->setMarked(false);
             }
         }
     }
@@ -516,15 +516,15 @@ void GcHeap::sweepPhaseYoung() {
     // 更新 youngBytes_ 为存活对象总大小
     youngBytes_ = 0;
     for (auto* obj : survivors) {
-        youngBytes_ += obj->allocSize;
+        youngBytes_ += obj->allocSize();
     }
     youngObjects_ = std::move(survivors);
 }
 
 void GcHeap::promoteToOld(GcObject* obj) {
-    obj->generation = 1;
+    obj->setGeneration(1);
     oldObjects_.push_back(obj);
-    oldBytes_ += obj->allocSize;
+    oldBytes_ += obj->allocSize();
     if (oldBytes_ >= kOldThreshold) {
         gcPending_ = true;
     }
@@ -542,20 +542,20 @@ void GcHeap::sweepPhaseAll() {
     size_t liveOldBytes = 0;
 
     for (auto* obj : youngObjects_) {
-        if (obj->marked) {
-            obj->marked = false;
+        if (obj->marked()) {
+            obj->setMarked(false);
             liveYoung.push_back(obj);
-            liveYoungBytes += obj->allocSize;
+            liveYoungBytes += obj->allocSize();
         }
     }
 
     for (auto* obj : oldObjects_) {
-        if (obj->marked) {
-            obj->marked = false;
+        if (obj->marked()) {
+            obj->setMarked(false);
             // sweepePhaseYoung 已将晋升对象的 generation 设为 1，
             // 此处的 gen==0 分支不再需要（且 promoteToOld 在迭代 oldObjects_ 时调用会 UB）
             liveOld.push_back(obj);
-            liveOldBytes += obj->allocSize;
+            liveOldBytes += obj->allocSize();
         }
     }
 
@@ -564,7 +564,7 @@ void GcHeap::sweepPhaseAll() {
         std::lock_guard<std::mutex> lk(weakHandles_m_);
         for (auto* wh : weakHandles_) {
             GcObject* obj = wh->get();
-            if (obj && !obj->marked) {
+            if (obj && !obj->marked()) {
                 wh->clear();
             }
         }
@@ -572,18 +572,18 @@ void GcHeap::sweepPhaseAll() {
 
     // 3. 调用 finalizer（对未标记且未 finalize 的对象）
     for (auto* obj : youngObjects_) {
-        if (!obj->marked && !obj->finalized) {
+        if (!obj->marked() && !obj->finalized()) {
             if (obj->desc && obj->desc->finalizer) {
                 obj->desc->finalizer(obj);
-                obj->finalized = true;
+                obj->setFinalized(true);
             }
         }
     }
     for (auto* obj : oldObjects_) {
-        if (!obj->marked && !obj->finalized) {
+        if (!obj->marked() && !obj->finalized()) {
             if (obj->desc && obj->desc->finalizer) {
                 obj->desc->finalizer(obj);
-                obj->finalized = true;
+                obj->setFinalized(true);
             }
         }
     }

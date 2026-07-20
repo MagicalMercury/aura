@@ -591,6 +591,28 @@ std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) 
     std::string target = genExpr(*e.target, isCoroutine);
     std::string value  = genExpr(*e.value, isCoroutine);
 
+    // s = s + x 优化：若变量是 string 且赋值为自身 + 单元素，改写为 append
+    // 如 s = s + "x" → s.get()->append(make_string("x"))
+    if (auto* targetId = dynamic_cast<const Identifier*>(e.target.get())) {
+        if (auto* binExpr = dynamic_cast<const BinaryExpr*>(e.value.get())) {
+            if (binExpr->op == "+") {
+                if (auto* leftId = dynamic_cast<const Identifier*>(binExpr->left.get())) {
+                    auto stripGet = [](const std::string& s) -> std::string {
+                        if (s.size() > 6 && s.substr(s.size() - 6) == ".get()")
+                            return s.substr(0, s.size() - 6);
+                        return s;
+                    };
+                    std::string targetBase = stripGet(targetId->name);
+                    std::string leftBase   = stripGet(leftId->name);
+                    if (targetBase == leftBase && stringVarNames_.count(targetBase)) {
+                        std::string rightExpr = genExpr(*binExpr->right, isCoroutine);
+                        return targetBase + ".get()->append(" + rightExpr + ")";
+                    }
+                }
+            }
+        }
+    }
+
     // 如果目标变量是字符串类型且值使用了 concat，更新追踪
     if (stringVarNames_.count(target)) {
         if (value.find("aura_rt::concat") == std::string::npos &&

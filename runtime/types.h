@@ -103,29 +103,39 @@ struct TypeDescriptor {
 // next 用于空闲链表或标记队列（由 gc.h 实现细节决定）。
 // ============================================================
 struct GcObject {
-    const TypeDescriptor* desc = nullptr;
-
-    // GC 内部使用的标记位
-    bool     marked = false;
-
-    // GC 内部链表指针（空闲链表 / 标记队列 / 终结队列）
-    GcObject* next  = nullptr;
-
-    // 分代 GC：0 = 新生代（young），1 = 老年代（old）
-    uint8_t  generation = 0;
-
-    // Finalizer 已调用标记（防止重复调用）
-    bool     finalized = false;
-
-    // 实际分配字节数（含对象头 + 内联数据 + 对齐填充）
-    // GC 分配时记录，promoteToOld 用于准确累加 oldBytes_
-    size_t   allocSize = 0;
-
-    // 对象存活年龄（经历 minor GC 的次数）
-    // 达到 kPromotionAge 后晋升到老年代
-    uint8_t  age = 0;
+    // vptr 自动生成（offset 0-7）
+    const TypeDescriptor* desc = nullptr;  // offset 8-15
+    GcObject* next = nullptr;              // offset 16-23
+    uint32_t allocSize_ = 0;               // offset 24-27  (单对象 < 4GB)
+    uint8_t  flags_ = 0;                    // offset 28
+        // bit 0: marked | bit 1: generation | bit 2: finalized | bit 3-7: age
 
     virtual ~GcObject() = default;
+
+    // ---- marked ----
+    bool marked() const { return flags_ & 0x01; }
+    void setMarked(bool v) { if (v) flags_ |= 0x01; else flags_ &= ~0x01; }
+
+    // ---- generation ----
+    uint8_t generation() const { return (flags_ >> 1) & 0x01; }
+    void setGeneration(uint8_t g) {
+        if (g & 0x01) flags_ |= 0x02; else flags_ &= ~0x02;
+    }
+
+    // ---- finalized ----
+    bool finalized() const { return flags_ & 0x04; }
+    void setFinalized(bool v) { if (v) flags_ |= 0x04; else flags_ &= ~0x04; }
+
+    // ---- age ----
+    uint8_t age() const { return (flags_ >> 3) & 0x1F; }
+    void setAge(uint8_t a) {
+        flags_ = (flags_ & ~0xF8) | ((a & 0x1F) << 3);
+    }
+    void incAge() { setAge(age() + 1); }
+
+    // ---- allocSize ----
+    size_t allocSize() const { return allocSize_; }
+    void  setAllocSize(size_t s) { allocSize_ = static_cast<uint32_t>(s); }
 };
 
 // ============================================================
