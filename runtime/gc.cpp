@@ -23,9 +23,12 @@ namespace aura_rt {
 // ============================================================
 // GcHeap 单例
 // ============================================================
+namespace {
+    [[gnu::init_priority(101)]] GcHeap g_gcHeap;
+}
+
 GcHeap& GcHeap::instance() {
-    static GcHeap heap;
-    return heap;
+    return g_gcHeap;
 }
 
 GcHeap::~GcHeap() {

@@ -194,7 +194,7 @@ public:
     size_t gcCount()           const { return gcCount_; }
     size_t minorGcCount()      const { return minorGcCount_; }
 
-private:
+public:
     GcHeap() = default;
 
     // 分配器内部结构

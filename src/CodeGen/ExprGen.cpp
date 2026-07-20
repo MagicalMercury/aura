@@ -82,7 +82,7 @@ std::string CodeGenerator::genFloatLiteral(const FloatLiteral& e) {
 }
 
 std::string CodeGenerator::genStringLiteral(const StringLiteral& e) {
-    return "aura_rt::make_string(\"" + e.value + "\")";
+    return "aura_rt::intern_string(\"" + e.value + "\")";
 }
 
 std::string CodeGenerator::genBoolLiteral(const BoolLiteral& e) {
@@ -281,6 +281,7 @@ std::vector<std::string> CodeGenerator::collectStringChain(const BinaryExpr& e,
 
 bool CodeGenerator::isStringExprInChain(const std::string& s) const {
     if (s.find("aura_rt::make_string") != std::string::npos
+        || s.find("aura_rt::intern_string") != std::string::npos
         || s.find("->to_string") != std::string::npos
         || s.find(".to_string") != std::string::npos
         || s.find("aura_rt::concat") != std::string::npos
@@ -309,11 +310,13 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
     // string + int / int + string / float + string 等组合
     if (e.op == "+") {
         bool leftIsStr  = left.find("aura_rt::make_string") != std::string::npos
+                       || left.find("aura_rt::intern_string") != std::string::npos
                        || left.find("->to_string") != std::string::npos
                        || left.find(".to_string") != std::string::npos
                        || left.find("aura_rt::concat") != std::string::npos
                        || left.find("aura_rt::string_concat") != std::string::npos;
         bool rightIsStr = right.find("aura_rt::make_string") != std::string::npos
+                       || right.find("aura_rt::intern_string") != std::string::npos
                        || right.find("->to_string") != std::string::npos
                        || right.find(".to_string") != std::string::npos
                        || right.find("aura_rt::concat") != std::string::npos
@@ -356,9 +359,11 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
     // 字符串值比较：== / != 用于 GcString* 时需要用 string_eq 而不是指针比较
     if (e.op == "==" || e.op == "!=") {
         bool leftIsStr  = left.find("aura_rt::make_string") != std::string::npos
+                       || left.find("aura_rt::intern_string") != std::string::npos
                        || left.find("aura_rt::concat") != std::string::npos
                        || left.find("aura_rt::string_concat") != std::string::npos;
         bool rightIsStr = right.find("aura_rt::make_string") != std::string::npos
+                       || right.find("aura_rt::intern_string") != std::string::npos
                        || right.find("aura_rt::concat") != std::string::npos
                        || right.find("aura_rt::string_concat") != std::string::npos;
         if (leftIsStr || rightIsStr) {
@@ -623,7 +628,8 @@ std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) 
     }
     // 如果值包含 concat，标记目标为字符串变量
     if (value.find("aura_rt::concat") != std::string::npos ||
-        value.find("aura_rt::make_string") != std::string::npos) {
+        value.find("aura_rt::make_string") != std::string::npos ||
+        value.find("aura_rt::intern_string") != std::string::npos) {
         stringVarNames_.insert(target);
     }
 

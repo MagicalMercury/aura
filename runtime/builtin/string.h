@@ -15,76 +15,94 @@
 
 namespace aura_rt {
 
+// 前向声明（GcRopeNode 需在 GcString 中引用）
+struct GcRopeNode;
+
 // ============================================================
 // GcString — 堆分配字符串
 //
-// plan §4.1: "string 映射为 GcString*"
-//
 // data 紧跟在对象体之后（this + 1），一次 GC 分配包含字符串对象和字符缓冲区。
-// TypeDescriptor::ptrFieldCount = 0（无独立 GC 指针字段）。
 // ============================================================
 struct GcString : GcObject {
-    int32_t length = 0;                          // offset 32-35
-    union {                                       // offset 36-39
-        int32_t capacity = 0;                     //   Flat 模式（parent == nullptr）
-        int32_t offset;                           //   Slice 模式（parent != nullptr）
+    int32_t length = 0;
+    union {
+        int32_t capacity = 0;                     //   Flat 模式
+        int32_t offset;                           //   Slice 模式
     } u;
-    GcString* parent = nullptr;                   // offset 40-47
+    GcString* parent = nullptr;                   // Slice 模式标记 / Rope 模式不用
 
     static const TypeDescriptor _desc;
 
-    // 核心工厂（分配内存，实现在 string.cpp）
+    // 核心工厂
     static GcString* make(const char* s);
     static GcString* make(const char* s, size_t len);
     static GcString* make(const std::string& s);
-
-    // 新增：带容量的工厂
     static GcString* make_with_capacity(size_t len, size_t cap);
 
-    // 扩展工厂（不变）
+    // 扩展工厂
     static GcString* from(const char* s);
     static GcString* from(const char* s, size_t len);
     static GcString* from(const std::string& s);
     static GcString* from(int32_t val);
     static GcString* from(double val);
     static GcString* from(bool val);
-
     static GcString* empty();
 
-    GcString* concat(const GcString& other) const;  // 重构为 concat_multi 包装
-
-    // 可变 append（Go 模式：返回新对象或 this）
+    GcString* concat(const GcString& other) const;  // 三层防护 自动切换 Flat/Rope
     GcString* append(const GcString* other);
     GcString* append(const char* s);
     GcString* append(const char* s, size_t len);
     GcString* append(int32_t val);
     GcString* append(double val);
     GcString* append(bool val);
-
-    // 子串共享（零拷贝 slice）
     GcString* slice(int32_t start, int32_t len) const;
 
-    // 模式判断
-    bool isSlice() const { return parent != nullptr; }
-    int32_t capacity() const { return isSlice() ? 0 : u.capacity; }
-    int32_t offset() const { return isSlice() ? u.offset : 0; }
+    // ---- 类型判断（用 desc 指针，不增加字段）----
+    bool isRope() const;
+    bool isSlice() const { return !isRope() && parent != nullptr; }
+    bool isFlat() const  { return !isRope() && parent == nullptr; }
 
-    // 数据访问
+    // ---- 数据访问 ----
     char* raw_data()             { return reinterpret_cast<char*>(this + 1); }
     const char* raw_data() const { return reinterpret_cast<const char*>(this + 1); }
-
-    char* data()             { return parent ? parent->raw_data() + u.offset : raw_data(); }
-    const char* data() const { return parent ? parent->raw_data() + u.offset : raw_data(); }
+    char* data();              // Flat/Slice/Rope 自动处理
+    const char* data() const;
 
     std::string_view view() const { return {data(), static_cast<size_t>(length)}; }
 
     bool operator==(const GcString& rhs) const { return view() == rhs.view(); }
     bool operator!=(const GcString& rhs) const { return view() != rhs.view(); }
 
-    ~GcString() = default;
-
+    // ---- 辅助 ----
     int32_t len() const { return length; }
+    int32_t capacity() const { return isSlice() ? 0 : u.capacity; }
+    int32_t ropeDepth() const;
+    GcString* ensure_flat() const;
+
+    ~GcString() = default;
 };
+
+// ============================================================
+// GcRopeNode — Rope 节点（继承 GcString，不增加 GcString 头部）
+// ============================================================
+struct GcRopeNode : GcString {
+    GcString* left = nullptr;            // 左子树
+    GcString* right = nullptr;           // 右子树
+    mutable GcString* flat_cache_ = nullptr;  // 扁平化缓存
+    int32_t depth = 1;                   // 树深度
+
+    static const TypeDescriptor _desc;
+
+    static GcRopeNode* make(GcString* l, GcString* r);
+    GcString* flatten() const;           // 递归扁平化 + 缓存
+
+private:
+    void flatten_recursive(char* dst, int32_t& pos, int32_t maxDepth) const;
+};
+
+// 字面量 intern：相同内容返回同一指针（注册为 GC 全局根，永不回收）
+GcString* intern_string(const char* s);
+GcString* intern_string(const char* s, size_t len);
 
 // ============================================================
 // ToString — Aura 内置接口
