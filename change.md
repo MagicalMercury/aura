@@ -1,473 +1,306 @@
-# GC Young→Old 晋升机制缺陷修复 Plan
+# GcSharedRoot 闭包 GC 根方案 Plan
 
-> 来源：[plan/gc_promotion_issues.md](file:///d:/you/Aura/plan/gc_promotion_issues.md)
+> Bug 来源：[example/test.aura](file:///d:/you/Aura/example/test.aura) `test_basic_closure` 编译失败，见 [example/output.txt](file:///d:/you/Aura/example/output.txt)
 > 日期：2026-07-19
 > 状态：草案（待批准）
-> 范围：5 个缺陷分 3 个 Phase 实施
+> 修复方案：方案 D（新增 `GcSharedRoot<T>` 模板类）
 
 ---
 
 ## 一、Summary
 
-修复 [plan/gc_promotion_issues.md](file:///d:/you/Aura/plan/gc_promotion_issues.md) 记录的 5 个 young→old 晋升机制缺陷，分 3 个 Phase：
+新增 `GcSharedRoot<T>` 模板类，专为闭包捕获 GC 指针变量设计。与 `GcRootHandle<T>` 互补：
 
-| Phase | 缺陷 | 风险 | 改动量 |
-|:---:|:---|:---:|:---:|
-| Phase 1 | 缺陷 1 (`oldBytes_` 偏小) + 缺陷 3 (栈根扫描跳过 old) | 低 | +25 行 |
-| Phase 2 | 缺陷 4 (无年龄门槛) + 缺陷 2 (写屏障未接入) | 中 | +60 行 |
-| Phase 3 | 缺陷 5 (old/young 混布 page) | 高 | 推迟 |
+- `GcRootHandle<T>`：栈上变量包装，**不可拷贝**，仅用于局部变量生命周期管理
+- `GcSharedRoot<T>`：堆上独立存值，**可拷贝**，专为闭包捕获场景设计
 
-**本 plan 详细描述 Phase 1 + Phase 2 的实施方案，Phase 3 仅作远期展望**。
+修复后 [example/test.aura](file:///d:/you/Aura/example/test.aura) 所有闭包场景编译通过，并完整支持"返回闭包捕获 GC 变量"场景。
 
 ---
 
 ## 二、Current State Analysis
 
-### 2.1 晋升机制现状
+### 2.1 Bug 现象
 
-[gc.cpp:497-503](file:///d:/you/Aura/runtime/gc.cpp#L497):
+**测试代码** [example/test.aura:7-13](file:///d:/you/Aura/example/test.aura#L7)：
 
-```cpp
-void GcHeap::promoteToOld(GcObject* obj) {
-    obj->generation = 1;
-    oldObjects_.push_back(obj);
-    oldBytes_ += obj->desc ? obj->desc->size : 0;   // ← 缺陷 1：用类型基础大小，非实际分配大小
-    if (oldBytes_ >= kOldThreshold) {
-        gcPending_ = true;
+```aura
+fun test_basic_closure(io: Io) {
+    let greeting = "Hello"
+    let say_hello = fun() {
+        io.println(greeting + " from closure!")  // 捕获 greeting
     }
+    say_hello()
 }
 ```
 
-### 2.2 关键数据结构
-
-[types.h:81-92](file:///d:/you/Aura/runtime/types.h#L81) `TypeDescriptor`：
+**生成的 C++** [example/test.cpp:34-43](file:///d:/you/Aura/example/test.cpp#L34)：
 
 ```cpp
-struct TypeDescriptor {
-    size_t        size;               // 对象总大小（字节），含内联数据
-    size_t        ptrFieldCount;
-    const size_t* ptrFieldOffsets;
-    size_t              inlineArrayFieldCount = 0;
-    const InlineArrayField* inlineArrayFields = nullptr;
-    void (*finalizer)(GcObject* self) = nullptr;
+aura_rt::task<void> test_basic_closure(aura_rt::Io io) {
+    aura_rt::GcString* greeting_raw = aura_rt::make_string("Hello");
+    aura_rt::GcRootHandle<aura_rt::GcString*> greeting(greeting_raw);
+    auto say_hello = [greeting, io]() -> aura_rt::task<void> {  // ❌ 拷贝已 delete
+        co_await io.println(aura_rt::concat(greeting.get(), aura_rt::make_string(" from closure!")));
+        co_return;
+    };
+    co_await say_hello();
+    co_return;
+}
+```
+
+**编译错误** [example/output.txt](file:///d:/you/Aura/example/output.txt)：
+
+```
+example/test.cpp:37:18: error: use of deleted function
+  'aura_rt::GcRootHandle<T>::GcRootHandle(const aura_rt::GcRootHandle<T>&)
+  [with T = aura_rt::GcString*]'
+  37 | auto say_hello = [greeting, io]() -> aura_rt::task<void> {
+```
+
+### 2.2 根因
+
+[runtime/gc.h:47-67](file:///d:/you/Aura/runtime/gc.h#L47) 当前 `GcRootHandle`：
+
+```cpp
+template <typename T>
+class GcRootHandle {
+public:
+    GcRootHandle(T& ref);
+    ~GcRootHandle();
+    GcRootHandle(const GcRootHandle&) = delete;          // ← 拷贝 delete
+    GcRootHandle& operator=(const GcRootHandle&) = delete;
+    void rebind(T& ref) { ptr_ = &ref; }
+    T& operator*()  const { return *ptr_; }
+    T* operator->() const { return ptr_; }
+    T  get()        const { return *ptr_; }
+private:
+    T* ptr_;   // ← 指向栈上变量
+    friend class GcHeap;
 };
 ```
 
-[types.h:105-121](file:///d:/you/Aura/runtime/types.h#L105) `GcObject`：
+**问题**：
+- `GcRootHandle` 设计为栈上包装，`ptr_` 指向栈上变量
+- 拷贝 delete 防止双 `unregisterRoot`
+- 但 lambda 按值捕获需要拷贝构造 → 编译失败
 
-```cpp
-struct GcObject {
-    const TypeDescriptor* desc = nullptr;
-    bool     marked = false;
-    GcObject* next  = nullptr;
-    uint8_t  generation = 0;       // 0=young, 1=old
-    bool     finalized = false;
-    virtual ~GcObject() = default;
-};
-```
+### 2.3 影响范围
 
-### 2.3 关键常量
+任何闭包捕获 GC 指针类型变量（`GcString*` / `Array<T>*` / 用户记录类型指针）的场景都编译失败。
 
-[gc.h:201-203](file:///d:/you/Aura/runtime/gc.h#L201):
+**已知受影响场景**：
+- 同步闭包（如 `test_basic_closure`）— 当前 test.aura 全部是这种
+- 返回闭包（如 `make_greeting(prefix: string) -> fun() -> string`）— 未来场景
 
-```cpp
-static constexpr size_t kPageSize        = 4096;
-static constexpr size_t kYoungThreshold  = 256 * 1024;   // 256 KB → minor GC
-static constexpr size_t kOldThreshold    = 1024 * 1024; // 1 MB → major GC
-```
+### 2.4 为何不用方案 A/B/C
 
-### 2.4 测试现象佐证
-
-2026-07-19 测试结果：
-- `before force: GC: alloc=741KB young=229KB old=0KB gc=0 minor=2 live=4644 pages=188`
-- `after force: GC: alloc=0KB young=0KB old=0KB gc=1 minor=2 live=4 pages=3`
-
-**关键观察**：`before force` 时 `old=0KB` — 即便 `live=4644`，`oldBytes_` 仍为 0，证明 `desc->size` 统计严重偏小。
+| 方案 | 缺陷 |
+|:---|:---|
+| A. 闭包按引用捕获 `[&name]` | 返回闭包场景悬空引用 |
+| B. 改造 `GcRootHandle` 存值 | 影响所有栈上变量路径，改动大风险高 |
+| C. `GcRootHandle` 加移动构造 | 解决不了返回闭包场景（栈帧销毁后 `ptr_` 悬空） |
 
 ---
 
 ## 三、Proposed Changes
 
-### Phase 1：低风险修复（缺陷 1 + 缺陷 3）
+### 3.1 改动文件
 
-#### Step 1.1：缺陷 1 — 修复 `oldBytes_` 统计
+| 文件 | 改动 | 行数 |
+|:---|:---|:---:|
+| [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) | 新增 `GcSharedRoot<T>` 模板类 | +45 |
+| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genFunExpr` 捕获列表改用 init-capture | +15 |
+| **合计** | | **+60** |
 
-**改动文件**：[runtime/types.h](file:///d:/you/Aura/runtime/types.h) + [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) + [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp)
+### 3.2 具体修改
 
-**3.1.1** `GcObject` 新增 `allocSize` 字段（[types.h:105-121](file:///d:/you/Aura/runtime/types.h#L105)）
+#### 3.2.1 新增 `GcSharedRoot<T>` 模板类
+
+[runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) 在 `GcRootHandle` 定义之后插入：
 
 ```cpp
-struct GcObject {
-    const TypeDescriptor* desc = nullptr;
-    bool     marked = false;
-    GcObject* next  = nullptr;
-    uint8_t  generation = 0;
-    bool     finalized = false;
+// ============================================================
+// GcSharedRoot<T> — 闭包捕获 GC 根的共享所有权版本
+//
+// 与 GcRootHandle<T> 互补：
+// - GcRootHandle：栈上包装，不可拷贝，ptr_ 指向栈变量
+// - GcSharedRoot：堆上独立存值，可拷贝，专为闭包捕获设计
+//
+// 使用场景：闭包 lambda 按值捕获 GC 指针类型变量时，
+// 用 GcSharedRoot 包装，每个 lambda 副本独立持有 GC 根。
+// ============================================================
+template <typename T>
+class GcSharedRoot {
+public:
+    explicit GcSharedRoot(T val) : ptr_(new T(val)) {
+        GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+    }
 
-    // 新增：实际分配字节数（含对象头 + 内联数据 + 对齐填充）
-    // GC 分配时记录，promoteToOld 用于准确累加 oldBytes_
-    size_t   allocSize = 0;
+    ~GcSharedRoot() {
+        if (ptr_) {
+            GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+            delete ptr_;
+            ptr_ = nullptr;
+        }
+    }
 
-    virtual ~GcObject() = default;
+    // 拷贝构造：新对象独立堆分配 + 独立 register
+    GcSharedRoot(const GcSharedRoot& other) : ptr_(new T(*other.ptr_)) {
+        GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+    }
+
+    // 拷贝赋值：先 unregister 旧值，再分配新值
+    GcSharedRoot& operator=(const GcSharedRoot& other) {
+        if (this != &other) {
+            GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+            delete ptr_;
+            ptr_ = new T(*other.ptr_);
+            GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+        }
+        return *this;
+    }
+
+    // 移动构造（C++17 起编译器为优化 lambda 捕获会用）
+    GcSharedRoot(GcSharedRoot&& other) noexcept : ptr_(other.ptr_) {
+        other.ptr_ = nullptr;
+    }
+
+    GcSharedRoot& operator=(GcSharedRoot&& other) noexcept {
+        if (this != &other) {
+            if (ptr_) {
+                GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+                delete ptr_;
+            }
+            ptr_ = other.ptr_;
+            other.ptr_ = nullptr;
+        }
+        return *this;
+    }
+
+    // 读取值（与 GcRootHandle::get() 兼容）
+    T get() const { return *ptr_; }
+
+    // 非 const 版本：返回引用，支持 `s.get() = value` 赋值
+    T& get() { return *ptr_; }
+
+    // 显式 set
+    void set(T val) { *ptr_ = val; }
+
+private:
+    T* ptr_;  // 堆上持有值，独立于栈帧生命周期
 };
 ```
 
-**3.1.2** `tryAlloc` 记录 `allocSize`（[gc.cpp:46-90](file:///d:/you/Aura/runtime/gc.cpp#L46)）
+**关键设计**：
+- **堆上存值**：`ptr_ = new T(val)`，与栈帧无关
+- **拷贝即独立根**：每个副本独立 register/unregister，无别名
+- **复用 `registerGlobalRoot`**：与 `GcGlobalRoot` 机制相同
+- **提供 `get()` 非 const 重载**：与已修复的 `GcRootHandle::get()` 保持一致，支持 `s.get() = value`
 
-在 [gc.cpp:74-82](file:///d:/you/Aura/runtime/gc.cpp#L74) 之后修改：
+#### 3.2.2 CodeGen `genFunExpr` 改造（init-capture 方案）
 
+[src/CodeGen/ExprGen.cpp:527+](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L527) `genFunExpr` 闭包捕获列表生成路径：
+
+**当前**（伪代码）：
 ```cpp
-GcObject* obj = static_cast<GcObject*>(mem);
-obj->desc       = desc;
-obj->marked     = false;
-obj->next       = nullptr;
-obj->generation = 0;
-obj->allocSize  = size;          // ← 新增：记录对齐后的实际分配大小
-obj->finalized  = false;
-
-youngObjects_.push_back(obj);
-youngBytes_ += size;
-allocatedBytes_ += size;
+auto lambda = [var1, var2, ...]() -> ... { ... }
 ```
 
-**3.1.3** `promoteToOld` 用 `allocSize`（[gc.cpp:497-503](file:///d:/you/Aura/runtime/gc.cpp#L497)）
-
+**改造后**（C++14 init-capture）：
 ```cpp
-void GcHeap::promoteToOld(GcObject* obj) {
-    obj->generation = 1;
-    oldObjects_.push_back(obj);
-    oldBytes_ += obj->allocSize;   // ← 改：用实际分配大小
-    if (oldBytes_ >= kOldThreshold) {
-        gcPending_ = true;
-    }
-}
-```
-
-**3.1.4** `sweepPhaseAll` 统计同步修正（[gc.cpp:509-560](file:///d:/you/Aura/runtime/gc.cpp#L509)）
-
-```cpp
-// 当前（错误）：
-liveOldBytes += obj->desc ? obj->desc->size : 0;
-
-// 改为：
-liveOldBytes += obj->allocSize;
-```
-
-**3.1.5** 行数估计
-
-| 文件 | 改动 | 行数 |
-|:---|:---|:---:|
-| [runtime/types.h](file:///d:/you/Aura/runtime/types.h) | + `allocSize` 字段 + 注释 | +3 |
-| [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | `tryAlloc` 记录 + `promoteToOld` 改用 + `sweepPhaseAll` 改用 | +1 / -2 |
-| **合计** | | **+2 净增** |
-
----
-
-#### Step 1.2：缺陷 3 — 修复栈根扫描跳过 old
-
-**改动文件**：[runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp)
-
-**3.2.1** 修改 [gc.cpp:353-372](file:///d:/you/Aura/runtime/gc.cpp#L353) `markPhase` 中栈根扫描逻辑
-
-当前：
-
-```cpp
-for (auto& [begin, end] : stackRoots_) {
-    char* start2 = static_cast<char*>(begin);
-    char* stop2  = static_cast<char*>(end);
-    for (char* p = start2; p + sizeof(void*) <= stop2; p += sizeof(void*)) {
-        void* candidate = *reinterpret_cast<void**>(p);
-        if (!candidate) continue;
-        for (Page* page = headPage_; page; page = page->next) {
-            if (candidate >= static_cast<void*>(page->data) &&
-                candidate < static_cast<void*>(page->data + kPageSize)) {
-                GcObject* obj = static_cast<GcObject*>(candidate);
-                if (!obj->desc || obj->desc->size == 0) break;
-                if (youngOnly && obj->generation == 1) break;   // ← 缺陷：跳过 old 但也跳过其引用的 young
-                markObject(obj);
-                break;
-            }
-        }
-    }
-}
-```
-
-改为：
-
-```cpp
-for (auto& [begin, end] : stackRoots_) {
-    char* start2 = static_cast<char*>(begin);
-    char* stop2  = static_cast<char*>(end);
-    for (char* p = start2; p + sizeof(void*) <= stop2; p += sizeof(void*)) {
-        void* candidate = *reinterpret_cast<void**>(p);
-        if (!candidate) continue;
-        for (Page* page = headPage_; page; page = page->next) {
-            if (candidate >= static_cast<void*>(page->data) &&
-                candidate < static_cast<void*>(page->data + kPageSize)) {
-                GcObject* obj = static_cast<GcObject*>(candidate);
-                if (!obj->desc || obj->desc->size == 0) break;
-                // 修复缺陷 3：youngOnly 模式下，
-                // - old 对象本身不重复标记（已由 globalRoots_ 处理或上次 major GC 标记）
-                // - 但仍需递归标记其引用的 young 对象（这是 minor GC 的关键）
-                // markObject 内部会判断 marked 标志，避免重复扫描 old
-                markObject(obj);
-                break;
-            }
-        }
-    }
+// GC 类型变量用 init-capture 创建 GcSharedRoot 副本，名字不变
+// 非 GC 类型变量保持原样
+auto lambda = [greeting = aura_rt::GcSharedRoot<GcString*>(greeting.get()),
+              numbers  = aura_rt::GcSharedRoot<Array<int32_t>*>(numbers.get()),
+              var3, ...]() -> ... {
+    // 闭包体完全不变！内部 greeting.get() 调用 GcSharedRoot::get()
+    ...
 }
 ```
 
 **关键设计**：
-- 移除 `if (youngOnly && obj->generation == 1) break;`
-- 改为始终调用 `markObject(obj)`
-- `markObject` 内部已有 `if (obj->marked) return;` 守卫（[gc.cpp:407-409](file:///d:/you/Aura/runtime/gc.cpp#L407)），重复调用安全
-- old 对象的 `markFields` 递归会标记其引用的 young 对象 — 这是 minor GC 正确性的关键
+- **init-capture 名字与外层变量同名** — 内部 `greeting` 遮蔽外层，但 `get()` 返回类型一致
+- **闭包体完全不改** — `greeting.get()` 调用从 `GcRootHandle::get()` 变为 `GcSharedRoot::get()`，返回类型相同
+- **仅 GC 类型变量改写** — 非 GC 类型变量（`int32_t` / `double` / `bool`）保持按值捕获
 
-**风险评估**：
-- ⚠️ 性能影响：minor GC 现在可能扫描更多 old 对象（栈上临时持有的 old 指针）
-- ✅ 但 `markObject` 的 `marked` 守卫避免重复扫描
-- ✅ old 对象的 `markFields` 仅遍历其指针字段，不递归到其他 old（已被标记）
+**具体步骤**：
 
-**3.2.2** 行数估计
+1. 在 `CaptureArgScanner` 扫描出捕获列表后，对每个 GC 类型捕获变量改写捕获形式
+2. 闭包体生成逻辑**完全不变**
 
-| 文件 | 改动 | 行数 |
-|:---|:---|:---:|
-| [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | 移除 1 行 break + 加注释 | -1 / +3 |
-| **合计** | | **+2 净增** |
+**判定变量是否为 GC 指针类型**：
+- 复用现有的 `gcRootVarNames_` 集合（已在变量声明时注册）
+- 若变量名在 `gcRootVarNames_` 中，则改写为 `[name = aura_rt::GcSharedRoot<T>(name.get())]`
 
----
-
-### Phase 2：中风险修复（缺陷 4 + 缺陷 2）
-
-#### Step 2.1：缺陷 4 — 引入年龄门槛
-
-**改动文件**：[runtime/types.h](file:///d:/you/Aura/runtime/types.h) + [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) + [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp)
-
-**3.3.1** `GcObject` 加 `age` 字段（[types.h:105-121](file:///d:/you/Aura/runtime/types.h#L105)）
+**需注意的变量类型推导**：
+CodeGen 已在变量声明时知道其 C++ 类型（如 `GcString*` / `Array<T>*`），生成 init-capture 时直接拼接：
 
 ```cpp
-struct GcObject {
-    const TypeDescriptor* desc = nullptr;
-    bool     marked = false;
-    GcObject* next  = nullptr;
-    uint8_t  generation = 0;
-    bool     finalized = false;
-    size_t   allocSize = 0;          // Phase 1 已加
-
-    // 新增：对象存活年龄（经历 minor GC 的次数）
-    uint8_t  age = 0;
-
-    virtual ~GcObject() = default;
-};
+[name = aura_rt::GcSharedRoot<CPP_TYPE>(name.get())]
 ```
 
-**3.3.2** `gc.h` 加晋升年龄阈值常量（[gc.h:201-203](file:///d:/you/Aura/runtime/gc.h#L201)）
+### 3.4 生成的 C++ 示例
+
+[test.cpp:34-43](file:///d:/you/Aura/example/test.cpp#L34) `test_basic_closure` 改造后：
 
 ```cpp
-static constexpr size_t kPageSize        = 4096;
-static constexpr size_t kYoungThreshold  = 256 * 1024;
-static constexpr size_t kOldThreshold    = 1024 * 1024;
-static constexpr uint8_t kPromotionAge   = 2;   // 新增：经历 2 次 minor GC 后晋升
-```
+aura_rt::task<void> test_basic_closure(aura_rt::Io io) {
+    aura_rt::GcString* greeting_raw = aura_rt::make_string("Hello");
+    aura_rt::GcRootHandle<aura_rt::GcString*> greeting(greeting_raw);
 
-**3.3.3** `sweepPhaseYoung` 改造为按年龄晋升（[gc.cpp:483-494](file:///d:/you/Aura/runtime/gc.cpp#L483)）
-
-当前：
-
-```cpp
-// 3. 晋升所有存活对象到老年代，清空新生代列表。
-for (auto* obj : youngObjects_) {
-    if (obj->marked) {
-        promoteToOld(obj);
-        obj->marked = false;
-    }
-}
-
-youngBytes_ = 0;
-youngObjects_.clear();
-```
-
-改为：
-
-```cpp
-// 3. 按年龄门槛晋升：age >= kPromotionAge 的存活对象晋升到老年代，
-// 其余存活对象 age++ 并留在新生代；未存活对象将被回收（youngObjects_.clear 后丢弃）。
-std::vector<GcObject*> survivors;
-for (auto* obj : youngObjects_) {
-    if (obj->marked) {
-        obj->age++;
-        if (obj->age >= kPromotionAge) {
-            promoteToOld(obj);
-            obj->marked = false;
-        } else {
-            survivors.push_back(obj);
-            obj->marked = false;
-        }
-    }
-    // 未 marked 的对象不进入 survivors，将被回收（内存由 compactAndReclaim 整理）
-}
-
-// 更新 youngBytes_ 为存活对象的总大小
-youngBytes_ = 0;
-for (auto* obj : survivors) {
-    youngBytes_ += obj->allocSize;
-}
-youngObjects_ = std::move(survivors);
-```
-
-**关键设计**：
-- `kPromotionAge = 2` — 经历 2 次 minor GC 仍存活的对象晋升
-- 短命对象（如临时字符串）在 1-2 次 minor GC 中即被回收，不进入老年代
-- 长期存活对象（如缓存单例）经过 2 次 minor GC 后晋升，稳定存在于老年代
-- `youngBytes_` 现在只统计存活对象（之前是 `youngBytes_ = 0`，不准确）
-
-**3.3.4** 行数估计
-
-| 文件 | 改动 | 行数 |
-|:---|:---|:---:|
-| [runtime/types.h](file:///d:/you/Aura/runtime/types.h) | + `age` 字段 | +1 |
-| [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) | + `kPromotionAge` 常量 | +1 |
-| [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | `sweepPhaseYoung` 改造 | +15 / -5 |
-| **合计** | | **+12 净增** |
-
----
-
-#### Step 2.2：缺陷 2 — CodeGen 接入写屏障
-
-**改动文件**：[src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) + [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h)
-
-**3.4.1** 改造 `genAssignExpr`（[ExprGen.cpp:566-585](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L566)）
-
-当前：
-
-```cpp
-std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) {
-    std::string target = genExpr(*e.target, isCoroutine);
-    std::string value  = genExpr(*e.value, isCoroutine);
-    // ... stringVarNames_ 追踪 ...
-    return target + " = " + value;
+    // init-capture：闭包内 greeting 是 GcSharedRoot<GcString*>，遮蔽外层
+    auto say_hello = [greeting = aura_rt::GcSharedRoot<aura_rt::GcString*>(greeting.get()), io]() -> aura_rt::task<void> {
+        // 闭包体完全不变！greeting.get() 调用 GcSharedRoot::get()
+        co_await io.println(aura_rt::concat(greeting.get(), aura_rt::make_string(" from closure!")));
+        co_return;
+    };
+    co_await say_hello();
+    co_return;
 }
 ```
 
-改为：
+**关键变化**：
+- lambda 捕获列表中 `greeting` 改为 init-capture：`greeting = aura_rt::GcSharedRoot<...>(greeting.get())`
+- 闭包体内 `greeting.get()` 调用**完全不变**（内部 `greeting` 类型变了，但 `get()` 返回类型一致）
+- 无需新增 `_shared` 后缀变量，无需修改闭包体引用
 
-```cpp
-std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) {
-    std::string target = genExpr(*e.target, isCoroutine);
-    std::string value  = genExpr(*e.value, isCoroutine);
-    // ... stringVarNames_ 追踪 ...
+### 3.5 返回闭包场景验证
 
-    // 写屏障：若 target 是 GC 对象字段（如 obj.field = newVal），插入 gc_write_barrier
-    // 仅对 obj.field = newVal 形式生效，不针对局部变量赋值（局部变量不涉及跨代引用）
-    if (isGcFieldAssignment(target)) {
-        // 生成：
-        //   target = value;
-        //   gc_write_barrier(parentObj, &target, value);
-        // target 形如 "obj.get()->field" 或 "obj->field"
-        auto [parentObj, fieldAddr] = decomposeFieldAccess(target);
-        return target + " = " + value + ";\n  aura_rt::gc_write_barrier(" +
-               parentObj + ", " + fieldAddr + ", " +
-               "static_cast<aura_rt::GcObject*>(" + value + "))";
-    }
-    return target + " = " + value;
+未来场景（当前 test.aura 未覆盖，但方案 D 支持）：
+
+```aura
+fun make_greeting(prefix: string) -> fun() -> string {
+    return fun() -> string { return prefix }
+}
+
+fun main() {
+    let g = make_greeting("Hi")
+    io.println(g())  // 输出 "Hi"
 }
 ```
 
-**3.4.2** 新增辅助方法 `isGcFieldAssignment` + `decomposeFieldAccess`
-
-在 [CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) 加私有方法声明：
+**生成的 C++**（init-capture 形式）：
 
 ```cpp
-// 判断 target 是否为 obj.field 形式（而非局部变量）
-[[nodiscard]] bool isGcFieldAssignment(const std::string& target) const;
+std::function<aura_rt::GcString*()> make_greeting(aura_rt::GcString* prefix_raw) {
+    aura_rt::GcRootHandle<aura_rt::GcString*> prefix(prefix_raw);
 
-// 将 obj.get()->field 分解为 (parentObj, fieldAddr)
-// parentObj: "obj.get()" — 用于 gc_write_barrier 的第一个参数
-// fieldAddr: "obj.get()->field" 的完整表达式 — 用于第二个参数（字段地址）
-[[nodiscard]] std::pair<std::string, std::string>
-decomposeFieldAccess(const std::string& target) const;
-```
-
-实现：
-
-```cpp
-bool CodeGenerator::isGcFieldAssignment(const std::string& target) const {
-    // 形如 "xxx->field" 或 "xxx.field"
-    // 排除局部变量（如 "s" 或 "s.get()"）
-    return target.find("->") != std::string::npos
-        || (target.find('.') != std::string::npos
-            && target.find(".get()") == std::string::npos);  // 排除 .get() 调用本身
+    // init-capture：prefix 在闭包内是 GcSharedRoot，移动到返回 lambda
+    return [prefix = aura_rt::GcSharedRoot<aura_rt::GcString*>(prefix.get())]() -> aura_rt::GcString* {
+        return prefix.get();
+    };
+    // prefix 析构（unregisterRoot）
+    // init-capture 创建的 GcSharedRoot 移动到返回的 lambda 中，仍存活
 }
 
-std::pair<std::string, std::string>
-CodeGenerator::decomposeFieldAccess(const std::string& target) const {
-    // 查找最后一个 -> 或 .
-    auto arrowPos = target.rfind("->");
-    auto dotPos   = target.rfind('.');
-
-    size_t splitPos = std::string::npos;
-    size_t fieldNameStart = std::string::npos;
-
-    if (arrowPos != std::string::npos) {
-        splitPos = arrowPos;
-        fieldNameStart = arrowPos + 2;
-    } else if (dotPos != std::string::npos) {
-        splitPos = dotPos;
-        fieldNameStart = dotPos + 1;
-    }
-
-    if (splitPos == std::string::npos) {
-        return {target, target};  // 无法分解，保守返回
-    }
-
-    std::string parentObj = target.substr(0, splitPos);
-    // fieldAddr 用 & 取地址
-    std::string fieldAddr = "&(" + target + ")";
-    return {parentObj, fieldAddr};
+void main() {
+    auto g = make_greeting(make_string("Hi"));
+    io.println(g());  // 闭包内 GcSharedRoot 仍存活，调用安全
 }
 ```
 
-**3.4.3** `gc_write_barrier` 已存在（[gc.h:299-301](file:///d:/you/Aura/runtime/gc.h#L299)），无需改动
-
-```cpp
-inline void gc_write_barrier(GcObject* parent, void* fieldAddr, GcObject* newVal) {
-    GcHeap::instance().writeBarrier(parent, fieldAddr, newVal);
-}
-```
-
-[gc.cpp:146-151](file:///d:/you/Aura/runtime/gc.cpp#L146) `writeBarrier` 已正确实现：
-
-```cpp
-void GcHeap::writeBarrier(GcObject* parent, void* /*fieldAddr*/, GcObject* newVal) {
-    if (parent && parent->generation == 1 && newVal && newVal->generation == 0) {
-        rememberedSet_.insert(parent);
-    }
-}
-```
-
-**关键设计**：
-- 仅对 `obj.field = newVal` 形式生成写屏障
-- 局部变量赋值（`s = value`）不生成屏障（栈变量不涉及跨代引用）
-- `gc_write_barrier` 内部判断 `parent->generation == 1 && newVal->generation == 0`，仅在跨代引用时记录
-- `rememberedSet_` 用 `std::set<GcObject*>` 去重
-- minor GC 的 [gc.cpp:386-389](file:///d:/you/Aura/runtime/gc.cpp#L386) 死代码将真正生效
-
-**3.4.4** 行数估计
-
-| 文件 | 改动 | 行数 |
-|:---|:---|:---:|
-| [src/CodeGen/CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) | + 2 个私有方法声明 | +6 |
-| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genAssignExpr` 改造 + 2 个方法实现 | +40 |
-| **合计** | | **+46 净增** |
-
----
-
-### Phase 3：远期展望（缺陷 5）
-
-**缺陷 5：old/young 混布 page** — 不在本 plan 范围内
-
-对应 [plan/gc_features_plan.md §十三](file:///d:/you/Aura/plan/gc_features_plan.md) `[~] 延后` 项，需架构级重构（compacting GC 或分离 page 分配器），风险过高，留待 profiling 证据充足后再做。
+**关键**：init-capture 创建的 `GcSharedRoot` 通过移动构造转移到返回的 lambda，独立于 `make_greeting` 的栈帧。
 
 ---
 
@@ -475,241 +308,188 @@ void GcHeap::writeBarrier(GcObject* parent, void* /*fieldAddr*/, GcObject* newVa
 
 ### 4.1 关键假设
 
-1. **`allocSize` 可准确记录**：`tryAlloc` 中 `size = (size + 7) & ~size_t(7)` 对齐后赋给 `obj->allocSize`，与 `youngBytes_ += size` 一致
-2. **`markObject` 的 `marked` 守卫足够**：[gc.cpp:407-409](file:///d:/you/Aura/runtime/gc.cpp#L407) `if (!obj || obj->marked) return;` 保证重复调用安全
-3. **`kPromotionAge = 2` 是合理初始值**：Java 默认 15，但 Aura 的 minor GC 频率较高（256KB 阈值），2 次已足够区分短命与长期对象
-4. **写屏障仅对字段赋值生效**：局部变量赋值不涉及跨代引用，无需屏障
-5. **`rememberedSet_` 用 `std::set` 去重**：避免同一 old 对象多次记录
+1. **`registerGlobalRoot` 机制稳定**：已被 `GcGlobalRoot<GcString>`（empty/true/false 单例、小整数缓存）验证过
+2. **`GcObject**` 转型安全**：`T` 是 `GcString*` / `Array<T>*` 等 GC 指针类型，转型为 `GcObject**` 后 `[ptr_]` 即 `GcObject*`
+3. **闭包捕获数量有限**：通常 1-3 个 GC 变量，`globalRoots_` 增长可控
 
-### 4.2 关键决策
+### 4.2 决策
 
 | 决策 | 选择 | 理由 |
 |:---|:---|:---|
-| 缺陷 1 修复方式 | `GcObject` 加 `allocSize` 字段 | 比 `TypeDescriptor::computeSize` 虚函数更简单，无虚调用开销 |
-| 缺陷 3 修复方式 | 移除 break，始终调用 `markObject` | `markObject` 的 `marked` 守卫已足够，避免重复扫描 |
-| 缺陷 4 晋升阈值 | `kPromotionAge = 2` | Aura minor GC 频率高，2 次已足够 |
-| 缺陷 4 survivor 区 | 不引入，直接复用 `youngObjects_` | 避免数据结构复杂化，`age` 字段已能区分 |
-| 缺陷 2 屏障范围 | 仅 `obj.field = newVal` | 局部变量赋值不涉及跨代引用 |
-| 缺陷 2 屏障实现 | 复用现有 `gc_write_barrier` | API 已就绪，只需 CodeGen 接入 |
+| 新增类 vs 改造 `GcRootHandle` | 新增 `GcSharedRoot` | 不破坏现有 `GcRootHandle` 语义，零迁移成本 |
+| 堆分配 vs 栈分配 | 堆分配 | 闭包可能逃逸出栈帧，必须堆分配 |
+| `registerGlobalRoot` vs `registerRoot` | `registerGlobalRoot` | 与 `GcGlobalRoot` 一致，独立于 `roots_` |
+| 拷贝 vs 移动 | 同时提供 | 拷贝支持 lambda 副本，移动支持 lambda 返回 |
+| lambda 捕获形式 | **C++14 init-capture** | 闭包体无需修改，名字遮蔽语义清晰 |
+| 不选 `_shared` 后缀方案 | 命名冗余，需维护映射 | init-capture 名字相同更简洁 |
 
-### 4.3 不破坏现有功能的验证
+### 4.3 不破坏现有功能验证
 
-- ✅ `allocSize` 是新增字段，默认 0，旧代码不依赖
-- ✅ `age` 是新增字段，默认 0，旧代码不依赖
-- ✅ `kPromotionAge` 是新增常量，不影响现有逻辑
-- ✅ `markObject` 移除 break 后，old 对象的 `marked` 守卫避免无限递归
-- ✅ `genAssignExpr` 对局部变量赋值路径不变（`isGcFieldAssignment` 返回 false）
-- ✅ `gc_write_barrier` 已存在，无新 API
+| 现有调用点 | 是否受影响 | 说明 |
+|:---|:---:|:---|
+| [StmtGen.cpp:165-169](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L165) `GcRootHandle<T> name(raw)` | ❌ | 仍用 `GcRootHandle` |
+| [ExprGen.cpp:84-86](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L84) `name + ".get()"` | ❌ | `GcRootHandle` 不变 |
+| [gc.cpp:347-350](file:///d:/you/Aura/runtime/gc.cpp#L347) `rootHandle->get()` | ❌ | `GcRootHandle` 不变 |
+| 闭包捕获 GC 变量 | ✅ 改造 | 改用 `GcSharedRoot` |
 
 ---
 
 ## 五、Verification Steps
 
-### 5.1 Phase 1 验证
+### 5.1 编译验证
 
-#### 5.1.1 缺陷 1 验证：`oldBytes_` 准确
+1. 修改 [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) 新增 `GcSharedRoot<T>`
+2. 修改 [src/CodeGen/CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) + [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp)
+3. 重新编译 [example/test.cpp](file:///d:/you/Aura/example/test.cpp)
+4. 确认无 `use of deleted function` 错误
 
-```aura
-fun main(io: Io) {
-    // 分配大量对象触发 minor GC
-    for i in range(0, 5000) {
-        let s = "iter " + i
-    }
-    let info = gc_stats()
-    io.println(info)  // 期望 old > 0KB（缓存单例已晋升）
-}
-```
+### 5.2 运行时验证
 
-**预期**：
-- `old` 不再是 0KB（缓存单例 + 长期存活对象正确累加）
-- `gc` 可能仍为 0（如果 `oldBytes_` 未达 1MB），但 `old` 数值合理
+运行 [example/test.aura](file:///d:/you/Aura/example/test.aura) 全部 9 个测试用例：
 
-#### 5.1.2 缺陷 3 验证：栈持有 old 指针不出错
+| 测试 | 预期输出 |
+|:---|:---|
+| 1. `test_basic_closure` | `Hello from closure!` |
+| 2. `test_math_closure` | `Square of 5: 25` |
+| 3. `test_higher_order` | `Apply twice double(10): 40` |
+| 4. `test_closure_factory` | `Triple 7: 21` |
+| 5. `test_generic_mapper` | `Doubled list: 2,4,6` + `Lengths: 1,2,3` |
+| 6. `test_nested_closure` | `Nested closure compute: 7` |
+| 7. `test_closure_exception` | `10 / 2 = 5` + `Caught: division by zero` |
+| 8. `test_recursive_closure` | `Factorial 5 = 120` |
+| 9. `main` | `=== All closure tests passed ===` + `gc_stats` |
 
-```aura
-fun main(io: Io) {
-    let s = "long lived string"  // 会被 GcRootHandle 包装
-    for i in range(0, 100) {
-        let tmp = "temp " + i
-    }
-    io.println(s)  // 期望 "long lived string" 不被错误回收
-    let info = gc_stats()
-    io.println(info)
-}
-```
+### 5.3 GC 行为验证
 
-**预期**：
-- `s` 在 minor GC 后仍能正确访问
-- 无 crash / 无 use-after-free
+**关键验证点**：
+- init-capture 创建的 `GcSharedRoot` 在 lambda 析构时调 `unregisterGlobalRoot` + `delete ptr_`
+- 闭包执行期间 `GcSharedRoot` 内的 `GcString*` 不会被 GC 回收
+- `gc_stats` 输出合理（无内存泄漏，`live` 数量稳定）
 
-### 5.2 Phase 2 验证
+### 5.4 返回闭包场景验证（可选，未来扩展）
 
-#### 5.2.1 缺陷 4 验证：年龄门槛生效
+构造测试用例验证返回闭包捕获 GC 变量：
 
 ```aura
-fun main(io: Io) {
-    let tmp1 = "temp1"  // 应在 1-2 次 minor GC 后被回收
-    for i in range(0, 10000) {
-        let tmp = "iter " + i
-    }
-    let info = gc_stats()
-    io.println(info)  // 期望 live 数量比无年龄门槛时少
-}
-```
-
-**预期**：
-- `tmp1` 经历 2 次 minor GC 后晋升到 old（如果在第 3 次 minor GC 时仍被引用）
-- 若 `tmp1` 在第 1 次 minor GC 后已无引用，应在 `sweepPhaseYoung` 中被回收，不晋升
-
-#### 5.2.2 缺陷 2 验证：写屏障记录跨代引用
-
-```aura
-type Holder {
-    ref: string
+fun make_greeting(prefix: string) -> fun() -> string {
+    return fun() -> string { return prefix }
 }
 
 fun main(io: Io) {
-    let h = Holder { ref: "initial" }  // h 晋升到 old
-    for i in range(0, 5000) {
-        h.ref = "iter " + i  // 写屏障应记录 h 到 rememberedSet_
-    }
-    let info = gc_stats()
-    io.println(info)
-    io.println(h.ref)
+    let g = make_greeting("Hi")
+    io.println(g())  // 输出 "Hi"
 }
 ```
 
-**预期**：
-- `h` 晋升到 old 后，`h.ref = "iter " + i` 触发写屏障
-- `rememberedSet_` 包含 `h`
-- minor GC 时 `h.ref` 指向的 young 对象被正确标记，不被回收
-- 最后 `io.println(h.ref)` 输出最后一个 `"iter 4999"`
+**预期**：编译通过 + 运行正确（init-capture 创建的 `GcSharedRoot` 通过移动构造转移到返回 lambda，独立于 `make_greeting` 栈帧）。
 
-### 5.3 综合回归测试
+### 5.5 回归测试
 
-```aura
-fun main(io: Io) {
-    let s = ""
-    for i in range(0, 5000) {
-        s = s + "x"
-    }
-    io.println(s.len())
-    gc_force()
-    let info = gc_stats()
-    io.println(info)
-    io.println(s.len())  // 期望 5000，未被错误回收
-}
-```
-
-**预期**：
-- 程序正常退出
-- `s` 在 `gc_force()` 后仍存活
-- `s.len()` 输出 5000
-
-### 5.4 性能验证
-
-对比修复前后的 GC 统计：
-
-| 指标 | 修复前 | 修复后预期 |
-|:---|:---:|:---:|
-| `old` 字节数 | 0 KB（错误） | 准确反映晋升对象大小 |
-| `gc` (major GC 次数) | 0（即使 live=4644） | 在 `old` 达 1MB 时自动触发 |
-| `live` 数量 | 包含短命对象 | 更少（年龄门槛过滤） |
-| minor GC 耗时 | 较高（无 rememberedSet_） | 降低（写屏障减少 old 扫描） |
+运行 [TODO.txt](file:///d:/you/Aura/TODO.txt) 中提到的所有现有测试，确认：
+- 字符串拼接行为不变
+- GC 行为不变
+- 无 crash / 无内存错误
+- 现有 `let s = <init>` 直接初始化的测试仍通过
+- GcString 优化 Step 1-3 测试仍通过
 
 ---
 
 ## 六、可能的风险与应对方案
 
-### 6.1 风险一：`allocSize` 字段增加内存开销
+### 6.1 风险一：`registerGlobalRoot` 在 `GcSharedRoot` 构造前被调用
 
-**问题**：每个 `GcObject` 多 8 字节（`size_t allocSize`）。
-
-**应对**：
-- ✅ Aura 对象通常较大（含字段/数据），8 字节占比可忽略
-- ✅ 收益（`oldBytes_` 准确）远大于成本
-
-### 6.2 风险二：缺陷 3 修复后 minor GC 扫描更多对象
-
-**问题**：移除 `youngOnly && generation == 1` break 后，栈上 old 指针会触发 `markObject` + `markFields`。
+**问题**：`GcSharedRoot<T>` 构造时，`T val` 参数可能是 GC 分配的新对象，若 GC 在构造中途触发，`ptr_` 尚未初始化。
 
 **应对**：
-- ✅ `markObject` 的 `marked` 守卫避免重复扫描
-- ✅ old 对象的 `markFields` 仅遍历其指针字段，递归深度有限
-- ⚠️ 若 profiling 显示明显性能下降，可优化为：仅当 old 对象未被标记时才 `markFields`
+- ✅ `ptr_ = new T(val)` 在 `registerGlobalRoot` 之前完成
+- ✅ 构造顺序：先 `new T(val)` → 再 `registerGlobalRoot` → GC 触发时 `ptr_` 已指向有效对象
+- ✅ 已在代码中按此顺序实现
 
-### 6.3 风险三：`kPromotionAge = 2` 可能不合适
+### 6.2 风险二：`globalRoots_` 列表膨胀
 
-**问题**：阈值过低 → 短命对象过早晋升；阈值过高 → survivor 区膨胀。
-
-**应对**：
-- ✅ 初始值 2 是保守选择，可在测试后调整
-- ⚠️ 若 oldObjects_ 膨胀过快，提高到 3-4
-- ⚠️ 若 youngObjects_ 积压过多，降低到 1
-
-### 6.4 风险四：写屏障对性能影响
-
-**问题**：每次 `obj.field = newVal` 都插入 `gc_write_barrier`，增加运行时开销。
+**问题**：每个闭包捕获的 GC 变量都注册到 `globalRoots_`，可能导致 markPhase 遍历成本上升。
 
 **应对**：
-- ✅ `writeBarrier` 内部仅做 2 次比较（generation 标志），极轻量
-- ✅ 仅 `parent->generation == 1 && newVal->generation == 0` 时才 `rememberedSet_.insert`
-- ⚠️ 热路径中频繁字段赋值可能影响性能 — 可后续优化为编译期判断（若字段类型非 GC 指针则跳过）
+- ✅ 闭包通常少量捕获（1-3 个变量）
+- ✅ 闭包作用域结束时 `GcSharedRoot` 析构，自动 unregister
+- ⚠️ 若闭包长期存活（如存储到 `Array<fun()>`），`globalRoots_` 会持续增长 — 这是预期行为，闭包持有的 GC 根必须存活
 
-### 6.5 风险五：写屏障 CodeGen 漏接
+### 6.3 风险三：`reinterpret_cast<GcObject**>(ptr_)` 类型安全
 
-**问题**：`genAssignExpr` 仅覆盖 `AssignExpr` 形式，可能漏接其他字段写入场景。
+**问题**：`ptr_` 是 `T*`（如 `GcString**`），转型为 `GcObject**` 是否安全。
 
 **应对**：
-- ⚠️ 需检查：构造函数字段初始化、`obj.field += value`、`obj.field.field2 = value` 等
-- ✅ Phase 2 实施时需全面排查 CodeGen 中所有字段写入点
-- 🟡 可后续在 `genFieldAccess` 或 `genMemberExpr` 层面统一拦截
+- ✅ `GcString` 继承自 `GcObject`（[string.h:9](file:///d:/you/Aura/runtime/builtin/string.h#L9) `struct GcString : GcObject`）
+- ✅ `GcString*` 可安全 `reinterpret_cast` 为 `GcObject*`（首地址相同）
+- ✅ `GcString**` 转 `GcObject**` 安全：指向指针的指针，指针本身大小相同
+- ✅ `GcGlobalRoot<T>` 已用此模式验证（[gc.h:120-126](file:///d:/you/Aura/runtime/gc.h#L120)）
+
+### 6.4 风险四：移动构造后原对象 `ptr_` 为 nullptr
+
+**问题**：移动构造后原对象的 `ptr_` 被置为 `nullptr`，若原对象析构时调 `unregisterGlobalRoot(nullptr)` 是否安全。
+
+**应对**：
+- ✅ 析构函数已检查 `if (ptr_)`，nullptr 时不调 `unregisterGlobalRoot`
+- ✅ 移动赋值也检查 `if (ptr_)` 后再 unregister 旧值
+
+### 6.5 风险五：init-capture 类型推导与名字遮蔽
+
+**问题**：
+1. init-capture 名字与外层变量同名，编译器是否正确处理遮蔽？
+2. init-capture 的 `GcSharedRoot` 临时对象生命周期是否正确？
+
+**应对**：
+- ✅ C++14 标准明确允许 init-capture 名字与外层同名（[expr.prim.lambda.capture]）
+- ✅ 内部 `greeting` 类型为 `GcSharedRoot<GcString*>`，遮蔽外层 `GcRootHandle<GcString*>`
+- ✅ init-capture 的临时对象在 lambda 构造时创建，生命周期与 lambda 相同
+- ✅ lambda 拷贝/移动时 `GcSharedRoot` 的拷贝/移动构造被调用（已实现）
+- ⚠️ 闭包体内若取 `auto& ref = greeting`（非 const 引用），引用的是内部 `GcSharedRoot` — 这是预期行为
 
 ---
 
-## 七、实施顺序与提交粒度
+## 七、实施顺序
 
-| 顺序 | Step | 提交点 | 依赖 | 行数估计 |
-|:---:|:---|:---|:---|:---:|
-| 1 | Step 1.1 | commit: "gc: fix oldBytes_ underestimation with allocSize field" | 无 | +2 |
-| 2 | Step 1.2 | commit: "gc: mark old objects referenced from stack in minor GC" | Step 1.1 | +2 |
-| 3 | Step 2.1 | commit: "gc: add age-based promotion threshold (kPromotionAge=2)" | Step 1.1 | +12 |
-| 4 | Step 2.2 | commit: "codegen: emit gc_write_barrier for field assignments" | Step 1.1 | +46 |
+| 步骤 | 操作 | 验证 | 可回滚 |
+|:---:|:---|:---|:---:|
+| 1 | [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) 新增 `GcSharedRoot<T>` 模板类 | 编译通过（独立编译单元） | ✅ |
+| 2 | [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) `genFunExpr` 捕获列表改用 init-capture | 重新生成 [test.cpp](file:///d:/you/Aura/example/test.cpp) | ✅ |
+| 3 | 重新编译 [example/test.cpp](file:///d:/you/Aura/example/test.cpp) | 无 `use of deleted function` 错误 | ✅ |
+| 4 | 运行 [example/test.aura](file:///d:/you/Aura/example/test.aura) | 9 个测试用例全部通过 | ✅ |
+| 5 | 回归测试 | 现有测试不破坏 | ✅ |
 
-**每个 Step 独立编译 + 测试，失败可回滚。**
+**每步独立编译 + 测试，失败可立即回滚。**
 
 ---
 
 ## 八、改动规模总览
 
-| 文件 | 改动 | Phase | 净增行数 |
-|:---|:---|:---:|:---:|
-| [runtime/types.h](file:///d:/you/Aura/runtime/types.h) | + `allocSize` + `age` 字段 | 1+2 | +4 |
-| [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) | + `kPromotionAge` 常量 | 2 | +1 |
-| [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | `tryAlloc` 记录 + `promoteToOld` 改用 + `sweepPhaseAll` 改用 + `sweepPhaseYoung` 改造 + `markPhase` 栈扫描修复 | 1+2 | +14 |
-| [src/CodeGen/CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) | + 2 个私有方法声明 | 2 | +6 |
-| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genAssignExpr` 改造 + 2 个方法实现 | 2 | +40 |
-| **合计** | | | **+65 净增** |
+| 文件 | 改动 | 净增行数 |
+|:---|:---|:---:|
+| [runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) | `GcSharedRoot<T>` 模板类 | +45 |
+| [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp) | `genFunExpr` 捕获列表改用 init-capture | +15 |
+| **合计** | | **+60** |
 
 ---
 
-## 九、与现有 plan 的关系
+## 九、后续
 
-| 现有 plan 项 | 状态 | 本 plan 处理 |
+完成本修复后：
+
+- [example/test.aura](file:///d:/you/Aura/example/test.aura) 9 个闭包测试用例编译运行通过
+- 闭包捕获 GC 指针变量场景完整支持（同步调用 + 返回闭包）
+- `GcRootHandle`（栈上）与 `GcSharedRoot`（堆上）分工明确：
+  - `GcRootHandle`：局部变量 GC 根，不可拷贝，零开销
+  - `GcSharedRoot`：闭包捕获 GC 根，可拷贝，堆分配
+- 未来可考虑：
+  - 若性能 profiling 显示 `GcSharedRoot` 堆分配是热点，可引入 small-object pool 优化
+  - 若需更复杂所有权（多闭包共享同一 GC 根），可引入 `std::shared_ptr<GcSharedRoot<T>>` 模式
+
+---
+
+## 十、与现有 plan 的关系
+
+| 现有 plan 项 | 状态 | 关系 |
 |:---|:---:|:---|
-| [gc_features_plan.md §九 精确栈扫描](file:///d:/you/Aura/plan/gc_features_plan.md) | [-] 暂不实施 | 不实施，缺陷 3 修复不依赖精确栈扫描 |
-| [gc_features_plan.md §十一 TLAB](file:///d:/you/Aura/plan/gc_features_plan.md) | [~] 延后 | 不实施，等待 sync_thread |
-| [gc_features_plan.md §十三 对象可移动性](file:///d:/you/Aura/plan/gc_features_plan.md) | [~] 延后 | 不实施，对应缺陷 5（Phase 3 远期） |
-| [TODO.txt §五 P3 分代年龄记录](file:///d:/you/Aura/TODO.txt) | `[ ]` | ✅ 本 plan Phase 2 Step 2.1 实施 |
-| [plan/gc_promotion_issues.md](file:///d:/you/Aura/plan/gc_promotion_issues.md) | 缺陷记录 | ✅ 本 plan 细化为实施 plan |
-
----
-
-## 十、后续
-
-完成本 plan 后：
-- [TODO.txt](file:///d:/you/Aura/TODO.txt) §五新增"GC 晋升机制修复"条目，标记 `[x]`
-- [plan/gc_promotion_issues.md](file:///d:/you/Aura/plan/gc_promotion_issues.md) 标注缺陷 1-4 已修复，缺陷 5 延后
-- [plan/gc_features_plan.md](file:///d:/you/Aura/plan/gc_features_plan.md) §十三状态保持 `[~] 延后`
-
-**Phase 3（缺陷 5）**留待 profiling 证据充足后再启动，对应 [gc_features_plan.md §十三](file:///d:/you/Aura/plan/gc_features_plan.md) `[~] 延后` 项。
+| [TODO.txt GcRootHandle 赋值 bug](file:///d:/you/Aura/TODO.txt) | ✅ 已完成 | 同源问题，本 plan 是其延伸 |
+| [plan/gc_promotion_issues.md 缺陷 2 写屏障](file:///d:/you/Aura/plan/gc_promotion_issues.md) | ✅ 已完成 | 写屏障针对字段赋值，与本 plan 独立 |
+| [plan/gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) | 进行中 | GcString 优化不受本 plan 影响 |

@@ -362,6 +362,76 @@ GcGlobalRoot<T>::~GcGlobalRoot() {
         reinterpret_cast<GcObject**>(&ptr_));
 }
 
+// ============================================================
+// GcSharedRoot<T> — 闭包捕获 GC 根的共享所有权版本
+//
+// 与 GcRootHandle<T> 互补：
+// - GcRootHandle：栈上包装，不可拷贝，ptr_ 指向栈变量
+// - GcSharedRoot：堆上独立存值，可拷贝，专为闭包捕获设计
+//
+// 使用场景：闭包 lambda 按值捕获 GC 指针类型变量时，
+// 用 GcSharedRoot 包装，每个 lambda 副本独立持有 GC 根。
+// CodeGen 使用 C++14 init-capture 生成：
+//   [name = aura_rt::GcSharedRoot<T>(name.get())]
+// ============================================================
+template <typename T>
+class GcSharedRoot {
+public:
+    explicit GcSharedRoot(T val) : ptr_(new T(val)) {
+        GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+    }
+
+    ~GcSharedRoot() {
+        if (ptr_) {
+            GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+            delete ptr_;
+            ptr_ = nullptr;
+        }
+    }
+
+    // 拷贝构造：新对象独立堆分配 + 独立 register
+    GcSharedRoot(const GcSharedRoot& other) : ptr_(new T(*other.ptr_)) {
+        GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+    }
+
+    // 拷贝赋值：先 unregister 旧值，再分配新值
+    GcSharedRoot& operator=(const GcSharedRoot& other) {
+        if (this != &other) {
+            GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+            delete ptr_;
+            ptr_ = new T(*other.ptr_);
+            GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+        }
+        return *this;
+    }
+
+    // 移动构造
+    GcSharedRoot(GcSharedRoot&& other) noexcept : ptr_(other.ptr_) {
+        other.ptr_ = nullptr;
+    }
+
+    GcSharedRoot& operator=(GcSharedRoot&& other) noexcept {
+        if (this != &other) {
+            if (ptr_) {
+                GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+                delete ptr_;
+            }
+            ptr_ = other.ptr_;
+            other.ptr_ = nullptr;
+        }
+        return *this;
+    }
+
+    // 读取值（与 GcRootHandle::get() 兼容，返回类型相同）
+    T  get() const { return *ptr_; }
+    T& get()       { return *ptr_; }
+
+    void set(T val) { *ptr_ = val; }
+
+private:
+    T* ptr_;  // 堆上持有值，独立于栈帧生命周期
+};
+
 } // namespace aura_rt
 
 // ============================================================

@@ -426,6 +426,10 @@ private:
     // genIdentifier 遇到这些变量名时生成 .get()
     std::set<std::string> gcRootVarNames_;
 
+    // GC 根变量名 → C++ 类型映射（如 "greeting" → "aura_rt::GcString*"）
+    // genFunExpr 的 init-capture 需要类型信息生成 GcSharedRoot<T>
+    std::unordered_map<std::string, std::string> gcRootTypes_;
+
     // 导入的命名空间名集合（路径名 + 别名，用于 genMethodCall 判断是否用 ::）
     std::set<std::string> importNsNames_;
 

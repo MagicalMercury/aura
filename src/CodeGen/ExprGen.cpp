@@ -776,9 +776,16 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
         if (i > 0) oss << ", ";
         auto cn = safeName(captures[i]);
         // 递归闭包：let 声明的变量被自身闭包引用 → 按引用捕获
-        if (!currentLetName_.empty() && captures[i] == currentLetName_)
-            oss << "&";
-        oss << cn;
+        if (!currentLetName_.empty() && captures[i] == currentLetName_) {
+            oss << "&" << cn;
+        } else if (gcRootVarNames_.count(captures[i])) {
+            // GC 根变量 → init-capture 创建 GcSharedRoot 副本
+            // 如 [greeting = aura_rt::GcSharedRoot<GcString*>(greeting.get())]
+            std::string type = gcRootTypes_[captures[i]];
+            oss << cn << " = aura_rt::GcSharedRoot<" << type << ">(" << cn << ".get())";
+        } else {
+            oss << cn;
+        }
     }
 
     // 模板参数列表

@@ -124,6 +124,7 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                     writeLine(cpp, type + " " + var + "_raw = " + init + ";");
                     writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + var + "(" + var + "_raw);");
                     gcRootVarNames_.insert(var);
+                    gcRootTypes_[var] = type;
                     for (auto& f : rec->fields) {
                         writeLine(cpp, var + ".get()->" + safeName(f.name) + " = "
                                   + (f.value ? genExpr(*f.value, currentFunctionIsCoroutine_) : "???") + ";");
@@ -167,6 +168,7 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
         writeLine(cpp, type + " " + varName + "_raw = " + init + ";");
         writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + varName + "(" + varName + "_raw);");
         gcRootVarNames_.insert(varName);
+        gcRootTypes_[varName] = type;
     } else {
         writeLine(cpp, type + " " + varName +
                   (init.empty() ? ";" : " = " + init + ";"));
@@ -241,6 +243,7 @@ void CodeGenerator::genConstStmt(std::ostream& cpp, const ConstDecl& decl) {
         writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + varName
                   + "(const_cast<" + type + "&>(" + varName + "_raw));");
         gcRootVarNames_.insert(varName);
+        gcRootTypes_[varName] = type;
     } else {
         writeLine(cpp, "const " + type + " " + varName +
                   (init.empty() ? ";" : " = " + init + ";"));
