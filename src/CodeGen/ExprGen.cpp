@@ -337,16 +337,25 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
         if (leftIsStr || rightIsStr) {
             auto chain = collectStringChain(e, isCoroutine);
             if (chain.size() >= 3 && isStringExprInChain(chain[0])) {
-                std::string result = "aura_rt::concat_multi({";
+                // 用 IIFE + GcRootHandle 包裹每个参数，compact 移动对象后自动更新指针
+                int hid = argHandleCounter_++;
+                std::string result = "[&](){";
+                for (size_t i = 0; i < chain.size(); ++i) {
+                    std::string expr = isStringExprInChain(chain[i])
+                                       ? chain[i]
+                                       : "aura_rt::GcString::from(" + chain[i] + ")";
+                    result += "auto _a" + std::to_string(hid) + "_" + std::to_string(i)
+                            + " = " + expr + ";";
+                    result += "aura_rt::GcRootHandle<aura_rt::GcString*> _h"
+                            + std::to_string(hid) + "_" + std::to_string(i)
+                            + "(_a" + std::to_string(hid) + "_" + std::to_string(i) + ");";
+                }
+                result += "return aura_rt::concat_multi({";
                 for (size_t i = 0; i < chain.size(); ++i) {
                     if (i) result += ", ";
-                    if (isStringExprInChain(chain[i])) {
-                        result += chain[i];
-                    } else {
-                        result += "aura_rt::GcString::from(" + chain[i] + ")";
-                    }
+                    result += "_a" + std::to_string(hid) + "_" + std::to_string(i);
                 }
-                result += "})";
+                result += "}); }()";
                 return result;
             }
         }

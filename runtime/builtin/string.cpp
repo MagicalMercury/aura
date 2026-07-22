@@ -184,22 +184,27 @@ GcString* GcString::concat(const GcString& other) const {
 // concat_multi — N 元拼接（平衡 Rope 树版本）
 // ============================================================
 GcString* concat_multi(std::initializer_list<const GcString*> parts) {
+    // 第 1 轮：计算 total + 缓存 (data, len)，防止 alloc() 后 parts 悬垂
     int32_t total = 0;
+    std::vector<std::pair<const char*, int32_t>> cached;
     for (auto* p : parts) {
-        if (p) total += p->length;
+        if (!p) continue;
+        int32_t len = p->length;
+        total += len;
+        cached.emplace_back(p->data(), len);
     }
 
     if (total < kConcatByCopySize) {
         size_t objSize = sizeof(GcString) + total + 1;
         auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
+        // alloc 可能触发 GC 移动 parts 对象，但缓存的数据不受影响
         r->length = total;
         r->u.capacity = total;
         r->parent = nullptr;
         char* dst = r->raw_data();
-        for (auto* s : parts) {
-            if (!s) continue;
-            std::memcpy(dst, s->data(), s->length);
-            dst += s->length;
+        for (auto& [data, len] : cached) {
+            std::memcpy(dst, data, len);
+            dst += len;
         }
         *dst = '\0';
         return r;

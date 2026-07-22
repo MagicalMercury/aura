@@ -1,288 +1,320 @@
-# Change Plan v6.1 — 静态对象析构顺序崩溃修复（方案 C）
+# Change Plan — Compacting GC Phase D 根因修复（GcRootHandle 方案）
 
-> **本 plan 完全覆盖之前的 v6 内容**（字面量 intern + Rope 表示），转为单一目标：
-> 修复运行 `./example/test.exe` 时的 `0xC0000005 (Access Violation)` 崩溃。
+> **目标**：修复 `concat_multi` 参数求值期间 compact 导致裸指针悬垂。
 >
-> 原则：**暂时禁止改动 Rope/Intern 等新功能**，仅做最小修复让程序能正常退出。
+> 日期：2026-07-22
+> 状态：待审查
 
 ---
 
-## 一、崩溃现象
+## 一、分析报告
 
-```
-PS D:\you\Aura> ./example/test.exe 2>&1
-GC: alloc=655.5KB young=183.9KB old=40.2KB gc=0 minor=2 live=4951 pages=165
-Run exit: -1073741819   ← 0xC0000005 Access Violation
-```
+### 1.1 Codebase Scan
 
-- GC 统计已正常输出（`alloc=655.5KB ...`），说明 `io.println(gc_stats())` 执行成功
-- 崩溃发生在**程序退出阶段**（静态对象析构）
-- `minor=2` 说明运行期间触发了 2 次 minor GC
-
----
-
-## 二、根本原因分析
-
-### 2.1 涉及的静态对象
-
-| 静态对象 | 文件 | 类型 | 析构时调用 |
-|:---|:---|:---|:---|
-| `GcHeap::heap` | [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) `instance()` 内 | Meyers Singleton | vector/mutex 自动析构 |
-| `g_internPool` | [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 匿名命名空间 | `unordered_map<string, unique_ptr<GcGlobalRoot<GcString>>>` | 逐个 `~GcGlobalRoot()` |
-| `g_internMutex` | 同上 | `std::shared_mutex` | 自动析构 |
-| `GcString::from(int)::_cache[2048]` | string.cpp | 裸指针数组 | 不析构（new 对象泄漏，OS 回收） |
-| `GcString::empty()::_e` | string.cpp | `GcGlobalRoot<GcString>` | `unregisterGlobalRoot()` |
-| `GcString::from(bool)::_t/_f` | string.cpp | `GcGlobalRoot<GcString>` | `unregisterGlobalRoot()` |
-
-### 2.2 C++ 静态对象析构顺序规则
-
-- **同一翻译单元内**：按声明逆序析构（C++ 标准保证）
-- **不同翻译单元之间**：**顺序未定义**（C++ 标准 §3.6.3）
-
-`g_internPool`（string.cpp）和 `GcHeap::heap`（gc.cpp）位于不同翻译单元，析构顺序由编译器/链接器决定。
-
-### 2.3 崩溃路径
-
-当 `GcHeap::heap` 先于 `g_internPool` 析构时：
-
-```
-程序退出
-├─ GcHeap::heap 析构
-│  ├─ globalRoots_ vector 析构（内存释放）
-│  └─ globalRoots_m_ mutex 析构（不可用）
-└─ g_internPool 析构
-   └─ unique_ptr<GcGlobalRoot<GcString>> 析构
-      └─ GcGlobalRoot::~GcGlobalRoot()
-         └─ GcHeap::instance().unregisterGlobalRoot(...)
-            ├─ std::lock_guard lk(globalRoots_m_)  ← 💥 mutex 已析构
-            └─ globalRoots_.push_back/erase(...)     ← 💥 vector 已析构
-```
-
-→ **Access Violation（0xC0000005）**
-
-### 2.4 为什么之前没崩溃？
-
-本次 v6 plan 新增了 `g_internPool` 静态变量。之前的静态 `GcGlobalRoot`（`_t`/`_f`/`_e`）都在 string.cpp 中，析构顺序由编译器在 string.cpp 内决定，可能恰好都在 `GcHeap::heap` 之前析构。
-
-新增 `g_internPool` 后：
-- `g_internPool` 是 `unordered_map`，析构时会逐个调用 value 的析构函数（`~GcGlobalRoot`）
-- 链接器可能决定 `g_internPool` 在 `GcHeap::heap` 之后析构
-- 导致 `~GcGlobalRoot` 访问已析构的 GcHeap 成员
-
-### 2.5 同样有风险的静态对象
-
-| 静态对象 | 析构时调用 GcHeap | 风险 |
+| 文件 | 职责 | 本计划是否改动 |
 |:---|:---|:---:|
-| `g_internPool` | `unregisterGlobalRoot` × N | 🔴 高（新增触发崩溃） |
-| `GcString::from(bool)::_t/_f` | `unregisterGlobalRoot` | 🟡 中 |
-| `GcString::empty()::_e` | `unregisterGlobalRoot` | 🟡 中 |
-| `GcString::from(int)::_cache[2048]` | 不析构 | 🟢 无 |
+| `runtime/gc.h` | GcHeap 类声明、GcRootHandle/GcGlobalRoot 模板 | ❌（已有 GcRootHandle） |
+| `runtime/gc.cpp` | GC 实现（alloc、minorGc、compact 等） | ❌（已正确实现） |
+| `runtime/builtin/string.cpp` | GcString 实现、concat_multi、intern_string | ❌ |
+| `runtime/builtin/string.h` | GcString 声明、concat_multi 声明 | ❌ |
+| `src/CodeGen/ExprGen.cpp` | 表达式 CodeGen，concat_multi 生成在第 339-349 行 | ✅ |
+| `src/CodeGen/CodeGen.h` | CodeGen 状态字段（计数器等） | ✅（新增计数器） |
+| `example/test.cpp` | 测试代码（由 aurac 生成） | 自动更新 |
 
----
-
-## 三、方案 C 设计：`[[gnu::init_priority(N)]]` 控制析构顺序
-
-### 3.1 原理
-
-GCC/Clang 扩展属性 `[[gnu::init_priority(N)]]`（N ∈ [1, 65535]）：
-- 静态对象按 **priority 升序初始化**
-- 静态对象按 **priority 降序析构**（与初始化相反）
-
-通过为每个静态对象分配 priority，强制确定析构顺序，消除跨翻译单元的顺序未定义问题。
-
-### 3.2 Priority 分配方案
-
-| Priority | 对象 | 文件 | 作用 |
-|:---:|:---|:---|:---|
-| 101 | `GcHeap::heap` | gc.cpp | GC 单例（必须最先初始化，最后析构） |
-| 102 | `GcString::from(int)::_cache[2048]` | string.cpp | 小整数缓存（裸指针数组） |
-| 103 | `GcString::empty()::_e` | string.cpp | 空字符串单例 |
-| 104 | `GcString::from(bool)::_t` / `_f` | string.cpp | 布尔字符串单例 |
-| 105 | `g_internPool` + `g_internMutex` | string.cpp | Intern 池 |
-
-### 3.3 初始化顺序（priority 升序）
+### 1.2 Dependency Map
 
 ```
-101: GcHeap::heap             ← 最先初始化
-102: from(int)::_cache
-103: empty()::_e
-104: from(bool)::_t/_f
-105: g_internPool              ← 最后初始化
+test.aura → aurac (CodeGen/ExprGen.cpp) → test.cpp
+                                            ↓
+                            concat_multi({intern_string(...), from(i), ...})
+                                            ↓
+                    runtime/builtin/string.cpp: concat_multi()
+                                            ↓
+                    runtime/gc.cpp: GcHeap::alloc() → tryAlloc()
+                                            ↓
+                    tryAlloc: youngBytes_ >= kYoungThreshold → minorGc() → compact()
+                                            ↓
+                    compact: 移动对象 → 更新 GcRootHandle.ptr_ 指向的变量
+                                            ↓
+                    但 initializer_list 中的裸指针未被更新 → 悬垂
 ```
 
-**保证**：所有 `GcGlobalRoot` 在 `GcHeap::heap` 之后初始化，因此 `GcGlobalRoot` 构造时调用 `registerGlobalRoot()` 时 GcHeap 已就绪。
+**关键数据流**：
+- `intern_string("iter ")` 返回 `GcGlobalRoot::ptr_` 的**值拷贝**（裸指针）
+- `from(i)` 调用 `make` → `GcHeap::alloc()` → 可能触发 `minorGc()` → `compact()`
+- compact 移动对象后，`updateAllReferences` 步骤 1 会更新所有 `GcRootHandle` 指向的变量
+- 但 initializer_list 中的裸指针**不是 GcRootHandle**，不会被更新
 
-### 3.4 析构顺序（priority 降序，与初始化相反）
+### 1.3 Interface Inventory
 
-```
-105: g_internPool + g_internMutex  ← 最先析构
-     └─ ~GcGlobalRoot() → unregisterGlobalRoot() → GcHeap 仍存活 ✅
-104: from(bool)::_t/_f
-     └─ ~GcGlobalRoot() → unregisterGlobalRoot() → GcHeap 仍存活 ✅
-103: empty()::_e
-     └─ ~GcGlobalRoot() → unregisterGlobalRoot() → GcHeap 仍存活 ✅
-102: from(int)::_cache           ← 不析构（裸指针数组）
-101: GcHeap::heap                ← 最后析构
-     └─ vector/mutex 自动析构 ✅ 无外部依赖
-```
-
-**保证**：所有 `GcGlobalRoot` 在 `GcHeap::heap` 之前析构，因此 `~GcGlobalRoot` 调用 `unregisterGlobalRoot()` 时 GcHeap 仍可用。
-
----
-
-## 四、改动详情
-
-### 4.1 [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) — GcHeap 单例加 priority 101
-
-```cpp
-GcHeap& GcHeap::instance() {
-    // 方案 C：用 gnu::init_priority 强制 GcHeap 最先初始化、最后析构
-    [[gnu::init_priority(101)]] static GcHeap heap;
-    return heap;
-}
-```
-
-### 4.2 [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) — 静态对象加 priority 102-105
-
-```cpp
-// string.cpp 顶部匿名命名空间
-namespace {
-    [[gnu::init_priority(105)]] std::unordered_map<std::string,
-        std::unique_ptr<GcGlobalRoot<GcString>>> g_internPool;
-    [[gnu::init_priority(105)]] std::shared_mutex g_internMutex;
-}
-
-// GcString::from(int)
-GcString* GcString::from(int32_t val) {
-    [[gnu::init_priority(102)]] static GcGlobalRoot<GcString>* _cache[2048] = {};
-    // ...
-}
-
-// GcString::empty()
-GcString* GcString::empty() {
-    [[gnu::init_priority(103)]] static GcGlobalRoot<GcString> _e{make("", 0)};
-    return _e.get();
-}
-
-// GcString::from(bool)
-GcString* GcString::from(bool val) {
-    [[gnu::init_priority(104)]] static GcGlobalRoot<GcString> _t{make("true")};
-    [[gnu::init_priority(104)]] static GcGlobalRoot<GcString> _f{make("false")};
-    return val ? _t.get() : _f.get();
-}
-```
-
-### 4.3 改动规模
-
-| 文件 | 改动 | 净增行数 |
-|:---|:---|:---:|
-| [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) | `GcHeap::instance()` 内 `static GcHeap heap` 加 `[[gnu::init_priority(101)]]` | +1 |
-| [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) | 5 个静态对象加 priority 102-105 | +5 |
-| **合计** | | **+6** |
-
----
-
-## 五、平台限制
-
-### 5.1 GCC/Clang 支持
-
-`[[gnu::init_priority(N)]]` 是 GCC/Clang 扩展属性：
-- GCC：默认可用，无需额外编译选项
-- Clang：默认可用
-- 当前项目 CMakeLists.txt 已配置 `-std=c++20 -fno-rtti`，与 `[[gnu::init_priority]]` 兼容
-
-### 5.2 MSVC 不支持
-
-- MSVC 不识别 `[[gnu::init_priority]]`，会忽略或报错
-- **用户已确认不迁移 MSVC**，本方案可接受
-
-### 5.3 编译器警告处理
-
-GCC 可能对 `[[gnu::init_priority]]` 发出 `-Wattributes` 警告（提示该属性不影响代码生成），可忽略或加 `-Wno-attributes` 抑制。
-
----
-
-## 六、验证方案
-
-### 6.1 编译验证
-
-```bash
-cmake --build build
-# 期望：无编译错误，可能有 -Wattributes 警告（可忽略）
-```
-
-### 6.2 运行验证
-
-```bash
-./example/test.exe 2>&1; echo "Run exit: $LASTEXITCODE"
-# 期望：
-# GC: alloc=655.5KB young=183.9KB old=40.2KB gc=0 minor=2 live=4951 pages=165
-# Run exit: 0    ← 不再 -1073741819
-```
-
-### 6.3 多次运行验证
-
-连续运行 10 次，确认退出码稳定为 0（排除偶然性）。
-
----
-
-## 七、实施顺序
-
-| 步骤 | 改动 | 验证 |
-|:---:|:---|:---|
-| 1 | [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) `GcHeap::instance()` 加 `[[gnu::init_priority(101)]]` | 编译通过 |
-| 2 | [runtime/builtin/string.cpp](file:///d:/you/Aura/runtime/builtin/string.cpp) 5 个静态对象加 priority 102-105 | 编译通过 |
-| 3 | 运行 `./example/test.exe` | 退出码 0 |
-| 4 | 连续运行 10 次 | 退出码稳定 0 |
-
----
-
-## 八、风险评估
-
-### 8.1 风险极低
-
-- **不改动任何业务逻辑**：只加 `[[gnu::init_priority]]` 属性
-- **不改动 GC 实现**：`unregisterGlobalRoot` 行为不变
-- **不改动 GcGlobalRoot**：析构链不变
-- **可立即回滚**：删除属性即恢复原状
-
-### 8.2 不影响现有功能
-
-- 所有现有测试（string 操作 / GC 扫描 / intern 池）行为不变
-- 仅改变静态对象的析构顺序，运行时行为完全一致
-
----
-
-## 九、与之前 v6 plan 的关系
-
-### 9.1 v6 plan 内容推迟
-
-原 v6 plan 包含的 Rope/Intern 功能**暂时不动**：
-
-| 项 | 状态 | 说明 |
+| 接口 | 签名 | 副作用 |
 |:---|:---|:---|
-| Part A: 字面量 intern | ✅ 已实施 | 引入 `g_internPool`，触发本崩溃 |
-| Part B: 小整数缓存扩展 | ✅ 已实施 | `from(int)::_cache[2048]` |
-| Part C: Rope 表示 | ❌ **推迟** | 待本崩溃修复后重新评估 |
+| `GcRootHandle(T& ref)` | 构造函数 | 注册到 `roots_`，GC 通过它发现和更新引用 |
+| `GcRootHandle::get()` | `T& get()` / `T get() const` | 返回被包装的引用/值 |
+| `GcRootHandle::~GcRootHandle()` | 析构函数 | 从 `roots_` 注销 |
+| `concat_multi` | `GcString* concat_multi(std::initializer_list<const GcString*>)` | 内部调用 alloc |
+| `intern_string` | `GcString* intern_string(const char*, size_t)` | 返回 GcGlobalRoot::ptr_ 值拷贝 |
 
-### 9.2 修复后计划
+### 1.4 GcRootHandle 的工作原理
 
-1. 实施本 v6.1 plan（+6 行）
-2. 运行 `./example/test.exe` 确认退出码 0
-3. 若 Part C (Rope) 仍需要，再单独出 plan
+```cpp
+// gc.h
+template <typename T>
+class GcRootHandle {
+    T* ptr_;  // 指向实际的 GC 指针变量
+};
+
+// gc.cpp markPhase 步骤 1（标记根对象）：
+for (auto* rootHandle : roots_) {
+    GcObject* obj = rootHandle->get();
+    if (obj) markObject(obj);  // 标记为存活
+}
+
+// gc.cpp updateAllReferences 步骤 1（compact 后自动更新）：
+for (auto* rootHandle : roots_) {
+    GcObject** fieldPtr = reinterpret_cast<GcObject**>(rootHandle->ptr_);
+    if (fieldPtr && *fieldPtr) {
+        if ((*fieldPtr)->forwarded()) {
+            *fieldPtr = (*fieldPtr)->forwardingPtr();  // 自动更新！
+        }
+    }
+}
+```
+
+**GcRootHandle 就是指针级别的 OopMap**：让 GC 知道每个引用的位置，compact 后自动更新。
+
+### 1.5 State & Side Effects
+
+- `argHandleCounter_`（新增）：GcRootHandle 临时变量名计数器
+- 副作用：无（GcRootHandle 构造/析构自动注册/注销，作用域内有效）
 
 ---
 
-## 十、关键变更说明
+## 二、根本原因
 
-**v6.1 设计要点**：
-- ✨ 采用方案 C：`[[gnu::init_priority(N)]]` 控制静态对象初始化/析构顺序
-- ✨ 5 级 priority（101-105）覆盖所有静态 GcGlobalRoot 对象
-- ✨ GcHeap 最先初始化（101），最后析构，保证所有 `~GcGlobalRoot` 时 GcHeap 可用
-- ✨ 暂时禁止改动 Rope/Intern 等新功能，仅做最小修复
-- ❌ 不采用方案 A（去掉 `unregisterGlobalRoot` 调用）：会导致 GcHeap 内部状态不一致
-- ❌ 不采用方案 B（`std::quick_exit`）：需要修改 main 函数，改动范围大
+### 2.1 崩溃时序
 
-**与 v6 的关系**：
-- v6 引入了 `g_internPool`，触发了静态对象析构顺序问题
-- v6.1 修复此问题，为后续 Rope 实施扫清障碍
+```
+concat_multi({intern_string("iter "), from(i), intern_string(" step "), from(i), intern_string(" done")})
+```
+
+| 步骤 | 求值 | 结果 |
+|:---:|:---|:---|
+| 1 | `intern_string("iter ")` | P1（旧页地址，裸指针） |
+| 2 | `from(i)` (i=2159 超缓存) | `make` → `alloc` → `minorGc` → `compact` |
+| 3 | compact 移动 "iter "，更新 `GcGlobalRoot::ptr_` | **但 P1 是值拷贝，未被更新** |
+| 4-6 | 后续参数求值 | 新地址 |
+| 7 | `concat_multi({P1(悬垂), ...})` | 访问 `P1->length` → SIGSEGV |
+
+### 2.2 GDB 验证
+
+用户确认：**"parts 列表中的地址后四个都被更改，第一个反而没变"** —— 完全吻合时序分析。
+
+### 2.3 根因本质
+
+GC compact 移动对象后，通过 `updateAllReferences` 更新所有已注册的 `GcRootHandle` 指向的变量。但 `concat_multi` 的参数是 initializer_list 中的**裸指针值拷贝**，不在 GC 跟踪范围内。
+
+**Java 的 OopMap + Safepoint 机制**通过在 safepoint 记录所有引用位置解决此问题。**GcRootHandle 是 Aura 的 OopMap 等价物**——让 GC 跟踪每个引用的位置，compact 后自动更新。
+
+---
+
+## 三、Proposed Changes
+
+### 改动 1：新增 argHandleCounter_ 字段（src/CodeGen/CodeGen.h）
+
+**What**：在 CodeGen 类中添加 `argHandleCounter_` 计数器，用于生成唯一的 GcRootHandle 变量名。
+
+**Where**：`src/CodeGen/CodeGen.h`，`listCounter_` 附近（第 411 行）
+
+**Why**：生成唯一变量名避免命名冲突。
+
+```cpp
+int listCounter_ = 0;
+int recordAllocCounter_ = 0;
+int argHandleCounter_ = 0;  // 新增：concat_multi 参数 GcRootHandle 变量名计数器
+```
+
+### 改动 2：CodeGen 为 concat_multi 参数生成 GcRootHandle（src/CodeGen/ExprGen.cpp）
+
+**What**：将 concat_multi 调用包裹在 IIFE 中，为每个参数生成临时变量 + GcRootHandle 保护。
+
+**Where**：`src/CodeGen/ExprGen.cpp` 第 339-349 行
+
+**Why**：让 GC 跟踪每个参数指针，compact 后自动更新，防止悬垂。
+
+```cpp
+// 修改前（第 339-349 行）：
+std::string result = "aura_rt::concat_multi({";
+for (size_t i = 0; i < chain.size(); ++i) {
+    if (i) result += ", ";
+    if (isStringExprInChain(chain[i])) {
+        result += chain[i];
+    } else {
+        result += "aura_rt::GcString::from(" + chain[i] + ")";
+    }
+}
+result += "})";
+
+// 修改后：
+int hid = argHandleCounter_++;
+std::string result = "[&](){";
+for (size_t i = 0; i < chain.size(); ++i) {
+    std::string expr = isStringExprInChain(chain[i])
+                       ? chain[i]
+                       : "aura_rt::GcString::from(" + chain[i] + ")";
+    result += "auto _a" + std::to_string(hid) + "_" + std::to_string(i)
+            + " = " + expr + ";";
+    result += "aura_rt::GcRootHandle<aura_rt::GcString*> _h"
+            + std::to_string(hid) + "_" + std::to_string(i)
+            + "(_a" + std::to_string(hid) + "_" + std::to_string(i) + ");";
+}
+result += "return aura_rt::concat_multi({";
+for (size_t i = 0; i < chain.size(); ++i) {
+    if (i) result += ", ";
+    result += "_a" + std::to_string(hid) + "_" + std::to_string(i);
+}
+result += "}); }()";
+```
+
+**生成的代码变化**：
+
+```cpp
+// 修改前：
+aura_rt::concat_multi({aura_rt::intern_string("iter "), aura_rt::GcString::from(i), ...})
+
+// 修改后：
+[&](){
+    auto _a0_0 = aura_rt::intern_string("iter ");
+    aura_rt::GcRootHandle<aura_rt::GcString*> _h0_0(_a0_0);
+    auto _a0_1 = aura_rt::GcString::from(i);
+    aura_rt::GcRootHandle<aura_rt::GcString*> _h0_1(_a0_1);
+    ...
+    return aura_rt::concat_multi({_a0_0, _a0_1, ...});
+}()
+```
+
+### 工作原理
+
+1. 每个参数求值后存入临时变量 `_a0_i`
+2. `GcRootHandle` 包装该变量，注册到 GC `roots_`
+3. 若后续参数求值触发 compact，`updateAllReferences` 步骤 1 自动更新 `_a0_i` 为新地址
+4. `concat_multi` 收到的所有指针都是最新的
+5. IIFE 结束时，所有 `GcRootHandle` 析构，从 `roots_` 注销
+
+---
+
+## 四、Impact Analysis
+
+| 组件 | 影响 | 说明 |
+|:---|:---|:---|
+| GcHeap | 无变更 | GcRootHandle 机制已存在 |
+| compact | 无变更 | 正常移动对象，自动更新 GcRootHandle |
+| minorGc | 无变更 | 正常执行 mark-sweep + compact |
+| concat_multi | 无 API 变更 | 生成的调用代码变更 |
+| CodeGen | 新增 argHandleCounter_ + 修改 concat_multi 生成 | 唯一变量名生成 |
+| 其他 concat 路径 | 不受影响 | `concat(a, b)` 双元素路径不走 concat_multi |
+
+**无 Breaking Change**：所有变更新增，不修改现有 API 签名。
+
+**GC 统计正常**：`gc>0 minor>0`，compact 正常触发，内存正常回收。
+
+---
+
+## 五、Boundary Condition Handling
+
+| Boundary Condition | Current Handling | Planned Handling | Test Strategy |
+|:---|:---|:---|:---|
+| 参数求值期间触发 compact | 崩溃 | GcRootHandle 自动更新指针 | 集成测试 |
+| GcRootHandle 变量名冲突 | 不存在 | argHandleCounter_ 生成唯一名 | 代码审查 |
+| 嵌套 concat_multi | 不存在 | argHandleCounter_ 每次递增 | 单元测试 |
+| GcRootHandle 构造/析构开销 | 不存在 | 每参数 2 次 register/unregister | 性能可接受 |
+| 空参数列表 | 不存在 | chain.size() >= 3 才走此路径 | 代码审查 |
+| 参数为 nullptr | 不存在 | GcRootHandle 支持 nullptr | 代码审查 |
+
+---
+
+## 六、Test Plan
+
+### 6.1 核心测试
+
+```powershell
+cd d:\you\Aura
+cmake --build build          # 重新编译 aurac
+cmake --build runtime/build   # 重新编译 runtime
+.\example\compile.cmd         # 重新生成 test.cpp 并编译
+.\example\test.exe            # 运行测试
+```
+
+**预期**：
+```
+GC: alloc=... gc>=0 minor>=0 pages=<50
+Run exit: 0
+```
+
+### 6.2 验证点
+
+- [ ] test.exe 退出码 0
+- [ ] 无 SIGSEGV/ACCESS_VIOLATION
+- [ ] **GC 统计正常（minor GC 次数 > 0）**
+- [ ] **compact 生效（pages 数量减少）**
+- [ ] 生成的 test.cpp 包含 GcRootHandle 包装
+
+### 6.3 回归测试
+
+- 双元素 concat 路径不受影响（`"a" + b` 不走 concat_multi）
+- 禁用 compact 触发点后测试仍正常
+
+---
+
+## 七、Implementation Steps
+
+### Step 1: 新增 argHandleCounter_ 字段（src/CodeGen/CodeGen.h）
+- 在 `listCounter_` 附近添加 `int argHandleCounter_ = 0;`
+- **验证**：编译通过
+
+### Step 2: 修改 concat_multi 生成代码（src/CodeGen/ExprGen.cpp）
+- 修改第 339-349 行，生成 IIFE + GcRootHandle 包装
+- **验证**：`cmake --build build` 编译通过
+
+### Step 3: 重新生成 test.cpp 并运行测试
+- 执行 `example/compile.cmd`
+- 运行 `example/test.exe`
+- **验证**：退出码 0，GC 统计 minor > 0，pages 减少
+
+### Rollback
+- 若测试失败，回退 Step 2 的 CodeGen 改动
+- 禁用 compact 触发点验证非 compact 路径
+
+---
+
+## 八、Risks & Mitigations
+
+| 风险 | 可能性 | 影响 | 缓解 |
+|:---|:---|:---|:---|
+| GcRootHandle 构造/析构开销 | 低 | 每参数 2 次 register/unregister | vector push_back/erase，O(1) |
+| 生成的代码膨胀 | 低 | 每参数多 2 行 | 可读性略降，但正确性优先 |
+| 嵌套 IIFE 命名冲突 | 极低 | argHandleCounter_ 保证唯一 | 计数器递增 |
+| GcRootHandle 析构异常 | 极低 | roots_ 未清理 | unregisterRoot 无异常操作 |
+
+---
+
+## 九、方案对比
+
+| 方案 | GC 统计 | compact | 复杂度 | 根本性 | 问题 |
+|:---|:---:|:---:|:---:|:---:|:---|
+| 禁用整个 GC（GcSuspendGuard） | gc=0 ❌ | 禁用 | 低 | 否 | GC 完全禁用 |
+| 禁用 compact（GcCompactSuspendGuard） | gc>0 | 禁用 | 低 | 否 | compact 可能永不执行 |
+| Pin 不移动 | gc>0 | 部分 | 中 | 否 | CodeGen 改动 = GcRootHandle |
+| **GcRootHandle** ✅ | **gc>0** | **正常** | **中** | **是** | **无副作用** |
+
+---
+
+## 十、后续扩展（Phase D-2）
+
+当前 Phase D-1 仅修复 concat_multi。其他 11 类场景（string_eq、concat 二元、记录字面量、列表字面量、用户函数调用等）存在同类问题，后续可系统性修复：
+
+1. 提取公共辅助函数 `genSafeArgs`，为 GC 指针参数生成 GcRootHandle
+2. 在 `genCallExpr`、`genMethodCall`、`genRecordExpr`、`genListExpr` 中调用
+3. 利用 `isGcPointerType` 判断参数类型，仅为 GC 指针参数生成 GcRootHandle
+
+这需要更大的 CodeGen 重构，作为后续工作。

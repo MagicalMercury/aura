@@ -123,9 +123,20 @@ struct GcObject {
     bool finalized() const      { return flags_ & kFinalizedBit; }
     void setFinalized(bool v)   { flags_ = (flags_ & ~kFinalizedBit) | (v ? kFinalizedBit : 0); }
 
-    // ---- age (bit 3-7, max 31) ----
+    // ---- age (bit 3-6, max 15) ----
     uint8_t age() const         { return (flags_ & kAgeMask) >> kAgeShift; }
     void incAge()              { flags_ += (1 << kAgeShift); }
+
+    // ---- forwarded (bit 7) ----
+    bool forwarded() const          { return flags_ & kForwardedBit; }
+    void setForwarded(bool v)       { flags_ = (flags_ & ~kForwardedBit) | (v ? kForwardedBit : 0); }
+    GcObject* forwardingPtr() const {
+        return reinterpret_cast<GcObject*>(const_cast<TypeDescriptor*>(desc));
+    }
+    void setForwardingPtr(GcObject* newAddr) {
+        desc = reinterpret_cast<const TypeDescriptor*>(newAddr);
+        setForwarded(true);
+    }
 
     // ---- allocSize ----
     size_t allocSize() const   { return allocSize_; }
@@ -136,8 +147,9 @@ private:
     static constexpr uint8_t kGenMask      = 0x02;  // bit 1
     static constexpr uint8_t kGenShift     = 1;
     static constexpr uint8_t kFinalizedBit = 0x04;  // bit 2
-    static constexpr uint8_t kAgeMask      = 0xF8;  // bit 3-7
+    static constexpr uint8_t kAgeMask      = 0x78;  // bit 3-6 (max 15)
     static constexpr uint8_t kAgeShift     = 3;
+    static constexpr uint8_t kForwardedBit = 0x80;  // bit 7
 };
 
 // ============================================================

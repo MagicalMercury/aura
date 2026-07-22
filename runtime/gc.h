@@ -28,6 +28,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace aura_rt {
@@ -116,6 +117,18 @@ private:
     T* ptr_;
 };
 
+// Compacting GC 迁移条目（拷贝到新页时使用）
+struct CompactEntry {
+    GcObject* oldAddr;
+    GcObject* newAddr;
+    size_t size;
+    const TypeDescriptor* desc;  // 备份的原始 desc（forwarded 后 desc 被覆盖）
+    uint32_t allocSize;          // 备份的 allocSize
+    uint8_t flags;               // 备份的 flags（含 marked/generation/age 等）
+};
+
+static_assert(sizeof(CompactEntry) <= 56);  // 紧凑存储
+
 // ============================================================
 // GcHeap — GC 堆管理器（单例）
 //
@@ -203,6 +216,12 @@ public:
     static constexpr size_t  kOldThreshold    = 1024 * 1024; // 1 MB → major GC
     static constexpr uint8_t kPromotionAge    = 2;           // 经历 2 次 minor GC 后晋升
 
+    // Compacting GC 触发阈值
+    enum class CompactScope { Young, All };
+    static constexpr size_t kMinPagesForMinorCompact          = 50;   // Minor: 页数 > 50
+    static constexpr size_t kMinorCompactFragmentationThreshold = 60; // Minor: 碎片率 > 60%
+    static constexpr size_t kMajorCompactFragmentationThreshold = 30; // Major: 碎片率 > 30%
+
     struct Page {
         char   data[kPageSize];
         size_t bumpOffset = 0;
@@ -231,6 +250,16 @@ public:
     void  promoteToOld(GcObject* obj);
     void  compactAndReclaim();
 
+    // Compacting GC
+    bool  shouldCompact(CompactScope scope);
+    void  compact(CompactScope scope);
+    void  computeForwardingAddresses(CompactScope scope);
+    void  copyObjectsToNewLocations(CompactScope scope);
+    void  rebuildPageList(CompactScope scope);
+    void  updateAllReferences(CompactScope scope);
+    void  updateObjectFields(GcObject* obj);
+    void  updateInlineArrayElements(GcObject* obj);
+
     // 预分配 OOM 错误（首次 tryAlloc 时懒初始化）
     void  ensureOomError();
 
@@ -255,6 +284,13 @@ public:
 
     // 记忆集：记录 old→young 引用的 old 对象集合
     std::set<GcObject*> rememberedSet_;
+
+    // compacting 期间临时存储 desc（forwarded=true 时 desc 被重解释为转发地址）
+    std::unordered_map<GcObject*, const TypeDescriptor*> savedDescs_;
+
+    // 拷贝式压缩：CompactEntry 列表 + 新页链表（方案 R）
+    std::vector<CompactEntry> compactEntries_;
+    Page* newPages_ = nullptr;
 
     // 全局根：长期存活的 GC 对象（运行时缓存 / interned 字符串）
     std::vector<GcObject**> globalRoots_;

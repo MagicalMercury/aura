@@ -410,6 +410,7 @@ private:
     // 列表表达式计数器 — 生成唯一的临时变量名
     int listCounter_ = 0;
     int recordAllocCounter_ = 0;
+    int argHandleCounter_ = 0;  // concat_multi 参数 GcRootHandle 变量名计数器
 
     // 当前正在生成的函数的协程状态
     bool currentFunctionIsCoroutine_ = false;
