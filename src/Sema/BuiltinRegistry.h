@@ -226,6 +226,11 @@ private:
             // --- string 方法 ---
             {"string", "len",    {},                           ReturnTypeInfo::Named("int")},
             {"string", "concat", {{"other", "string"}},        ReturnTypeInfo::Generic(0, "string")},
+            {"string", "append", {{"other", "string"}},        ReturnTypeInfo::Named("string")},
+            {"string", "append", {{"i", "int"}},               ReturnTypeInfo::Named("string")},
+            {"string", "append", {{"f", "float"}},             ReturnTypeInfo::Named("string")},
+            {"string", "append", {{"b", "bool"}},              ReturnTypeInfo::Named("string")},
+            {"string", "slice",  {{"start", "int"}, {"len", "int"}}, ReturnTypeInfo::Named("string")},
 
             // --- [T] 方法（13 个）---
             {"[T]", "len",       {},                                ReturnTypeInfo::Named("int")},
@@ -259,6 +264,9 @@ private:
             // path.new / path.join 不再硬编码，由 builtins/path.aurai 按需加载
             // channel 构造函数
             {"channel", {{"cap", "int"}},  ReturnTypeInfo::Named("channel")},
+            // GC 内建函数
+            {"gc_force", {}, ReturnTypeInfo::None()},
+            {"gc_stats", {}, ReturnTypeInfo::Named("string")},
         };
     }
 

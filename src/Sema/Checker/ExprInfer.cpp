@@ -8,28 +8,36 @@ namespace Aura {
 // ============================================================
 
 std::unique_ptr<SemType> SemAnalyzer::inferExpr(const ASTNode& expr) {
-    if (auto* e = dynamic_cast<const IntLiteral*>(&expr))          return inferIntLiteral(*e);
-    if (auto* e = dynamic_cast<const FloatLiteral*>(&expr))        return inferFloatLiteral(*e);
-    if (auto* e = dynamic_cast<const StringLiteral*>(&expr))       return inferStringLiteral(*e);
-    if (auto* e = dynamic_cast<const BoolLiteral*>(&expr))         return inferBoolLiteral(*e);
-    if (dynamic_cast<const NoneLiteral*>(&expr))                     return NoneSemType::make();
-    if (auto* e = dynamic_cast<const Identifier*>(&expr))          return inferIdentifier(*e);
-    if (auto* e = dynamic_cast<const ListExpr*>(&expr))            return inferListExpr(*e);
-    if (auto* e = dynamic_cast<const RecordExpr*>(&expr))          return inferRecordExpr(*e);
-    if (auto* e = dynamic_cast<const BinaryExpr*>(&expr))          return inferBinaryExpr(*e);
-    if (auto* e = dynamic_cast<const UnaryExpr*>(&expr))           return inferUnaryExpr(*e);
-    if (auto* e = dynamic_cast<const CallExpr*>(&expr))            return inferCall(*e);
-    if (auto* e = dynamic_cast<const MethodCallExpr*>(&expr))      return inferMethodCall(*e);
-    if (auto* e = dynamic_cast<const MemberAccessExpr*>(&expr))    return inferMemberAccess(*e);
-    if (auto* e = dynamic_cast<const IndexExpr*>(&expr))           return inferIndexExpr(*e);
-    if (auto* e = dynamic_cast<const AssignExpr*>(&expr))          return inferAssign(*e);
-    if (auto* e = dynamic_cast<const ErrorPropagationExpr*>(&expr))return inferErrorPropagation(*e);
-    if (auto* e = dynamic_cast<const PipeExpr*>(&expr))            return inferPipe(*e);
-    if (auto* e = dynamic_cast<const FunExpr*>(&expr))             return inferFunExpr(*e);
-
-    // fallback：未知表达式节点类型
-    error(expr, "internal error: unknown expression node in type inference");
-    return ErrorSemType::make();
+    std::unique_ptr<SemType> result;
+    if (auto* e = dynamic_cast<const IntLiteral*>(&expr))          result = inferIntLiteral(*e);
+    else if (auto* e = dynamic_cast<const FloatLiteral*>(&expr))        result = inferFloatLiteral(*e);
+    else if (auto* e = dynamic_cast<const StringLiteral*>(&expr))       result = inferStringLiteral(*e);
+    else if (auto* e = dynamic_cast<const BoolLiteral*>(&expr))         result = inferBoolLiteral(*e);
+    else if (dynamic_cast<const NoneLiteral*>(&expr))                     result = NoneSemType::make();
+    else if (auto* e = dynamic_cast<const Identifier*>(&expr))          result = inferIdentifier(*e);
+    else if (auto* e = dynamic_cast<const ListExpr*>(&expr))            result = inferListExpr(*e);
+    else if (auto* e = dynamic_cast<const RecordExpr*>(&expr))          result = inferRecordExpr(*e);
+    else if (auto* e = dynamic_cast<const BinaryExpr*>(&expr))          result = inferBinaryExpr(*e);
+    else if (auto* e = dynamic_cast<const UnaryExpr*>(&expr))           result = inferUnaryExpr(*e);
+    else if (auto* e = dynamic_cast<const CallExpr*>(&expr))            result = inferCall(*e);
+    else if (auto* e = dynamic_cast<const MethodCallExpr*>(&expr))      result = inferMethodCall(*e);
+    else if (auto* e = dynamic_cast<const MemberAccessExpr*>(&expr))    result = inferMemberAccess(*e);
+    else if (auto* e = dynamic_cast<const IndexExpr*>(&expr))           result = inferIndexExpr(*e);
+    else if (auto* e = dynamic_cast<const AssignExpr*>(&expr))          result = inferAssign(*e);
+    else if (auto* e = dynamic_cast<const ErrorPropagationExpr*>(&expr))result = inferErrorPropagation(*e);
+    else if (auto* e = dynamic_cast<const PipeExpr*>(&expr))            result = inferPipe(*e);
+    else if (auto* e = dynamic_cast<const FunExpr*>(&expr))             result = inferFunExpr(*e);
+    else {
+        error(expr, "internal error: unknown expression node in type inference");
+        return ErrorSemType::make();
+    }
+    // 统一设置 inferredType：保存到 typeStore_ 延长生命周期
+    // CodeGen 依赖 inferredType 判断是否需要 GcRootHandle 包装
+    if (result) {
+        typeStore_.push_back(result->clone());
+        const_cast<ASTNode&>(expr).inferredType = typeStore_.back().get();
+    }
+    return result;
 }
 
 std::unique_ptr<SemType> SemAnalyzer::inferIntLiteral(const IntLiteral&) {
@@ -293,6 +301,11 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
         std::string fqName = id->name + "." + e.method;
         if (auto* fn = BuiltinRegistry::get().findFunction(fqName, (int)e.args.size())) {
+            // 对参数进行类型推断，设置 args 的 inferredType
+            // （CodeGen 依赖此信息判断是否需要 GcRootHandle 包装）
+            for (auto& arg : e.args) {
+                if (arg) (void)inferExpr(*arg);
+            }
             auto& ret = fn->returns;
             switch (ret.kind) {
                 case ReturnTypeInfo::Kind::None:
@@ -321,6 +334,11 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     }
 
     if (!typeKey.empty()) {
+        // 对参数进行类型推断，设置 args 的 inferredType
+        // （CodeGen 依赖此信息判断是否需要 GcRootHandle 包装）
+        for (auto& arg : e.args) {
+            if (arg) (void)inferExpr(*arg);
+        }
         if (auto* entry = BuiltinRegistry::get().findMethod(typeKey, e.method, (int)e.args.size())) {
             auto& ret = entry->returns;
             switch (ret.kind) {

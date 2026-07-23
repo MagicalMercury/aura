@@ -233,6 +233,12 @@ private:
     // 检查类型是否是注册的堆对象类型（记录/接口/泛型记录）
     [[nodiscard]] bool isHeapType(const std::string& auraName) const;
 
+    // 判断 SemType 是否对应 GC 堆对象指针（用于 GcRootHandle 包装决策）
+    [[nodiscard]] bool isHeapSemType(const SemType* type) const;
+
+    // 判断 C++ 类型字符串是否为 GC 指针类型（如 GcString*, User*, Array<T>*）
+    [[nodiscard]] bool isGcPointerType(const std::string& cppType) const;
+
     // 注册一个用户定义的类型名
     void registerTypeName(const std::string& auraName, bool isHeap);
 
@@ -323,6 +329,12 @@ private:
     [[nodiscard]] std::string genUnaryExpr(const UnaryExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genCallExpr(const CallExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genMethodCall(const MethodCallExpr& e, bool isCoroutine);
+
+    // 为 GC 堆类型参数生成 IIFE + GcRootHandle 包装
+    // args: (expr_string, inferredType) 对；callExpr: 包装后的调用表达式
+    [[nodiscard]] std::string genGcRootedArgs(
+        const std::vector<std::pair<std::string, const SemType*>>& args,
+        const std::string& callExpr, bool isCoroutine);
     [[nodiscard]] std::string genMemberAccess(const MemberAccessExpr& e);
     [[nodiscard]] std::string genIndexExpr(const IndexExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genAssignExpr(const AssignExpr& e, bool isCoroutine);
@@ -331,6 +343,20 @@ private:
 
     // --- 闭包 ---
     [[nodiscard]] std::string genFunExpr(const FunExpr& e, bool isCoroutine);
+
+    // 收集 BinaryExpr(+, left, right) 的所有 string 操作数，链长 ≥ 3 时用于 concat_multi
+    [[nodiscard]] std::vector<std::string> collectStringChain(const BinaryExpr& e,
+                                                              bool isCoroutine);
+
+    // 判定生成的 C++ 表达式是否为 GcString* 类型（用于 concat_multi 的 GcString::from 转换）
+    [[nodiscard]] bool isStringExprInChain(const std::string& s) const;
+
+    // 写屏障辅助：检测赋值目标是否为 GC 对象字段（obj.get()->field 或 this->field）
+    [[nodiscard]] bool isGcFieldAssignment(const std::string& target) const;
+
+    // 写屏障辅助：将 "obj.get()->field" 分解为 (parentObj="obj.get()", fieldAddr="&(obj.get()->field)")
+    [[nodiscard]] std::pair<std::string, std::string>
+    decomposeFieldAccess(const std::string& target) const;
 
     // ============================================================
     // 协程判定辅助
@@ -393,6 +419,7 @@ private:
     // 列表表达式计数器 — 生成唯一的临时变量名
     int listCounter_ = 0;
     int recordAllocCounter_ = 0;
+    int argHandleCounter_ = 0;  // concat_multi 参数 GcRootHandle 变量名计数器
 
     // 当前正在生成的函数的协程状态
     bool currentFunctionIsCoroutine_ = false;
@@ -407,6 +434,14 @@ private:
 
     // 字符串类型变量名集合（用于 genBinaryExpr 检测 string + T 拼接）
     std::set<std::string> stringVarNames_;
+
+    // 当前函数内已注册为 GcRootHandle 的变量名集合
+    // genIdentifier 遇到这些变量名时生成 .get()
+    std::set<std::string> gcRootVarNames_;
+
+    // GC 根变量名 → C++ 类型映射（如 "greeting" → "aura_rt::GcString*"）
+    // genFunExpr 的 init-capture 需要类型信息生成 GcSharedRoot<T>
+    std::unordered_map<std::string, std::string> gcRootTypes_;
 
     // 导入的命名空间名集合（路径名 + 别名，用于 genMethodCall 判断是否用 ::）
     std::set<std::string> importNsNames_;

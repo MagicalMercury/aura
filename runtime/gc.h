@@ -20,10 +20,16 @@
 // ============================================================
 
 #include "types.h"
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <cstddef>
+#include <mutex>
 #include <set>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace aura_rt {
@@ -54,11 +60,86 @@ public:
 
     T& operator*()  const { return *ptr_; }
     T* operator->() const { return ptr_; }
-    T  get()        const { return *ptr_; }
+    T& get()              { return *ptr_; }  // 非 const：返回引用，可作赋值左侧
+    T  get()        const { return *ptr_; }  // const：返回值，兼容读取场景
 
 private:
     T* ptr_;
     friend class GcHeap;
+};
+
+// ============================================================
+// GcWeakHandle — 弱引用
+//
+// 持有 GC 对象引用但不阻止其被回收。访问前需检查 valid()。
+// sweep 阶段自动清空指向已回收对象的弱引用。
+// ============================================================
+class GcWeakHandleBase {
+public:
+    explicit GcWeakHandleBase(GcObject* obj);
+    ~GcWeakHandleBase();
+    GcWeakHandleBase(const GcWeakHandleBase&) = delete;
+    GcWeakHandleBase& operator=(const GcWeakHandleBase&) = delete;
+
+    GcObject* get() const { return ptr_; }
+    bool valid() const { return ptr_ != nullptr; }
+    void clear() { ptr_ = nullptr; }
+
+private:
+    GcObject* ptr_;
+    friend class GcHeap;
+};
+
+template <typename T>
+class GcWeakHandle : public GcWeakHandleBase {
+public:
+    explicit GcWeakHandle(T* obj) : GcWeakHandleBase(static_cast<GcObject*>(obj)) {}
+    T* get() const { return static_cast<T*>(GcWeakHandleBase::get()); }
+};
+
+// ============================================================
+// GcGlobalRoot — 全局根引用（运行时缓存用）
+//
+// 用于 GcString::empty() / from(bool) / from(int) 等运行时缓存的 GC 单例。
+// 构造时注册为全局根，析构时取消。通常作为 static 局部变量。
+// ============================================================
+template <typename T>
+class GcGlobalRoot {
+public:
+    explicit GcGlobalRoot(T* obj);
+    ~GcGlobalRoot();
+    GcGlobalRoot(const GcGlobalRoot&) = delete;
+    GcGlobalRoot& operator=(const GcGlobalRoot&) = delete;
+
+    T* get() const { return ptr_; }
+    T* operator->() const { return ptr_; }
+
+private:
+    T* ptr_;
+};
+
+// Compacting GC 迁移条目（拷贝到新页时使用）
+struct CompactEntry {
+    GcObject* oldAddr;
+    GcObject* newAddr;
+    size_t size;
+    const TypeDescriptor* desc;  // 备份的原始 desc（forwarded 后 desc 被覆盖）
+    uint32_t allocSize;          // 备份的 allocSize
+    uint8_t flags;               // 备份的 flags（含 marked/generation/age 等）
+};
+
+static_assert(sizeof(CompactEntry) <= 56);  // 紧凑存储
+
+// ============================================================
+// GcCompactSuspendGuard — RAII guard：构造时禁 compact，析构时恢复
+// 用于 runtime 函数内部 alloc 期间保护已有指针不被 compact 移动
+// ============================================================
+class GcCompactSuspendGuard {
+public:
+    GcCompactSuspendGuard();
+    ~GcCompactSuspendGuard();
+    GcCompactSuspendGuard(const GcCompactSuspendGuard&) = delete;
+    GcCompactSuspendGuard& operator=(const GcCompactSuspendGuard&) = delete;
 };
 
 // ============================================================
@@ -99,6 +180,22 @@ public:
     // 强制触发一次完整 GC（major GC）
     void forceGc();
 
+    // 多线程：线程注册/注销（用于 GC stop-the-world）
+    void registerThread(std::thread::id id);
+    void unregisterThread(std::thread::id id);
+
+    // GC 统计
+    struct Stats {
+        size_t allocatedBytes;
+        size_t youngBytes;
+        size_t oldBytes;
+        size_t gcCount;
+        size_t minorGcCount;
+        size_t liveObjectCount;
+        size_t pageCount;
+    };
+    Stats getStats() const;
+
     // 根集合管理
     void registerRoot(GcRootHandle<GcObject*>* root);
     void unregisterRoot(GcRootHandle<GcObject*>* root);
@@ -108,6 +205,14 @@ public:
     void registerStackRoots(void* begin, void* end);
     void unregisterStackRoots(void* begin, void* end);
 
+    // 全局根注册：用于运行时缓存的 GC 对象（如 GcString::empty() 单例）
+    void registerGlobalRoot(GcObject** rootPtr);
+    void unregisterGlobalRoot(GcObject** rootPtr);
+
+    // 弱引用注册：sweep 时清空指向已回收对象的句柄
+    void registerWeak(GcWeakHandleBase* wh);
+    void unregisterWeak(GcWeakHandleBase* wh);
+
     // 统计信息
     size_t allocatedBytes()    const { return allocatedBytes_; }
     size_t youngBytes()        const { return youngBytes_; }
@@ -115,13 +220,20 @@ public:
     size_t gcCount()           const { return gcCount_; }
     size_t minorGcCount()      const { return minorGcCount_; }
 
-private:
+public:
     GcHeap() = default;
 
     // 分配器内部结构
-    static constexpr size_t kPageSize        = 4096;
-    static constexpr size_t kYoungThreshold  = 256 * 1024;  // 256 KB → minor GC
-    static constexpr size_t kOldThreshold    = 1024 * 1024; // 1 MB → major GC
+    static constexpr size_t  kPageSize        = 4096;
+    static constexpr size_t  kYoungThreshold  = 256 * 1024;  // 256 KB → minor GC
+    static constexpr size_t  kOldThreshold    = 1024 * 1024; // 1 MB → major GC
+    static constexpr uint8_t kPromotionAge    = 2;           // 经历 2 次 minor GC 后晋升
+
+    // Compacting GC 触发阈值
+    enum class CompactScope { Young, All };
+    static constexpr size_t kMinPagesForMinorCompact          = 50;   // Minor: 页数 > 50
+    static constexpr size_t kMinorCompactFragmentationThreshold = 60; // Minor: 碎片率 > 60%
+    static constexpr size_t kMajorCompactFragmentationThreshold = 30; // Major: 碎片率 > 30%
 
     struct Page {
         char   data[kPageSize];
@@ -151,8 +263,27 @@ private:
     void  promoteToOld(GcObject* obj);
     void  compactAndReclaim();
 
+    // Compacting GC
+    bool  shouldCompact(CompactScope scope);
+    void  compact(CompactScope scope);
+    void  computeForwardingAddresses(CompactScope scope);
+    void  copyObjectsToNewLocations(CompactScope scope);
+    void  rebuildPageList(CompactScope scope);
+    void  updateAllReferences(CompactScope scope);
+    void  updateObjectFields(GcObject* obj);
+    void  updateInlineArrayElements(GcObject* obj);
+
+    // compact 暂停计数控制（供 GcCompactSuspendGuard 使用）
+    void incCompactSuspend() { ++compactSuspendedCount_; }
+    void decCompactSuspend() { --compactSuspendedCount_; }
+
     // 预分配 OOM 错误（首次 tryAlloc 时懒初始化）
     void  ensureOomError();
+
+    // compact 暂停计数（>0 时 compact 延迟执行，mark-sweep 仍正常执行）
+    int     compactSuspendedCount_ = 0;
+    // compact 延迟标志：suspend 期间若有 compact 请求，置 true；alloc 入口检查并补执行
+    bool    compactPending_ = false;
 
     Page*   headPage_    = nullptr;
     Page*   currentPage_ = nullptr;
@@ -164,7 +295,10 @@ private:
     bool    gcPending_      = false;  // 有 GC 请求待处理
 
     // 根集合
-    std::vector<GcRootHandle<GcObject*>*> roots_;
+    // 使用 unordered_set：registerRoot O(1)、unregisterRoot O(1)（原 vector 的 unregister 是 O(n)）
+    // 遍历顺序不重要：markPhase 和 updateAllReferences 对每个 root 独立操作
+    // 指针作 key 安全：活跃 GcRootHandle 地址唯一，析构前必调用 unregisterRoot
+    std::unordered_set<GcRootHandle<GcObject*>*> roots_;
 
     // 栈帧根：{begin, end} 对，GC 扫描其中所有对齐的指针
     std::vector<std::pair<void*, void*>> stackRoots_;
@@ -176,9 +310,37 @@ private:
     // 记忆集：记录 old→young 引用的 old 对象集合
     std::set<GcObject*> rememberedSet_;
 
+    // compacting 期间临时存储 desc（forwarded=true 时 desc 被重解释为转发地址）
+    std::unordered_map<GcObject*, const TypeDescriptor*> savedDescs_;
+
+    // 拷贝式压缩：CompactEntry 列表 + 新页链表（方案 R）
+    std::vector<CompactEntry> compactEntries_;
+    Page* newPages_ = nullptr;
+
+    // 全局根：长期存活的 GC 对象（运行时缓存 / interned 字符串）
+    std::vector<GcObject**> globalRoots_;
+    std::mutex              globalRoots_m_;
+
+    // 已注册的 TypeDescriptor 集合：所有合法的 desc 指针地址
+    // alloc 时注册；保守栈扫描时用于验证 candidate->desc 是否为合法对象
+    // 防止把 GcString 的 inline 数据（length/capacity 等）误读为 GcObject header
+    std::unordered_set<const TypeDescriptor*> registeredDescs_;
+
+    // 弱引用句柄：sweep 时清空指向已回收对象的句柄
+    std::vector<GcWeakHandleBase*> weakHandles_;
+    std::mutex                     weakHandles_m_;
+
     // OOM 错误缓存（GC 启动时预分配，无需额外内存即可抛出）
     Error oomError_;
     bool  oomInit_      = false;  // 防止 ensureOomError → make_string → alloc → ensureOomError 递归
+
+    // --- 多线程 Stop-The-World ---
+    std::mutex                  threads_m_;
+    std::vector<std::thread::id> registered_threads_;
+    std::atomic<bool>           gc_in_progress_{false};
+    std::atomic<int>            stopped_threads_{0};
+    std::condition_variable     all_stopped_cv_;
+    std::mutex                  all_stopped_m_;
 };
 
 // ============================================================
@@ -224,18 +386,117 @@ inline void gc_unregister_stack_roots(void* begin, void* end) {
     GcHeap::instance().unregisterStackRoots(begin, end);
 }
 
+// GC 统计（格式化字符串）
+GcString* gc_stats_string();
+
+// STW 安全 forceGc（供 Aura gc_force() 调用）
+inline void gc_force_major() { GcHeap::instance().forceGc(); }
+
 // ============================================================
 // GcRootHandle 模板方法实现（必须在 GcHeap 定义之后）
 // ============================================================
 template <typename T>
 GcRootHandle<T>::GcRootHandle(T& ref) : ptr_(&ref) {
-    GcHeap::instance().registerRoot(this);
+    GcHeap::instance().registerRoot(
+        reinterpret_cast<GcRootHandle<GcObject*>*>(this));
 }
 
 template <typename T>
 GcRootHandle<T>::~GcRootHandle() {
-    if (ptr_) GcHeap::instance().unregisterRoot(this);
+    if (ptr_) GcHeap::instance().unregisterRoot(
+        reinterpret_cast<GcRootHandle<GcObject*>*>(this));
 }
+
+// GcWeakHandleBase 实现（必须在 GcHeap 定义之后）
+inline GcWeakHandleBase::GcWeakHandleBase(GcObject* obj) : ptr_(obj) {
+    GcHeap::instance().registerWeak(this);
+}
+inline GcWeakHandleBase::~GcWeakHandleBase() {
+    GcHeap::instance().unregisterWeak(this);
+}
+
+// GcGlobalRoot 模板方法实现（必须在 GcHeap 定义之后）
+template <typename T>
+GcGlobalRoot<T>::GcGlobalRoot(T* obj) : ptr_(obj) {
+    GcHeap::instance().registerGlobalRoot(
+        reinterpret_cast<GcObject**>(&ptr_));
+}
+
+template <typename T>
+GcGlobalRoot<T>::~GcGlobalRoot() {
+    GcHeap::instance().unregisterGlobalRoot(
+        reinterpret_cast<GcObject**>(&ptr_));
+}
+
+// ============================================================
+// GcSharedRoot<T> — 闭包捕获 GC 根的共享所有权版本
+//
+// 与 GcRootHandle<T> 互补：
+// - GcRootHandle：栈上包装，不可拷贝，ptr_ 指向栈变量
+// - GcSharedRoot：堆上独立存值，可拷贝，专为闭包捕获设计
+//
+// 使用场景：闭包 lambda 按值捕获 GC 指针类型变量时，
+// 用 GcSharedRoot 包装，每个 lambda 副本独立持有 GC 根。
+// CodeGen 使用 C++14 init-capture 生成：
+//   [name = aura_rt::GcSharedRoot<T>(name.get())]
+// ============================================================
+template <typename T>
+class GcSharedRoot {
+public:
+    explicit GcSharedRoot(T val) : ptr_(new T(val)) {
+        GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+    }
+
+    ~GcSharedRoot() {
+        if (ptr_) {
+            GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+            delete ptr_;
+            ptr_ = nullptr;
+        }
+    }
+
+    // 拷贝构造：新对象独立堆分配 + 独立 register
+    GcSharedRoot(const GcSharedRoot& other) : ptr_(new T(*other.ptr_)) {
+        GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+    }
+
+    // 拷贝赋值：先 unregister 旧值，再分配新值
+    GcSharedRoot& operator=(const GcSharedRoot& other) {
+        if (this != &other) {
+            GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+            delete ptr_;
+            ptr_ = new T(*other.ptr_);
+            GcHeap::instance().registerGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+        }
+        return *this;
+    }
+
+    // 移动构造
+    GcSharedRoot(GcSharedRoot&& other) noexcept : ptr_(other.ptr_) {
+        other.ptr_ = nullptr;
+    }
+
+    GcSharedRoot& operator=(GcSharedRoot&& other) noexcept {
+        if (this != &other) {
+            if (ptr_) {
+                GcHeap::instance().unregisterGlobalRoot(reinterpret_cast<GcObject**>(ptr_));
+                delete ptr_;
+            }
+            ptr_ = other.ptr_;
+            other.ptr_ = nullptr;
+        }
+        return *this;
+    }
+
+    // 读取值（与 GcRootHandle::get() 兼容，返回类型相同）
+    T  get() const { return *ptr_; }
+    T& get()       { return *ptr_; }
+
+    void set(T val) { *ptr_ = val; }
+
+private:
+    T* ptr_;  // 堆上持有值，独立于栈帧生命周期
+};
 
 } // namespace aura_rt
 
