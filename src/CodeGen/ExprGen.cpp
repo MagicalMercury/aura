@@ -15,6 +15,12 @@ bool CodeGenerator::isHeapSemType(const SemType* type) const {
         return p->kind == PrimSemType::String;
     if (dynamic_cast<const NoneSemType*>(type)) return false;
     if (dynamic_cast<const ErrorSemType*>(type)) return false;
+    // 接口/函数类型不是 GC 堆对象：
+    //   - 接口是抽象类，按 const& 传递，不归 GC 管理
+    //   - std::function 是 C++ RT 对象，不在 GC 堆中
+    // 两者若误判为 heap，genGcRootedArgs 会生成 auto 值拷贝（接口是抽象类→编译失败）
+    if (dynamic_cast<const InterfaceSemType*>(type)) return false;
+    if (dynamic_cast<const FuncSemType*>(type)) return false;
     if (auto* u = dynamic_cast<const UnionSemType*>(type)) {
         for (auto& v : u->variants)
             if (isHeapSemType(v.get())) return true;
@@ -59,24 +65,37 @@ std::string CodeGenerator::genGcRootedArgs(
         return awaitPrefix + result;
     }
 
+    // 协程调用（awaitPrefix 非空）时，IIFE 返回 task 后局部变量立即析构，
+    // 但协程是懒启动（initial_suspend=suspend_always），恢复执行时引用已析构的临时对象 → 悬垂。
+    // 因此非堆参数必须在 IIFE 外声明（auto 值拷贝），生命周期跨越 co_await。
+    // 堆参数仍留在 IIFE 内（配 GcRootHandle，GC compact 后自动更新指针）。
     int hid = argHandleCounter_++;
-    std::ostringstream oss;
-    oss << "[&]() -> auto {\n";
+    std::ostringstream outer;  // 协程调用时，非堆参数声明到 IIFE 外
+    std::ostringstream inner;  // IIFE 内：堆参数 + 非协程非堆参数
+    inner << "[&]() -> auto {\n";
     for (size_t i = 0; i < args.size(); ++i) {
         auto& [argExpr, type] = args[i];
         std::string vi = "_a" + std::to_string(hid) + "_" + std::to_string(i);
-        oss << "    auto " << vi << " = (" << argExpr << ");\n";
-        if (isHeapSemType(type)) {
-            oss << "    aura_rt::GcRootHandle<decltype(" << vi << ")> _h"
-                << hid << "_" << i << "(" << vi << ");\n";
+        bool isHeap = isHeapSemType(type);
+        if (isHeap) {
+            // 堆类型：IIFE 内 auto + GcRootHandle
+            inner << "    auto " << vi << " = (" << argExpr << ");\n";
+            inner << "    aura_rt::GcRootHandle<decltype(" << vi << ")> _h"
+                  << hid << "_" << i << "(" << vi << ");\n";
+        } else if (!awaitPrefix.empty()) {
+            // 非堆 + 协程调用：IIFE 外 auto 值拷贝，生命周期跨越 co_await
+            outer << "auto " << vi << " = (" << argExpr << ");\n";
+        } else {
+            // 非堆 + 非协程：IIFE 内 const auto& 引用绑定
+            inner << "    const auto& " << vi << " = (" << argExpr << ");\n";
         }
     }
-    oss << "    return " << expr << ";\n";
-    oss << "  }()";
+    inner << "    return " << expr << ";\n";
+    inner << "  }()";
     // 替换 {0}, {1}, ... 为实际变量名
     // 堆类型参数：使用 _h{hid}_{i}.get() 读取 GcRootHandle 中可能被 GC 更新的指针
     // 非堆类型参数：使用原始变量 _a{hid}_{i}
-    std::string result = oss.str();
+    std::string result = outer.str() + awaitPrefix + inner.str();
     for (size_t i = 0; i < args.size(); ++i) {
         std::string placeholder = "{" + std::to_string(i) + "}";
         std::string repl;
@@ -91,7 +110,7 @@ std::string CodeGenerator::genGcRootedArgs(
             pos += repl.size();
         }
     }
-    return awaitPrefix + result;
+    return result;
 }
 
 // ============================================================
@@ -1077,6 +1096,30 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     oss << " {\n";
     indentLevel_++;
 
+    // Bug 2 修复：闭包参数注册到 stringVarNames_ / valueTypeVarNames_
+    // 否则 isStringExprInChain 漏判闭包内的 string 参数，用 GcString::from() 包装
+    // 已是 GcString* 的变量 → 匹配 from(bool) 隐式转换 → 输出 "true"
+    auto savedStringVars = stringVarNames_;
+    auto savedValueVars  = valueTypeVarNames_;
+    for (auto& p : e.params) {
+        std::string pname = safeName(p.name);
+        if (!p.type) continue;
+        std::string ptype = mapType(*p.type);
+        // string 参数 → stringVarNames_
+        if (ptype.find("aura_rt::GcString*") != std::string::npos)
+            stringVarNames_.insert(pname);
+        // 接口参数 → valueTypeVarNames_（引用用 . 不是 ->）
+        if (auto* nt = dynamic_cast<const NamedType*>(p.type.get()))
+            if (interfaceNames_.count(nt->name))
+                valueTypeVarNames_.insert(pname);
+        // 值类型参数 → valueTypeVarNames_
+        if (auto* nt = dynamic_cast<const NamedType*>(p.type.get()))
+            if ((registeredTypes_.count(nt->name) && !registeredTypes_[nt->name])
+                || (BuiltinRegistry::get().findType(nt->name) != nullptr
+                    && !BuiltinRegistry::get().isHeapType(nt->name)))
+                valueTypeVarNames_.insert(pname);
+    }
+
     // invoke_result_t 推导声明（使用 F&& 完美转发）
     for (size_t ci = 0; ci < callableParamIndices.size(); ++ci) {
         auto* ft = dynamic_cast<const FunctionType*>(
@@ -1145,6 +1188,10 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     }
     indentLevel_--;
     oss << indentStr() << "}";
+
+    // Bug 2 修复：恢复 stringVarNames_ / valueTypeVarNames_，避免污染外层作用域
+    stringVarNames_ = savedStringVars;
+    valueTypeVarNames_ = savedValueVars;
 
     lastClosureIsCoro_ = closureIsCoro;
     return oss.str();

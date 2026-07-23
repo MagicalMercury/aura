@@ -1,371 +1,273 @@
-# Change Plan — CodeGen 字符串拼接路径修复：取消 operator+ 重载，统一走 concat
+# Change Plan — complex_closure GC 安全审查 + 接口适配器生命周期修复
 
 > 日期：2026-07-23
-> 状态：待审查
-> 前置：Compacting GC Phase D-2 已完成（compact suspend 机制可用）
+> 状态：**✅ 已修复并验证通过**
+> 触发：`example/test.aura`（complex_closure 用例）编译通过但运行期 SIGSEGV
 
 ---
 
-## Analysis Report（前置分析）
+## 一、任务背景
 
-### A. Codebase Scan
+用户要求：「尝试修复这个小 bug。以及全面审查此次生成的代码中是否可能出现因为中途移动 GC 导致指针失效」。
 
-| 文件 | 责任 |
-|:---|:---|
-| `src/CodeGen/ExprGen.cpp` | Aura AST → C++ 表达式生成。`genBinaryExpr` 负责 `+` 等二元运算符 |
-| `src/Sema/Checker/ExprInfer.cpp` | Sema 类型推断。`inferBinaryExpr` 已能识别 `string + T → string` |
-| `src/Sema/SemType.h` | SemType 体系，`PrimSemType::String` 表示 string 类型 |
-| `runtime/builtin/string.h` | GcString 定义、`operator+` 重载声明、`concat` 别名 |
-| `runtime/builtin/string.cpp` | GcString 实现、6 个 `operator+` 实现（用 GcRootHandle 保护临时对象） |
-| `runtime/gc.h` | `GcRootHandle`、`GcCompactSuspendGuard` 定义 |
-| `runtime/gc.cpp` | GC 实现，已清理调试代码 |
+输入：
+- `example/test.aura`：complex_closure 测试用例（管道、重试、接口、Tree 递归、计数器、条件组合）
+- `example/test.cpp`：aurac 生成的 C++ 代码
 
-### B. Dependency Map
-
-```
-Aura 源码:  acc + i
-    │
-    ▼
-[Parser]    BinaryExpr{op:"+", left:IdentRef("acc"), right:IdentRef("i")}
-    │
-    ▼
-[Sema]      inferBinaryExpr → inferredType = PrimSemType::String
-            （e.left->inferredType 已是 String，e.right 是 Int）
-    │
-    ▼
-[CodeGen]   genBinaryExpr
-            ├── 子串匹配 make_string/concat/intern_string → 漏判（acc 是参数流入）
-            ├── stringVarNames_ 回溯 → 漏判（StmtGen 只在 init 含 make_string/concat 时登记）
-            └── 兜底路径 → return "(" + left + " + " + right + ")"
-                                              ↓
-                                     生成 (acc.get() + i)
-                                              ↓
-                            C++ 重载决议：GcString* + int = 指针算术（非 operator+）
-                                              ↓
-                                     运行时指针偏移 → SIGSEGV
-```
-
-### C. Interface Inventory
-
-**当前 string.h 中的拼接相关 API**：
-
-| API | 签名 | 调用方 |
-|:---|:---|:---|
-| `operator+(const GcString&, const GcString&)` | inline → `a.concat(b)` | CodeGen 不再生成（理论存在） |
-| `operator+(const GcString&, int32_t)` 等 6 个 | 声明，实现在 string.cpp | CodeGen 不生成 `*a + b` 形式 → 永不调用 |
-| `operator+(const GcString&, const T&)` ToString 模板 ×2 | inline | CodeGen 不生成 |
-| `concat(GcString*, GcString*)` | inline → `string_concat` | CodeGen 链长=2 生成 |
-| `concat(GcString*, int32_t)` 等 6 个 | inline → `*a + b`（依赖 operator+） | CodeGen 链长=2 生成（修复后） |
-| `concat_multi({...})` | 声明，实现在 string.cpp | CodeGen 链长≥3 生成 |
-
-**关键观察**：
-- CodeGen **永不生成** `*ptr + val` 形式（`genIdentifier` 只生成 `name` 或 `name.get()`）
-- 因此所有 `operator+(const GcString&, ...)` 重载**实际从未被调用**
-- `concat(GcString*, int32_t)` 等 inline 别名内部 `return *a + b;` 调用 `operator+`，但 C++ 重载决议对 `GcString*` + `int32_t` 不会走这条路径——等一下，inline 别名内部 `*a` 是解引用得到 `const GcString&`，再 `+ b` 会触发 `operator+(const GcString&, int32_t)`。所以 inline 别名当前是**能正确工作**的。
-
-### D. Business Logic Extraction
-
-**genBinaryExpr 字符串检测逻辑（[ExprGen.cpp:404-463](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L404-463)）**：
-
-1. **子串匹配**（line 405-416）：检测 `left`/`right` 字符串中是否含 `aura_rt::make_string`、`aura_rt::intern_string`、`->to_string`、`aura_rt::concat` 等关键字
-2. **stringVarNames_ 回溯**（line 419-425）：剥离 `.get()` 后查表
-3. **链长≥3**：走 `concat_multi` + IIFE + GcRootHandle（[line 432-453](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L432-453)）
-4. **链长=2**：走 `aura_rt::concat({0}, {1})` + genGcRootedArgs（[line 456-462](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L456-462)）
-5. **兜底**：`return "(" + left + " " + op + " " + right + ")"`（[line 490](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L490)）← **bug 所在**
-
-**Sema 已正确推断类型**（[ExprInfer.cpp:104-116](file:///d:/you/Aura/src/Sema/Checker/ExprInfer.cpp#L104-116)）：
-
-```cpp
-if (op == "+" && (leftIsStr || rightIsStr)) {
-    return stringType();
-}
-```
-
-但 CodeGen 没用 Sema 的 `inferredType`——它自己又用 substring 重新判断了一遍。
-
-### E. State & Side Effects
-
-- `stringVarNames_` 在 `DeclGen.cpp:222, 273, 365, 418, 468` 被每个作用域开始时 clear
-- `StmtGen.cpp:186-190` 只在 init 含 `make_string`/`concat` 时登记，**漏 `intern_string`**
-- 函数参数（`DeclGen.cpp:234-236`）和某些赋值路径（`ExprGen.cpp:815-819`）会登记
-- **`acc` 是从参数 `prefix` 复制来的**（`acc_raw = prefix; GcRootHandle<...> acc(acc_raw);`），init 是 `prefix`，不含任何关键字 → `stringVarNames_` 不收录 → CodeGen 检测失败 → 走兜底指针算术
-
-### F. Boundary Condition Coverage
-
-| 边界条件 | 当前处理 | 是否相关 |
-|:---|:---|:---:|
-| 左操作数是 string 字面量 | 子串匹配 `intern_string` 命中 | ✓ |
-| 左操作数是 `make_string`/`concat` 表达式 | 子串匹配命中 | ✓ |
-| 左操作数是函数参数流入的 string 变量 | **未处理**（漏判 → 指针算术） | ✓ 关键 |
-| 左操作数是字段访问 `obj.field`（field 是 string） | **未处理** | ✓ |
-| 左操作数是函数返回值（返回 string） | 子串匹配 `->to_string`/`.to_string` 部分命中；其他返回路径未处理 | ✓ |
-| 右操作数是 string | 同上对称 | ✓ |
-| 链长≥3 且链根是 int | `isStringExprInChain` 检查链根；当前 `leftIsStr\|\|rightIsStr` 触发条件已放宽 | ✓ |
-| `from(b)` 触发 mark-sweep 回收临时对象 | operator+ 实现中已用 GcRootHandle 保护 | ✓ |
-| `a.concat(other)` 内部 alloc 触发 compact 移动 `a` 引用 | `GcString::concat` 内部 `GcCompactSuspendGuard` 已禁 compact | ✓ |
-| 空字符串 `+` 空字符串 | `GcString::concat` 有 `other.length == 0` / `length == 0` 快速返回 | ✓ |
-| `concat(nullptr, x)` | `string_concat` 有 `a ? ... : b` 处理 nullptr | ✓ |
-| ASLR 导致 GDB 地址不一致 | 与本修复无关 | — |
+完整审查报告见 `plan/codegen_gc_safety_audit.md`，本节聚焦当前**未解决**的运行期崩溃。
 
 ---
 
-## 4.1 Title & Metadata
+## 二、已修复的 Bug（确认有效）
 
-- **Plan Title**：CodeGen 字符串拼接路径修复 — 取消 operator+ 重载，统一走 concat
-- **Author/Agent**：Agent (GLM-5.2)
-- **Date**：2026-07-23
-- **Related modules**：`src/CodeGen/ExprGen.cpp`、`runtime/builtin/string.h`、`runtime/builtin/string.cpp`
+### Bug A — 接口/抽象类生成 `auto` 值拷贝（编译期失败）✅
 
-## 4.2 Objectives
+- **位置**：`src/CodeGen/ExprGen.cpp` [line 12-30](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L12-30)、[line 62-78](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L62-78)
+- **根因**：`genGcRootedArgs` 对所有参数统一生成 `auto _a = (expr);` 值拷贝；对抽象类 `StringProcessor` 触发编译错误
+- **修复**：
+  1. `isHeapSemType` 显式排除 `InterfaceSemType` 和 `FuncSemType`（否则两者 fall through 到 `return true`）
+  2. 非堆类型用 `const auto&` 引用绑定，避免抽象类拷贝
 
-修复 `genBinaryExpr` 漏判 string 类型导致的 C++ 指针算术 bug（`acc.get() + i`）。具体做法是在 CodeGen 中基于 Sema `inferredType` 兜底识别 string，并移除运行时不再被调用的 `operator+` 重载，统一使用 `aura_rt::concat(...)` 函数族。
+### Bug B — 用户函数堆类型参数未保护（运行期 SIGSEGV）✅
 
-## 4.3 Current State Summary
+- **位置**：`src/CodeGen/DeclGen.cpp` [line 243-256](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L243-256)、[line 273-285](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L273-285)、[line 344-352](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L344-352)
+- **根因**：`map_tree(f, node)` 中 `node` 是裸指针，`Array::make(0)` 触发 GC compact 移动 node 后悬垂
+- **修复**：
+  1. `funSignature` 中堆类型参数加 `_raw` 后缀（如 `Tree<T>* node_raw`）
+  2. 函数体入口生成 `GcRootHandle<decltype(node_raw)> node(node_raw);`
+  3. 参数名加入 `gcRootVarNames_`，`genIdentifier` 生成 `.get()`
+  4. `gcRootTypes_` 存 `decltype(varName_raw)`，避免泛型闭包 `compose(auto transforms)` 中未绑定模板参数 T 无法解析
 
-**关键发现**：
-1. CodeGen 的 substring 检测逻辑脆弱，无法识别从函数参数/字段流入的 string 变量
-2. Sema 已正确推断 `acc + i` 为 string 类型，但 CodeGen 没用这个信息
-3. 运行时 `operator+` 重载实际从未被 CodeGen 调用（CodeGen 不生成 `*ptr + val`），属于死代码
-4. `concat` 别名（`concat(GcString*, int32_t)` 等）内部 `return *a + b` 调用 `operator+`，仍依赖 operator+ 实现
+### Bug D — compose lambda 捕获 transforms 裸指针 ✅
 
-## 4.4 Proposed Changes
+- **位置**：`example/test.cpp:42-55`
+- **根因**：`[transforms]` 值捕获裸 `Array*`，循环体 `t()` 触发 GC 后悬垂
+- **修复**：CodeGen 已生成 `GcSharedRoot<decltype(transforms_raw)>` init-capture，lambda 副本独立持有 GC 根
 
-### 改动 1：ExprGen.cpp 基于 inferredType 兜底识别 string
+---
 
-- **What**：在 `genBinaryExpr` 的字符串检测逻辑末尾，加基于 `e.left->inferredType`/`e.right->inferredType` 的兜底检测
-- **Where**：`src/CodeGen/ExprGen.cpp:425` 之后（在现有 `stringVarNames_` 回溯之后，链长判断之前）
-- **Why**：Sema 的类型推断是最权威的——它已能识别 `string + T` / `T + string` 的结果类型和操作数类型。基于 substring 匹配的检测注定漏判（参数流入、字段访问等路径无法穷举）
+## 三、process_with_interface SIGSEGV — 已修复 ✅
 
-**具体代码**：
+### 现象
 
-```cpp
-// 兜底：基于 Sema 推断类型识别 string（最可靠）
-// 覆盖从函数参数、字段赋值等路径流入的 string 变量，
-// 这类变量 init 不含 make_string/concat 子串，substring 匹配会漏判。
-auto isStringSemType = [](const SemType* type) -> bool {
-    if (!type) return false;
-    if (auto* p = dynamic_cast<const PrimSemType*>(type))
-        return p->kind == PrimSemType::String;
-    return false;
-};
-if (!leftIsStr && isStringSemType(e.left->inferredType)) leftIsStr = true;
-if (!rightIsStr && isStringSemType(e.right->inferredType)) rightIsStr = true;
+```
+Thread 1 received signal SIGSEGV, Segmentation fault.
+0x0000000000000000 in ?? ()
+#1  process_with_interface (frame_ptr=0x7060e0) at example/test.cpp:165
+#2  aura_main (frame_ptr=0x6e5850) at example/test.cpp:187
 ```
 
-### 改动 2：string.h 移除 operator+ 重载，concat 别名自包含
+- 退出码 `-1073741819`（0xC0000005）
+- rip=0x0 → null 函数指针调用（虚表失效）
 
-- **What**：移除 9 个 `operator+` 重载（1 个 string+string inline + 6 个基础类型声明 + 2 个 ToString 模板）；重写 6 个 `concat` 别名使其不再依赖 operator+
-- **Where**：`runtime/builtin/string.h:135-162`（operator+ 区段）、`runtime/builtin/string.h:174-181`（concat 别名）
-- **Why**：CodeGen 改为统一生成 `aura_rt::concat(...)` 后，`operator+` 永不被调用；保留只会让代码读者误以为存在两条拼接路径，且 6 个 inline concat 别名内部 `return *a + b` 依赖 operator+，删除 operator+ 后必须改写
+### gdb 关键现场（frame 1）
 
-**string.h 改动后形态**：
-
-```cpp
-// ============================================================
-// 字符串拼接 — 统一通过 aura_rt::concat 函数族
-// CodeGen 一律生成 aura_rt::concat(a, b)，不依赖 C++ operator+ 重载
-// （避免 GcString* + int 被识别为指针算术）
-// ============================================================
-
-inline GcString* concat(GcString* a, GcString* b) {
-    return a ? (b ? a->concat(*b) : a) : b;
-}
-
-// 基础类型重载：实现移到 string.cpp（需 GcRootHandle 保护 from() 临时对象）
-GcString* concat(GcString* a, int32_t b);
-GcString* concat(int32_t a,    GcString* b);
-GcString* concat(GcString* a, double b);
-GcString* concat(double a,    GcString* b);
-GcString* concat(GcString* a, bool b);
-GcString* concat(bool a,       GcString* b);
-
-// ToString 类型：模板，inline 即可
-template <ToString T>
-inline GcString* concat(GcString* a, const T& b) {
-    return a->concat(*b.to_string());
-}
-template <ToString T>
-inline GcString* concat(const T& a, GcString* b) {
-    return a.to_string()->concat(*b);
-}
+```
+processor = @0x5ff650: {_vptr.StringProcessor = 0x7ff7ff5eb480 <vtable for StringProcessor+16>}
+data_raw  = 0x1a03b8
+result    = 0xbaadf00dbaadf00d      ← Windows 未初始化内存标记
+_Coro_resume_index = 2
+Aw0/T002/T003/Fs 局部变量全部 = 0xbaadf00dbaadf00d
 ```
 
-### 改动 3：string.cpp 实现 6 个 concat 重载（已审查边界）
-
-- **What**：删除 6 个 `operator+` 实现，改为 6 个 `concat` 重载实现（签名从 `const GcString&` 改为 `GcString*`）
-- **Where**：`runtime/builtin/string.cpp:90-119`
-- **Why**：配合 string.h 改动，把 GcRootHandle 保护逻辑迁移到 concat 重载
-
-#### 边界审查结果
-
-| 边界 | 原方案处理 | 新方案处理 | 验证 |
-|:---|:---|:---|:---:|
-| `a` 是引用，compact 后悬垂 | `operator+(const GcString& a, ...)` 中 `a` 是引用，`from(b)` 触发 compact 会移动 `a` 引用的对象，引用变悬垂 | `concat(GcString* a, ...)` 中 `a` 是值拷贝，`GcRootHandle<GcString*> a_guard(a)` 注册为 root，compact 时 GC 通过 `roots_` 自动更新 `a` 本地变量 | ✓ |
-| `from(b)` 临时对象被 mark-sweep 回收 | 原 operator+ 用 GcRootHandle 保护 tmp | 同样用 `GcRootHandle<GcString*> tmp_guard(tmp)` 保护 | ✓ |
-| `a->concat(other)` 内部 compact 移动 `other` 引用 | `GcString::concat` 内部 `GcCompactSuspendGuard` 已禁 compact | 不变 | ✓ |
-| `from(b)` 内部 compact 期间 `a` 被移动 | 原方案无保护 → 悬垂 | `a_guard` 已注册为 root，compact 自动更新 `*ptr_`（即 `a` 本地变量） | ✓ |
-| `a == nullptr` | 未处理 | 调用方 CodeGen 生成的 `acc.get()` 不会是 nullptr；保留崩溃行为（程序员错误） | ✓ |
-| `b` 在 `[-1024, 1023]` 范围 | `from(b)` 返回全局缓存 | 同上，`GcGlobalRoot` 已保护 | ✓ |
-| `b` 超出范围 | `from(b)` 新分配对象 | 同上，`tmp_guard` 保护 | ✓ |
-
-**关键改进**：原 `operator+(const GcString& a, ...)` 的 `a` 引用悬垂问题被根治——新签名 `concat(GcString* a, ...)` 把 `a` 改为值拷贝，配合 `GcRootHandle` 可被 compact 自动更新。
-
-**string.cpp 改动后形态**：
-
-```cpp
-// ============================================================
-// concat 实现（需 GcRootHandle 保护 a 和 from() 返回的临时对象）
-// 关键：a 是值拷贝的 GcString*，a_guard 注册后 compact 会自动更新 a 本地变量
-// ============================================================
-GcString* concat(GcString* a, int32_t b) {
-    GcRootHandle<GcString*> a_guard(a);     // 保护 a，compact 时自动更新
-    GcString* tmp = GcString::from(b);
-    GcRootHandle<GcString*> tmp_guard(tmp);  // 保护 tmp，mark-sweep 不回收
-    return a_guard.get()->concat(*tmp_guard.get());
-}
-GcString* concat(int32_t a, GcString* b) {
-    GcString* tmp = GcString::from(a);
-    GcRootHandle<GcString*> tmp_guard(tmp);
-    GcRootHandle<GcString*> b_guard(b);
-    return tmp_guard.get()->concat(*b_guard.get());
-}
-GcString* concat(GcString* a, double b) {
-    GcRootHandle<GcString*> a_guard(a);
-    GcString* tmp = GcString::from(b);
-    GcRootHandle<GcString*> tmp_guard(tmp);
-    return a_guard.get()->concat(*tmp_guard.get());
-}
-GcString* concat(double a, GcString* b) {
-    GcString* tmp = GcString::from(a);
-    GcRootHandle<GcString*> tmp_guard(tmp);
-    GcRootHandle<GcString*> b_guard(b);
-    return tmp_guard.get()->concat(*b_guard.get());
-}
-GcString* concat(GcString* a, bool b) {
-    GcRootHandle<GcString*> a_guard(a);
-    // from(bool) 返回全局缓存，已由 GcGlobalRoot 保护，无需 tmp_guard
-    return a_guard.get()->concat(*GcString::from(b));
-}
-GcString* concat(bool a, GcString* b) {
-    GcRootHandle<GcString*> b_guard(b);
-    return GcString::from(a)->concat(*b_guard.get());
-}
+反汇编（崩溃指令）：
+```
+0x7ff7ff5b2529 <process_with_interface()+392>:   call   *%rsi   ← rsi=0，调用 null
+=> 0x7ff7ff5b252b <+394>:   mov    0x20(%rbp),%rdx
 ```
 
-**为何 bool 不需要 tmp_guard**：`GcString::from(bool)` 返回 `static GcGlobalRoot<GcString>` 内的指针，全局根已被 GC 跟踪（[gc.cpp:431-435 markPhase](file:///d:/you/Aura/runtime/gc.cpp#L431-435)、[gc.cpp:997-1004 updateAllReferences](file:///d:/you/Aura/runtime/gc.cpp#L997-1004)），mark-sweep 不会回收、compact 会自动更新全局根的 ptr_。
+### 根因分析
 
-## 4.5 Impact Analysis
+**核心证据**：`processor._vptr.StringProcessor` 指向 **`vtable for StringProcessor+16`（基类 vtable）**，而不是 `StringProcessorFunc`（派生类）的 vtable。
 
-| 组件 | 影响 | 说明 |
-|:---|:---|:---:|
-| CodeGen `genBinaryExpr` | 新增 ~12 行 inferredType 兜底 | 向后兼容，仅扩大识别范围 |
-| `string.h` operator+ 区段 | 删除 28 行（line 135-162） | ⚠️ BREAKING（移除公共 API） |
-| `string.h` concat 别名 | 6 个 inline 改声明 + 2 个 ToString 模板新增 | 签名不变，调用方无感 |
-| `string.cpp` operator+ 实现 | 删除 6 个函数，替换为 6 个 concat 实现 | 内部实现迁移 |
-| 生成的 test.cpp | `acc.get() + i` → `aura_rt::concat(acc.get(), i)` | 修复目标 |
-| 其他 `+` 表达式（int+int 等） | 不受影响（leftIsStr/rightIsStr 仍为 false，走兜底 `+`） | 无变化 |
-| `==` / `!=` 字符串比较 | 不受影响（独立分支） | 无变化 |
+`StringProcessor` 是抽象类（含纯虚 `process`），无法直接构造。vptr 指向基类 vtable 的**唯一可能**是：**对象已经被析构**——C++ 析构链中，派生类析构后 vptr 会被编译器调整为基类 vtable，再调用基类析构函数。
 
-**Breaking Change 说明**：移除 `operator+(const GcString&, ...)` 是有意的——这些重载在 CodeGen 修复后永不被调用。若有外部 C++ 代码直接调用 `*strPtr + 42`，需改为 `aura_rt::concat(strPtr, 42)`。
+→ **processor 引用绑定的 StringProcessorFunc 临时对象在协程恢复时已被析构**。
 
-## 4.6 Boundary Condition Handling Strategy
+### 临时对象生命周期追踪
 
-| Boundary Condition | Current Handling | Planned Handling | Test Strategy |
-|:---|:---|:---|:---|
-| 左操作数从函数参数流入 | 漏判 → 指针算术 → SIGSEGV | inferredType 兜底识别 → 走 concat | `example/test.aura` concat_n 循环 |
-| 左操作数从字段访问流入 | 漏判 | inferredType 兜底识别 | 字段为 string 的 record 测试 |
-| `from(b)` 临时对象被 mark-sweep 回收 | operator+ 中 GcRootHandle 保护 | concat 实现中 GcRootHandle 保护（迁移） | ASan 构建 + 长循环测试 |
-| `a.concat(other)` 内部 compact 移动 `a` 引用 | `GcString::concat` 内部 GcCompactSuspendGuard | 不变 | 现有测试覆盖 |
-| 空字符串拼接 | `GcString::concat` 快速返回 | 不变 | `s + ""` 测试 |
-| `concat(nullptr, x)` | `string_concat` 处理 nullptr | 保留 nullptr 处理 | `concat(nullptr, s)` 单测 |
-| 链长≥3 且链根是 int | `isStringExprInChain` 检查 | 不变 | `1 + "a" + "b" + "c"` 测试 |
-| ToString 类型拼接 | `operator+` ToString 模板 | concat ToString 模板 | 用户类型实现 to_string 测试 |
+崩溃调用链（`example/test.cpp:256-263`）：
 
-## 4.7 Test Plan
+```cpp
+co_await [&]() -> auto {
+    auto _a20_0 = (io);
+    aura_rt::GcRootHandle<decltype(_a20_0)> _h20_0(_a20_0);
+    const auto& _a20_1 = (StringProcessorFunc(processor));   // ← 临时对象，生命周期延长到 _a20_1 作用域
+    auto _a20_2 = (aura_rt::intern_string("Hello"));
+    aura_rt::GcRootHandle<decltype(_a20_2)> _h20_2(_a20_2);
+    return process_with_interface(_h20_0.get(), _a20_1, _h20_2.get());
+}();
+```
 
-### Unit / 集成测试
+C++20 协程参数传递规则：
+- `aura_rt::Io io` — 值拷贝到 frame
+- `const StringProcessor& processor` — **引用绑定**，frame 中只存引用（指向 IIFE 栈帧上的临时对象）
+- `aura_rt::GcString* data_raw` — 值拷贝到 frame
+
+执行时序：
+1. IIFE 调用，进入 lambda 体
+2. 创建 `_a20_1` 引用绑定的 `StringProcessorFunc(processor)` 临时对象（在 IIFE 栈帧上）
+3. 调用 `process_with_interface(...)` → 进入协程
+4. 协程同步执行：构造 `data`、调用 `processor.process(data.get())`（line 165）
+5. 协程执行 `co_await io.println(...)`（line 166-175）→ **挂起**，返回 task
+6. IIFE lambda 体返回 task → **IIFE 局部变量按声明逆序析构**
+   - `_h20_2` 析构（GcRootHandle 注销）
+   - `_a20_2` 析构
+   - `_a20_1` 引用绑定解除 → **StringProcessorFunc 临时对象析构**（vptr 回退到 StringProcessor 基类）
+   - `_h20_0` 析构
+   - `_a20_0` 析构
+7. `co_await task` 恢复协程 → 协程从挂起点继续
+8. 协程访问 `processor.process(...)`（gdb 显示的崩溃点）→ **vptr 已失效** → call null → SIGSEGV
+
+### 与 gdb 现场的对应
+
+- `processor._vptr = StringProcessor vtable+16` → 对应步骤 6 的"vptr 回退到基类"
+- `result = 0xbaadf00dbaadf00d` → frame 局部变量未初始化标记（Windows debug heap）
+- `_Coro_resume_index = 2` → 与单 co_await 不符，疑为 frame 被破坏或 gdb 误读字段；但与 vptr 失效证据一致
+- `call *%rsi` 中 rsi=0 → 虚表项为 0（纯虚函数在基类 vtable 中为 null 或 `__cxa_pure_virtual`）
+
+### 根因总结
+
+**`genGcRootedArgs` 生成的 IIFE 把接口适配器 `StringProcessorFunc(processor)` 作为 IIFE 临时对象。IIFE 返回 task 后临时对象立即析构，但协程 frame 中的 `const StringProcessor& processor` 引用仍指向已析构的内存。协程恢复时通过悬垂引用访问 vptr → SIGSEGV。**
+
+**这是 GC 移动之外的另一类指针失效：C++ 临时对象生命周期与协程 frame 生命周期不匹配。** 与 GC compact 无关，但属于"中途指针失效"的同类问题。
+
+---
+
+## 四、修复方案（已实施 ✅）
+
+### 方案 1（采纳）：协程调用时非堆参数声明到 IIFE 外部
+
+**思路**：把 `StringProcessorFunc(processor)` 从 IIFE 临时对象改为调用方（`aura_main` 协程）的局部变量。aura_main 是协程，局部变量在 frame 中，生命周期持续到协程结束，能覆盖所有内部 `co_await` 的恢复时机。
+
+**CodeGen 改动**：在 `StmtGen::genExprStmt`（或 `genCallExpr`）中，识别含接口适配器的协程调用，先在当前作用域声明局部变量：
+
+```cpp
+// 期望生成（aura_main 内）：
+StringProcessorFunc _adapt_20_1(processor);    // aura_main 局部变量，frame 中
+co_await [&]() -> auto {
+    auto _a20_0 = (io);
+    aura_rt::GcRootHandle<decltype(_a20_0)> _h20_0(_a20_0);
+    auto _a20_2 = (aura_rt::intern_string("Hello"));
+    aura_rt::GcRootHandle<decltype(_a20_2)> _h20_2(_a20_2);
+    return process_with_interface(_h20_0.get(), _adapt_20_1, _h20_2.get());
+}();
+```
+
+**影响范围**：
+- `src/CodeGen/StmtGen.cpp` — 需要支持"表达式前导声明"
+- `src/CodeGen/ExprGen.cpp` `genCallExpr` [line 583-598](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L583-598) — 接口适配器包装逻辑需配合
+- 需要新增 `preStmts_` 机制，让表达式生成能向前驱语句注入声明
+
+### 方案 2：接口适配器堆分配 + shared_ptr
+
+**思路**：把 `StringProcessorFunc` 放到堆上，`std::make_shared<StringProcessorFunc>(processor)`，shared_ptr 作为 IIFE 局部变量。但 IIFE 返回时 shared_ptr 析构，对象被释放（除非 task 持有 shared_ptr）。
+
+→ 需要让 task 持有 shared_ptr，改动 task 类型，**复杂度高，不推荐**。
+
+### 方案 3：接口参数改为值语义（不通过引用传递）
+
+**思路**：把 `const StringProcessor& processor` 改为 `std::function<GcString*(GcString*)>` 直接传递。但这需要改 Aura 语言的接口语义，**改动过大，不推荐**。
+
+### 推荐采纳：方案 1
+
+---
+
+## 五、其他遗留 Bug（审查中发现，未修复）
+
+### Bug C — for-range 迭代器悬垂（运行期，未触发）
+
+- **位置**：`example/test.cpp:88` `for (auto child : *node.get()->children)`、`example/test.cpp:46` `for (auto t : *transforms.get())`
+- **根因**：`Array::begin()/end()` 返回的迭代器内部存储指向 chunk 的裸指针。循环体触发 GC compact 移动 chunk 后，`__begin`/`__end` 悬垂
+- **当前状态**：complex_closure 测试中 GC 未在循环中触发 compact，未崩溃；但属于潜在隐患
+- **修复方向**：用索引访问替代 range-based for，或循环体外加 `GcCompactSuspendGuard`
+
+### Bug E — `make_processor` 中 `from(s)` 语义（次要）
+
+- **位置**：`example/test.cpp:159` `auto _a3_1 = aura_rt::GcString::from(s);`
+- **观察**：`s` 已是 `GcString*`，但 `from` 没有 `from(GcString*)` 重载。当前编译通过，可能匹配隐式转换路径
+- **状态**：待确认 CodeGen 是否错误包装了已是 GcString* 的变量
+
+### genMethodDecl 同步修复（待办）
+
+- **位置**：`src/CodeGen/DeclGen.cpp` `genMethodDecl`（line 358+）
+- **问题**：当前只修了 `genFunctionDecl` 的堆类型参数 `_raw` + GcRootHandle 包装，方法（`genMethodDecl`）未做同步修复
+- **状态**：complex_closure 测试未涉及方法堆类型参数，未触发；但属于遗漏
+
+---
+
+## 六、验证计划（修复后执行）
 
 ```powershell
 cd d:\you\Aura
 cmake --build build           # 编译 aurac
 cmake --build runtime/build   # 编译 runtime
-.\example\compile.cmd         # 用 aurac 重新生成 test.cpp 并编译
+.\example\compile.cmd         # 重新生成 test.cpp 并编译
 .\example\test.exe            # 运行测试
 ```
 
-**预期**：
-- `test1_pass ~ test20_pass` 全部通过
-- 退出码 0
-- GC 统计：`gc>=0 minor>=0 pages<60`
-- 不再出现 `0xC0000005` ACCESS_VIOLATION
-
-### 边界回归
-
-| 测试场景 | 覆盖边界 | 预期 |
-|:---|:---|:---:|
-| `concat_n` 循环 5000 次拼接 | 参数流入的 string 变量 | 通过 |
-| while 循环 200 次累加 | 同上 | 通过 |
-| `s + 42` / `42 + s` / `s + 3.14` / `s + true` | 6 个 concat 重载 | 通过 |
-| `s1 + s2 + s3 + s4` | 链长≥3 走 concat_multi | 通过 |
-| `s + user.to_string()` | ToString 模板 | 通过 |
-| `s == "abc"` / `s != "abc"` | 字符串比较独立分支 | 通过 |
-| ASan 构建 | 临时对象保护 | 无内存错误 |
-
-## 4.8 Implementation Steps (Ordered)
-
-### Step 1：CodeGen 修复（已完成）
-
-- 修改 `src/CodeGen/ExprGen.cpp` `genBinaryExpr`：在 line 425 后添加 inferredType 兜底检测
-- **预期**：aurac 生成的 test.cpp 中 `acc + i` → `aura_rt::concat(acc.get(), i)`
-- **回滚**：删除新增的 12 行代码
-
-### Step 2：string.h 清理 operator+
-
-- 删除 `runtime/builtin/string.h:135-162`（所有 operator+ 重载）
-- 重写 `runtime/builtin/string.h:174-181`：保留 `concat(GcString*, GcString*)` inline；6 个基础类型 concat 改为声明；新增 2 个 ToString 模板
-- **预期**：string.h 不再含任何 `operator+` 声明
-- **回滚**：恢复原 operator+ 区段和 concat 别名
-
-### Step 3：string.cpp 实现 6 个 concat 重载
-
-- 删除 `runtime/builtin/string.cpp:90-119`（6 个 operator+ 实现）
-- 替换为 6 个 concat 重载实现（签名 `const GcString&` → `GcString*`）
-- **预期**：string.cpp 不再含任何 `operator+` 定义
-- **回滚**：恢复原 operator+ 实现
-
-### Step 4：编译 + 测试
-
-```powershell
-cmake --build build
-cmake --build runtime/build
-.\example\compile.cmd
-.\example\test.exe; "exit=$LASTEXITCODE"
+**预期输出**：
+```
+=== Complex Closure Tests ===
+Pipeline: 9
+Retry: 70
+Processed: [Hello]
+Tree root doubled: 2
+Child 0 doubled: 4
+Grandchild doubled: 8
+Counter: 11, 12
+Cond(4): 16
+Cond(5): -5
+=== All complex closure tests passed ===
 ```
 
-**预期**：`exit=0`，全部测试通过
-
-## 4.9 Risks & Mitigations
-
-| 风险 | 可能性 | 影响 | 缓解 |
-|:---|:---|:---|:---|
-| `inferredType` 为 null（Sema 未填充） | 低 | 兜底检测失效，回退到 substring 匹配 | `isStringSemType` 内部已检查 null |
-| `PrimSemType` 的 dynamic_cast 失败 | 低 | 兜底检测失效 | Sema 类型体系稳定，cast 是标准用法 |
-| 其他生成代码仍依赖 `operator+` | 中 | 链接错误 | Step 4 编译会暴露所有调用点 |
-| ToString 模板无法匹配 | 低 | 用户类型拼接失败 | 模板签名保持 `const T&`，与原 operator+ 一致 |
-| `concat(GcString*, GcString*)` nullptr 行为变化 | 低 | 旧 `string_concat` 已处理 nullptr | 保留 `a ? ... : b` 逻辑 |
+退出码 0，不再出现 `0xC0000005` ACCESS_VIOLATION。
 
 ---
 
-## 附录：当前已确认的死代码（待删除）
+## 七、新增 Bug 修复 — 闭包 string 参数被 from(bool) 隐式转换 ✅
 
-| 位置 | 代码 | 死代码原因 |
-|:---|:---|:---|
-| string.h:141-143 | `operator+(const GcString&, const GcString&)` inline | CodeGen 不生成 `*a + *b`，生成 `concat(a, b)` |
-| string.h:147-152 | 6 个 `operator+` 声明 | 同上 |
-| string.h:155-163 | 2 个 ToString 模板 operator+ | 同上 |
-| string.cpp:93-119 | 6 个 `operator+` 实现 | 同上 |
+### Bug F — `make_processor` 中 `from(s)` 输出 "true" 而非 "Hello"
 
-**保留**：
-- `concat(GcString*, GcString*)` inline 别名 → CodeGen 链长=2 时生成
-- `concat_multi({...})` → CodeGen 链长≥3 时生成
-- `GcString::concat(const GcString&)` 成员函数 → 上述两者内部调用
+- **位置**：`src/CodeGen/ExprGen.cpp` `genFunExpr` [line 1099-1121](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L1099-1121)
+- **根因**：`genFunExpr` 未将闭包参数注册到 `stringVarNames_`。`isStringExprInChain` 漏判闭包内的 string 参数 `s`，用 `GcString::from(s)` 包装已是 `GcString*` 的变量 → 匹配 `from(bool)` 隐式转换 → 输出 "true"
+- **修复**：在 `genFunExpr` 闭包体生成前，将 string 参数注册到 `stringVarNames_`、接口参数注册到 `valueTypeVarNames_`、值类型参数注册到 `valueTypeVarNames_`；生成完毕后恢复原值，避免污染外层作用域
+
+---
+
+## 八、验证结果 ✅
+
+```
+=== Complex Closure Tests ===
+Pipeline: 9
+Retry: 70
+Processed: [Hello]          ← 修复前为 [true]，现已正确
+Tree root doubled: 2
+Child 0 doubled: 4
+Grandchild doubled: 8
+Counter: 11, 12
+Cond(4): 16
+Cond(5): -5
+=== All complex closure tests passed ===
+GC: alloc=3.5KB young=3.5KB old=0B gc=0 minor=0 live=64 pages=1
+Exit code: 0                ← 修复前为 -1073741819 (SIGSEGV)
+```
+
+所有测试通过，退出码 0。
+
+---
+
+## 九、遗留问题（未修复）
+
+### Bug C — for-range 迭代器悬垂（运行期，未触发）
+
+- **位置**：`example/test.cpp:88` `for (auto child : *node.get()->children)`、`example/test.cpp:46` `for (auto t : *transforms.get())`
+- **根因**：`Array::begin()/end()` 返回的迭代器内部存储指向 chunk 的裸指针。循环体触发 GC compact 移动 chunk 后，`__begin`/`__end` 悬垂
+- **当前状态**：complex_closure 测试中 GC 未在循环中触发 compact，未崩溃；但属于潜在隐患
+- **修复方向**：用索引访问替代 range-based for，或循环体外加 `GcCompactSuspendGuard`
+
+### genMethodDecl 同步修复（待办）
+
+- **位置**：`src/CodeGen/DeclGen.cpp` `genMethodDecl`（line 358+）
+- **问题**：当前只修了 `genFunctionDecl` 的堆类型参数 `_raw` + GcRootHandle 包装，方法（`genMethodDecl`）未做同步修复
+- **状态**：complex_closure 测试未涉及方法堆类型参数，未触发；但属于遗漏

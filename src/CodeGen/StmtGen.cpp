@@ -125,15 +125,19 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                     writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + var + "(" + var + "_raw);");
                     gcRootVarNames_.insert(var);
                     gcRootTypes_[var] = type;
+                    int recIdx = recordAllocCounter_++;
                     for (auto& f : rec->fields) {
                         std::string fval = f.value ? genExpr(*f.value, currentFunctionIsCoroutine_) : "???";
                         // 堆类型字段值：预求值，防止后续字段求值期间 GC 导致裸指针悬垂
+                        // 用 recIdx 后缀避免同一作用域内多个 RecordExpr 的 _fv_ 变量名冲突
                         if (f.value && isHeapSemType(f.value->inferredType)) {
-                            writeLine(cpp, "auto _fv_" + safeName(f.name) + " = (" + fval + ");");
-                            writeLine(cpp, "aura_rt::GcRootHandle<decltype(_fv_" + safeName(f.name)
-                                      + ")> _fh_" + safeName(f.name) + "(_fv_" + safeName(f.name) + ");");
+                            std::string fv = "_fv_" + std::to_string(recIdx) + "_" + safeName(f.name);
+                            std::string fh = "_fh_" + std::to_string(recIdx) + "_" + safeName(f.name);
+                            writeLine(cpp, "auto " + fv + " = (" + fval + ");");
+                            writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + fv
+                                      + ")> " + fh + "(" + fv + ");");
                             writeLine(cpp, var + ".get()->" + safeName(f.name)
-                                      + " = _fh_" + safeName(f.name) + ".get();");
+                                      + " = " + fh + ".get();");
                         } else {
                             writeLine(cpp, var + ".get()->" + safeName(f.name) + " = " + fval + ";");
                         }
@@ -290,7 +294,7 @@ void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
         }
 
         if (isPtr) {
-            int recIdx = listCounter_++;
+            int recIdx = recordAllocCounter_++;
             std::string var = "_rec_" + std::to_string(recIdx);
             writeLine(cpp, "auto* _raw = aura_rt::gc_alloc<" + recType
                       + ">(&" + recType + "::_desc);");
@@ -298,11 +302,13 @@ void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
             for (auto& f : rec->fields) {
                 std::string fval = f.value ? genExpr(*f.value, isCoroutine) : "???";
                 if (f.value && isHeapSemType(f.value->inferredType)) {
-                    writeLine(cpp, "auto _fv_" + safeName(f.name) + " = (" + fval + ");");
-                    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_fv_" + safeName(f.name)
-                              + ")> _fh_" + safeName(f.name) + "(_fv_" + safeName(f.name) + ");");
+                    std::string fv = "_fv_" + std::to_string(recIdx) + "_" + safeName(f.name);
+                    std::string fh = "_fh_" + std::to_string(recIdx) + "_" + safeName(f.name);
+                    writeLine(cpp, "auto " + fv + " = (" + fval + ");");
+                    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + fv
+                              + ")> " + fh + "(" + fv + ");");
                     writeLine(cpp, var + ".get()->" + safeName(f.name)
-                              + " = _fh_" + safeName(f.name) + ".get();");
+                              + " = " + fh + ".get();");
                 } else {
                     writeLine(cpp, var + ".get()->" + safeName(f.name) + " = " + fval + ";");
                 }

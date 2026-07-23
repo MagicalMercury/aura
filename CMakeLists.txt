@@ -1,8 +1,18 @@
 cmake_minimum_required(VERSION 4.1)
 
-# 使用 MSYS2 UCRT64 的 GCC 工具链
-set(CMAKE_C_COMPILER "C:/msys64/ucrt64/bin/gcc.exe")
-set(CMAKE_CXX_COMPILER "C:/msys64/ucrt64/bin/g++.exe")
+# 深度调试选项：开启后切换到 MSYS2 CLANG64 的 clang 并启用 AddressSanitizer
+# 默认关闭，使用环境变量配置的 g++（UCRT64 GCC，即当前常规模式）
+option(ENABLE_ASAN "启用 AddressSanitizer 深度调试（切换到 CLANG64 clang）" OFF)
+
+if(ENABLE_ASAN)
+    # 深度调试：CLANG64 的 clang 带 ASAN 运行时，UCRT64 的 GCC 不支持 ASAN
+    set(CMAKE_C_COMPILER "C:/msys64/clang64/bin/clang.exe")
+    set(CMAKE_CXX_COMPILER "C:/msys64/clang64/bin/clang++.exe")
+else()
+    # 常规模式：使用环境变量配置的 g++（UCRT64 GCC）
+    set(CMAKE_C_COMPILER "C:/msys64/ucrt64/bin/gcc.exe")
+    set(CMAKE_CXX_COMPILER "C:/msys64/ucrt64/bin/g++.exe")
+endif()
 
 project(Aura)
 
@@ -18,6 +28,20 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} -Os -g -DNDEBUG")
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -O2 -g -DNDEBUG")
+
+# AddressSanitizer 配置（仅在 ENABLE_ASAN 开启时生效）
+# 注意：clang++ 默认调用 UCRT64 的 GNU ld，但 GNU ld 不会自动链接 ASAN 运行时库。
+# 必须用 -fuse-ld=lld 强制 clang 使用 clang64 自带的 ld.lld，后者能正确发现并链接
+# libclang_rt.asan_dynamic-x86_64.dll.a 等运行时库。
+if(ENABLE_ASAN)
+    message(STATUS ">>> 深度调试模式：CLANG64 clang + lld + AddressSanitizer")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address -fuse-ld=lld")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address -fuse-ld=lld")
+else()
+    message(STATUS ">>> 常规模式：UCRT64 g++")
+endif()
 
 # 禁用 C++20 模块自动扫描（本项目不使用模块）
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
@@ -73,3 +97,14 @@ set(AURA_HEADERS
 add_executable(aurac ${AURA_SOURCES} ${AURA_HEADERS})
 
 target_include_directories(aurac PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# ASAN 模式下：编译后将 ASAN 动态运行时 DLL 复制到 aurac 输出目录
+# 这样 aurac.exe 同目录就有 libclang_rt.asan_dynamic-x86_64.dll，运行时自动找到
+if(ENABLE_ASAN)
+    set(ASAN_DLL "C:/msys64/clang64/bin/libclang_rt.asan_dynamic-x86_64.dll")
+    add_custom_command(TARGET aurac POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ASAN_DLL}"
+            "$<TARGET_FILE_DIR:aurac>"
+        COMMENT "Copying ASAN runtime DLL to output directory")
+endif()

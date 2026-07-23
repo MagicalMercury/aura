@@ -444,13 +444,18 @@ template<typename T>
 class ArrayIterator {
     ArrayChunk<T>* chunk;
     int32_t pos;   // 当前 chunk 内的位置
+    // Bug C 修复：注册 chunk 到 GC roots，compact 移动 chunk 后自动更新指针
+    // 否则 for-range 循环体触发 GC compact 后，chunk 指针悬垂 → SIGSEGV
+    GcRootHandle<ArrayChunk<T>*> chunkRoot;
 public:
-    explicit ArrayIterator(ArrayChunk<T>* c, int32_t p = 0) : chunk(c), pos(p) {
+    explicit ArrayIterator(ArrayChunk<T>* c, int32_t p = 0)
+        : chunk(c), pos(p), chunkRoot(chunk) {
         // 跳过空 chunk（构造时即对齐到有效元素）
         while (chunk && pos >= chunk->used) {
             chunk = chunk->next;
             pos = 0;
         }
+        // chunkRoot.ptr_ 指向 &chunk，chunk 值变化后自动跟踪
     }
 
     T& operator*() { return chunk->data()[pos]; }
@@ -465,11 +470,12 @@ public:
         return *this;
     }
 
-    ArrayIterator operator++(int) {
-        ArrayIterator tmp = *this;
-        ++ *this;
-        return tmp;
-    }
+    // 不可拷贝/移动（GcRootHandle 限制 + 保证 ptr_ 稳定指向 &chunk）
+    // C++17 强制 RVO 保证 auto __begin = arr.begin() 不需要拷贝构造
+    ArrayIterator(const ArrayIterator&) = delete;
+    ArrayIterator& operator=(const ArrayIterator&) = delete;
+    ArrayIterator(ArrayIterator&&) = delete;
+    ArrayIterator& operator=(ArrayIterator&&) = delete;
 
     bool operator!=(const ArrayIterator& o) const { return chunk != o.chunk || pos != o.pos; }
     bool operator==(const ArrayIterator& o) const { return chunk == o.chunk && pos == o.pos; }

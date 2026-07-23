@@ -243,14 +243,11 @@ void GcHeap::unregisterThread(std::thread::id id) {
 // 根集合管理
 // ============================================================
 void GcHeap::registerRoot(GcRootHandle<GcObject*>* root) {
-    roots_.push_back(root);
+    roots_.insert(root);
 }
 
 void GcHeap::unregisterRoot(GcRootHandle<GcObject*>* root) {
-    auto it = std::find(roots_.begin(), roots_.end(), root);
-    if (it != roots_.end()) {
-        roots_.erase(it);
-    }
+    roots_.erase(root);
 }
 
 void GcHeap::registerStackRoots(void* begin, void* end) {

@@ -241,6 +241,19 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
                     valueTypeVarNames_.insert(p.name);
             }
         }
+        // Bug B 修复：堆类型参数注册为 GcRootHandle 变量
+        // 函数签名已生成 varName_raw，函数体入口会包装为同名 GcRootHandle
+        // 这里把 varName 加入 gcRootVarNames_，让 genIdentifier 生成 .get()
+        // gcRootTypes_ 存 decltype(varName_raw)，lambda 捕获时用此类型生成 GcSharedRoot
+        //   （避免源类型含未绑定模板参数 T，如 compose(auto transforms) 的 Array<Transform<T>>*）
+        if (p.type) {
+            std::string ptype = mapParamType(*p.type);
+            if (isGcPointerType(ptype)) {
+                std::string varName = safeName(p.name);
+                gcRootVarNames_.insert(varName);
+                gcRootTypes_[varName] = "decltype(" + varName + "_raw)";
+            }
+        }
     }
 
     // 模板函数或 auto 返回（泛型闭包）→ 体放入头文件（跨模块可见）
@@ -260,6 +273,18 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
         : static_cast<std::ostream&>(cpp);
 
     out << tprefix << sig << " {\n";
+    // Bug B 修复：函数体入口为堆类型参数生成 GcRootHandle 包装
+    // 签名形如 `Tree<T>* node_raw`，此处生成 `GcRootHandle<decltype(node_raw)> node(node_raw);`
+    // 用 decltype 而非显式 ptype，避免泛型闭包（compose(auto transforms)）中
+    // 源类型含未绑定模板参数 T 而无法在函数作用域解析的问题
+    for (auto& p : decl.params) {
+        if (!p.type) continue;
+        std::string ptype = mapParamType(*p.type);
+        if (!isGcPointerType(ptype)) continue;
+        std::string varName = safeName(p.name);
+        out << "  aura_rt::GcRootHandle<decltype(" << varName << "_raw)> "
+            << varName << "(" << varName << "_raw);\n";
+    }
     if (decl.body) genBlock(out, *decl.body, isCoro);
     // 协程函数末尾无 return 时补 co_return，确保 C++20 将其识别为协程
     if (isCoro) {
@@ -319,6 +344,15 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
             sig << (decl.params[i].type ? mapParamType(*decl.params[i].type) : "auto");
         }
         sig << " " << safeName(decl.params[i].name);
+
+        // 堆类型参数加 _raw 后缀，函数体开头会用 GcRootHandle 包装为同名变量
+        // （防止函数体内 alloc 触发 GC 移动对象后参数悬垂）
+        if (decl.params[i].type) {
+            std::string ptype = mapParamType(*decl.params[i].type);
+            if (isGcPointerType(ptype)) {
+                sig << "_raw";
+            }
+        }
     }
     sig << ")";
     return sig.str();
@@ -382,6 +416,15 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
                 if (interfaceNames_.count(nt->name))
                     valueTypeVarNames_.insert(p.name);
             }
+            // Bug B 同步修复：堆类型参数注册为 GcRootHandle 变量
+            // 方法签名会生成 varName_raw，方法体入口包装为同名 GcRootHandle
+            // genIdentifier 据此生成 .get()，lambda 捕获用 gcRootTypes_ 生成 GcSharedRoot
+            std::string ptype = mapParamType(*p.type);
+            if (isGcPointerType(ptype)) {
+                std::string varName = safeName(p.name);
+                gcRootVarNames_.insert(varName);
+                gcRootTypes_[varName] = "decltype(" + varName + "_raw)";
+            }
         }
     }
 
@@ -401,6 +444,13 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
         if (i > 0) sig += ", ";
         sig += (decl.params[i].type ? mapParamType(*decl.params[i].type) : "auto")
              + " " + safeName(decl.params[i].name);
+        // Bug B 同步修复：堆类型参数加 _raw 后缀，方法体入口用 GcRootHandle 包装
+        if (decl.params[i].type) {
+            std::string ptype = mapParamType(*decl.params[i].type);
+            if (isGcPointerType(ptype)) {
+                sig += "_raw";
+            }
+        }
     }
     sig += ")";
 
@@ -411,6 +461,17 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
 
     out << tprefix << sig << " {\n";
     currentReceiverName_ = decl.receiverName;
+    // Bug B 同步修复：方法体入口为堆类型参数生成 GcRootHandle 包装
+    // 签名形如 `Tree<T>::map(Tree<U>* node_raw)`，此处生成 `GcRootHandle<decltype(node_raw)> node(node_raw);`
+    // 用 decltype 避免泛型方法中未绑定模板参数无法解析的问题
+    for (auto& p : decl.params) {
+        if (!p.type) continue;
+        std::string ptype = mapParamType(*p.type);
+        if (!isGcPointerType(ptype)) continue;
+        std::string varName = safeName(p.name);
+        out << "  aura_rt::GcRootHandle<decltype(" << varName << "_raw)> "
+            << varName << "(" << varName << "_raw);\n";
+    }
     if (decl.body) genBlock(out, *decl.body, isCoro);
     currentReceiverName_.clear();
     out << "}\n\n";

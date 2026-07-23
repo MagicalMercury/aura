@@ -295,7 +295,10 @@ public:
     bool    gcPending_      = false;  // 有 GC 请求待处理
 
     // 根集合
-    std::vector<GcRootHandle<GcObject*>*> roots_;
+    // 使用 unordered_set：registerRoot O(1)、unregisterRoot O(1)（原 vector 的 unregister 是 O(n)）
+    // 遍历顺序不重要：markPhase 和 updateAllReferences 对每个 root 独立操作
+    // 指针作 key 安全：活跃 GcRootHandle 地址唯一，析构前必调用 unregisterRoot
+    std::unordered_set<GcRootHandle<GcObject*>*> roots_;
 
     // 栈帧根：{begin, end} 对，GC 扫描其中所有对齐的指针
     std::vector<std::pair<void*, void*>> stackRoots_;

@@ -88,6 +88,14 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
             // 记录类型的规范名（如 "Tree"），供 CodeGen 映射 C++ 类型
             if (auto* rec = dynamic_cast<RecordSemType*>(resolved.get())) {
                 rec->canonicalName = t->name;
+                // 非泛型自引用类型（如 type IntTree = { children: [IntTree] }）：
+                // resolveType 在解析自引用字段时返回 GenericSemType(name="IntTree")
+                // 但 resolvedName 为空。sealSelfRefs 将 resolvedName 设为类型名，
+                // 使 CodeGen 的 mapSemType 能正确映射为 C++ 类型名（而非 "auto"）
+                // 泛型类型的 sealSelfRefs 在 materializeCanonicalName 中调用
+                if (t->typeParams.empty()) {
+                    sealSelfRefs(resolved, t->name, t->name);
+                }
             }
             // 用完整类型更新占位符
             auto* existing = symtab_.lookupGlobal(t->name);
