@@ -2,7 +2,7 @@
 // ============================================================
 // aura_rt/builtin/string.h ─ GcString 完整定义 + 扩展 API
 //
-// GcString 定义、工厂方法、拼接（operator+/concat）、
+// GcString 定义、工厂方法、拼接（concat 函数族，不依赖 C++ operator+）、
 // ToString 接口——实现该接口的类型可直接与 GcString 拼接。
 //
 // 原 types.h 中的 GcString 已全部迁移至此。
@@ -110,7 +110,7 @@ GcString* intern_string(const char* s, size_t len);
 // Aura 中任何实现了 fun (self T) to_string() -> string 的类型
 // 自动满足此接口，可以直接参与字符串拼接（s + expr）。
 //
-// C++ 侧用 concept 约束 operator+ 模板重载：
+// C++ 侧用 concept 约束 concat 模板重载：
 //   任何有 GcString* to_string() const 的类型都可用。
 // ============================================================
 
@@ -134,44 +134,37 @@ inline GcString* GcString::from(const std::string& s) {
 }
 
 // ============================================================
-// operator+ 重载 — 参数为 const GcString&（类类型，不是指针）
+// 字符串拼接 — 统一通过 aura_rt::concat 函数族
+//
+// CodeGen 一律生成 aura_rt::concat(a, b)，不依赖 C++ operator+ 重载，
+// 避免 GcString* + int 被识别为指针算术导致 SIGSEGV。
+// 实现：
+//   - concat(GcString*, GcString*)           inline（nullptr 安全）
+//   - concat(GcString*, int32_t) 等 6 个      声明 → string.cpp 实现（用 GcRootHandle 保护）
+//   - concat(GcString*, const T&) 2 个模板   inline（ToString 类型）
 // ============================================================
 
-// --- string + string ---
-inline GcString* operator+(const GcString& a, const GcString& b) {
-    return a.concat(b);
+inline GcString* concat(GcString* a, GcString* b) {
+    return a ? (b ? a->concat(*b) : a) : b;
 }
 
-// --- string + 基础类型 ---
-inline GcString* operator+(const GcString& a, int32_t b) {
-    return a.concat(*GcString::from(b));
-}
-inline GcString* operator+(int32_t a, const GcString& b) {
-    return GcString::from(a)->concat(b);
-}
+// 基础类型重载：实现移到 string.cpp
+// 需用 GcRootHandle 保护 a（防 compact 移动）和 GcString::from(b) 返回的临时对象
+GcString* concat(GcString* a, int32_t b);
+GcString* concat(int32_t a,    GcString* b);
+GcString* concat(GcString* a, double b);
+GcString* concat(double a,     GcString* b);
+GcString* concat(GcString* a, bool b);
+GcString* concat(bool a,       GcString* b);
 
-inline GcString* operator+(const GcString& a, double b) {
-    return a.concat(*GcString::from(b));
-}
-inline GcString* operator+(double a, const GcString& b) {
-    return GcString::from(a)->concat(b);
-}
-
-inline GcString* operator+(const GcString& a, bool b) {
-    return a.concat(*GcString::from(b));
-}
-inline GcString* operator+(bool a, const GcString& b) {
-    return GcString::from(a)->concat(b);
-}
-
-// --- string + ToString 类型 ---
+// ToString 类型：模板，inline 即可
 template <ToString T>
-inline GcString* operator+(const GcString& a, const T& b) {
-    return a.concat(*b.to_string());
+inline GcString* concat(GcString* a, const T& b) {
+    return a->concat(*b.to_string());
 }
 template <ToString T>
-inline GcString* operator+(const T& a, const GcString& b) {
-    return a.to_string()->concat(b);
+inline GcString* concat(const T& a, GcString* b) {
+    return a.to_string()->concat(*b);
 }
 
 // ============================================================
@@ -183,15 +176,6 @@ inline GcString* string_concat(GcString* a, GcString* b) { return a ? a->concat(
 inline GcString* int_to_string(int32_t val)           { return GcString::from(val); }
 inline GcString* float_to_string(double val)          { return GcString::from(val); }
 inline GcString* bool_to_string(bool val)             { return GcString::from(val); }
-
-// 旧 concat 多重重载别名（GcString* → 解引用后调用 operator+）
-inline GcString* concat(GcString* a, GcString* b)  { return string_concat(a, b); }
-inline GcString* concat(GcString* a, int32_t b)    { return *a + b; }
-inline GcString* concat(int32_t a,    GcString* b) { return a + *b; }
-inline GcString* concat(GcString* a, double b)     { return *a + b; }
-inline GcString* concat(double a,     GcString* b) { return a + *b; }
-inline GcString* concat(GcString* a, bool b)       { return *a + b; }
-inline GcString* concat(bool a,        GcString* b) { return a + *b; }
 
 // 字符串值比较
 inline bool string_eq(GcString* a, GcString* b) {

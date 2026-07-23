@@ -29,6 +29,7 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace aura_rt {
@@ -128,6 +129,18 @@ struct CompactEntry {
 };
 
 static_assert(sizeof(CompactEntry) <= 56);  // 紧凑存储
+
+// ============================================================
+// GcCompactSuspendGuard — RAII guard：构造时禁 compact，析构时恢复
+// 用于 runtime 函数内部 alloc 期间保护已有指针不被 compact 移动
+// ============================================================
+class GcCompactSuspendGuard {
+public:
+    GcCompactSuspendGuard();
+    ~GcCompactSuspendGuard();
+    GcCompactSuspendGuard(const GcCompactSuspendGuard&) = delete;
+    GcCompactSuspendGuard& operator=(const GcCompactSuspendGuard&) = delete;
+};
 
 // ============================================================
 // GcHeap — GC 堆管理器（单例）
@@ -260,8 +273,17 @@ public:
     void  updateObjectFields(GcObject* obj);
     void  updateInlineArrayElements(GcObject* obj);
 
+    // compact 暂停计数控制（供 GcCompactSuspendGuard 使用）
+    void incCompactSuspend() { ++compactSuspendedCount_; }
+    void decCompactSuspend() { --compactSuspendedCount_; }
+
     // 预分配 OOM 错误（首次 tryAlloc 时懒初始化）
     void  ensureOomError();
+
+    // compact 暂停计数（>0 时 compact 延迟执行，mark-sweep 仍正常执行）
+    int     compactSuspendedCount_ = 0;
+    // compact 延迟标志：suspend 期间若有 compact 请求，置 true；alloc 入口检查并补执行
+    bool    compactPending_ = false;
 
     Page*   headPage_    = nullptr;
     Page*   currentPage_ = nullptr;
@@ -295,6 +317,11 @@ public:
     // 全局根：长期存活的 GC 对象（运行时缓存 / interned 字符串）
     std::vector<GcObject**> globalRoots_;
     std::mutex              globalRoots_m_;
+
+    // 已注册的 TypeDescriptor 集合：所有合法的 desc 指针地址
+    // alloc 时注册；保守栈扫描时用于验证 candidate->desc 是否为合法对象
+    // 防止把 GcString 的 inline 数据（length/capacity 等）误读为 GcObject header
+    std::unordered_set<const TypeDescriptor*> registeredDescs_;
 
     // 弱引用句柄：sweep 时清空指向已回收对象的句柄
     std::vector<GcWeakHandleBase*> weakHandles_;

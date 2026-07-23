@@ -126,8 +126,17 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                     gcRootVarNames_.insert(var);
                     gcRootTypes_[var] = type;
                     for (auto& f : rec->fields) {
-                        writeLine(cpp, var + ".get()->" + safeName(f.name) + " = "
-                                  + (f.value ? genExpr(*f.value, currentFunctionIsCoroutine_) : "???") + ";");
+                        std::string fval = f.value ? genExpr(*f.value, currentFunctionIsCoroutine_) : "???";
+                        // 堆类型字段值：预求值，防止后续字段求值期间 GC 导致裸指针悬垂
+                        if (f.value && isHeapSemType(f.value->inferredType)) {
+                            writeLine(cpp, "auto _fv_" + safeName(f.name) + " = (" + fval + ");");
+                            writeLine(cpp, "aura_rt::GcRootHandle<decltype(_fv_" + safeName(f.name)
+                                      + ")> _fh_" + safeName(f.name) + "(_fv_" + safeName(f.name) + ");");
+                            writeLine(cpp, var + ".get()->" + safeName(f.name)
+                                      + " = _fh_" + safeName(f.name) + ".get();");
+                        } else {
+                            writeLine(cpp, var + ".get()->" + safeName(f.name) + " = " + fval + ";");
+                        }
                     }
                     currentLetName_.clear();
                     expectedTemplateArgs_.clear();
@@ -283,13 +292,22 @@ void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
         if (isPtr) {
             int recIdx = listCounter_++;
             std::string var = "_rec_" + std::to_string(recIdx);
-            writeLine(cpp, "auto* " + var + " = aura_rt::gc_alloc<" + recType
+            writeLine(cpp, "auto* _raw = aura_rt::gc_alloc<" + recType
                       + ">(&" + recType + "::_desc);");
+            writeLine(cpp, "aura_rt::GcRootHandle<decltype(_raw)> " + var + "(_raw);");
             for (auto& f : rec->fields) {
-                writeLine(cpp, var + "->" + safeName(f.name) + " = "
-                          + (f.value ? genExpr(*f.value, isCoroutine) : "???") + ";");
+                std::string fval = f.value ? genExpr(*f.value, isCoroutine) : "???";
+                if (f.value && isHeapSemType(f.value->inferredType)) {
+                    writeLine(cpp, "auto _fv_" + safeName(f.name) + " = (" + fval + ");");
+                    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_fv_" + safeName(f.name)
+                              + ")> _fh_" + safeName(f.name) + "(_fv_" + safeName(f.name) + ");");
+                    writeLine(cpp, var + ".get()->" + safeName(f.name)
+                              + " = _fh_" + safeName(f.name) + ".get();");
+                } else {
+                    writeLine(cpp, var + ".get()->" + safeName(f.name) + " = " + fval + ";");
+                }
             }
-            writeLine(cpp, prefix + " " + var + ";");
+            writeLine(cpp, prefix + " " + var + ".get();");
             return;
         }
     }
@@ -301,7 +319,6 @@ void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
 }
 
 void CodeGenerator::genThrowStmt(std::ostream& cpp, const ThrowStmt& stmt) {
-    // Aura 中 throw { field = val, ... } → aura_rt::Error(val, ...)
     if (stmt.expr) {
         if (auto* rec = dynamic_cast<const RecordExpr*>(stmt.expr.get())) {
             std::string kind, message;
@@ -309,9 +326,21 @@ void CodeGenerator::genThrowStmt(std::ostream& cpp, const ThrowStmt& stmt) {
                 if (f.name == "kind")    kind    = f.value ? genExpr(*f.value, false) : "???";
                 if (f.name == "message") message = f.value ? genExpr(*f.value, false) : "???";
             }
-            writeLine(cpp, "throw aura_rt::Error(" + kind + ", " + message + ");");
+            // 预求值 + GcRootHandle 保护 kind/message（Error 浅拷贝裸指针）
+            writeLine(cpp, "{");
+            writeLine(cpp, "    auto _k = (" + kind + ");");
+            writeLine(cpp, "    aura_rt::GcRootHandle<decltype(_k)> _hk(_k);");
+            writeLine(cpp, "    auto _m = (" + message + ");");
+            writeLine(cpp, "    aura_rt::GcRootHandle<decltype(_m)> _hm(_m);");
+            writeLine(cpp, "    throw aura_rt::Error(_hk.get(), _hm.get());");
+            writeLine(cpp, "}");
         } else {
-            writeLine(cpp, "throw aura_rt::Error(" + genExpr(*stmt.expr, false) + ");");
+            std::string eVal = genExpr(*stmt.expr, false);
+            writeLine(cpp, "{");
+            writeLine(cpp, "    auto _e = (" + eVal + ");");
+            writeLine(cpp, "    aura_rt::GcRootHandle<decltype(_e)> _he(_e);");
+            writeLine(cpp, "    throw aura_rt::Error(_he.get());");
+            writeLine(cpp, "}");
         }
     } else {
         writeLine(cpp, "throw;");

@@ -87,6 +87,47 @@ GcString* GcString::from(bool val) {
     return val ? _t.get() : _f.get();
 }
 
+// ============================================================
+// concat 重载实现（替代原 operator+，签名从 const GcString& 改为 GcString*）
+//
+// 关键：a 是值拷贝的 GcString*，a_guard 注册为 root 后，
+//       compact 时 GC 会通过 roots_ 自动更新 a 本地变量（*ptr_ = 新地址）。
+//       这根治了原 operator+ 中 a 是引用、compact 移动对象后引用变悬垂的问题。
+// ============================================================
+GcString* concat(GcString* a, int32_t b) {
+    GcRootHandle<GcString*> a_guard(a);     // 保护 a，compact 时自动更新
+    GcString* tmp = GcString::from(b);
+    GcRootHandle<GcString*> tmp_guard(tmp);  // 保护 tmp，mark-sweep 不回收
+    return a_guard.get()->concat(*tmp_guard.get());
+}
+GcString* concat(int32_t a, GcString* b) {
+    GcString* tmp = GcString::from(a);
+    GcRootHandle<GcString*> tmp_guard(tmp);
+    GcRootHandle<GcString*> b_guard(b);
+    return tmp_guard.get()->concat(*b_guard.get());
+}
+GcString* concat(GcString* a, double b) {
+    GcRootHandle<GcString*> a_guard(a);
+    GcString* tmp = GcString::from(b);
+    GcRootHandle<GcString*> tmp_guard(tmp);
+    return a_guard.get()->concat(*tmp_guard.get());
+}
+GcString* concat(double a, GcString* b) {
+    GcString* tmp = GcString::from(a);
+    GcRootHandle<GcString*> tmp_guard(tmp);
+    GcRootHandle<GcString*> b_guard(b);
+    return tmp_guard.get()->concat(*b_guard.get());
+}
+GcString* concat(GcString* a, bool b) {
+    GcRootHandle<GcString*> a_guard(a);
+    // from(bool) 返回全局缓存，已由 GcGlobalRoot 保护，无需 tmp_guard
+    return a_guard.get()->concat(*GcString::from(b));
+}
+GcString* concat(bool a, GcString* b) {
+    GcRootHandle<GcString*> b_guard(b);
+    return GcString::from(a)->concat(*b_guard.get());
+}
+
 GcString* GcString::empty() {
     static GcGlobalRoot<GcString> _e{make("", 0)};
     return _e.get();
@@ -106,6 +147,7 @@ static constexpr int32_t kConcatByCopySize = 128;
 static constexpr int32_t kFlatFallbackThreshold = 64;
 
 static GcString* concat_flat(const GcString* a, const GcString* b) {
+    GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 a/b 及其 data() 内部指针
     int32_t total = a->length + b->length;
     size_t objSize = sizeof(GcString) + total + 1;
     auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
@@ -120,6 +162,7 @@ static GcString* concat_flat(const GcString* a, const GcString* b) {
 
 static GcString* concat_multi_flat_range(const std::vector<const GcString*>& parts,
                                           size_t start, size_t end) {
+    GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 parts 及其 data()
     int32_t total = 0;
     for (size_t i = start; i < end; ++i) total += parts[i]->length;
     size_t objSize = sizeof(GcString) + total + 1;
@@ -138,6 +181,7 @@ static GcString* concat_multi_flat_range(const std::vector<const GcString*>& par
 
 static GcString* build_balanced_rope(const std::vector<const GcString*>& parts,
                                       size_t start, size_t end) {
+    GcCompactSuspendGuard _compactGuard;  // 递归 alloc，保护 parts
     if (end - start == 1) return const_cast<GcString*>(parts[start]);
     if (end - start == 0) return GcString::empty();
     int32_t subtreeTotal = 0;
@@ -160,6 +204,7 @@ static GcString* build_balanced_rope(const std::vector<const GcString*>& parts,
 // GcString::concat — 三层防护：超小直接 copy、深度越界 flatten、正常构建 Rope
 // ============================================================
 GcString* GcString::concat(const GcString& other) const {
+    GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 this/other 及调用 concat_flat/rope make
     int32_t totalLen = length + other.length;
     if (other.length == 0) return const_cast<GcString*>(this);
     if (length == 0) return const_cast<GcString*>(&other);
@@ -184,27 +229,23 @@ GcString* GcString::concat(const GcString& other) const {
 // concat_multi — N 元拼接（平衡 Rope 树版本）
 // ============================================================
 GcString* concat_multi(std::initializer_list<const GcString*> parts) {
-    // 第 1 轮：计算 total + 缓存 (data, len)，防止 alloc() 后 parts 悬垂
+    GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 parts 中的裸指针值拷贝
     int32_t total = 0;
-    std::vector<std::pair<const char*, int32_t>> cached;
     for (auto* p : parts) {
-        if (!p) continue;
-        int32_t len = p->length;
-        total += len;
-        cached.emplace_back(p->data(), len);
+        if (p) total += p->length;
     }
 
     if (total < kConcatByCopySize) {
         size_t objSize = sizeof(GcString) + total + 1;
         auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
-        // alloc 可能触发 GC 移动 parts 对象，但缓存的数据不受影响
         r->length = total;
         r->u.capacity = total;
         r->parent = nullptr;
         char* dst = r->raw_data();
-        for (auto& [data, len] : cached) {
-            std::memcpy(dst, data, len);
-            dst += len;
+        for (auto* s : parts) {
+            if (!s) continue;
+            std::memcpy(dst, s->data(), s->length);
+            dst += s->length;
         }
         *dst = '\0';
         return r;
@@ -237,6 +278,7 @@ GcString* GcString::make_with_capacity(size_t len, size_t cap) {
 // ============================================================
 
 GcString* GcString::append(const GcString* other) {
+    GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 this/other 及 alloc 新对象
     if (!other || other->length == 0) return this;
 
     size_t needed = static_cast<size_t>(length) + static_cast<size_t>(other->length);
@@ -411,6 +453,7 @@ const TypeDescriptor GcRopeNode::_desc = {
 // GcRopeNode::make — 创建 Rope 节点
 // ============================================================
 GcRopeNode* GcRopeNode::make(GcString* l, GcString* r) {
+    GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 l/r
     auto* node = static_cast<GcRopeNode*>(
         GcHeap::instance().alloc(sizeof(GcRopeNode), &_desc)
     );
@@ -428,6 +471,7 @@ GcRopeNode* GcRopeNode::make(GcString* l, GcString* r) {
 // GcRopeNode::flatten + flatten_recursive
 // ============================================================
 GcString* GcRopeNode::flatten() const {
+    GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 dst 跨 alloc
     if (flat_cache_) return flat_cache_;
     auto* flat = static_cast<GcString*>(
         GcHeap::instance().alloc(sizeof(GcString) + length + 1, &GcString::_desc)

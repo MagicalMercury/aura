@@ -22,6 +22,16 @@
 namespace aura_rt {
 
 // ============================================================
+// GcCompactSuspendGuard — 实现
+// ============================================================
+GcCompactSuspendGuard::GcCompactSuspendGuard() {
+    GcHeap::instance().incCompactSuspend();
+}
+GcCompactSuspendGuard::~GcCompactSuspendGuard() {
+    GcHeap::instance().decCompactSuspend();
+}
+
+// ============================================================
 // GcHeap 单例
 // ============================================================
 namespace {
@@ -48,6 +58,15 @@ GcObject* GcHeap::alloc(size_t size, const TypeDescriptor* desc) {
 }
 
 GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
+    // 入口：若 compact 被延迟，先补执行（此时 compactSuspendedCount_ == 0）
+    if (compactSuspendedCount_ == 0 && compactPending_) {
+        compactPending_ = false;
+        if (shouldCompact(CompactScope::Young))
+            compact(CompactScope::Young);
+        else if (shouldCompact(CompactScope::All))
+            compact(CompactScope::All);
+    }
+
     // 首次调用时懒初始化 OOM 错误字符串
     ensureOomError();
 
@@ -81,6 +100,10 @@ GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
     obj->setGeneration(0);  // 新生代
     obj->setFinalized(false);
     obj->setAllocSize(size);
+
+    // 注册 desc 到合法集合（首次出现时插入，后续 O(1) 查询）
+    // 用于保守栈扫描时验证 candidate 是否为真实对象起始
+    if (desc) registeredDescs_.insert(desc);
 
     youngObjects_.push_back(obj);
     youngBytes_ += size;
@@ -333,16 +356,17 @@ GcString* gc_stats_string() {
 // ============================================================
 void GcHeap::minorGc() {
     ++minorGcCount_;
-
     // Phase 1: 标记
     markPhase(/* youngOnly = */ true);
-
     // Phase 2: 清除 + 晋升
     sweepPhaseYoung();
-
     // Compacting GC 触发点
     if (shouldCompact(CompactScope::Young)) {
-        compact(CompactScope::Young);
+        if (compactSuspendedCount_ > 0) {
+            compactPending_ = true;   // 延迟 compact
+        } else {
+            compact(CompactScope::Young);
+        }
     }
 }
 
@@ -387,7 +411,12 @@ void GcHeap::markPhase(bool youngOnly) {
                     candidate < static_cast<void*>(page->data + kPageSize)) {
                     GcObject* obj = static_cast<GcObject*>(candidate);
                     // 验证是否为有效的 GC 对象再读取字段
-                    if (!obj->desc || obj->desc->size == 0) break;
+                    // 关键：candidate 可能落在 GcString 等对象的 inline 数据区域中间
+                    // 此时 obj->desc 会被误读为 length/capacity 等数值（如 0x38）
+                    // 用 registeredDescs_ 查表验证 desc 是否为已注册的合法 TypeDescriptor
+                    if (!obj->desc) break;
+                    if (registeredDescs_.find(obj->desc) == registeredDescs_.end()) break;
+                    if (obj->desc->size == 0) break;
                     // 始终标记：markObject 有 marked 守卫，old 对象不会重复扫描
                     markObject(obj);
                     break;
@@ -604,7 +633,9 @@ void GcHeap::sweepPhaseAll() {
     allocatedBytes_ = youngBytes_ + oldBytes_;
 
     // 2. 若大量对象死亡，执行紧缩
-    if (shouldCompact(CompactScope::All)) {
+    if (compactSuspendedCount_ > 0) {
+        compactPending_ = true;   // 延迟所有 compact 操作（含 compactAndReclaim）
+    } else if (shouldCompact(CompactScope::All)) {
         compact(CompactScope::All);
     } else {
         compactAndReclaim();

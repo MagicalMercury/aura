@@ -233,6 +233,9 @@ private:
     // 检查类型是否是注册的堆对象类型（记录/接口/泛型记录）
     [[nodiscard]] bool isHeapType(const std::string& auraName) const;
 
+    // 判断 SemType 是否对应 GC 堆对象指针（用于 GcRootHandle 包装决策）
+    [[nodiscard]] bool isHeapSemType(const SemType* type) const;
+
     // 判断 C++ 类型字符串是否为 GC 指针类型（如 GcString*, User*, Array<T>*）
     [[nodiscard]] bool isGcPointerType(const std::string& cppType) const;
 
@@ -326,6 +329,12 @@ private:
     [[nodiscard]] std::string genUnaryExpr(const UnaryExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genCallExpr(const CallExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genMethodCall(const MethodCallExpr& e, bool isCoroutine);
+
+    // 为 GC 堆类型参数生成 IIFE + GcRootHandle 包装
+    // args: (expr_string, inferredType) 对；callExpr: 包装后的调用表达式
+    [[nodiscard]] std::string genGcRootedArgs(
+        const std::vector<std::pair<std::string, const SemType*>>& args,
+        const std::string& callExpr, bool isCoroutine);
     [[nodiscard]] std::string genMemberAccess(const MemberAccessExpr& e);
     [[nodiscard]] std::string genIndexExpr(const IndexExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genAssignExpr(const AssignExpr& e, bool isCoroutine);
