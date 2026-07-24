@@ -377,6 +377,7 @@ void CodeGenerator::genWhileStmt(std::ostream& cpp, const WhileStmt& stmt,
                                   bool isCoroutine) {
     cpp << indentStr() << "while (" << genExpr(*stmt.condition, isCoroutine) << ") {\n";
     if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+    writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint：长循环可被 GC 暂停
     cpp << indentStr() << "}\n";
 }
 
@@ -406,6 +407,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
                     << "; " << var << " += " << step << ") {\n";
             }
             if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+            writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
             cpp << indentStr() << "}\n";
             return;
         }
@@ -421,6 +423,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
             writeLine(cpp, "if (" + chName + "->is_done()) break;");
             writeLine(cpp, "auto " + var + " = co_await " + chName + "->receive();");
             if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+            writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
             indentLevel_--;
             cpp << indentStr() << "}\n";
             return;
@@ -432,6 +435,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
     cpp << indentStr() << "for (auto " << safeName(stmt.itemName)
         << " : *" << iter << ") {\n";
     if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+    writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
     cpp << indentStr() << "}\n";
 }
 
@@ -439,6 +443,7 @@ void CodeGenerator::genLoopStmt(std::ostream& cpp, const LoopStmt& stmt,
                                  bool isCoroutine) {
     cpp << indentStr() << "while (true) {\n";
     if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+    writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
     cpp << indentStr() << "}\n";
 }
 
@@ -577,6 +582,12 @@ void CodeGenerator::genTryCatchRaw(std::ostream& cpp,
 
 void CodeGenerator::genSyncStmt(std::ostream& cpp, const SyncStmt& stmt,
                                  bool /*isCoroutine*/) {
+    // sync thread 分支：多线程模式
+    if (stmt.isThread) {
+        genSyncThreadStmt(cpp, stmt);
+        return;
+    }
+
     if (stmt.maxExpr) {
         // 有界版本：sync(max = N) { ... }
         std::string maxN = genExpr(*stmt.maxExpr, false);
@@ -598,6 +609,42 @@ void CodeGenerator::genSyncStmt(std::ostream& cpp, const SyncStmt& stmt,
         writeLine(cpp, "co_await aura_rt::when_all(std::move(_tasks));");
         cpp << indentStr() << "}\n";
     }
+}
+
+// ============================================================
+// sync thread 块：多线程实现
+//
+// 生成代码结构：
+//   {
+//       aura_rt::sync_thread_context _stx(maxN);  // RAII: 构造 beginGroup，析构 waitGroup
+//       aura_rt::ThreadPool::instance().ensureStarted();
+//       // spawn 语句 → _stx.submit([](params) { body });
+//       // 析构时 waitGroup 阻塞至所有任务完成
+//   }
+// ============================================================
+void CodeGenerator::genSyncThreadStmt(std::ostream& cpp, const SyncStmt& stmt) {
+    cpp << indentStr() << "{\n";
+    indentLevel_++;
+
+    // 无界保护：maxExpr=0 表示无界（默认上限 = hardware_concurrency）
+    std::string maxArg = stmt.maxExpr ? genExpr(*stmt.maxExpr, false) : "0";
+    writeLine(cpp, "aura_rt::sync_thread_context _stx(" + maxArg + ");");
+    // 懒启动线程池（首次调用时初始化）
+    writeLine(cpp, "aura_rt::ThreadPool::instance().ensureStarted();");
+
+    // 生成块体：spawn 会被分派到 genSpawnAsThread
+    // 注意：sync thread 块体以非协程模式生成（isCoroutine=false），
+    // 因为内部不能有 co_await，且 spawn body 是普通 lambda
+    bool oldInSyncThread = inSyncThreadBlock_;
+    inSyncThreadBlock_ = true;
+    if (stmt.body) genBlock(cpp, *stmt.body, false);
+    inSyncThreadBlock_ = oldInSyncThread;
+
+    // 块结束前触发 safepoint（可能执行延迟的 GC）
+    writeLine(cpp, "aura_rt::gc_safepoint();");
+    // sync_thread_context 析构会调用 waitGroup，阻塞至所有任务完成
+    indentLevel_--;
+    cpp << indentStr() << "}\n";
 }
 
 void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt,
@@ -655,6 +702,9 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt,
     indentLevel_--;
     writeLine(cpp, "}(" + var + ", io, _tasks));");
 
+    // L2 safepoint：sync for 循环回边
+    writeLine(cpp, "aura_rt::gc_safepoint();");
+
     // 4. Close for loop
     indentLevel_--;
     cpp << indentStr() << "}\n";
@@ -672,6 +722,12 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt,
 
 void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
                                   bool /*isCoroutine*/) {
+    // sync thread 块内的 spawn：分派到线程版本
+    if (inSyncThreadBlock_) {
+        genSpawnAsThread(cpp, stmt);
+        return;
+    }
+
     // === 显式传参模式（spawn (io: Io, n: int) { ... }） ===
     if (!stmt.params.empty()) {
         // 检查用户是否已声明 io / _tasks
@@ -764,6 +820,65 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
     for (auto& v : freeVars)
         cpp << safeName(v) << ", ";
     cpp << "io, _tasks));\n";
+}
+
+// ============================================================
+// sync thread 内的 spawn：生成 std::function 并提交到线程池
+//
+// 生成代码结构：
+//   _stx.submit([capture_list]() mutable { body });
+//
+// 关键约束：
+//   1. 使用值捕获 [capture_list] 而非参数传递，避免 lambda 返回值与 submit 签名冲突
+//   2. 强制 ioSync_=true（sync thread 内不能用 co_await）
+//   3. worker 入口/出口由 ThreadPool 管理，GC registerThread 已在 workerLoop 完成
+//   4. mutable 标记：允许 lambda 内修改捕获的变量
+// ============================================================
+void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
+    // R3 由 Sema 保证：sync thread 内 spawn 必须显式传参
+    // 此处 stmt.params 非空
+
+    bool oldIoSync = ioSync_;
+    ioSync_ = true;  // 强制 io 方法用 _sync 版本（不能用 co_await）
+
+    // 生成捕获列表：显式参数按值捕获
+    // io 特殊处理：引用捕获（Io 通常不可拷贝，且共享底层 iocp）
+    cpp << indentStr() << "_stx.submit([";
+    bool hasIo = false;
+    std::vector<std::string> valueCaptures;
+    for (size_t i = 0; i < stmt.params.size(); ++i) {
+        if (stmt.params[i].name == "io") {
+            hasIo = true;
+            continue;  // io 单独处理
+        }
+        valueCaptures.push_back(safeName(stmt.params[i].name));
+    }
+    // 值捕获列表
+    for (size_t i = 0; i < valueCaptures.size(); ++i) {
+        if (i > 0) cpp << ", ";
+        cpp << valueCaptures[i];
+    }
+    // io 引用捕获（最后添加）
+    if (hasIo) {
+        if (!valueCaptures.empty()) cpp << ", ";
+        cpp << "&io";
+    }
+    cpp << "]() mutable {";
+
+    // lambda body
+    indentLevel_++;
+    insideSpawn_ = true;
+    // 显式参数已在 Sema 中注册为只读符号，此处直接生成体
+    for (auto& s : stmt.body) {
+        if (s) genStmt(cpp, *s, false);  // 非协程！
+    }
+    insideSpawn_ = false;
+    indentLevel_--;
+    cpp << "\n";
+
+    cpp << indentStr() << "});\n";
+
+    ioSync_ = oldIoSync;
 }
 
 // ============================================================

@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
-#include <shared_mutex>
+#include <mutex>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -526,22 +526,34 @@ void GcRopeNode::flatten_recursive(char* dst, int32_t& pos, int32_t maxDepth) co
 // ============================================================
 namespace {
     [[gnu::init_priority(105)]] std::unordered_map<std::string, std::unique_ptr<GcGlobalRoot<GcString>>> g_internPool;
-    [[gnu::init_priority(105)]] std::shared_mutex g_internMutex;
+    // 注意：不用 std::shared_mutex，MinGW 下有 bug
+    //   https://github.com/msys2/MINGW-packages/issues/25193
+    //   现象：lock_shared() 抛 "__ret == 0" 断言。读路径改用独占锁，
+    //   find() 本身耗时极小，对并发性能影响可忽略。
+    [[gnu::init_priority(105)]] std::mutex g_internMutex;
 }
 
 GcString* intern_string(const char* s, size_t len) {
-    std::string_view keyView(s, len);
+    std::string key(s, len);
+    // 1. 独占锁查找（替代 shared_lock，规避 MinGW shared_mutex bug）
     {
-        std::shared_lock lk(g_internMutex);
-        auto it = g_internPool.find(std::string(keyView));
-        if (it != g_internPool.end()) return it->second->get();
-    }
-    {
-        std::unique_lock lk(g_internMutex);
-        std::string key(keyView);
+        std::lock_guard lk(g_internMutex);
         auto it = g_internPool.find(key);
         if (it != g_internPool.end()) return it->second->get();
-        auto root = std::make_unique<GcGlobalRoot<GcString>>(GcString::make(s, len));
+    }
+    // 2. 不持锁 alloc：make → alloc → 可能触发 safepoint/GC
+    //    关键：不能持 g_internMutex 时 alloc，否则 STW 时其他线程
+    //    阻塞在 lock_guard 无法到达 safepoint → 死锁
+    GcString* newly = GcString::make(s, len);
+    // 3. 写锁 double-check insert
+    {
+        std::lock_guard lk(g_internMutex);
+        auto it = g_internPool.find(key);
+        if (it != g_internPool.end()) {
+            // 别人已插入，丢弃 newly（等 GC 回收）
+            return it->second->get();
+        }
+        auto root = std::make_unique<GcGlobalRoot<GcString>>(newly);
         GcString* result = root->get();
         g_internPool.emplace(std::move(key), std::move(root));
         return result;

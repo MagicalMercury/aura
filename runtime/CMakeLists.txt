@@ -43,6 +43,7 @@ add_library(aura_rt STATIC
     types.cpp
     gc.cpp
     task.cpp
+    thread_pool.cpp
     builtin/io.cpp
     builtin/string.cpp
     win_iocp.cpp

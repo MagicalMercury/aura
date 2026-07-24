@@ -177,7 +177,14 @@ std::unique_ptr<Stmt> Parser::parseSyncStmt() {
     auto stmt = std::make_unique<SyncStmt>();
     setNodePos(stmt.get(), tok);
 
-    // 可选参数：sync(max = expr) { ... }
+    // 检测 thread 软关键字：sync thread { ... } 或 sync thread(max=N) { ... }
+    // 'thread' 在此位置作为关键字识别，其他位置仍是普通标识符
+    if (check(TokType::Identifier) && peek().lexeme == "thread") {
+        advance();  // consume 'thread'
+        stmt->isThread = true;
+    }
+
+    // 可选参数：sync(max = expr) { ... } 或 sync thread(max = expr) { ... }
     if (check(TokType::LParen)) {
         advance(); // (
         consume(TokType::Identifier, "expected 'max' after 'sync('");

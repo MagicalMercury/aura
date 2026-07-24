@@ -218,11 +218,13 @@ struct TryCatchStmt : Stmt {
 struct SyncStmt : Stmt {
     std::unique_ptr<BlockStmt> body;
     std::unique_ptr<ASTNode> maxExpr;  // 可选：sync(max=N) 中的 N 表达式
+    bool isThread = false;             // true 表示 sync thread（多线程），false 表示 sync（协程）
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<SyncStmt>();
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
         if (maxExpr) n->maxExpr = maxExpr->clone();
+        n->isThread = isThread;
         n->line = line; n->col = col;
         return n;
     }

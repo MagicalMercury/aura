@@ -219,7 +219,32 @@ void SemAnalyzer::checkTryCatchStmt(const TryCatchStmt& stmt) {
 }
 
 void SemAnalyzer::checkSyncStmt(const SyncStmt& stmt) {
-    // 检查 max 表达式
+    // sync thread 分支：多线程模式
+    if (stmt.isThread) {
+        // R1: 禁止嵌套 sync thread
+        if (inSyncThreadBlock_) {
+            error(stmt, "nested sync thread not allowed");
+            return;
+        }
+        // R4: maxExpr 类型检查
+        if (stmt.maxExpr) {
+            auto maxTy = inferExpr(*stmt.maxExpr);
+            if (!isAssignable(*intType(), *maxTy)) {
+                error(*stmt.maxExpr, "sync thread max must be int, got '" + maxTy->toString() + "'");
+            }
+        }
+        // 进入 sync thread 块：设置标志（spawn 将走 R3 检查分支）
+        bool oldInSync = insideSync_;
+        bool oldInThread = inSyncThreadBlock_;
+        insideSync_ = true;          // spawn 合法
+        inSyncThreadBlock_ = true;   // 多线程模式
+        if (stmt.body) checkBlock(*stmt.body);
+        insideSync_ = oldInSync;
+        inSyncThreadBlock_ = oldInThread;
+        return;
+    }
+
+    // 原有 sync 协程逻辑
     if (stmt.maxExpr) {
         auto maxTy = inferExpr(*stmt.maxExpr);
         if (!isAssignable(*intType(), *maxTy)) {
@@ -269,6 +294,13 @@ void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
         error(stmt, DiagCode::E018_SpawnOutsideSync,
           "'spawn' can only be used inside a 'sync' block",
           "wrap the spawn statement in 'sync { ... }'");
+        return;
+    }
+
+    // R3: sync thread 块内的 spawn 必须显式传参（避免隐式捕获导致数据竞争）
+    if (inSyncThreadBlock_ && stmt.params.empty()) {
+        error(stmt, "spawn in sync thread must have explicit params"
+                    " (use 'spawn (io: Io, x: int) { ... }' form in sync thread block)");
         return;
     }
 

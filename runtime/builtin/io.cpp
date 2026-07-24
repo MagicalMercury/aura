@@ -19,11 +19,17 @@
 
 namespace aura_rt {
 
+// 终端输出锁：多线程 println/println_sync 并发时保证整行原子输出
+namespace {
+    std::mutex g_coutM;
+}
+
 // ============================================================
 // 终端 I/O
 // ============================================================
 
 task<void> Io::println(GcString* value) const {
+    std::lock_guard<std::mutex> lk(g_coutM);
     if (value && value->data()) {
         std::cout << std::string_view(value->data(), value->length) << '\n';
     } else {
@@ -33,6 +39,7 @@ task<void> Io::println(GcString* value) const {
 }
 
 void Io::println_sync(GcString* value) const {
+    std::lock_guard<std::mutex> lk(g_coutM);
     if (value && value->data()) {
         std::cout << std::string_view(value->data(), value->length) << '\n';
     } else {

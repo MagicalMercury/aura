@@ -141,6 +141,7 @@ private:
     bool currentFunctionThrows_ = false;
     bool insideLoop_ = false; // break/continue 仅在循环内合法
     bool insideSync_ = false; // spawn 仅在 sync 块内合法
+    bool inSyncThreadBlock_ = false;  // sync thread 块内（禁止嵌套 / 无参 spawn）
     int  insideTry_  = 0;    // try 块嵌套深度（>0 时 ! 不报 non-throwing）
 
     // ============ 递归类型解析 ============

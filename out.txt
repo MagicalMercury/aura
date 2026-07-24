@@ -1,100 +1,110 @@
-=cmd-param-changed,param="logging enabled",value="on"
-43^done
-(gdb) 
-~"#0  0x00007ff6027dce3c in aura_rt::GcObject::marked (this=0x1167220) at D:/you/Aura/runtime/types.h:115\n"
-~"#1  0x00007ff6027c995d in aura_rt::GcHeap::markObject (this=0x7ff602808040 <aura_rt::(anonymous namespace)::g_gcHeap>, obj=0x1167220) at D:/you/Aura/runtime/gc.cpp:465\n"
-~"#2  0x00007ff6027c941c in aura_rt::GcHeap::markPhase (this=0x7ff602808040 <aura_rt::(anonymous namespace)::g_gcHeap>, youngOnly=true) at D:/you/Aura/runtime/gc.cpp:401\n"
-~"#3  0x00007ff6027c92e1 in aura_rt::GcHeap::minorGc (this=0x7ff602808040 <aura_rt::(anonymous namespace)::g_gcHeap>) at D:/you/Aura/runtime/gc.cpp:361\n"
-~"#4  0x00007ff6027c8156 in aura_rt::GcHeap::tryAlloc (this=0x7ff602808040 <aura_rt::(anonymous namespace)::g_gcHeap>, size=40, desc=0x7ff6027fa820 <aura_rt::GcString::_desc>) at D:/you/Aura/runtime/gc.cpp:78\n"
-~"#5  0x00007ff6027c8097 in aura_rt::GcHeap::alloc (this=0x7ff602808040 <aura_rt::(anonymous namespace)::g_gcHeap>, size=39, desc=0x7ff6027fa820 <aura_rt::GcString::_desc>) at D:/you/Aura/runtime/gc.cpp:57\n"
-~"#6  0x00007ff6027d1c1c in aura_rt::concat_flat (a=0x11409e0, b=0x11709d8) at D:/you/Aura/runtime/builtin/string.cpp:112\n"
-~"#7  0x00007ff6027d20b2 in aura_rt::GcString::concat (this=0x11409e0, other=...) at D:/you/Aura/runtime/builtin/string.cpp:172\n"
-~"#8  0x00007ff6027dc9b8 in aura_rt::operator+ (a=..., b=57) at D:/you/Aura/runtime/builtin/string.h:147\n"
-~"#9  0x00007ff6027dc40e in aura_rt::concat (a=0x11409e0, b=57) at D:/you/Aura/runtime/builtin/string.h:189\n"
-~"#10 0x00007ff6027c2108 in array_push_n (arr=0x1140950, n=100) at D:/you/Aura/example/test.cpp:91\n"
-~"#11 0x00007ff6027c5d3c in aura_main (frame_ptr=0x71a480) at D:/you/Aura/example/test.cpp:334\n"
-~"#12 0x00007ff6027e0afb in std::__n4861::coroutine_handle<void>::resume (this=0x779ef8) at C:/msys64/ucrt64/include/c++/16.1.0/coroutine:142\n"
-~"#13 0x00007ff6027dc44c in aura_rt::detail::task_promise_base::final_awaiter::await_suspend (this=0x779ef8) at D:/you/Aura/runtime/task.h:43\n"
-~"#14 0x00007ff6027cdcbe in aura_rt::Io::println (frame_ptr=0x779ec0) at D:/you/Aura/runtime/builtin/io.cpp:28\n"
-~"#15 0x00007ff6027c7778 in aura_main (frame_ptr=0x71a480) at D:/you/Aura/example/test.cpp:109\n"
-~"#16 0x00007ff6027e0afb in std::__n4861::coroutine_handle<void>::resume (this=0x779c78) at C:/msys64/ucrt64/include/c++/16.1.0/coroutine:142\n"
-~"#17 0x00007ff6027dc44c in aura_rt::detail::task_promise_base::final_awaiter::await_suspend (this=0x779c78) at D:/you/Aura/runtime/task.h:43\n"
-~"#18 0x00007ff6027cdcbe in aura_rt::Io::println (frame_ptr=0x779c40) at D:/you/Aura/runtime/builtin/io.cpp:28\n"
-~"#19 0x00007ff6027c7778 in aura_main (frame_ptr=0x71a480) at D:/you/Aura/example/test.cpp:109\n"
-~"#20 0x00007ff6027e0afb in std::__n4861::coroutine_handle<void>::resume (this=0x779ab8) at C:/msys64/ucrt64/include/c++/16.1.0/coroutine:142\n"
-~"#21 0x00007ff6027dc44c in aura_rt::detail::task_promise_base::final_awaiter::await_suspend (this=0x779ab8) at D:/you/Aura/runtime/task.h:43\n"
-~"#22 0x00007ff6027cdcbe in aura_rt::Io::println (frame_ptr=0x779a80) at D:/you/Aura/runtime/builtin/io.cpp:28\n"
-~"#23 0x00007ff6027c7778 in aura_main (frame_ptr=0x71a480) at D:/you/Aura/example/test.cpp:109\n"
-~"#24 0x00007ff6027e0afb in std::__n4861::coroutine_handle<void>::resume (this=0x779628) at C:/msys64/ucrt64/include/c++/16.1.0/coroutine:142\n"
-~"#25 0x00007ff6027dc44c in aura_rt::detail::task_promise_base::final_awaiter::await_suspend (this=0x779628) at D:/you/Aura/runtime/task.h:43\n"
-~"#26 0x00007ff6027cdcbe in aura_rt::Io::println (frame_ptr=0x7795f0) at D:/you/Aura/runtime/builtin/io.cpp:28\n"
-~"#27 0x00007ff6027c7778 in aura_main (frame_ptr=0x71a480) at D:/you/Aura/example/test.cpp:109\n"
-~"#28 0x00007ff6027e0afb in std::__n4861::coroutine_handle<void>::resume (this=0x736a68) at C:/msys64/ucrt64/include/c++/16.1.0/coroutine:142\n"
-~"#29 0x00007ff6027dc44c in aura_rt::detail::task_promise_base::final_awaiter::await_suspend (this=0x736a68) at D:/you/Aura/runtime/task.h:43\n"
-~"#30 0x00007ff6027cdcbe in aura_rt::Io::println (frame_ptr=0x736a30) at D:/you/Aura/runtime/builtin/io.cpp:28\n"
-~"#31 0x00007ff6027c7778 in aura_main (frame_ptr=0x71a480) at D:/you/Aura/example/test.cpp:109\n"
-~"#32 0x00007ff6027e0afb in std::__n4861::coroutine_handle<void>::resume (this=0x7353e8) at C:/msys64/ucrt64/include/c++/16.1.0/coroutine:142\n"
-~"#33 0x00007ff6027dc44c in aura_rt::detail::task_promise_base::final_awaiter::await_suspend (this=0x7353e8) at D:/you/Aura/runtime/task.h:43\n"
-~"#34 0x00007ff6027cdcbe in aura_rt::Io::println (frame_ptr=0x7353b0) at D:/you/Aura/runtime/builtin/io.cpp:28\n"
-~"#35 0x00007ff6027c7778 in aura_main (frame_ptr=0x71a480) at D:/you/Aura/example/test.cpp:109\n"
-~"#36 0x00007ff6027e0afb in std::__n4861::coroutine_handle<void>::resume (this=0x727a38) at C:/msys64/ucrt64/include/c++/16.1.0/coroutine:142\n"
-~"#37 0x00007ff6027dc44c in aura_rt::detail::task_promise_base::final_awaiter::await_suspend (this=0x727a38) at D:/you/Aura/runtime/task.h:43\n"
-~"#38 0x00007ff6027cdcbe in aura_rt::Io::println (frame_ptr=0x727a00) at D:/you/Aura/runtime/builtin/io.cpp:28\n"
-~"#39 0x00007ff6027c7778 in aura_main (frame_ptr=0x71a480) at D:/you/Aura/example/test.cpp:109\n"
-~"#40 0x00007ff6027e0afb in std::__n4861::coroutine_handle<void>::resume (this=0x7275c8) at C:/msys64/ucrt64/include/c++/16.1.0/coroutine:142\n"
-~"#41 0x00007ff6027dc44c in aura_rt::detail::task_promise_base::final_awaiter::await_suspend (this=0x7275c8) at D:/you/Aura/runtime/task.h:43\n"
-~"#42 0x00007ff6027cdcbe in aura_rt::Io::println (frame_ptr=0x727590) at D:/you/Aura/runtime/builtin/io.cpp:28\n"
-~"#43 0x00007ff6027c7778 in aura_main (frame_ptr=0x71a480) at D:/you/Aura/example/test.cpp:109\n"
-~"#44 0x00007ff6027e0afb in std::__n4861::coroutine_handle<void>::resume (this=0x755078) at C:/msys64/ucrt64/include/c++/16.1.0/coroutine:142\n"
-~"#45 0x00007ff6027dc44c in aura_rt::detail::task_promise_base::final_awaiter::await_suspend (this=0x755078) at D:/you/Aura/runtime/task.h:43\n"
-~"#46 0x00007ff6027cdcbe in aura_rt::Io::println (frame_ptr=0x755040) at D:/you/Aura/runtime/builtin/io.cpp:28\n"
-~"#47 0x00007ff6027c7778 in aura_main (frame_ptr=0x71a480) at D:/you/Aura/example/test.cpp:109\n"
-~"#48 0x00007ff6027e0afb in std::__n4861::coroutine_handle<void>::resume (this=0x725ed8) at C:/msys64/ucrt64/include/c++/16.1.0/coroutine:142\n"
-~"#49 0x00007ff6027dc44c in aura_rt::detail::task_promise_base::final_awaiter::await_suspend (this=0x725ed8) at D:/you/Aura/runtime/task.h:43\n"
-~"#50 0x00007ff6027cdcbe in aura_rt::Io::println (frame_ptr=0x725ea0) at D:/you/Aura/runtime/builtin/io.cpp:28\n"
-~"#51 0x00007ff6027c7778 in aura_main (frame_ptr=0x71a480) at D:/you/Aura/example/test.cpp:109\n"
-~"#52 0x00007ff6027e09fb in std::__n4861::coroutine_handle<aura_rt::task<void>::promise_type>::resume (this=0x5ffe30) at C:/msys64/ucrt64/include/c++/16.1.0/coroutine:247\n"
-~"#53 0x00007ff6027cd47d in aura_rt::run_event_loop (mainTask=...) at D:/you/Aura/runtime/task.cpp:33\n"
-~"#54 0x00007ff6027c7eb5 in main () at D:/you/Aura/example/test.cpp:514\n"
-~"#55 0x00007ff6027c115a in __tmainCRTStartup () at D:/W/B/src/mingw-w64/mingw-w64-crt/crt/crtexe.c:265\n"
-~"#56 0x00007fff011be957 in KERNEL32!BaseThreadInitThunk () from C:\\windows\\System32\\kernel32.dll\n"
-~"#57 0x00007fff02de7c1c in ntdll!RtlUserThreadStart () from C:\\windows\\SYSTEM32\\ntdll.dll\n"
-~"#58 0x0000000000000000 in ?? ()\n"
-44^done
-(gdb) 
-~"$1 = (const aura_rt::GcObject * const) 0x1167220\n"
-45^done
-(gdb) 
-&"\342\235\214\357\270\217 Cannot access memory at address 0x1167220\n"
-46^error,msg="Cannot access memory at address 0x1167220"
-(gdb) 
-47^done,value="0x5fe6a0"
-(gdb) 
-48^done,variables=[{name="arr"},{name="n"},{name="i"}],filtered="1"
-(gdb) 
-~"type = aura_rt::Array<aura_rt::GcString*> *\n"
-49^done
-(gdb) 
-~"type = int32_t\n"
-50^done
-(gdb) 
-~"type = int\n"
-51^done
-(gdb) 
-52^done,cidr-id="1",name="v1",exp="arr",value="0x1140950",type="aura_rt::Array<aura_rt::GcString*> *",numchild="5"
-0^done
-(gdb) 
-53^done,cidr-id="2",name="v2",exp="n",value="100",type="int32_t",numchild="0"
-0^done
-(gdb) 
-54^done,cidr-id="3",name="v3",exp="i",value="57",type="int",numchild="0"
-0^done
-(gdb) 
-~"$2 = (aura_rt::ArrayChunk<aura_rt::GcString*> *) 0x1140978\n"
-55^done
-(gdb) 
-~"$3 = (aura_rt::ArrayChunk<aura_rt::GcString*> *) 0x1150570\n"
-56^done
-(gdb) 
-~"Warning: 'set logging off', an alias for the command 'set logging enabled', is deprecated.\n"
-~"Use 'set logging enabled off'.\n\n"
+# sync thread 多线程测试调试状态（2026-07-24）
+
+## 当前测试
+example/test.aura 包含 3 个 sync thread 测试：
+1. 基本多线程（无界）：2 个 spawn 输出 "hello from thread N"
+2. 有界并发 max=4：10 个 spawn 输出 "task N"
+3. GC 压力 max=2：100 个 spawn 输出 "string N"
+
+## 已完成的修复
+### TLAB 实现（已完成，ASAN 验证通过）
+- gc.h/gc.cpp: Tlab 结构、tryAlloc 双路径、flushTlab/refillTlab
+- thread_pool.cpp: workerLoop 用 wait_for 响应 GC safepoint
+
+### GC 并发数据竞争修复（已完成）
+- gc.h: compactSuspendedCount_ → atomic<int>
+- gc.h: gcPending_ → atomic<bool>
+- gc.h: oomInit_ → atomic<bool>（call_once 不可行，递归调用自死锁）
+- gc.h: 新增 stackRootsM_ 保护 stackRoots_
+- gc.h: 新增 rememberedSetM_ 保护 rememberedSet_
+- gc.cpp: ensureOomError 用 atomic<bool> 替代 call_once
+- gc.cpp: register/unregisterStackRoots 加锁
+- gc.cpp: writeBarrier 加锁
+- gc.cpp: gcPending_ 全部改 load/store
+- gc.cpp: compactSuspendedCount_ 读取改 load
+
+## ✅ 已解决：shared_mutex 断言 __ret == 0
+根因：MinGW 下 std::shared_mutex 实现有 bug
+  - 参考：https://github.com/msys2/MINGW-packages/issues/25193
+  - 现象：lock_shared() 抛 "__ret == 0" 断言，多线程测试第一行即崩溃
+修复：runtime/builtin/string.cpp:527-561
+  - 将 g_internMutex 类型从 std::shared_mutex 改为 std::mutex
+  - intern_string 读路径由 std::shared_lock 改为 std::lock_guard（独占锁）
+  - unordered_map::find() 耗时极小，独占锁对并发性能影响可忽略
+  - 移除 #include <shared_mutex>，改为 #include <mutex>
+验证：test.aura 全部 3 个测试通过，退出码 0
+  - 测试 1：2 行 "hello from thread N"
+  - 测试 2：10 行 "task N"（0-9）
+  - 测试 3：100 行 "string N"（0-99）
+  - 最后输出 "done"
+  - 输出顺序有少量交错（如 string 5 在 string 4 前），属多线程并发正常现象
+
+## 此前尝试的相关修复（保留）
+### #1 intern_string 持锁 alloc（已修复）
+- 文件：runtime/builtin/string.cpp:536-561
+- 修改：改为"不持锁 alloc"模式（读锁查找 → 解锁 alloc → 写锁 double-check insert）
+
+### #6 cout 无锁并发（已修复）
+- 文件：runtime/builtin/io.cpp:22-48
+- 修改：新增 g_coutM mutex 保护 println/println_sync
+
+### #7 ensureStarted 无锁初始化（已修复）
+- 文件：runtime/thread_pool.h:68, thread_pool.cpp:20-31
+- 修改：用 std::call_once + ensureStartedOnce_ 保护
+
+## 审计报告发现但未修复的问题（P0-P3）
+来源：search agent 完整审计 runtime/ 目录
+
+### P0（严重，可能导致崩溃）
+- #1 intern_string 持锁 alloc → STW 死锁【已修复未解决】
+- #2 GcString::from(int32_t) _cache 数组无锁
+  - 文件：runtime/builtin/string.cpp:61-76
+  - 问题：static GcGlobalRoot<GcString>* _cache[2048] 多线程并发读写
+  - 风险：globalRoots_ 悬垂指针，GC 读野指针崩溃
+- #3 GcRopeNode::flat_cache_ 并发访问无锁
+  - 文件：runtime/builtin/string.cpp:473-488
+  - 问题：mutable GcString* flat_cache_ 多线程并发读写
+- #4 GcString::append 就地修改 GC 共享对象
+  - 文件：runtime/builtin/string.cpp:280-365
+  - 问题：就地 memcpy 修改 length/data，破坏共享不变式
+
+### P1（中等）
+- #5 ensureOomError 中 oomError_ 并发读写
+  - 文件：runtime/gc.cpp:274-284
+  - 问题：atomic<bool> oomInit_ 只挡同线程递归，不挡多线程并发
+- #6 cout/cin 无锁【已修复未解决】
+- #7 ensureStarted 无锁【已修复未解决】
+
+### P2（低风险）
+- #8 compactPending_ 非 atomic
+  - 文件：runtime/gc.h:317
+- #9 youngBytes_/oldBytes_/allocatedBytes_/gcCount_/minorGcCount_ 非 atomic
+  - 文件：runtime/gc.h:325-329
+- #10 EventLoop::ready_.empty() 无锁读
+  - 文件：runtime/task.cpp:62
+- #11 ThreadPool::workerCount() 无锁读 workers_
+  - 文件：runtime/thread_pool.h:51
+
+## 下一步建议
+1. 修复 #2 from(int) _cache 无锁（加 mutex 或 call_once）
+2. 修复 #3 GcRopeNode::flat_cache_ 无锁（加 mutex，注意 alloc 期间不持锁）
+3. 修复 #4 GcString::append 就地修改（删除就地修改分支，总是返回新对象）
+4. 若仍崩溃，用 ASAN 模式重新编译 runtime 获取精确栈追踪：
+   - Remove-Item -Recurse -Force build, runtime/build
+   - cmake -S . -B build -DENABLE_ASAN=ON
+   - cmake -S runtime -B runtime/build -DENABLE_ASAN=ON
+   - cmake --build build
+   - cmake --build runtime/build
+   - 手动编译 test.cpp 用 ASAN
+5. 检查是否还有其他持锁触发 GC 的路径（如 GcGlobalRoot 构造时 registerGlobalRoot）
+
+## 关键文件
+- runtime/gc.h / runtime/gc.cpp
+- runtime/thread_pool.h / runtime/thread_pool.cpp
+- runtime/builtin/string.cpp
+- runtime/builtin/io.cpp
+- example/test.aura / example/test.cpp
+- change.md（当前修复记录）
+- change.md.bak.20260724（sync thread 原始 plan）
+- plan/TLAB_implementation.md（TLAB 完整方案）
+- plan/sync_thread_plan.md（sync thread 完整方案）

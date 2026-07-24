@@ -6,6 +6,7 @@
 #include "types.h"
 #include "gc.h"
 #include "task.h"
+#include "thread_pool.h"   // sync thread 运行时支持
 #include "builtin/string.h"
 #include "builtin/path.h"
 #include "builtin/io.h"

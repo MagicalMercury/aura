@@ -304,11 +304,13 @@ private:
     void genContinueStmt(std::ostream& cpp);
     void genTryCatchStmt(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
     void genSyncStmt(std::ostream& cpp, const SyncStmt& stmt, bool isCoroutine);
+    void genSyncThreadStmt(std::ostream& cpp, const SyncStmt& stmt);  // sync thread 多线程
     void genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, bool isCoroutine);
 
     // 原始 try/catch（非协程模式回退，被 genTryCatchStmt 复用）
     void genTryCatchRaw(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
     void genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt, bool isCoroutine);
+    void genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt);  // sync thread 内的 spawn
     void genMatchStmt(std::ostream& cpp, const MatchStmt& stmt, bool isCoroutine);
     void genExprStmt(std::ostream& cpp, const ExprStmt& stmt, bool isCoroutine);
 
@@ -415,6 +417,9 @@ private:
 
     // 当前是否在 spawn 块内生成代码（避免嵌套协程 co_await）
     bool insideSpawn_ = false;
+
+    // 当前是否在 sync thread 块内（控制 spawn 生成分派到 genSpawnAsThread）
+    bool inSyncThreadBlock_ = false;
 
     // 列表表达式计数器 — 生成唯一的临时变量名
     int listCounter_ = 0;

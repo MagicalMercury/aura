@@ -168,6 +168,9 @@ public:
     // 尝试分配，GC 后仍失败则抛出 OutOfMemoryError
     GcObject* tryAlloc(size_t size, const TypeDescriptor* desc);
 
+    // 全局慢路径分配（持 allocM_）：大对象/TLAB 未初始化/TLAB 满时调用
+    GcObject* tryAllocSlow(size_t size, const TypeDescriptor* desc);
+
     // 主动抛出预缓存的 OutOfMemoryError（供外部 tryAlloc 降级路径使用）
     [[noreturn]] void throwOutOfMemory();
 
@@ -245,6 +248,33 @@ public:
     void* bumpAlloc(size_t size);
     void  freeAllPages();
 
+    // ============================================================
+    // TLAB — 线程局部分配缓冲
+    //
+    // 每个注册的线程持有一个 TLAB，bump 分配在自己的 curPage 上进行，
+    // 避免多线程竞争全局 currentPage_。localYoung 记录本线程分配的对象，
+    // safepoint 入口 flushTlab 合并到全局 youngObjects_。
+    //
+    // compact 安全：flushTlab 清空 curPage，避免 compact 释放旧页后悬垂。
+    // ============================================================
+    struct Tlab {
+        Page*   curPage = nullptr;          // 当前分配页（nullptr 时走 refill）
+        size_t  bumpOffset = 0;             // 当前页 bump 偏移
+        std::vector<GcObject*> localYoung;  // 本线程分配的对象
+        size_t  localYoungBytes = 0;       // 本线程分配的字节数
+    };
+
+    // TLAB 操作（实现见 gc.cpp）
+    void  flushTlab();      // safepoint 入口调用：合并 localYoung 到全局，清空 curPage
+    void  refillTlab();     // tryAllocSlow 中调用：申请新页给 TLAB（持 allocM_）
+    Tlab* ensureTlab();     // registerThread 时调用：分配 TLAB 结构
+    void  releaseTlab();    // unregisterThread 时调用：flush + 释放 TLAB 结构
+
+    // 每线程独立 TLAB 指针（thread_local 保证线程隔离）
+    // 注：用裸指针，由 registerThread/unregisterThread 显式管理生命周期
+    //     避免 thread_local 析构顺序与 GcHeap 单例冲突
+    static thread_local Tlab* tlab_;
+
     // --- GC 核心 ---
     void  minorGc();   // 仅扫描新生代
     void  majorGc();   // 全量标记-清除
@@ -281,9 +311,14 @@ public:
     void  ensureOomError();
 
     // compact 暂停计数（>0 时 compact 延迟执行，mark-sweep 仍正常执行）
-    int     compactSuspendedCount_ = 0;
+    // atomic：多线程下 GcCompactSuspendGuard 构造/析构并发 ++/--
+    std::atomic<int> compactSuspendedCount_{0};
     // compact 延迟标志：suspend 期间若有 compact 请求，置 true；alloc 入口检查并补执行
     bool    compactPending_ = false;
+
+    // 多线程并发分配保护：bumpAlloc 串行化
+    // 单线程下无竞争，开销极低；多线程下避免页链表损坏
+    std::mutex allocM_;
 
     Page*   headPage_    = nullptr;
     Page*   currentPage_ = nullptr;
@@ -292,23 +327,31 @@ public:
     size_t  oldBytes_       = 0;
     size_t  gcCount_        = 0;
     size_t  minorGcCount_   = 0;
-    bool    gcPending_      = false;  // 有 GC 请求待处理
+    std::atomic<bool> gcPending_{false};  // 有 GC 请求待处理（atomic：多线程读写）
 
     // 根集合
     // 使用 unordered_set：registerRoot O(1)、unregisterRoot O(1)（原 vector 的 unregister 是 O(n)）
     // 遍历顺序不重要：markPhase 和 updateAllReferences 对每个 root 独立操作
     // 指针作 key 安全：活跃 GcRootHandle 地址唯一，析构前必调用 unregisterRoot
+    // 多线程安全：registerRoot/unregisterRoot 用 rootsM_ 保护
     std::unordered_set<GcRootHandle<GcObject*>*> roots_;
+    std::mutex  rootsM_;
 
     // 栈帧根：{begin, end} 对，GC 扫描其中所有对齐的指针
+    // 多线程安全：register/unregister 用 stackRootsM_ 保护（mutator 并发）
+    // GC 遍历在 STW 期间，无需锁
     std::vector<std::pair<void*, void*>> stackRoots_;
+    std::mutex              stackRootsM_;
 
     // 分代对象追踪
     std::vector<GcObject*> youngObjects_;  // 新生代（gen 0）
     std::vector<GcObject*> oldObjects_;    // 老年代（gen 1）
 
     // 记忆集：记录 old→young 引用的 old 对象集合
+    // 多线程安全：writeBarrier 中 insert 用 rememberedSetM_ 保护（mutator 并发）
+    // GC 内访问（markPhase/sweep/clear/update）在 STW 期间，无需锁
     std::set<GcObject*> rememberedSet_;
+    std::mutex          rememberedSetM_;
 
     // compacting 期间临时存储 desc（forwarded=true 时 desc 被重解释为转发地址）
     std::unordered_map<GcObject*, const TypeDescriptor*> savedDescs_;
@@ -331,8 +374,12 @@ public:
     std::mutex                     weakHandles_m_;
 
     // OOM 错误缓存（GC 启动时预分配，无需额外内存即可抛出）
+    // 多线程安全：oomInit_ 用 atomic 防止数据竞争
+    // 注：不能用 call_once/mutex——make_string→alloc→tryAlloc→ensureOomError 会递归
+    //     调用自身，call_once/mutex 不支持递归持锁，会自死锁
+    //     oomInit_ 标志挡递归（同线程），fast path 检查 oomError_.kind 挡并发
     Error oomError_;
-    bool  oomInit_      = false;  // 防止 ensureOomError → make_string → alloc → ensureOomError 递归
+    std::atomic<bool> oomInit_{false};
 
     // --- 多线程 Stop-The-World ---
     std::mutex                  threads_m_;
@@ -341,6 +388,10 @@ public:
     std::atomic<int>            stopped_threads_{0};
     std::condition_variable     all_stopped_cv_;
     std::mutex                  all_stopped_m_;
+
+    // TLAB 全局列表（用于调试/统计，不参与 GC 扫描）
+    std::mutex                  tlabList_m_;
+    std::vector<Tlab*>          tlabList_;
 };
 
 // ============================================================

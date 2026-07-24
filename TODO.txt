@@ -7,7 +7,7 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-07-20（GcString 第三阶段 Rope + 第四阶段 Intern D1/D2 已完成）
+# 最近更新：2026-07-24（sync thread 多线程语句已完成 + MinGW shared_mutex bug 规避）
 
 ================================================================
 [ 一 ] 内置 API 与模块（plan/plan11.md）
@@ -104,11 +104,19 @@
 GC 晋升机制缺陷修复（基于 plan/gc_promotion_issues.md，2026-07-19）
 ----------------------------------------------------------------
 
-[x] P3  缺陷 5：old/young 混布 page（compacting GC）
-      - 现状：晋升不移动对象内存，old/young 混布同一 page
-      - 缺：compacting GC 或分离 young/old page 分配器
-      - 风险：高（架构级重构，需更新所有引用）
-      - 延后：对应 plan/gc_features_plan.md §十三 [~] 延后
+[x] P3  缺陷 5：old/young 混布 page（compacting GC）  [2026-07-23 完成]
+      - 实现：Compact GC 单线程稳定，所有 9 类 bug 已修复
+        （Bug A: genGcRootedArgs auto 值拷贝；Bug B: map_tree 未保护 raw 指针；
+         Bug C: for-range 迭代器悬垂；Bug D: compose lambda 悬垂；
+         Bug E: 协程恢复递归栈溢出；Bug F: 非泛型自引用 record sealSelfRefs；
+         Bug G: Error 的 GC 移动适配；以及 hash_set 优化 + compact 暂停计数）
+      - 验证：complex_closure 9 项断言 + Array 7 项测试（含 GC compact 遍历
+        和 200 元素 GC 压力测试）全部通过，ASAN 无报错
+      - 文件：runtime/gc.h, runtime/gc.cpp, runtime/task.cpp, runtime/types.cpp,
+        runtime/builtin/{array.h, io.cpp, io.h, string.h, string.cpp},
+        src/CodeGen/{CodeGen.cpp, ExprGen.cpp, DeclGen.cpp, StmtGen.cpp},
+        src/Sema/Checker/DeclChecker.cpp, src/main.cpp
+      - 对应：plan/gc_features_plan.md §十三 [x] 完成
 
 ----------------------------------------------------------------
 GC 其他功能清单（基于 2026-07-19 重新核验）
@@ -123,22 +131,35 @@ GC 其他功能清单（基于 2026-07-19 重新核验）
         精确扫描。stackRoots_ 的保守扫描仅作协程帧兜底。
       - 远期改进：若 profiling 显示内存占用过高，再做精确扫描
 
-[~] P2  TLAB（Thread-Local Allocation Buffer）  [2026-07-18 延后]
-      - 现状：bumpAlloc 是全局单线程的（currentPage_ + bumpOffset）
-      - 缺：多线程并发分配需要每线程独立 TLAB，避免锁竞争
-      - 延后原因：当前 sync_thread_plan.md 尚未实施，无多线程分配压力
-      - 前置：先实现多线程 GC 暂停（已完成 P1 §八）
+[x] P2  TLAB（Thread-Local Allocation Buffer）  [2026-07-24 完成]
+      - 实现：每线程独立 TLAB（curPage + bumpOffset + localYoung + localYoungBytes）
+        tryAlloc 改造为 TLAB 优先快路径（无锁）+ 全局慢路径（持 allocM_）
+        safepoint 入口 flushTlab 合并 localYoung 到全局 youngObjects_ + 清空 curPage
+        compact 安全：flushTlab 在 GC 操作前执行，避免页释放后 curPage 悬垂
+        大对象（> kPageSize/2）走全局慢路径，避免 TLAB 单页浪费
+        thread_local Tlab* 裸指针，由 registerThread/unregisterThread 显式管理
+      - 配套修复：roots_ (unordered_set) 并发 insert/erase UAF → 新增 rootsM_ 互斥锁
+        worker 线程空闲时 cv_.wait_for 超时定期检查 gcPending_ 响应 STW
+      - 验证：sync thread Test 3（100 次字符串拼接 × 2 worker）ASAN 无报错
+        输出完整（string 0-99 + done），无卡死
+      - 文件：runtime/gc.h, runtime/gc.cpp, runtime/thread_pool.cpp
+      - plan：plan/TLAB_implementation.md
 
 [-] P2  GC 触发策略调优  [2026-07-18 暂不实施]
       - 现状：kYoungThreshold=256KB, kOldThreshold=1MB（写死）
       - 暂不实施原因：当前无配置系统（ConfigDecl 未实现）
       - 远期改进：待 Aura 配置系统完善后再做
 
-[~] P2  对象可移动性（compacting GC）  [2026-07-18 延后]
-      - 现状：compactAndReclaim 只回收整页，不搬运对象
-      - 缺：mark-compact 算法，存活对象拷贝到新页，消除碎片
-      - 延后原因：风险过高（需更新所有引用）
-      - 与缺陷 5 合并处理
+[x] P2  对象可移动性（compacting GC）  [2026-07-23 完成]
+      - 实现：mark-compact 算法完成，存活对象拷贝到新页，消除碎片
+        computeForwardingAddresses → copyObjectsToNewLocations →
+        rebuildPageList → updateAllReferences 完整链路
+        roots_ / stack / fields / array 元素 / 协程帧 所有引用自动更新
+      - 配套：GcRootHandle（栈根）、GcGlobalRoot（全局根）、GcSharedRoot（闭包捕获）、
+        GcWeakHandle（弱引用）+ compactSuspendedCount 暂停机制
+      - 验证：见缺陷 5（complex_closure + Array 全量测试，ASAN 无报错）
+      - 文件：runtime/gc.h, runtime/gc.cpp（compact 相关方法）
+      - 对应：plan/gc_features_plan.md §十三 [x] 完成
 
 [ ] P3  并发 GC（concurrent marking）
       - 现状：GC 全程 stop-the-world
@@ -245,9 +266,12 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
       - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
       - 详见：plan/gcstring_optimization.md §三 Step 7 / §C1
 
-[x] P2  字符串字面量 Intern 池（D1）  [第四阶段] [2026-07-20 完成]
+[x] P2  字符串字面量 Intern 池（D1）  [第四阶段] [2026-07-20 完成 / 2026-07-24 修复]
       - 实现：intern_string(const char*, size_t) + g_internPool（unordered_map<string,
-        unique_ptr<GcGlobalRoot<GcString>>>）+ g_internMutex（shared_mutex）双重检查锁定
+        unique_ptr<GcGlobalRoot<GcString>>>）+ g_internMutex 双重检查锁定
+      - v2 修复（2026-07-24）：g_internMutex 从 std::shared_mutex 改为 std::mutex
+        原因：MinGW 下 std::shared_mutex 有 bug（msys2/MINGW-packages#25193），
+        lock_shared() 抛 "__ret == 0" 断言。读路径改用独占锁（find() 耗时极小）。
       - CodeGen 改造：genStringLiteral 改为生成 aura_rt::intern_string("...")
       - 收益：相同字面量只分配一次（5000 次循环 3 个字面量从 15000 次分配 → 3 次）
       - 静态对象加 [[gnu::init_priority(105)]]（v6.1 修复析构顺序崩溃）
@@ -336,3 +360,44 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
 
 [ ] P3  plan/ 中历史文档归档
       - plan1.md - plan17.md 等已完成的 plan 应移到 plan/done/ 子目录
+
+================================================================
+[ 十 ] 并发与多线程（plan/sync_thread_plan.md）
+================================================================
+
+[x] P1  sync thread 多线程语句  [2026-07-24 完成]
+      - plan：plan/sync_thread_plan.md（详细实施方案已就绪）
+      - 实现：
+          * 进程级全局线程池 + FIFO 全局队列（方案 A，见 issue 决策）
+          * 无界 sync thread 默认上限 = hardware_concurrency
+          * safepoint 三层插入：L1 分配点（已有）/ L2 循环回边 / L3 任务边界
+          * 工作线程启动时 registerThread，退出时 unregisterThread
+          * spawn 内强制 ioSync_ = true（必须用 _sync 版本）
+          * TLAB（Thread-Local Allocation Buffer）每线程独立分配缓冲，避免多线程竞争全局分配
+      - 配套修复：
+          * GC 并发数据竞争：compactSuspendedCount_/gcPending_/oomInit_ 改 atomic
+          * roots_ (unordered_set) 并发 UAF → 新增 rootsM_ 互斥锁
+          * rememberedSet_ 并发 → 新增 rememberedSetM_ 互斥锁
+          * intern_string 持锁 alloc 导致 STW 死锁 → 改为"不持锁 alloc"模式
+          * cout 无锁并发 → 新增 g_coutM 互斥锁保护 println/println_sync
+          * 线程池 ensureStarted 无锁初始化 → 用 std::call_once 保护
+          * MinGW std::shared_mutex bug → 改用 std::mutex（msys2/MINGW-packages#25193）
+          * worker 空闲时不响应 GC → cv_.wait_for 超时定期检查 gcPending_
+      - 验证：test.aura 全部 3 个测试通过，退出码 0
+        - 测试 1：基本多线程（无界）2 行 "hello from thread N"
+        - 测试 2：有界并发 max=4，10 行 "task N"
+        - 测试 3：GC 压力 max=2，100 行 "string N" + done
+        - 输出顺序有少量交错（多线程并发正常现象），无数据损坏
+      - 前置工作：循环回边 safepoint 插入（StmtGen 改动，单线程也受益）
+      - 文件：src/AST/Stmt.h, src/Parser/StmtParser.cpp,
+              src/Sema/Checker/StmtChecker.cpp, src/CodeGen/StmtGen.cpp,
+              runtime/thread_pool.h (新增), runtime/thread_pool.cpp (新增),
+              runtime/gc.h, runtime/gc.cpp, runtime/builtin/string.cpp,
+              runtime/builtin/io.cpp, runtime/builtin/io.h
+      - 后置：plan/channel_plan.md（channel<T> 跨线程通信）
+
+[ ] P3  线程池 work-stealing 任务队列（待基准测试触发）
+      - issue：plan/thread_pool_work_stealing_issue.md [2026-07-23 审核通过]
+      - 现状：sync thread v1 采用 FIFO 全局队列（方案 A）
+      - 触发条件：worker > 32 吞吐不达标 / 引入递归 spawn / CPU 密集分治为主用例
+      - 演进：方案 A → 方案 B（work-stealing），保持 ThreadPool::submit API 不变
