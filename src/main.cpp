@@ -88,10 +88,8 @@ std::string gccFlags(const CliOptions& opts) {
 // ============================================================
 int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
     // 0. 加载内置 .aurai（始终加载 io.aurai）
-    {
-        Aura::ModuleManager mgr(diag);
-        mgr.loadBuiltinAurai();
-    }
+    Aura::ModuleManager mgr(diag);
+    mgr.loadBuiltinAurai();
 
     std::string source = Aura::readFile(opts.inputPath);
     diag.setSourceView(source);
@@ -109,16 +107,44 @@ int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
         return 1;
     }
 
+    // 按需加载 import 声明的内置模块 .aurai（如 import path → 加载 path.aurai）
+    // 单文件模式下不会走 compileMultiFile 的 parseModule 流程，
+    // 因此必须在此显式扫描 ImportDecl 并加载对应 .aurai，否则 Sema 找不到命名空间
+    for (auto& d : program->decls) {
+        if (auto* imp = dynamic_cast<Aura::ImportDecl*>(d.get())) {
+            if (imp->isBuiltin) {
+                mgr.loadAuraiFile(imp->path + ".aurai");
+            }
+        }
+    }
+
     // 语义分析（尽力模式：Parser 有非致命错误也继续）
     Aura::SemAnalyzer sema(diag);
     (void)sema.analyze(*program);
+
+    // 收集 builtin import（如 import path），传递给 CodeGen 生成命名空间别名
+    // 单文件模式下不会走 compileMultiFile 的 import 收集流程，
+    // 因此必须在此显式构建 CodeGenImport 列表，否则 CodeGen 不生成 `namespace path = aura_rt::path;`
+    std::vector<Aura::CodeGenImport> cgImports;
+    for (auto& d : program->decls) {
+        if (auto* imp = dynamic_cast<Aura::ImportDecl*>(d.get())) {
+            if (imp->isBuiltin) {
+                Aura::CodeGenImport ci;
+                ci.path      = imp->path;
+                ci.alias     = imp->alias;
+                ci.isBuiltin = true;
+                ci.modName   = imp->path;  // 内置模块名即命名空间键
+                cgImports.push_back(ci);
+            }
+        }
+    }
 
     // C++ 代码生成（仅在无错误时生成可用代码）
     if (!diag.hasErrors()) {
         Aura::CodeGenerator cg(diag);
         Aura::CodeGenConfig cfg;
         cfg.setConfig(sema);
-        auto unit = cg.generate(*program, moduleName, {}, "", cfg);
+        auto unit = cg.generate(*program, moduleName, cgImports, "", cfg);
         if (diag.hasErrors()) {
             std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
             diag.print(std::cerr);

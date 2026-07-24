@@ -1,5 +1,4 @@
 #include "CodeGen.h"
-#include "../Sema/BuiltinRegistry.h"
 #include "../Sema/SemAnalyzer.h"
 #include <filesystem>
 #include <sstream>

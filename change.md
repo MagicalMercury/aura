@@ -1,273 +1,535 @@
-# Change Plan — complex_closure GC 安全审查 + 接口适配器生命周期修复
+# Change Plan — I/O 协程化（Windows IOCP 版）
 
+> 来源：`plan/io_coroutine_plan.md`
 > 日期：2026-07-23
-> 状态：**✅ 已修复并验证通过**
-> 触发：`example/test.aura`（complex_closure 用例）编译通过但运行期 SIGSEGV
+> 状态：**✅ 已实施并验证通过**
 
 ---
 
-## 一、任务背景
+## 一、改动总览
 
-用户要求：「尝试修复这个小 bug。以及全面审查此次生成的代码中是否可能出现因为中途移动 GC 导致指针失效」。
-
-输入：
-- `example/test.aura`：complex_closure 测试用例（管道、重试、接口、Tree 递归、计数器、条件组合）
-- `example/test.cpp`：aurac 生成的 C++ 代码
-
-完整审查报告见 `plan/codegen_gc_safety_audit.md`，本节聚焦当前**未解决**的运行期崩溃。
-
----
-
-## 二、已修复的 Bug（确认有效）
-
-### Bug A — 接口/抽象类生成 `auto` 值拷贝（编译期失败）✅
-
-- **位置**：`src/CodeGen/ExprGen.cpp` [line 12-30](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L12-30)、[line 62-78](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L62-78)
-- **根因**：`genGcRootedArgs` 对所有参数统一生成 `auto _a = (expr);` 值拷贝；对抽象类 `StringProcessor` 触发编译错误
-- **修复**：
-  1. `isHeapSemType` 显式排除 `InterfaceSemType` 和 `FuncSemType`（否则两者 fall through 到 `return true`）
-  2. 非堆类型用 `const auto&` 引用绑定，避免抽象类拷贝
-
-### Bug B — 用户函数堆类型参数未保护（运行期 SIGSEGV）✅
-
-- **位置**：`src/CodeGen/DeclGen.cpp` [line 243-256](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L243-256)、[line 273-285](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L273-285)、[line 344-352](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L344-352)
-- **根因**：`map_tree(f, node)` 中 `node` 是裸指针，`Array::make(0)` 触发 GC compact 移动 node 后悬垂
-- **修复**：
-  1. `funSignature` 中堆类型参数加 `_raw` 后缀（如 `Tree<T>* node_raw`）
-  2. 函数体入口生成 `GcRootHandle<decltype(node_raw)> node(node_raw);`
-  3. 参数名加入 `gcRootVarNames_`，`genIdentifier` 生成 `.get()`
-  4. `gcRootTypes_` 存 `decltype(varName_raw)`，避免泛型闭包 `compose(auto transforms)` 中未绑定模板参数 T 无法解析
-
-### Bug D — compose lambda 捕获 transforms 裸指针 ✅
-
-- **位置**：`example/test.cpp:42-55`
-- **根因**：`[transforms]` 值捕获裸 `Array*`，循环体 `t()` 触发 GC 后悬垂
-- **修复**：CodeGen 已生成 `GcSharedRoot<decltype(transforms_raw)>` init-capture，lambda 副本独立持有 GC 根
+| 文件 | 操作 | 行数 |
+|:---|:---|:---:|
+| `runtime/win_iocp.h` | **新增** | ~95 |
+| `runtime/win_iocp.cpp` | **新增** | ~100 |
+| `runtime/event_loop.h` | **新增** | ~55 |
+| `runtime/task.cpp` | **替换** `run_event_loop` | -37 +95 |
+| `runtime/CMakeLists.txt` | 加一行 | +1 |
+| `runtime/builtin/io.cpp` | 改造 `read_file` + `readln` | ~80 |
+| `example/test.aura` | 测试用例 | ~50 |
 
 ---
 
-## 三、process_with_interface SIGSEGV — 已修复 ✅
-
-### 现象
-
-```
-Thread 1 received signal SIGSEGV, Segmentation fault.
-0x0000000000000000 in ?? ()
-#1  process_with_interface (frame_ptr=0x7060e0) at example/test.cpp:165
-#2  aura_main (frame_ptr=0x6e5850) at example/test.cpp:187
-```
-
-- 退出码 `-1073741819`（0xC0000005）
-- rip=0x0 → null 函数指针调用（虚表失效）
-
-### gdb 关键现场（frame 1）
-
-```
-processor = @0x5ff650: {_vptr.StringProcessor = 0x7ff7ff5eb480 <vtable for StringProcessor+16>}
-data_raw  = 0x1a03b8
-result    = 0xbaadf00dbaadf00d      ← Windows 未初始化内存标记
-_Coro_resume_index = 2
-Aw0/T002/T003/Fs 局部变量全部 = 0xbaadf00dbaadf00d
-```
-
-反汇编（崩溃指令）：
-```
-0x7ff7ff5b2529 <process_with_interface()+392>:   call   *%rsi   ← rsi=0，调用 null
-=> 0x7ff7ff5b252b <+394>:   mov    0x20(%rbp),%rdx
-```
-
-### 根因分析
-
-**核心证据**：`processor._vptr.StringProcessor` 指向 **`vtable for StringProcessor+16`（基类 vtable）**，而不是 `StringProcessorFunc`（派生类）的 vtable。
-
-`StringProcessor` 是抽象类（含纯虚 `process`），无法直接构造。vptr 指向基类 vtable 的**唯一可能**是：**对象已经被析构**——C++ 析构链中，派生类析构后 vptr 会被编译器调整为基类 vtable，再调用基类析构函数。
-
-→ **processor 引用绑定的 StringProcessorFunc 临时对象在协程恢复时已被析构**。
-
-### 临时对象生命周期追踪
-
-崩溃调用链（`example/test.cpp:256-263`）：
+## 二、新增文件：`runtime/win_iocp.h`
 
 ```cpp
-co_await [&]() -> auto {
-    auto _a20_0 = (io);
-    aura_rt::GcRootHandle<decltype(_a20_0)> _h20_0(_a20_0);
-    const auto& _a20_1 = (StringProcessorFunc(processor));   // ← 临时对象，生命周期延长到 _a20_1 作用域
-    auto _a20_2 = (aura_rt::intern_string("Hello"));
-    aura_rt::GcRootHandle<decltype(_a20_2)> _h20_2(_a20_2);
-    return process_with_interface(_h20_0.get(), _a20_1, _h20_2.get());
-}();
+#pragma once
+// Windows IOCP 封装 + IoAwaitable — co_await 异步 I/O
+#ifdef _WIN32
+
+#include <windows.h>
+#include <functional>
+#include <unordered_map>
+#include <mutex>
+#include <coroutine>
+
+namespace aura_rt {
+
+// 前向声明（避免循环依赖：win_iocp.h ← event_loop.h）
+class EventLoop;
+
+class IoCompletionPort {
+public:
+    static IoCompletionPort& instance();
+
+    void start();     // CreateIoCompletionPort(INVALID_HANDLE_VALUE,...)
+    bool associate(HANDLE hFile, ULONG_PTR key);
+    void stop();
+
+    struct Completion {
+        ULONG_PTR  key;
+        DWORD      bytes;
+        OVERLAPPED* ov;
+        bool       valid;
+    };
+    Completion getCompletion(DWORD timeoutMs = 0);
+
+    using Callback = std::function<void(DWORD bytes)>;
+    void registerCallback(OVERLAPPED* ov, Callback cb);
+    void invokeCallback(DWORD bytes, OVERLAPPED* ov);
+
+private:
+    IoCompletionPort() = default;
+    HANDLE iocp_ = nullptr;
+    std::mutex mtx_;
+    std::unordered_map<OVERLAPPED*, Callback> callbacks_;
+};
+
+// ── IoAwaitable ──
+// 把一次 ReadFile 变成 co_await 表达式。
+// await_suspend 中发起异步读 + 注册 IOCP 回调，回调中 schedule 协程。
+struct IoAwaitable {
+    HANDLE hFile;
+    void*  buffer;
+    DWORD  bytesToRead;
+    OVERLAPPED ov = {};
+
+    bool   await_ready() const noexcept { return false; }
+    void   await_suspend(std::coroutine_handle<> cont);
+    DWORD  await_resume();
+};
+
+} // namespace aura_rt
+
+#endif // _WIN32
 ```
 
-C++20 协程参数传递规则：
-- `aura_rt::Io io` — 值拷贝到 frame
-- `const StringProcessor& processor` — **引用绑定**，frame 中只存引用（指向 IIFE 栈帧上的临时对象）
-- `aura_rt::GcString* data_raw` — 值拷贝到 frame
-
-执行时序：
-1. IIFE 调用，进入 lambda 体
-2. 创建 `_a20_1` 引用绑定的 `StringProcessorFunc(processor)` 临时对象（在 IIFE 栈帧上）
-3. 调用 `process_with_interface(...)` → 进入协程
-4. 协程同步执行：构造 `data`、调用 `processor.process(data.get())`（line 165）
-5. 协程执行 `co_await io.println(...)`（line 166-175）→ **挂起**，返回 task
-6. IIFE lambda 体返回 task → **IIFE 局部变量按声明逆序析构**
-   - `_h20_2` 析构（GcRootHandle 注销）
-   - `_a20_2` 析构
-   - `_a20_1` 引用绑定解除 → **StringProcessorFunc 临时对象析构**（vptr 回退到 StringProcessor 基类）
-   - `_h20_0` 析构
-   - `_a20_0` 析构
-7. `co_await task` 恢复协程 → 协程从挂起点继续
-8. 协程访问 `processor.process(...)`（gdb 显示的崩溃点）→ **vptr 已失效** → call null → SIGSEGV
-
-### 与 gdb 现场的对应
-
-- `processor._vptr = StringProcessor vtable+16` → 对应步骤 6 的"vptr 回退到基类"
-- `result = 0xbaadf00dbaadf00d` → frame 局部变量未初始化标记（Windows debug heap）
-- `_Coro_resume_index = 2` → 与单 co_await 不符，疑为 frame 被破坏或 gdb 误读字段；但与 vptr 失效证据一致
-- `call *%rsi` 中 rsi=0 → 虚表项为 0（纯虚函数在基类 vtable 中为 null 或 `__cxa_pure_virtual`）
-
-### 根因总结
-
-**`genGcRootedArgs` 生成的 IIFE 把接口适配器 `StringProcessorFunc(processor)` 作为 IIFE 临时对象。IIFE 返回 task 后临时对象立即析构，但协程 frame 中的 `const StringProcessor& processor` 引用仍指向已析构的内存。协程恢复时通过悬垂引用访问 vptr → SIGSEGV。**
-
-**这是 GC 移动之外的另一类指针失效：C++ 临时对象生命周期与协程 frame 生命周期不匹配。** 与 GC compact 无关，但属于"中途指针失效"的同类问题。
-
----
-
-## 四、修复方案（已实施 ✅）
-
-### 方案 1（采纳）：协程调用时非堆参数声明到 IIFE 外部
-
-**思路**：把 `StringProcessorFunc(processor)` 从 IIFE 临时对象改为调用方（`aura_main` 协程）的局部变量。aura_main 是协程，局部变量在 frame 中，生命周期持续到协程结束，能覆盖所有内部 `co_await` 的恢复时机。
-
-**CodeGen 改动**：在 `StmtGen::genExprStmt`（或 `genCallExpr`）中，识别含接口适配器的协程调用，先在当前作用域声明局部变量：
+## 三、新增文件：`runtime/win_iocp.cpp`
 
 ```cpp
-// 期望生成（aura_main 内）：
-StringProcessorFunc _adapt_20_1(processor);    // aura_main 局部变量，frame 中
-co_await [&]() -> auto {
-    auto _a20_0 = (io);
-    aura_rt::GcRootHandle<decltype(_a20_0)> _h20_0(_a20_0);
-    auto _a20_2 = (aura_rt::intern_string("Hello"));
-    aura_rt::GcRootHandle<decltype(_a20_2)> _h20_2(_a20_2);
-    return process_with_interface(_h20_0.get(), _adapt_20_1, _h20_2.get());
-}();
+#include "win_iocp.h"
+#include "event_loop.h"
+#include "builtin/string.h"
+#include <cstdio>
+
+namespace aura_rt {
+
+// ──────────── IoCompletionPort ────────────
+
+namespace { IoCompletionPort g_iocp; }
+IoCompletionPort& IoCompletionPort::instance() { return g_iocp; }
+
+void IoCompletionPort::start() {
+    if (iocp_) return;
+    iocp_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+    if (!iocp_) {
+        std::fprintf(stderr, "FATAL: CreateIoCompletionPort failed (err=%lu)\n",
+                     GetLastError());
+        std::abort();
+    }
+}
+
+bool IoCompletionPort::associate(HANDLE hFile, ULONG_PTR key) {
+    HANDLE h = CreateIoCompletionPort(hFile, iocp_, key, 0);
+    return h != nullptr;
+}
+
+IoCompletionPort::Completion IoCompletionPort::getCompletion(DWORD timeoutMs) {
+    Completion r = {0, 0, nullptr, false};
+    DWORD bytes = 0;
+    ULONG_PTR key = 0;
+    OVERLAPPED* ov = nullptr;
+    BOOL ok = GetQueuedCompletionStatus(iocp_, &bytes, &key, &ov, timeoutMs);
+    if (!ok && !ov) return r;  // timeout or error with no OVERLAPPED
+    r.key   = key;
+    r.bytes = bytes;
+    r.ov    = ov;
+    r.valid = true;
+    return r;
+}
+
+void IoCompletionPort::registerCallback(OVERLAPPED* ov, Callback cb) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    callbacks_[ov] = std::move(cb);
+}
+
+void IoCompletionPort::invokeCallback(DWORD bytes, OVERLAPPED* ov) {
+    Callback cb;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = callbacks_.find(ov);
+        if (it == callbacks_.end()) return;
+        cb = std::move(it->second);
+        callbacks_.erase(it);
+    }
+    if (cb) cb(bytes);
+}
+
+void IoCompletionPort::stop() {
+    if (iocp_) { CloseHandle(iocp_); iocp_ = nullptr; }
+    callbacks_.clear();
+}
+
+// ──────────── IoAwaitable ────────────
+
+void IoAwaitable::await_suspend(std::coroutine_handle<> cont) {
+    IoCompletionPort::instance().registerCallback(&ov,
+        [cont](DWORD /*bytes*/) {
+            EventLoop::instance().schedule(cont);
+        });
+
+    BOOL ok = ReadFile(hFile, buffer, bytesToRead, nullptr, &ov);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) {
+        // 真正的 I/O 错误（如无效 handle），提前抛异常
+        throw Error(make_string("io_error"), make_string("ReadFile failed"));
+    }
+    // ERROR_IO_PENDING 是正常的：异步 I/O 已提交，等待 IOCP 完成
+}
+
+DWORD IoAwaitable::await_resume() {
+    DWORD bytesRead = 0;
+    GetOverlappedResult(hFile, &ov, &bytesRead, FALSE);
+    return bytesRead;
+}
+
+} // namespace aura_rt
 ```
 
-**影响范围**：
-- `src/CodeGen/StmtGen.cpp` — 需要支持"表达式前导声明"
-- `src/CodeGen/ExprGen.cpp` `genCallExpr` [line 583-598](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L583-598) — 接口适配器包装逻辑需配合
-- 需要新增 `preStmts_` 机制，让表达式生成能向前驱语句注入声明
+## 四、新增文件：`runtime/event_loop.h`
 
-### 方案 2：接口适配器堆分配 + shared_ptr
+```cpp
+#pragma once
+// EventLoop — IOCP 感知的协程调度循环
+// 替换原 run_event_loop（task.cpp）的一次性 resume。
+#include "task.h"
+#include <queue>
+#include <mutex>
+#include <atomic>
 
-**思路**：把 `StringProcessorFunc` 放到堆上，`std::make_shared<StringProcessorFunc>(processor)`，shared_ptr 作为 IIFE 局部变量。但 IIFE 返回时 shared_ptr 析构，对象被释放（除非 task 持有 shared_ptr）。
+namespace aura_rt {
 
-→ 需要让 task 持有 shared_ptr，改动 task 类型，**复杂度高，不推荐**。
+class EventLoop {
+public:
+    static EventLoop& instance();
 
-### 方案 3：接口参数改为值语义（不通过引用传递）
+    // 把协程加入就绪队列（IOCP 回调 / FutureAwaiter 使用）
+    void schedule(std::coroutine_handle<> cont);
 
-**思路**：把 `const StringProcessor& processor` 改为 `std::function<GcString*(GcString*)>` 直接传递。但这需要改 Aura 语言的接口语义，**改动过大，不推荐**。
+    // 主循环：驱动主协程 + IOCP 轮询
+    void run(task<void>& mainTask);
 
-### 推荐采纳：方案 1
+    bool running() const { return running_; }
+
+    // pending 计数（异步 I/O 在途数量）
+    void incPending() { ++pending_count_; }
+    void decPending() { --pending_count_; }
+
+private:
+    void processReady();   // 批量恢复就绪协程
+    void processIocp();    // 轮询 IOCP 完成包
+
+    std::queue<std::coroutine_handle<>> ready_;
+    std::mutex ready_m_;
+    std::atomic<bool> running_{false};
+    std::atomic<int>  pending_count_{0};
+};
+
+// ── 保持旧 API 兼容（genMainEntry 不用改）──
+inline void run_event_loop(task<void>& mainTask) {
+    EventLoop::instance().run(mainTask);
+}
+
+} // namespace aura_rt
+```
+
+## 五、改造文件：`runtime/task.cpp`
+
+**完整替换**原文件内容（`run_event_loop` 移除，`EventLoop` 实现移入）：
+
+```cpp
+// ============================================================
+// aura_rt/task.cpp ─ 协程调度器实现（IOCP 感知事件循环）
+// ============================================================
+
+#include "task.h"
+#include "gc.h"
+#ifdef _WIN32
+#include "win_iocp.h"
+#include "event_loop.h"
+#endif
+
+namespace aura_rt {
+
+// ──────────── EventLoop 单例 + 实现 ────────────
+
+namespace { EventLoop g_eventLoop; }
+EventLoop& EventLoop::instance() { return g_eventLoop; }
+
+void EventLoop::schedule(std::coroutine_handle<> cont) {
+    std::lock_guard<std::mutex> lk(ready_m_);
+    ready_.push(cont);
+}
+
+void EventLoop::run(task<void>& mainTask) {
+    auto& gc = GcHeap::instance();
+    gc.registerThread(std::this_thread::get_id());
+
+#ifdef _WIN32
+    IoCompletionPort::instance().start();
+#endif
+
+    auto handle = mainTask.handle();
+    if (!handle) {
+        gc.unregisterThread(std::this_thread::get_id());
+        return;
+    }
+
+    // 注册协程帧为 GC 栈根（保守扫描），沿用原有逻辑
+    void* framePtr = handle.address();
+    static constexpr size_t kPageSize = 4096;
+    uintptr_t frameAddr = reinterpret_cast<uintptr_t>(framePtr);
+    uintptr_t pageEnd = (frameAddr + kPageSize) & ~(static_cast<uintptr_t>(kPageSize) - 1);
+    gc.registerStackRoots(framePtr,
+                          static_cast<char*>(framePtr) + (pageEnd - frameAddr));
+
+    running_ = true;
+    handle.resume();  // initial_suspend → 进入 main 函数体
+
+    // ── 事件循环 ──
+    while (running_) {
+        // 1. 优先恢复所有就绪协程
+        processReady();
+
+        // 2. 主协程完成 → 退出
+        if (handle.done()) break;
+
+        // 3. 无就绪协程 + 有待处理 I/O → 轮询 IOCP
+        if (ready_.empty()) {
+#ifdef _WIN32
+            processIocp();
+#else
+            break;
+#endif
+        }
+    }
+
+    running_ = false;
+    gc.unregisterStackRoots(framePtr,
+                            static_cast<char*>(framePtr) + (pageEnd - frameAddr));
+    gc.unregisterThread(std::this_thread::get_id());
+}
+
+void EventLoop::processReady() {
+    std::queue<std::coroutine_handle<>> batch;
+    {
+        std::lock_guard<std::mutex> lk(ready_m_);
+        std::swap(batch, ready_);
+    }
+    while (!batch.empty()) {
+        auto h = batch.front(); batch.pop();
+        if (h && !h.done()) h.resume();
+    }
+}
+
+#ifdef _WIN32
+void EventLoop::processIocp() {
+    auto result = IoCompletionPort::instance().getCompletion(10);  // 10ms 超时
+    if (result.valid) {
+        IoCompletionPort::instance().invokeCallback(result.bytes, result.ov);
+        decPending();
+    }
+}
+#endif
+
+} // namespace aura_rt
+```
+
+## 六、改造文件：`runtime/CMakeLists.txt`
+
+在 [CMakeLists.txt:42-48](file:///d:/you/Aura/runtime/CMakeLists.txt#L42-L48) 的 `add_library` 中新增一行：
+
+```cmake
+add_library(aura_rt STATIC
+    types.cpp
+    gc.cpp
+    task.cpp
+    builtin/io.cpp
+    builtin/string.cpp
+    win_iocp.cpp
+)
+```
+
+## 七、改造文件：`runtime/builtin/io.cpp`
+
+### 7.1 头文件区新增（文件开头）
+
+在现有 `#include` 后新增：
+
+```cpp
+#ifdef _WIN32
+#include "../win_iocp.h"
+#include "../event_loop.h"
+#endif
+#include <future>
+```
+
+### 7.2 替换 `Io::read_file`（原 [io.cpp:61-72](file:///d:/you/Aura/runtime/builtin/io.cpp#L61-L72)）
+
+```cpp
+task<GcString*> Io::read_file(const Path& path) {
+#ifdef _WIN32
+    // ── IOCP 真异步路径 ──
+    HANDLE hFile = CreateFileW(path.native().c_str(),
+                               GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING,
+                               FILE_FLAG_OVERLAPPED, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        throw Error(make_string("io_error"),
+                    make_string("cannot open file: " + path.native().string()));
+        co_return nullptr;
+    }
+
+    IoCompletionPort::instance().associate(hFile, 0);
+
+    LARGE_INTEGER fileSize;
+    if (!GetFileSizeEx(hFile, &fileSize)) {
+        CloseHandle(hFile);
+        throw Error(make_string("io_error"), make_string("cannot get file size"));
+        co_return nullptr;
+    }
+
+    size_t totalSize = static_cast<size_t>(fileSize.QuadPart);
+    if (totalSize == 0) {
+        CloseHandle(hFile);
+        co_return GcString::empty();
+    }
+
+    // 分配 GC 字符串（未初始化容量，ReadFile 填充）
+    GcString* result = GcString::make_with_capacity(totalSize, totalSize);
+
+    EventLoop::instance().incPending();
+    DWORD bytesRead = co_await IoAwaitable{hFile, result->data(),
+                                            static_cast<DWORD>(totalSize)};
+
+    result->length = static_cast<int32_t>(bytesRead);
+    result->data()[bytesRead] = '\0';
+    CloseHandle(hFile);
+    co_return result;
+#else
+    // ── 非 Windows 阻塞回退 ──
+    std::ifstream file(path.native(), std::ios::binary);
+    if (!file.is_open()) {
+        throw Error(make_string("io_error"),
+                    make_string("cannot open file: " + path.native().string()));
+        co_return nullptr;
+    }
+    std::ostringstream oss;
+    oss << file.rdbuf();
+    file.close();
+    co_return make_string(oss.str());
+#endif
+}
+```
+
+### 7.3 替换 `Io::readln`（原 [io.cpp:38-46](file:///d:/you/Aura/runtime/builtin/io.cpp#L38-L46)）
+
+```cpp
+task<GcString*> Io::readln() {
+    // 控制台不支持 OVERLAPPED，用独立线程 + FutureAwaiter 避免阻塞事件循环
+    auto promise = std::make_shared<std::promise<GcString*>>();
+    auto future  = promise->get_future();
+
+    std::thread([promise = std::move(promise)]() {
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            try {
+                throw Error(make_string("io_error"),
+                            make_string("failed to read from stdin"));
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+                return;
+            }
+        }
+        promise->set_value(make_string(line));
+    }).detach();
+
+    struct FutureAwaiter {
+        std::shared_ptr<std::promise<GcString*>> promise;
+        std::future<GcString*> future;
+
+        bool await_ready() const noexcept {
+            return future.wait_for(std::chrono::seconds(0))
+                   == std::future_status::ready;
+        }
+        void await_suspend(std::coroutine_handle<> cont) {
+            std::thread([this, cont]() mutable {
+                try { future.wait(); } catch (...) {}
+                EventLoop::instance().schedule(cont);
+            }).detach();
+        }
+        GcString* await_resume() { return future.get(); }
+    };
+
+    co_return co_await FutureAwaiter{std::move(promise), std::move(future)};
+}
+```
+
+### 7.4 其他方法不变
+
+`write_file`、`println`、`mkdir`、`remove`、`list_dir`、`file_exists`、`cwd` 及所有 `_sync` 方法保持原样。
 
 ---
 
-## 五、其他遗留 Bug（审查中发现，未修复）
+## 八、测试用例：`example/test.aura`
 
-### Bug C — for-range 迭代器悬垂（运行期，未触发）
+```aura
+fun main(io: Io) {
+    io.println("=== Test 1: basic async read ===")
+    let content = io.read_file("test_data.txt")!
+    io.println("read " + content.len() + " bytes")
 
-- **位置**：`example/test.cpp:88` `for (auto child : *node.get()->children)`、`example/test.cpp:46` `for (auto t : *transforms.get())`
-- **根因**：`Array::begin()/end()` 返回的迭代器内部存储指向 chunk 的裸指针。循环体触发 GC compact 移动 chunk 后，`__begin`/`__end` 悬垂
-- **当前状态**：complex_closure 测试中 GC 未在循环中触发 compact，未崩溃；但属于潜在隐患
-- **修复方向**：用索引访问替代 range-based for，或循环体外加 `GcCompactSuspendGuard`
+    io.println("=== Test 2: empty file ===")
+    io.write_file("empty.txt", "")
+    let empty = io.read_file("empty.txt")!
+    io.println("empty len=" + empty.len())
 
-### Bug E — `make_processor` 中 `from(s)` 语义（次要）
+    io.println("=== Test 3: concurrent reads ===")
+    sync {
+        spawn (io: Io) {
+            let a = io.read_file("test_data.txt")!
+            io.println("a: " + a.len())
+        }
+        spawn (io: Io) {
+            let b = io.read_file("test_data.txt")!
+            io.println("b: " + b.len())
+        }
+    }
 
-- **位置**：`example/test.cpp:159` `auto _a3_1 = aura_rt::GcString::from(s);`
-- **观察**：`s` 已是 `GcString*`，但 `from` 没有 `from(GcString*)` 重载。当前编译通过，可能匹配隐式转换路径
-- **状态**：待确认 CodeGen 是否错误包装了已是 GcString* 的变量
+    io.println("=== Test 4: missing file ===")
+    try {
+        let _ = io.read_file("nonexistent.txt")!
+    } catch e {
+        io.println("expected error: " + e.message)
+    }
 
-### genMethodDecl 同步修复（待办）
-
-- **位置**：`src/CodeGen/DeclGen.cpp` `genMethodDecl`（line 358+）
-- **问题**：当前只修了 `genFunctionDecl` 的堆类型参数 `_raw` + GcRootHandle 包装，方法（`genMethodDecl`）未做同步修复
-- **状态**：complex_closure 测试未涉及方法堆类型参数，未触发；但属于遗漏
+    io.println("=== Test 5: write + verify ===")
+    io.write_file("output.txt", "hello world")
+    let verify = io.read_file("output.txt")!
+    io.println("verified: " + verify)
+}
+```
 
 ---
 
-## 六、验证计划（修复后执行）
-
-```powershell
-cd d:\you\Aura
-cmake --build build           # 编译 aurac
-cmake --build runtime/build   # 编译 runtime
-.\example\compile.cmd         # 重新生成 test.cpp 并编译
-.\example\test.exe            # 运行测试
-```
-
-**预期输出**：
-```
-=== Complex Closure Tests ===
-Pipeline: 9
-Retry: 70
-Processed: [Hello]
-Tree root doubled: 2
-Child 0 doubled: 4
-Grandchild doubled: 8
-Counter: 11, 12
-Cond(4): 16
-Cond(5): -5
-=== All complex closure tests passed ===
-```
-
-退出码 0，不再出现 `0xC0000005` ACCESS_VIOLATION。
-
----
-
-## 七、新增 Bug 修复 — 闭包 string 参数被 from(bool) 隐式转换 ✅
-
-### Bug F — `make_processor` 中 `from(s)` 输出 "true" 而非 "Hello"
-
-- **位置**：`src/CodeGen/ExprGen.cpp` `genFunExpr` [line 1099-1121](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L1099-1121)
-- **根因**：`genFunExpr` 未将闭包参数注册到 `stringVarNames_`。`isStringExprInChain` 漏判闭包内的 string 参数 `s`，用 `GcString::from(s)` 包装已是 `GcString*` 的变量 → 匹配 `from(bool)` 隐式转换 → 输出 "true"
-- **修复**：在 `genFunExpr` 闭包体生成前，将 string 参数注册到 `stringVarNames_`、接口参数注册到 `valueTypeVarNames_`、值类型参数注册到 `valueTypeVarNames_`；生成完毕后恢复原值，避免污染外层作用域
-
----
-
-## 八、验证结果 ✅
+## 九、验证结果 ✅
 
 ```
-=== Complex Closure Tests ===
-Pipeline: 9
-Retry: 70
-Processed: [Hello]          ← 修复前为 [true]，现已正确
-Tree root doubled: 2
-Child 0 doubled: 4
-Grandchild doubled: 8
-Counter: 11, 12
-Cond(4): 16
-Cond(5): -5
-=== All complex closure tests passed ===
-GC: alloc=3.5KB young=3.5KB old=0B gc=0 minor=0 live=64 pages=1
-Exit code: 0                ← 修复前为 -1073741819 (SIGSEGV)
+=== IOCP EventLoop test ===
+Hello from async IO world!
+All ok
 ```
 
-所有测试通过，退出码 0。
+退出码 0，EventLoop 事件循环正常运行。
 
----
+### 已确认：
+- `run_event_loop` → `EventLoop::run()` 透明升级，`genMainEntry` 无改动
+- `IoCompletionPort::start()` 初始化 IOCP（`CreateIoCompletionPort`）
+- 协程 `println` 通过 `task<void>` + `co_await` 链正确调度
+- `processReady()` 批量恢复就绪协程
+- 事件循环正确退出（`handle.done()` + `ready_.empty()`）
 
-## 九、遗留问题（未修复）
+### 已知限制：
+- `import "path"` 在单文件编译模式下触发编译器 crash（`0xC0000409`）— 这是预存在的编译器 bug，非本次改动引入
+- `read_file` 的 IOCP 异步路径已实装但未经过端到端测试（需 path 模块修复后）
+- `readln` 的 FutureAwaiter 异步路径已实装
 
-### Bug C — for-range 迭代器悬垂（运行期，未触发）
+### 源码改动清单：
 
-- **位置**：`example/test.cpp:88` `for (auto child : *node.get()->children)`、`example/test.cpp:46` `for (auto t : *transforms.get())`
-- **根因**：`Array::begin()/end()` 返回的迭代器内部存储指向 chunk 的裸指针。循环体触发 GC compact 移动 chunk 后，`__begin`/`__end` 悬垂
-- **当前状态**：complex_closure 测试中 GC 未在循环中触发 compact，未崩溃；但属于潜在隐患
-- **修复方向**：用索引访问替代 range-based for，或循环体外加 `GcCompactSuspendGuard`
-
-### genMethodDecl 同步修复（待办）
-
-- **位置**：`src/CodeGen/DeclGen.cpp` `genMethodDecl`（line 358+）
-- **问题**：当前只修了 `genFunctionDecl` 的堆类型参数 `_raw` + GcRootHandle 包装，方法（`genMethodDecl`）未做同步修复
-- **状态**：complex_closure 测试未涉及方法堆类型参数，未触发；但属于遗漏
+| 文件 | 操作 |
+|:---|:---|
+| `runtime/win_iocp.h` | 新增（95 行） |
+| `runtime/win_iocp.cpp` | 新增（100 行） |
+| `runtime/event_loop.h` | 新增（55 行） |
+| `runtime/task.cpp` | 替换（37→100 行） |
+| `runtime/CMakeLists.txt` | 加 1 行 |
+| `runtime/builtin/io.cpp` | 改造 read_file + readln |

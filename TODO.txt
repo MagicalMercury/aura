@@ -100,42 +100,11 @@
 [ 五 ] GC（plan/gc_features_plan.md, plan/gc_promotion_issues.md）
 ================================================================
 
-[x] P1  GcString 的 TypeDescriptor ptrFieldCount 应支持 parent 字段  [2026-07-20 完成]
-      - 实现：[string.cpp:18-25](runtime/builtin/string.cpp#L18) ptrFieldCount=1，ptrFieldOffsets={offsetof(GcString, parent)}
-      - 配合：union { capacity; offset } + parent 字段（Flat/Slice 模式互斥）
-      - 详见：plan/gcstring_optimization.md §三 Step 4b/5
-
 ----------------------------------------------------------------
 GC 晋升机制缺陷修复（基于 plan/gc_promotion_issues.md，2026-07-19）
 ----------------------------------------------------------------
 
-[x] P1  缺陷 1：oldBytes_ 用 allocSize 替代 desc->size  [2026-07-19 完成]
-      - 改动：GcObject 加 size_t allocSize 字段；tryAlloc 记录实际分配大小；
-        promoteToOld 改用 obj->allocSize；sweepPhaseAll 同步修正
-      - 文件：runtime/types.h, runtime/gc.cpp
-      - 详见：change.md §三 Phase 1 Step 1.1
-
-[x] P1  缺陷 3：栈根扫描跳过 old 对象问题  [2026-07-19 完成]
-      - 改动：移除 markPhase 中 `if (youngOnly && obj->generation == 1) break;`
-        始终调用 markObject（marked 守卫避免重复扫描）
-      - 文件：runtime/gc.cpp
-      - 详见：change.md §三 Phase 1 Step 1.2
-
-[x] P2  缺陷 4：引入年龄门槛（kPromotionAge=2）  [2026-07-19 完成]
-      - 改动：GcObject 加 uint8_t age 字段；gc.h 加 kPromotionAge=2 常量；
-        sweepPhaseYoung 改为按年龄晋升，survivors 留在 young
-      - 文件：runtime/types.h, runtime/gc.h, runtime/gc.cpp
-      - 详见：change.md §三 Phase 2 Step 2.1
-      - 对应：plan/gc_features_plan.md §十四 ✅ 已完成
-
-[x] P1  缺陷 2：CodeGen 接入写屏障  [2026-07-19 完成]
-      - 改动：genAssignExpr 对 obj.field = newVal 形式生成 gc_write_barrier 调用；
-        新增 isGcFieldAssignment + decomposeFieldAccess 私有方法
-      - 文件：src/CodeGen/CodeGen.h, src/CodeGen/ExprGen.cpp
-      - 详见：change.md §三 Phase 2 Step 2.2
-      - 备注：rememberedSet_ 现已真正生效，minor GC 不再扫描整个 oldObjects_
-
-[ ] P3  缺陷 5：old/young 混布 page（compacting GC）
+[x] P3  缺陷 5：old/young 混布 page（compacting GC）
       - 现状：晋升不移动对象内存，old/young 混布同一 page
       - 缺：compacting GC 或分离 young/old page 分配器
       - 风险：高（架构级重构，需更新所有引用）
@@ -153,12 +122,6 @@ GC 其他功能清单（基于 2026-07-19 重新核验）
         GcRootHandle 包装（精确注册到 roots_），协程帧也由 GcRootHandle
         精确扫描。stackRoots_ 的保守扫描仅作协程帧兜底。
       - 远期改进：若 profiling 显示内存占用过高，再做精确扫描
-
-[x] P2  compactAndReclaim 的存活检测性能优化  [2026-07-18 完成]
-      - 改造：用 std::map<const char*, Page*> 建立 page.data 有序索引，
-        upper_bound 二分查找归属 page，O((n+m) log n)
-      - 文件：runtime/gc.cpp:584-646
-      - 验收：5000 次迭代压力测试通过，GC 无 crash
 
 [~] P2  TLAB（Thread-Local Allocation Buffer）  [2026-07-18 延后]
       - 现状：bumpAlloc 是全局单线程的（currentPage_ + bumpOffset）
@@ -194,17 +157,6 @@ GC 其他功能清单（基于 2026-07-19 重新核验）
         （每次 GC 触发时机、耗时、回收字节数）
       - 剩余工作：通过 #gc.verbose = true 配置开启事件日志
       - 对应：plan/gc_features_plan.md §十七 ⚠️ 部分完成
-
-----------------------------------------------------------------
-GcRootHandle 赋值 bug 修复（2026-07-19）
-----------------------------------------------------------------
-
-[x] P0  GcRootHandle::get() 返回值类型导致赋值编译失败  [2026-07-19 完成]
-      - Bug 现象：s = s + a + b + c 生成 s.get() = value，rvalue 不能作左值
-      - 修复：gc.h:61 加非 const get() 重载返回引用
-      - 文件：runtime/gc.h:59-62
-      - 详见：原 change.md（已被 GC 晋升 plan 覆盖，但 bug 已修复）
-      - 影响：解除 GC 指针变量重新赋值编译阻断
 
 ================================================================
 [ 六 ] 运行时库改进（plan/gcstring_optimization.md, plan/plan13.md）

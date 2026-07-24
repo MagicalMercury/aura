@@ -8,13 +8,11 @@
 //   builtin/*.aurai（Phase 4）— Io/Path 模块接口声明
 // ============================================================
 
-#include "SemType.h"
 #include "../AST/Stmt.h"
 #include "../AST/Type.h"
 #include <cstdint>
 #include <set>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <vector>
 

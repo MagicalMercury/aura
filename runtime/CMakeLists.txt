@@ -45,6 +45,7 @@ add_library(aura_rt STATIC
     task.cpp
     builtin/io.cpp
     builtin/string.cpp
+    win_iocp.cpp
 )
 
 target_include_directories(aura_rt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

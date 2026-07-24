@@ -195,7 +195,9 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     }
 
     // 跟踪值类型变量（如 Path，用 . 而非 ->）
-    if (!init.empty() && (
+    // 排除 GC 堆指针类型：content=io.read_file(...) 的 init 是 IIFE 包装，
+    // 内部可能包含 path::new_(...)，但不能因此把 GcString* 类型的 content 误判为值类型
+    if (!gcRootVarNames_.count(varName) && !init.empty() && (
         init.find("path::") != std::string::npos ||
         init.find("Path(") != std::string::npos)) {
         valueTypeVarNames_.insert(varName);
@@ -484,10 +486,18 @@ void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
     }
 
     // 2. 推断结果类型
+    // 优先用 SemType 推导（避免 decltype(initExpr) 中嵌套 lambda 在未求值上下文无法捕获变量）
     std::string initExpr = genExpr(*setupLet->initializer, false);
-    std::string resultType = setupLet->type
-        ? mapType(*setupLet->type)
-        : "decltype(" + initExpr + ")";
+    std::string resultType;
+    if (setupLet->type) {
+        resultType = mapType(*setupLet->type);
+    } else if (setupLet->initializer && setupLet->initializer->inferredType) {
+        resultType = mapSemType(*setupLet->initializer->inferredType);
+    }
+    if (resultType.empty() || resultType == "auto") {
+        // 退化：无法从 SemType 推导，用 decltype（仅在 initExpr 不含 lambda 时安全）
+        resultType = "decltype(" + initExpr + ")";
+    }
     std::string varName = safeName(setupLet->name);
     std::string cv = safeName(stmt.catchVar);
 
@@ -513,6 +523,12 @@ void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
     cpp << indentStr() << "if (std::holds_alternative<aura_rt::Error>(_try)) {\n";
     indentLevel_++;
     writeLine(cpp, "auto& " + cv + " = std::get<aura_rt::Error>(_try);");
+    // GC 安全：variant 中的 Error 是值嵌入的，GC 不知道其内部结构，
+    // 不会自动更新 kind/message/extra 指针。用 GcRootHandle 保护，
+    // catchBody 中若有 co_await 触发 GC compact，指针会被自动更新。
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".kind)> _eh_kind(" + cv + ".kind);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".message)> _eh_msg(" + cv + ".message);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".extra)> _eh_extra(" + cv + ".extra);");
     valueTypeVarNames_.insert(cv);
     if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine);
     valueTypeVarNames_.erase(cv);
@@ -539,9 +555,17 @@ void CodeGenerator::genTryCatchRaw(std::ostream& cpp,
     if (stmt.tryBody) genBlock(cpp, *stmt.tryBody, isCoroutine);
     std::string cv = safeName(stmt.catchVar);
     cpp << indentStr() << "} catch (aura_rt::Error& " << cv << ") {\n";
+    indentLevel_++;
+    // GC 安全：Error 在 C++ 异常存储区中（非 GC 堆），GC compact 不会自动更新
+    // 其内部的 GcString* 指针（kind/message/extra）。用 GcRootHandle 持有这些指针的地址，
+    // GC compact 时会通过 roots_ 更新它们，防止 catchBody 中访问悬垂指针。
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".kind)> _eh_kind(" + cv + ".kind);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".message)> _eh_msg(" + cv + ".message);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".extra)> _eh_extra(" + cv + ".extra);");
     valueTypeVarNames_.insert(cv);
     if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, false);
     valueTypeVarNames_.erase(cv);
+    indentLevel_--;
     cpp << indentStr() << "}\n";
 }
 

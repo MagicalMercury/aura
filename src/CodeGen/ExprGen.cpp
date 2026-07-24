@@ -655,8 +655,9 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         if (id->name == "io") isIoCall = true;
     }
 
-    // #io.sync = true：所有 IO 方法统一加 _sync 后缀，提前返回
-    if (isIoCall && ioSync_) {
+    // #io.sync = true 或非协程上下文：所有 IO 方法统一加 _sync 后缀，提前返回
+    // 非协程上下文（如 try/catch 协程安全模式的 IIFE）不能用 co_await，必须走同步版本
+    if (isIoCall && (ioSync_ || !isCoroutine)) {
         std::vector<std::string> syncArgExprs;
         for (size_t i = 0; i < e.args.size(); ++i)
             syncArgExprs.push_back(genExpr(*e.args[i], false));
@@ -689,8 +690,11 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
     // 判断是命名空间限定下的构造调用：math.Pair(...) → math::Pair_ctor(...)
     // 检查条件：对象是导入的命名空间 + (方法名是本地注册的堆类型 或 以大写开头(跨模块类型))
     bool isNsCtor = false;
+    // isNs：receiver 是导入的命名空间别名（如 path、io），不应作为表达式参与 GcRootedArgs 包装
+    bool isNs = false;
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
         if (importNsNames_.count(id->name)) {
+            isNs = true;
             if (registeredTypes_.count(e.method) && registeredTypes_[e.method]) {
                 isNsCtor = true;
             } else if (!e.method.empty() && std::isupper(static_cast<unsigned char>(e.method[0]))) {
@@ -751,8 +755,10 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         raw << ")";
         return raw.str();
     };
-    if (isIoCall || isNsCtor) {
-        // 用 genGcRootedArgs 包装参数（obj 是值类型，不参与包装）
+    if (isIoCall || isNsCtor || isNs) {
+        // 用 genGcRootedArgs 包装参数（obj 是值类型/命名空间，不参与包装）
+        // isNs：path.new(...) / math.abs(...) 等，receiver 是 namespace 别名，
+        // 不能作为表达式求值（不能 `const auto& x = (path);`），必须直接用 obj 名字生成 obj::method(...)
         std::vector<std::pair<std::string, const SemType*>> ioArgs;
         for (size_t i = 0; i < e.args.size(); ++i)
             ioArgs.push_back({mArgExprs[i], e.args[i]->inferredType});
