@@ -13,6 +13,7 @@
 #include "builtin/array.h"
 #include "builtin/sync.h"
 #include "builtin/channel.h"
+#include "builtin/mutex.h"
 
 #include <functional>
 #include <ranges>

@@ -51,6 +51,8 @@ void CodeGenerator::genStmt(std::ostream& cpp, const Stmt& stmt,
         { genSyncForStmt(cpp, *sf, isCoroutine); return; }
     if (auto* sp = dynamic_cast<const SpawnStmt*>(&stmt))
         { genSpawnStmt(cpp, *sp, isCoroutine); return; }
+    if (auto* l = dynamic_cast<const LockStmt*>(&stmt))
+        { genLockStmt(cpp, *l, isCoroutine); return; }
     if (auto* m = dynamic_cast<const MatchStmt*>(&stmt))
         { genMatchStmt(cpp, *m, isCoroutine); return; }
     if (auto* e = dynamic_cast<const ExprStmt*>(&stmt))
@@ -77,8 +79,14 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                 && !typeAliasTemplateParams_.count(baseName))
                 type = rs->canonicalName + "*";
         } else if (auto* gs = dynamic_cast<const GenericSemType*>(decl.inferredType)) {
-            if (!gs->resolvedName.empty())
+            if (!gs->resolvedName.empty()) {
                 type = gs->resolvedName + "*";
+            } else if (auto* ti = BuiltinRegistry::get().findType(gs->name)) {
+                // BuiltinPrim::Other 类型无显式类型标注时（如 let m = sync.Mutex()）
+                // 用 BuiltinRegistry.cppType（如 "aura_rt::Mutex*"）
+                // channel<T> 仍要求显式类型标注（需要模板参数）
+                type = ti->cppType;
+            }
         } else if (auto* ls = dynamic_cast<const ListSemType*>(decl.inferredType)) {
             type = mapSemType(*ls);
         } else if (auto* ps = dynamic_cast<const PrimSemType*>(decl.inferredType)) {
@@ -820,6 +828,29 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
     for (auto& v : freeVars)
         cpp << safeName(v) << ", ";
     cpp << "io, _tasks));\n";
+}
+
+// ============================================================
+// lock 语句：lock (lockExpr) { body }
+//
+// v1.0 仅 Mutex 分支：生成 RAII guard，生命周期限制在块作用域内。
+// _guard 构造时 acquire（m->lock()），析构时 release（m->unlock()）。
+// 块结束自动 unlock，无需用户手动操作，且禁止跨函数持有锁。
+//
+// 注意：lock 块内强制 isCoroutine=false（同步执行）。
+//       v1.0 简化：lock 块内调用 io 异步方法需用户自行用 _sync 版本。
+// ============================================================
+void CodeGenerator::genLockStmt(std::ostream& cpp, const LockStmt& stmt,
+                                  bool /*isCoroutine*/) {
+    std::string lockExpr = stmt.lockExpr ? genExpr(*stmt.lockExpr, false) : "";
+
+    cpp << indentStr() << "{\n";
+    indentLevel_++;
+    writeLine(cpp, "auto _guard = aura_rt::__acquire_lock(" + lockExpr + ");");
+    if (stmt.body) genBlock(cpp, *stmt.body, false);
+    // _guard 在块结束析构，自动 unlock
+    indentLevel_--;
+    cpp << indentStr() << "}\n";
 }
 
 // ============================================================

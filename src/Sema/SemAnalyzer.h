@@ -106,6 +106,7 @@ private:
     void checkSyncStmt(const SyncStmt& stmt);
     void checkSyncForStmt(const SyncForStmt& stmt);
     void checkSpawnStmt(const SpawnStmt& stmt);
+    void checkLockStmt(const LockStmt& stmt);   // lock (m) { } 块语句
     void checkExprStmt(const ExprStmt& stmt);
 
     // ============ 表达式类型推断 ============
@@ -142,6 +143,7 @@ private:
     bool insideLoop_ = false; // break/continue 仅在循环内合法
     bool insideSync_ = false; // spawn 仅在 sync 块内合法
     bool inSyncThreadBlock_ = false;  // sync thread 块内（禁止嵌套 / 无参 spawn）
+    bool inLockBlock_ = false;        // lock 块内（禁止 return/break/continue 跨出）
     int  insideTry_  = 0;    // try 块嵌套深度（>0 时 ! 不报 non-throwing）
 
     // ============ 递归类型解析 ============

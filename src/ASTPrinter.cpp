@@ -359,6 +359,13 @@ void SyncForStmt::print(std::ostream& os, int indent) const {
     if (body) body->print(os, indent + 1);
 }
 
+void LockStmt::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "LockStmt\n";
+    if (lockExpr) lockExpr->print(os, indent + 1);
+    if (body) body->print(os, indent + 1);
+}
+
 void SpawnStmt::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << "SpawnStmt" << '\n';

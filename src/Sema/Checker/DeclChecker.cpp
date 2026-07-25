@@ -171,6 +171,12 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
         if (!n->namespacePrefix.empty())
             fullName = n->namespacePrefix[0] + "." + n->name;
         auto result = resolveNamedType(fullName);
+        // sync 命名空间限定的内置类型（如 sync.Mutex）：
+        // BuiltinRegistry 中只注册 "Mutex"，需用 n->name 再查一次
+        if (dynamic_cast<const ErrorSemType*>(result.get()) &&
+            n->namespacePrefix.size() == 1 && n->namespacePrefix[0] == "sync") {
+            result = resolveNamedType(n->name);
+        }
         // 未找到类型 → 报错（Io/Path 为内置能力类型，由 CodeGen 注册）
         if (dynamic_cast<const ErrorSemType*>(result.get()) &&
             fullName != "None" && fullName != "int" && fullName != "float" &&

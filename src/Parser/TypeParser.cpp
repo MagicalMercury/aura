@@ -97,11 +97,13 @@ std::unique_ptr<TypeExpr> Parser::parsePrimaryType() {
     // 命名类型，可能是泛型实例化: Name<T> 或 Name<A, B>
     // 也可能是命名空间限定: ns.Name<T>
     // None 也是合法的类型名
-    if (check(TokType::Identifier) || check(TokType::None)) {
+    // sync 是关键字但在类型上下文作为伪模块名（如 sync.Mutex）
+    if (check(TokType::Identifier) || check(TokType::None) || check(TokType::Sync)) {
         auto& tok = advance();
         auto n = std::make_unique<NamedType>();
         setNodePos(n.get(), tok);
-        n->name = tok.lexeme;
+        // sync 关键字在类型位置作为伪模块名 "sync"
+        n->name = (tok.type == TokType::Sync) ? "sync" : tok.lexeme;
 
         // 解析命名空间前缀: a.b.c.Name → prefix = [a, b, c], name = Name
         while (match(TokType::Dot)) {

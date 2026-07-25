@@ -105,6 +105,10 @@ void SemAnalyzer::checkReturnStmt(const ReturnStmt& stmt) {
             error(*stmt.expr, "return type mismatch: expected '" + currentReturnType_->toString() + "', got '" + typeStore_.back()->toString() + "'");
         }
     }
+    // L3: lock 块内禁止 return 跨出
+    if (inLockBlock_) {
+        error(stmt, "cannot return out of lock block");
+    }
     // 无表达式的 return 允许（void 等价）
 }
 
@@ -297,6 +301,12 @@ void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
         return;
     }
 
+    // L6: lock 块内禁止 spawn（spawn 不应持锁）
+    if (inLockBlock_) {
+        error(stmt, "cannot spawn inside lock block");
+        return;
+    }
+
     // R3: sync thread 块内的 spawn 必须显式传参（避免隐式捕获导致数据竞争）
     if (inSyncThreadBlock_ && stmt.params.empty()) {
         error(stmt, "spawn in sync thread must have explicit params"
@@ -333,6 +343,44 @@ void SemAnalyzer::checkExprStmt(const ExprStmt& stmt) {
     if (stmt.expr) {
         auto _ = inferExpr(*stmt.expr);
     }
+}
+
+// ============================================================
+// lock (lockExpr) { body }
+//
+// v1.0 仅支持 Mutex*。lockExpr 求值后须为 Mutex 类型。
+// 进入 body 时设置 inLockBlock_=true，由 checkReturnStmt /
+// checkStmt(break/continue) / checkSpawnStmt 检测 L3/L6 违规。
+// ============================================================
+void SemAnalyzer::checkLockStmt(const LockStmt& stmt) {
+    // L1: lockExpr 类型检查（v1.0 仅允许 Mutex*）
+    if (stmt.lockExpr) {
+        auto lockTy = inferExpr(*stmt.lockExpr);
+        if (!lockTy) {
+            error(*stmt.lockExpr, "cannot infer lock expression type");
+            return;
+        }
+        // Mutex 在 BuiltinRegistry 注册为 BuiltinPrim::Other，
+        // Sema 推断后为 GenericSemType(name="Mutex")（与 channel 一致）
+        bool isMutex = false;
+        if (auto* gs = dynamic_cast<const GenericSemType*>(lockTy.get())) {
+            if (gs->name == "Mutex") isMutex = true;
+        }
+        if (!isMutex) {
+            error(*stmt.lockExpr,
+                "lock requires sync.Mutex, got '" + lockTy->toString() + "'");
+            return;
+        }
+        // 标注 lockExpr 的 inferredType（供 CodeGen 读取）
+        const_cast<ASTNode*>(stmt.lockExpr.get())->inferredType = lockTy.get();
+        typeStore_.push_back(std::move(lockTy));
+    }
+
+    // 进入 lock 块：设置标志，检查 body
+    bool oldInLock = inLockBlock_;
+    inLockBlock_ = true;
+    if (stmt.body) checkBlock(*stmt.body);
+    inLockBlock_ = oldInLock;
 }
 
 } // namespace Aura

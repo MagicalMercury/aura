@@ -396,6 +396,29 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
               runtime/builtin/io.cpp, runtime/builtin/io.h
       - 后置：plan/channel_plan.md（channel<T> 跨线程通信）
 
+[ ] P2  sync 锁族 + lock 块语句（统一语法）  [2026-07-24 plan 审核通过]
+      - plan：plan/mutex_plan.md
+      - 方案：C（统一 lock 块语句，禁止跨函数持有锁）
+      - 语法（统一）：
+          lock (m) { ... }          # Mutex 独占（v1.0）
+          lock (rw.r()) { ... }     # RWMutex 读（v1.1）
+          lock (rw.w()) { ... }     # RWMutex 写（v1.1）
+          lock (once) { ... }       # Once 一次性执行（v1.1）
+          lock (wg) { ... }         # WaitGroup 登记（v1.1）
+      - 分期：
+          v1.0: sync.Mutex + LockStmt AST/Parser/Sema/CodeGen 全链路
+          v1.1: RWMutex + Once + WaitGroup（复用 LockStmt，零 AST 改动）
+      - 关键设计：
+          * 间接指针持有同步原语（std::mutex 不可移动，规避 compact memcpy 损坏）
+          * 终结器释放间接原语（复用现有 GC finalizer 机制）
+          * RWMutex 用 mutex+cv 模拟（规避 MinGW shared_mutex bug）
+      - 依赖：sync thread 实施完成 ✅
+      - 文件：runtime/builtin/mutex.h(新增), mutex.cpp(新增),
+              src/AST/Stmt.h, src/Parser/StmtParser.cpp,
+              src/Sema/Checker/StmtChecker.cpp, src/Sema/BuiltinRegistry.h,
+              src/CodeGen/StmtGen.cpp, src/CodeGen/ExprGen.cpp
+      - 细粒度锁：record 内嵌 mu / 分段锁 / per-object 锁（远期）
+
 [ ] P3  线程池 work-stealing 任务队列（待基准测试触发）
       - issue：plan/thread_pool_work_stealing_issue.md [2026-07-23 审核通过]
       - 现状：sync thread v1 采用 FIFO 全局队列（方案 A）

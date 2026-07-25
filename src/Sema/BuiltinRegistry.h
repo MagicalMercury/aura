@@ -215,6 +215,7 @@ private:
             {"Io",     {"Io",     false, true, BuiltinPrim::Other,    "aura_rt::Io"}},
             {"Path",   {"Path",   false, true, BuiltinPrim::Other,    "aura_rt::Path"}},
             {"channel",{"channel",true,  true, BuiltinPrim::Other,    "aura_rt::Channel*"}},
+            {"Mutex",  {"Mutex",  true,  true, BuiltinPrim::Other,     "aura_rt::Mutex*"}},
         };
 
         // ============================================================
@@ -262,6 +263,8 @@ private:
             // path.new / path.join 不再硬编码，由 builtins/path.aurai 按需加载
             // channel 构造函数
             {"channel", {{"cap", "int"}},  ReturnTypeInfo::Named("channel")},
+            // sync.Mutex 构造函数（无参数，返回 Mutex*）
+            {"sync.Mutex", {}, ReturnTypeInfo::Named("Mutex")},
             // GC 内建函数
             {"gc_force", {}, ReturnTypeInfo::None()},
             {"gc_stats", {}, ReturnTypeInfo::Named("string")},

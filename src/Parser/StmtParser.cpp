@@ -22,12 +22,20 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
     if (check(TokType::Throw))    return parseThrowStmt();
     if (check(TokType::Try))      return parseTryCatchStmt();
     if (check(TokType::Sync)) {
-        // lookahead：sync for 还是 sync？
+        // lookahead：sync for → sync for；sync . → 表达式（如 sync.Mutex()）；其他 → sync 块
         if (peekNext().type == TokType::For)
             return parseSyncForStmt();
+        if (peekNext().type == TokType::Dot)
+            return parseExprStmt();  // sync.Mutex() 作为表达式语句
         return parseSyncStmt();
     }
     if (check(TokType::Spawn))    return parseSpawnStmt();
+    // lock 软关键字：语句起始位置 + 后续 '(' 时识别为 LockStmt
+    // 其他位置仍是普通标识符（如 let lock = ...）
+    if (check(TokType::Identifier) && peek().lexeme == "lock"
+        && peekNext().type == TokType::LParen) {
+        return parseLockStmt();
+    }
     if (check(TokType::Match))    return parseMatchStmt();
     if (check(TokType::Break))    {
         auto tok = advance();
@@ -239,7 +247,12 @@ std::unique_ptr<Stmt> Parser::parseSpawnStmt() {
 
     while (!check(TokType::RBrace) && !atEnd()) {
         auto s = parseStmt();
-        if (s) stmt->body.push_back(std::move(s));
+        if (s) {
+            stmt->body.push_back(std::move(s));
+        } else {
+            // 错误恢复：同步到下一个安全恢复点，避免死循环
+            synchronize();
+        }
     }
 
     consume(TokType::RBrace, "expected '}' after spawn body");
@@ -256,6 +269,22 @@ std::unique_ptr<Stmt> Parser::parseSpawnStmt() {
         consume(TokType::RParen, "expected ')' after spawn arguments");
     }
 
+    return stmt;
+}
+
+// lock (lockExpr) { body }
+// lock 是软关键字：仅在语句起始位置 + 后续 '(' 时识别为 LockStmt
+// 其他位置（如 let lock = ...）仍作为普通标识符
+std::unique_ptr<Stmt> Parser::parseLockStmt() {
+    auto tok = advance();  // consume 'lock' 标识符
+    auto stmt = std::make_unique<LockStmt>();
+    setNodePos(stmt.get(), tok);
+
+    consume(TokType::LParen, "expected '(' after lock");
+    stmt->lockExpr = parseExpr();
+    consume(TokType::RParen, "expected ')' after lock expression");
+
+    stmt->body = parseBlock();
     return stmt;
 }
 

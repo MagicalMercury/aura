@@ -230,6 +230,20 @@ struct SyncStmt : Stmt {
     }
 };
 
+// lock (lockExpr) { body } — 互斥锁块语句（v1.0 仅 Mutex）
+struct LockStmt : Stmt {
+    std::unique_ptr<ASTNode> lockExpr;   // 锁表达式，求值为 Mutex*
+    std::unique_ptr<BlockStmt> body;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<LockStmt>();
+        if (lockExpr) n->lockExpr = lockExpr->clone();
+        if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
 struct SpawnStmt : Stmt {
     std::vector<Param> params;                     // spawn 参数列表（显式传参）
     std::vector<std::unique_ptr<ASTNode>> args;    // 可选的显式实参（异名时使用）

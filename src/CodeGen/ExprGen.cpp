@@ -646,6 +646,14 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
 }
 
 std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCoroutine) {
+    // sync.Mutex() 构造特殊处理：sync 是内置伪模块，非真实对象
+    // 解析为 MethodCallExpr(object=Identifier("sync"), method="Mutex")
+    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+        if (id->name == "sync" && e.method == "Mutex" && e.args.empty()) {
+            return "aura_rt::make_mutex()";
+        }
+    }
+
     std::string obj = genExpr(*e.object, isCoroutine);
     std::ostringstream oss;
 

@@ -311,6 +311,7 @@ private:
     void genTryCatchRaw(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
     void genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt, bool isCoroutine);
     void genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt);  // sync thread 内的 spawn
+    void genLockStmt(std::ostream& cpp, const LockStmt& stmt, bool isCoroutine);  // lock (m) { }
     void genMatchStmt(std::ostream& cpp, const MatchStmt& stmt, bool isCoroutine);
     void genExprStmt(std::ostream& cpp, const ExprStmt& stmt, bool isCoroutine);
 

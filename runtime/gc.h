@@ -52,7 +52,10 @@ public:
     GcRootHandle(T& ref);
     ~GcRootHandle();
 
-    GcRootHandle(const GcRootHandle&) = delete;
+    // 允许拷贝：新 GcRootHandle 注册独立 GC 根，ptr_ 指向同一栈地址
+    // 安全前提：原 GcRootHandle 的生命周期覆盖拷贝的生命周期
+    // （sync thread 的 waitGroup 保证 worker 任务完成前主线程栈稳定）
+    GcRootHandle(const GcRootHandle& other);
     GcRootHandle& operator=(const GcRootHandle&) = delete;
 
     // 更新被包装的引用目标（用于移动赋值后）
@@ -455,6 +458,15 @@ GcRootHandle<T>::GcRootHandle(T& ref) : ptr_(&ref) {
 template <typename T>
 GcRootHandle<T>::~GcRootHandle() {
     if (ptr_) GcHeap::instance().unregisterRoot(
+        reinterpret_cast<GcRootHandle<GcObject*>*>(this));
+}
+
+// 拷贝构造：新 GcRootHandle 注册独立 GC 根，ptr_ 指向同一栈地址
+// 安全前提：原 GcRootHandle 的生命周期覆盖拷贝的生命周期
+// （sync thread 的 waitGroup 保证 worker 任务完成前主线程栈稳定）
+template <typename T>
+GcRootHandle<T>::GcRootHandle(const GcRootHandle& other) : ptr_(other.ptr_) {
+    GcHeap::instance().registerRoot(
         reinterpret_cast<GcRootHandle<GcObject*>*>(this));
 }
 

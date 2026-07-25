@@ -65,6 +65,7 @@ private:
     std::unique_ptr<Stmt> parseSyncStmt();
     std::unique_ptr<Stmt> parseSyncForStmt();
     std::unique_ptr<Stmt> parseSpawnStmt();
+    std::unique_ptr<Stmt> parseLockStmt();   // lock (m) { } 块语句
     std::unique_ptr<Stmt> parseMatchStmt();
     std::unique_ptr<Stmt> parseExprStmt();
 

@@ -46,6 +46,7 @@ add_library(aura_rt STATIC
     thread_pool.cpp
     builtin/io.cpp
     builtin/string.cpp
+    builtin/mutex.cpp
     win_iocp.cpp
 )
 
