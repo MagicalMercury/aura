@@ -40,6 +40,8 @@
 | **`sync(max=N)` 有界并发** | ✅ 已实现 | [concurrency_lang_spec.md](plan/concurrency_lang_spec.md) — `bounded_sync` |
 | **`channel<T>` 协程通道** | ✅ 已实现 | [concurrency_lang_spec.md](plan/concurrency_lang_spec.md) — send/receive/close/for-in |
 | **`sync for` 并行迭代器** | ✅ 已实现 | [concurrency_lang_spec.md](plan/concurrency_lang_spec.md) — 语法糖展开 |
+| **`sync thread` 真线程并发**（`sync thread(max=N)`） | ✅ 已实现 | [sync_thread_plan.md](plan/sync_thread_plan.md) — 全局 ThreadPool + TLAB + STW |
+| **`sync.Mutex` + `lock` 块语句**（`lock (m) { }`） | ✅ 已实现 | [mutex_plan.md](plan/mutex_plan.md) — RAII 强制 + 间接指针规避 compact |
 | **闭包参数类型推断**（`let op: fun(int,int)->int = fun(a,b){...}`） | 🔴 未实现 | 规范 §5.3 已定义 |
 | **异步 I/O**（io_uring / OVERLAPPED / epoll） | 🔴 未实现 | 当前所有 I/O 均为纯阻塞实现 |
 | **接口类型擦除**（`interface` 多态派发） | 🔴 未实现 | — |

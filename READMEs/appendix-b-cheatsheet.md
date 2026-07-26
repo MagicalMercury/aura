@@ -15,7 +15,9 @@
 | 构造函数 | `fun (self T) T(...)` 可选；无则可用记录字面量 |
 | 闭包 | `fun (params) throws -> Ret { ... }`，捕获外部变量；**不能直接声明泛型参数** |
 | 函数类型 | 统一使用 `fun(params) -> Ret`，无返回用 `-> None` |
-| 并发 | `sync` 结构化并发，`spawn` 启动任务（必须在 `sync` 块内） |
+| 并发（协程） | `sync { spawn (io: Io) { ... } }`，单线程协作式 |
+| 并发（真线程） | `sync thread(max = N) { spawn (io: Io) { ... } }`，多核并行 |
+| 互斥锁 | `let m = sync.Mutex()`，`lock (m) { ... }` 块语句强制 RAII |
 | 能力对象 | I/O 副作用通过 `io: Io` 显式传递 |
 | `path` 模块 | 纯路径操作，`import path`（无引号） |
 | `Error` 类型 | `{ kind: string, message: string, ... }` 可附加自定义字段 |

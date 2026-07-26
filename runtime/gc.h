@@ -346,6 +346,27 @@ public:
     std::vector<std::pair<void*, void*>> stackRoots_;
     std::mutex              stackRootsM_;
 
+    // 协程帧实际大小映射：promise_type::operator new/delete 调用 noteCoroutineFrame
+    // 用途：GC 保守扫描时用实际帧大小，避免固定 4096 字节范围越过帧边界
+    //      （ASAN heap-buffer-overflow 根因）
+    // 多线程安全：operator new/delete 在 mutator 线程调用，用 frameSizeM_ 保护；
+    //             GC 在 STW 期间查询，无需锁
+    std::unordered_map<void*, size_t> frameSizes_;
+    std::mutex                        frameSizeM_;
+
+    // 注册/注销协程帧大小（由 task<T>::promise_type::operator new/delete 调用）
+    void noteCoroutineFrame(void* framePtr, size_t size) {
+        std::lock_guard<std::mutex> lk(frameSizeM_);
+        if (size == 0) frameSizes_.erase(framePtr);
+        else           frameSizes_[framePtr] = size;
+    }
+
+    // 查询栈根对应的实际字节范围（找不到则返回 0，调用方回退到旧逻辑）
+    size_t getFrameSize(void* framePtr) const {
+        auto it = frameSizes_.find(framePtr);
+        return it == frameSizes_.end() ? 0 : it->second;
+    }
+
     // 分代对象追踪
     std::vector<GcObject*> youngObjects_;  // 新生代（gen 0）
     std::vector<GcObject*> oldObjects_;    // 老年代（gen 1）
@@ -389,6 +410,7 @@ public:
     std::vector<std::thread::id> registered_threads_;
     std::atomic<bool>           gc_in_progress_{false};
     std::atomic<int>            stopped_threads_{0};
+    std::atomic<uint64_t>       gc_epoch_{0};  // GC 代次：每次 GC 完成后递增
     std::condition_variable     all_stopped_cv_;
     std::mutex                  all_stopped_m_;
 

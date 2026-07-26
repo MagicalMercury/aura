@@ -24,6 +24,19 @@ let maybe: int | None = None     // 初始为空
 // maybe = 42                    // 后续赋值
 ```
 
+### 内置 GC 类型
+
+Aura 提供若干内置的 GC 堆对象类型，由运行时管理生命周期，可直接构造：
+
+| 类型 | 构造形式 | 说明 |
+|:---|:---|:---|
+| `string` | 字符串字面量 / `make_string()` | GC 管理的字符串（见 §3.5） |
+| `[T]` | `[v1, v2, ...]` | 动态数组，GC 对象 |
+| `channel<T>` | `channel(cap)` | 协程通道（见 [§11.2](11-concurrency.md#112-协程间通信-channelt)） |
+| `sync.Mutex` | `sync.Mutex()` | 互斥锁，配合 `lock` 块（见 [§11.6](11-concurrency.md#116-syncmutex-与-lock-块)） |
+
+> `sync.Mutex` 是 GC 堆对象，生命周期由 GC 管理。`sync` 是伪模块名，用作类型/构造调用的命名空间前缀，运行时等价于裸 `Mutex` 类型。
+
 ## 3.2 复合类型
 
 **记录类型**（结构类型，按形状匹配，同形状的记录类型互相兼容）：

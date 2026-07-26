@@ -64,7 +64,8 @@ private:
     std::deque<std::pair<uint64_t, std::function<void()>>> tasks_;
     std::mutex m_;
     std::condition_variable cv_;
-    bool stop_ = false;
+    // atomic：shutdown 写、workerLoop 读（消除 TSan 数据竞争告警）
+    std::atomic<bool> stop_{false};
     std::once_flag ensureStartedOnce_;  // 保证 ensureStarted 只执行一次（多线程首次 submit 并发安全）
 
     // group 等待机制

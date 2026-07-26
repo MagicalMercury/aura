@@ -66,26 +66,42 @@ void ThreadPool::submitInGroup(uint64_t groupId, std::function<void()> task) {
 }
 
 void ThreadPool::waitGroup(uint64_t groupId) {
-    // main 线程在等待 group 完成时，必须定期检查 GC safepoint
-    // 否则若 worker 触发 GC STW，会等待 main 线程停止，但 main 阻塞在此处导致死锁
-    std::unique_lock<std::mutex> lk(groupM_);
-    while (true) {
-        // 检查 group 是否完成
+    // 锁策略优化（减少 lock-order-inversion 风险）：
+    //   原实现用 unique_lock(groupM_) + groupCv_.wait_for 长时间持有 groupM_，
+    //   导致 main 线程 acquire groupM_ → release → acquire all_stopped_m_（safepoint），
+    //   而 worker 线程 acquire all_stopped_m_ → release → acquire groupM_，
+    //   形成 TSan lock-order-inversion 环。
+    //
+    //   改用原子轮询：pending 是 std::atomic<int>，可直接无锁读取。
+    //   groupM_ 仅在获取 GroupState 指针和提取状态时短暂持有，
+    //   safepoint 调用完全在无锁状态下进行。
+    GroupState* state = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(groupM_);
         auto it = groups_.find(groupId);
-        if (it == groups_.end() || it->second->pending.load() == 0) break;
-        // 短超时等待，醒来后检查 GC safepoint
-        groupCv_.wait_for(lk, std::chrono::milliseconds(1));
-        lk.unlock();
-        gc_safepoint();  // 响应 GC STW 请求
-        lk.lock();
+        if (it != groups_.end()) {
+            state = it->second.get();
+        }
     }
-    // 取出 group 状态（移动语义，避免在锁外访问 groups_）
-    auto stateIt = groups_.find(groupId);
-    if (stateIt != groups_.end()) {
-        auto statePtr = std::move(stateIt->second);
-        groups_.erase(stateIt);
-        lk.unlock();
-        // 若有异常，rethrow 第一个
+    if (!state) return;  // group 不存在
+
+    // 原子轮询 pending — 无锁，期间可安全调用 gc_safepoint()
+    while (state->pending.load() > 0) {
+        gc_safepoint();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // 提取 group 状态用于异常处理
+    std::unique_ptr<GroupState> statePtr;
+    {
+        std::lock_guard<std::mutex> lk(groupM_);
+        auto it = groups_.find(groupId);
+        if (it != groups_.end()) {
+            statePtr = std::move(it->second);
+            groups_.erase(it);
+        }
+    }
+    if (statePtr) {
         std::lock_guard<std::mutex> elk(statePtr->excsM);
         if (!statePtr->excs.empty()) {
             std::rethrow_exception(statePtr->excs.front());
@@ -99,21 +115,27 @@ void ThreadPool::workerLoop(size_t /*idx*/) {
 
     while (true) {
         std::pair<uint64_t, std::function<void()>> task;
+        bool got_task = false;
         {
             std::unique_lock<std::mutex> lk(m_);
-            // 空闲 worker 也需响应 GC STW：用 wait_for 定期检查 gcPending_
-            cv_.wait_for(lk, std::chrono::milliseconds(1),
-                         [&]{ return stop_ || !tasks_.empty(); });
-            if (stop_ && tasks_.empty()) break;
-            if (tasks_.empty()) {
-                // wait_for 超时：检查 GC safepoint 后继续等待
+            // 空闲 worker 也需响应 GC STW
+            // 注：不用 cv_.wait_for — GCC 11 TSan 对 pthread_cond_timedwait 的
+            // mutex 释放/重获追踪有 bug，会误报 "double lock of a mutex"。
+            // 改用 unlock + sleep_for + lock 轮询模式，功能等价但 TSan 兼容。
+            if (tasks_.empty() && !stop_.load()) {
                 lk.unlock();
                 gc_safepoint();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
+            if (stop_.load() && tasks_.empty()) break;
+            if (tasks_.empty()) continue;
             task = std::move(tasks_.front());
             tasks_.pop_front();
+            got_task = true;
         }
+
+        if (!got_task) continue;
 
         // L3 safepoint：执行 task 前检查 GC 暂停请求
         gc_safepoint();
@@ -149,7 +171,7 @@ void ThreadPool::workerLoop(size_t /*idx*/) {
 void ThreadPool::shutdown() {
     {
         std::lock_guard<std::mutex> lk(m_);
-        stop_ = true;
+        stop_.store(true);
     }
     cv_.notify_all();
     for (auto& t : workers_) {
@@ -181,8 +203,15 @@ sync_thread_context::~sync_thread_context() {
 }
 
 void sync_thread_context::submit(std::function<void()> task) {
-    // 信号量限流：并发数达上限时阻塞，等待其他任务完成
-    sem_.acquire();
+    // safepoint 感知获取并发槽：不能直接 sem_.acquire()。
+    // 原因：调用方（通常是已向 GC 注册的主线程）在信号量上阻塞时，若 worker
+    //   触发 GC stop-the-world，执行者会等待主线程到达 safepoint，但主线程
+    //   卡在信号量上无法响应 → 死锁。
+    // 改用 try_acquire_for 轮询：阻塞最多 1ms，超时主动调用 gc_safepoint()
+    //   响应 STW 请求，将 STW 延迟控制在 ~1ms 内。
+    while (!sem_.try_acquire_for(std::chrono::milliseconds(1))) {
+        gc_safepoint();
+    }
     // 包装 task：用 RAII 保证 sem_.release() 总是执行（即使 task 抛异常）
     // 否则信号量泄漏会导致后续 submit 永久阻塞，最终 waitGroup 死锁
     ThreadPool::instance().submitInGroup(groupId_, [this, task = std::move(task)]() mutable {

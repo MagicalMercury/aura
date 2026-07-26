@@ -45,6 +45,12 @@ GcHeap& GcHeap::instance() {
     return g_gcHeap;
 }
 
+// task<T>::promise_type::operator new/delete 调用
+// 实现在 gc.cpp，避免 task.h → gc.h 循环依赖
+void noteCoroutineFrameImpl(void* framePtr, std::size_t size) {
+    GcHeap::instance().noteCoroutineFrame(framePtr, size);
+}
+
 GcHeap::~GcHeap() {
     // 进程退出时不主动释放 GC 页。
     // 原因：静态析构顺序不确定，其他对象（协程帧 / std::vector 等）
@@ -327,26 +333,59 @@ void GcHeap::safepoint() {
     // 多线程场景：本线程尝试成为 GC 执行者
     if (!gc_in_progress_.exchange(true)) {
         // 抢到 GC 锁：等待其他线程到达 safepoint
+        // 注：不用 cv_.wait_for — GCC 11 TSan 对 pthread_cond_timedwait 的
+        // mutex 释放/重获追踪有 bug，会误报 "double lock of a mutex"。
+        // 改用 unlock + sleep_for + lock 轮询模式。
         {
             std::unique_lock<std::mutex> lk(all_stopped_m_);
-            all_stopped_cv_.wait(lk, [this, threadCount]{
-                return stopped_threads_.load() >= static_cast<int>(threadCount) - 1;
-            });
+            int stalls = 0;
+            while (stopped_threads_.load() < static_cast<int>(threadCount) - 1) {
+                lk.unlock();
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                lk.lock();
+                if (stopped_threads_.load() < static_cast<int>(threadCount) - 1) {
+                    if (++stalls >= 100) {  // 100 × 10ms = 1s
+                        std::fprintf(stderr,
+                            "[GC] *** STW DEADLOCK ***: %d/%d thread(s) cannot reach safepoint.\n",
+                            static_cast<int>(threadCount) - 1 - stopped_threads_.load(),
+                            static_cast<int>(threadCount) - 1);
+                        std::abort();
+                    }
+                }
+            }
         }
         // 所有其他线程已停止，执行 GC
         gcPending_.store(false);
         if (youngBytes_ >= kYoungThreshold / 2) minorGc();
         if (oldBytes_ >= kOldThreshold) majorGc();
 
-        // 唤醒所有线程
-        gc_in_progress_ = false;
-        stopped_threads_ = 0;
-        all_stopped_cv_.notify_all();
+        // 唤醒所有线程：递增 gc_epoch_ 通知所有等待者
+        {
+            std::lock_guard<std::mutex> lk(all_stopped_m_);
+            stopped_threads_ = 0;
+            gc_in_progress_ = false;
+            gc_epoch_.fetch_add(1);       // 递增代次，唤醒所有等待者
+            all_stopped_cv_.notify_all();
+        }
     } else {
-        // 其他线程正在执行 GC，本线程停止
-        stopped_threads_++;
+        // 非 initiator：本线程停止，等待 GC 完成
+        // 使用 gc_epoch_ 变化作为唤醒条件（而非 gc_in_progress_ = false），
+        // 避免背靠背 GC 周期中非 initiator 错过唤醒导致死锁。
+        // notify_all() 确保 initiator 被唤醒（避免 thundering-herd）。
+        //
+        // 注：不用 wait_for — GCC 11 TSan 对 pthread_cond_timedwait 的 mutex
+        // 释放/重获追踪有 bug，会误报 "double lock of a mutex"。
+        // 改用 unlock + sleep_for + lock 轮询模式。
         std::unique_lock<std::mutex> lk(all_stopped_m_);
-        all_stopped_cv_.wait(lk, [this]{ return !gc_in_progress_.load(); });
+        if (!gc_in_progress_.load()) return;  // GC 已完成，无需参与
+        uint64_t my_epoch = gc_epoch_.load();
+        stopped_threads_++;
+        all_stopped_cv_.notify_all();
+        while (gc_epoch_.load() == my_epoch) {
+            lk.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            lk.lock();
+        }
     }
 }
 
@@ -455,6 +494,12 @@ void GcHeap::unregisterWeak(GcWeakHandleBase* wh) {
 // ============================================================
 
 void GcHeap::forceGc() {
+    // 关键：必须先 flushTlab 再 GC，否则：
+    //   1. TLAB 的 localYoung 未合并到全局 youngObjects_ → GC 漏标
+    //   2. compact 释放页后 TLAB curPage 悬垂 → 下次分配写入已释放内存
+    // safepoint() 路径已有 flushTlab，forceGc 单线程路径也要补上
+    flushTlab();
+
     size_t threadCount;
     {
         std::lock_guard<std::mutex> lk(threads_m_);
@@ -467,7 +512,7 @@ void GcHeap::forceGc() {
         return;
     }
 
-    // 多线程场景：走 STW
+    // 多线程场景：走 STW（safepoint 内会再次 flushTlab，幂等）
     gcPending_.store(true);
     safepoint();
 }
@@ -561,6 +606,13 @@ void GcHeap::markPhase(bool youngOnly) {
     for (auto& [begin, end] : stackRoots_) {
         char* start2 = static_cast<char*>(begin);
         char* stop2  = static_cast<char*>(end);
+        // 优先使用实际协程帧大小（避免越过帧边界 → ASAN 报错 / 读到未映射内存）
+        // 找不到时回退到 end 指针（向后兼容）
+        size_t actualSize = getFrameSize(begin);
+        if (actualSize > 0) {
+            char* frameEnd = start2 + actualSize;
+            if (frameEnd < stop2) stop2 = frameEnd;
+        }
         for (char* p = start2; p + sizeof(void*) <= stop2; p += sizeof(void*)) {
             void* candidate = *reinterpret_cast<void**>(p);
             if (!candidate) continue;
@@ -732,7 +784,7 @@ void GcHeap::promoteToOld(GcObject* obj) {
 // ============================================================
 
 void GcHeap::sweepPhaseAll() {
-    // 1. 统计存活对象
+    // 1. 统计存活对象（不清除 marked 标志，留给 finalizer 检查用）
     std::vector<GcObject*> liveYoung;
     std::vector<GcObject*> liveOld;
     size_t liveYoungBytes = 0;
@@ -740,7 +792,6 @@ void GcHeap::sweepPhaseAll() {
 
     for (auto* obj : youngObjects_) {
         if (obj->marked()) {
-            obj->setMarked(false);
             liveYoung.push_back(obj);
             liveYoungBytes += obj->allocSize();
         }
@@ -748,7 +799,6 @@ void GcHeap::sweepPhaseAll() {
 
     for (auto* obj : oldObjects_) {
         if (obj->marked()) {
-            obj->setMarked(false);
             // sweepePhaseYoung 已将晋升对象的 generation 设为 1，
             // 此处的 gen==0 分支不再需要（且 promoteToOld 在迭代 oldObjects_ 时调用会 UB）
             liveOld.push_back(obj);
@@ -768,6 +818,7 @@ void GcHeap::sweepPhaseAll() {
     }
 
     // 3. 调用 finalizer（对未标记且未 finalize 的对象）
+    //    注意：此时 marked 标志尚未清除，finalizer 通过 marked 区分存活/死亡
     for (auto* obj : youngObjects_) {
         if (!obj->marked() && !obj->finalized()) {
             if (obj->desc && obj->desc->finalizer) {
@@ -784,6 +835,10 @@ void GcHeap::sweepPhaseAll() {
             }
         }
     }
+
+    // 4. 清除存活对象的 marked 标志（为下次 GC 准备）
+    for (auto* obj : liveYoung) obj->setMarked(false);
+    for (auto* obj : liveOld)   obj->setMarked(false);
 
     youngObjects_ = std::move(liveYoung);
     oldObjects_   = std::move(liveOld);
