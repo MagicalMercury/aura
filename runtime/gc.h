@@ -311,7 +311,7 @@ public:
     void decCompactSuspend() { --compactSuspendedCount_; }
 
     // 预分配 OOM 错误（首次 tryAlloc 时懒初始化）
-    void  ensureOomError();
+    void ensureOomError();
 
     // compact 暂停计数（>0 时 compact 延迟执行，mark-sweep 仍正常执行）
     // atomic：多线程下 GcCompactSuspendGuard 构造/析构并发 ++/--
@@ -582,54 +582,5 @@ public:
 private:
     T* ptr_;  // 堆上持有值，独立于栈帧生命周期
 };
-
-} // namespace aura_rt
-
-// ============================================================
-// Array<T> 模板方法实现（必须放头文件 — 用户会实例化各种 T）
-// ============================================================
-namespace aura_rt {
-
-//template <typename T>
-//Array<T>* Array<T>::make(int32_t initialCapacity) {
-//    if (initialCapacity < 4) initialCapacity = 4;
-//    auto* arr = gc_alloc<Array<T>>(&desc());
-//    arr->capacity = initialCapacity;
-//    arr->length   = 0;
-//    arr->elements = static_cast<T*>(GcHeap::instance().allocRaw(sizeof(T) * initialCapacity));
-//    return arr;
-//}
-
-//template <typename T>
-//void Array<T>::push(const T& value) {
-//    if (length >= capacity) {
-//        int32_t newCap = capacity ? capacity * 2 : 4;
- //       auto*   newBuf = static_cast<T*>(GcHeap::instance().allocRaw(sizeof(T) * newCap));
- //       for (int32_t i = 0; i < length; ++i) newBuf[i] = elements[i];
- //       elements = newBuf;
- //       capacity = newCap;
-//   }
-//    elements[length++] = value;
-//}
-
-// ============================================================
-// 字符串工具声明（已迁移到 builtin/string.h）
-// #include "builtin/string.h" 即可获得所有声明
-// ============================================================
-/*
-GcString* make_string(const char* s);
-GcString* make_string(const std::string& s);
-GcString* string_concat(GcString* a, GcString* b);
-GcString* int_to_string(int32_t val);
-GcString* float_to_string(double val);
-GcString* concat(GcString* a, GcString* b);
-GcString* concat(GcString* a, int32_t b);
-GcString* concat(int32_t a, GcString* b);
-GcString* concat(GcString* a, double b);
-GcString* concat(double a, GcString* b);
-GcString* bool_to_string(bool val);
-GcString* concat(GcString* a, bool b);
-GcString* concat(bool a, GcString* b);
-*/
 
 } // namespace aura_rt

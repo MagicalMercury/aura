@@ -216,6 +216,13 @@ private:
             {"Path",   {"Path",   false, true, BuiltinPrim::Other,    "aura_rt::Path"}},
             {"channel",{"channel",true,  true, BuiltinPrim::Other,    "aura_rt::Channel*"}},
             {"Mutex",  {"Mutex",  true,  true, BuiltinPrim::Other,     "aura_rt::Mutex*"}},
+            // v1.1: RWMutex / Once（堆对象，可分配在 GC 堆）
+            {"RWMutex", {"RWMutex", true, true, BuiltinPrim::Other,     "aura_rt::RWMutex*"}},
+            {"Once",    {"Once",    true, true, BuiltinPrim::Other,     "aura_rt::Once*"}},
+            // 虚拟类型：r()/w() 返回的锁视图，仅用于 Sema 类型推断和 L1 检查
+            // 不是堆类型，用户不能直接声明
+            {"RWMutexReadView",  {"RWMutexReadView",  false, false, BuiltinPrim::Other, "aura_rt::RWMutex::ReadGuard"}},
+            {"RWMutexWriteView", {"RWMutexWriteView", false, false, BuiltinPrim::Other, "aura_rt::RWMutex::WriteGuard"}},
         };
 
         // ============================================================
@@ -251,6 +258,10 @@ private:
             {"channel", "send",    {{"value", "T"}},  ReturnTypeInfo::None()},
             {"channel", "receive", {},                  ReturnTypeInfo::Generic(0, "channel")},
             {"channel", "close",   {},                  ReturnTypeInfo::None()},
+
+            // --- RWMutex 方法：r()/w() 返回锁视图（无参数）---
+            {"RWMutex", "r", {}, ReturnTypeInfo::Named("RWMutexReadView")},
+            {"RWMutex", "w", {}, ReturnTypeInfo::Named("RWMutexWriteView")},
         };
 
         // ============================================================
@@ -265,6 +276,9 @@ private:
             {"channel", {{"cap", "int"}},  ReturnTypeInfo::Named("channel")},
             // sync.Mutex 构造函数（无参数，返回 Mutex*）
             {"sync.Mutex", {}, ReturnTypeInfo::Named("Mutex")},
+            // v1.1: sync.RWMutex / sync.Once 构造函数
+            {"sync.RWMutex", {}, ReturnTypeInfo::Named("RWMutex")},
+            {"sync.Once",    {}, ReturnTypeInfo::Named("Once")},
             // GC 内建函数
             {"gc_force", {}, ReturnTypeInfo::None()},
             {"gc_stats", {}, ReturnTypeInfo::Named("string")},

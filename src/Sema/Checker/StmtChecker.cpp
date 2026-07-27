@@ -353,25 +353,30 @@ void SemAnalyzer::checkExprStmt(const ExprStmt& stmt) {
 // checkStmt(break/continue) / checkSpawnStmt 检测 L3/L6 违规。
 // ============================================================
 void SemAnalyzer::checkLockStmt(const LockStmt& stmt) {
-    // L1: lockExpr 类型检查（v1.0 仅允许 Mutex*）
+    // L1: lockExpr 类型检查（v1.1 扩展为 Mutex/RWMutexReadView/RWMutexWriteView/Once）
     if (stmt.lockExpr) {
         auto lockTy = inferExpr(*stmt.lockExpr);
         if (!lockTy) {
             error(*stmt.lockExpr, "cannot infer lock expression type");
             return;
         }
-        // Mutex 在 BuiltinRegistry 注册为 BuiltinPrim::Other，
-        // Sema 推断后为 GenericSemType(name="Mutex")（与 channel 一致）
-        bool isMutex = false;
+        // 识别合法锁类型：
+        //   Mutex/RWMutexReadView/RWMutexWriteView/Once 在 BuiltinRegistry 注册为
+        //   BuiltinPrim::Other，Sema 推断后为 GenericSemType
+        bool isLockType = false;
         if (auto* gs = dynamic_cast<const GenericSemType*>(lockTy.get())) {
-            if (gs->name == "Mutex") isMutex = true;
+            if (gs->name == "Mutex" || gs->name == "RWMutexReadView"
+                || gs->name == "RWMutexWriteView" || gs->name == "Once") {
+                isLockType = true;
+            }
         }
-        if (!isMutex) {
+        if (!isLockType) {
             error(*stmt.lockExpr,
-                "lock requires sync.Mutex, got '" + lockTy->toString() + "'");
+                "lock requires sync.Mutex/RWMutex.r()/.w()/Once, got '"
+                + lockTy->toString() + "'");
             return;
         }
-        // 标注 lockExpr 的 inferredType（供 CodeGen 读取）
+        // 标注 lockExpr 的 inferredType（供 CodeGen 读取分派）
         const_cast<ASTNode*>(stmt.lockExpr.get())->inferredType = lockTy.get();
         typeStore_.push_back(std::move(lockTy));
     }

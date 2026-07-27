@@ -844,6 +844,50 @@ void CodeGenerator::genLockStmt(std::ostream& cpp, const LockStmt& stmt,
                                   bool /*isCoroutine*/) {
     std::string lockExpr = stmt.lockExpr ? genExpr(*stmt.lockExpr, false) : "";
 
+    // 由 Sema 推断的 lockExpr 类型分派（v1.1 扩展）
+    // - Once：lock (once) { body } → once->do_([&] { body })
+    // - Mutex / RWMutexReadView / RWMutexWriteView：RAII guard
+    std::string typeName;
+    if (stmt.lockExpr && stmt.lockExpr->inferredType) {
+        if (auto* gs = dynamic_cast<const GenericSemType*>(stmt.lockExpr->inferredType)) {
+            typeName = gs->name;
+        }
+    }
+
+    if (typeName == "Once") {
+        // lock (once) { body } → once->do_([&] { body })
+        writeLine(cpp, lockExpr + "->do_([&] {");
+        indentLevel_++;
+        if (stmt.body) genBlock(cpp, *stmt.body, false);
+        indentLevel_--;
+        writeLine(cpp, "});");
+        return;
+    }
+
+    if (typeName == "RWMutexReadView") {
+        // lock (rw.r()) { body } → auto _guard = rw->r();
+        // rw.r() 本身返回 ReadGuard 并获取锁，_guard 析构时释放
+        cpp << indentStr() << "{\n";
+        indentLevel_++;
+        writeLine(cpp, "auto _guard = " + lockExpr + ";");
+        if (stmt.body) genBlock(cpp, *stmt.body, false);
+        indentLevel_--;
+        cpp << indentStr() << "}\n";
+        return;
+    }
+
+    if (typeName == "RWMutexWriteView") {
+        // lock (rw.w()) { body } → auto _guard = rw->w();
+        cpp << indentStr() << "{\n";
+        indentLevel_++;
+        writeLine(cpp, "auto _guard = " + lockExpr + ";");
+        if (stmt.body) genBlock(cpp, *stmt.body, false);
+        indentLevel_--;
+        cpp << indentStr() << "}\n";
+        return;
+    }
+
+    // 默认：Mutex —— RAII guard
     cpp << indentStr() << "{\n";
     indentLevel_++;
     writeLine(cpp, "auto _guard = aura_rt::__acquire_lock(" + lockExpr + ");");

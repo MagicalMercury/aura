@@ -1,316 +1,295 @@
-# change.md：sync.Mutex + lock 块语句（v1.0 实施代码）
+# Plan：sync 锁族 v1.1 实施方案（RWMutex / Once）
 
-> 来源 plan：plan/mutex_plan.md §三 v1.0
-> 范围：仅 sync.Mutex + `lock (m) { }` 块语句，全链路打通
-> 状态：待审查
+> 来源：[plan/mutex_plan.md](file:///d:/you/Aura/plan/mutex_plan.md) §4
+> 范围：sync.RWMutex / sync.Once，复用 v1.0 的 LockStmt，零 AST/Parser 改动
+> 关键约束：所有锁族 Guard 必须 safepoint 感知（v1.0 死锁修复确立，见 [plan/done/gc_mutex_deadlock_fix_report.md](file:///d:/you/Aura/plan/done/gc_mutex_deadlock_fix_report.md)）
+> 注：WaitGroup 已从 v1.1 移除（sync_thread_context 自动等待使其冗余，推到 v1.2 重新设计）
 
 ---
 
-## 一、运行时
+## 一、runtime/builtin/mutex.h（续写，新增 RWMutex/Once）
 
-### 1.1 新增文件：runtime/builtin/mutex.h
+在现有 `Mutex` 之后、`} // namespace aura_rt` 之前追加：
 
 ```cpp
-#pragma once
 // ============================================================
-// aura_rt/builtin/mutex.h — 用户级互斥锁 + lock 块运行时支持
+// RWMutex — 读写锁（多读单写）
 //
-// 设计要点：
-//   1. std::mutex 不可移动，但 GcObject 在 compact GC 时会被 memcpy
-//      搬迁。直接内嵌 std::mutex 会导致内部状态损坏。
-//      → 用间接指针：Mutex 主体搬迁，指向的堆 mutex 不动。
-//   2. 间接指针指向的 std::mutex 不是 GC 对象，需终结器释放。
-//   3. 不暴露 lock()/unlock() 给用户，强制走 lock (m) { } 块语句。
+// 用法：lock (rw.r()) { } / lock (rw.w()) { }
+// 关键设计（v1.0 死锁修复确立）：
+//   1. Inner::m 用 std::timed_mutex（非 std::mutex），支持 try_lock 轮询
+//   2. 删除 cv：避免 TSan 误报 + STW 死锁
+//   3. Guard 构造用 try_lock 轮询 + gc_safepoint()
+//   4. GcRootHandle<RWMutex*> 防 compact 搬迁悬垂 + locked_ 标志防 TSan 误报
 // ============================================================
-
-#include "../gc.h"
-#include <mutex>
-
-namespace aura_rt {
-
-// ============================================================
-// Mutex — 互斥锁（GC 堆对象）
-// ============================================================
-struct Mutex : GcObject {
-    std::mutex* m_;  // 间接指针，指向 new 出的 mutex
+struct RWMutex : GcObject {
+    struct Inner {
+        std::timed_mutex m;
+        std::atomic<int> readers{0};
+        std::atomic<bool> writer_active{false};
+        std::atomic<int> waiting_writers{0};  // 等待中的 writer 数量（写优先，防 reader starve writer）
+    };
+    Inner* inner_;  // 间接指针，指向 new 出的 Inner
 
     static const TypeDescriptor _desc;
 
-    // RAII 守卫（用户不可见，由 lock 块生成的 _guard 持有）
-    class Guard {
+    // 读锁守卫：多读并发，与读互斥不与写互斥
+    class ReadGuard {
     public:
-        explicit Guard(Mutex* m) : m_(m) { m_->m_->lock(); }
-        ~Guard() { if (m_) m_->m_->unlock(); }
-        Guard(Guard&& o) noexcept : m_(o.m_) { o.m_ = nullptr; }
-        Guard(const Guard&) = delete;
-        Guard& operator=(const Guard&) = delete;
-        Guard& operator=(Guard&&) = delete;
+        explicit ReadGuard(RWMutex* rw)
+            : rw_(rw), gcRoot_(rw_), locked_(false) {
+            // try_lock 轮询 + safepoint 响应 STW
+            while (true) {
+                if (rw_->inner_->m.try_lock()) {
+                    // 写优先：若有 writer 等待或活跃，reader 让出
+                    if (!rw_->inner_->writer_active.load(std::memory_order_acquire)
+                        && rw_->inner_->waiting_writers.load(std::memory_order_acquire) == 0) {
+                        rw_->inner_->readers.fetch_add(1, std::memory_order_acq_rel);
+                        rw_->inner_->m.unlock();
+                        locked_ = true;
+                        return;
+                    }
+                    rw_->inner_->m.unlock();
+                }
+                gc_safepoint();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        ~ReadGuard() {
+            if (locked_ && rw_) {
+                rw_->inner_->readers.fetch_sub(1, std::memory_order_acq_rel);
+                locked_ = false;
+            }
+        }
+        ReadGuard(ReadGuard&& o) noexcept
+            : rw_(o.rw_), gcRoot_(rw_), locked_(o.locked_) {
+            gcRoot_.rebind(rw_);
+            o.rw_ = nullptr;
+            o.locked_ = false;
+        }
+        ReadGuard(const ReadGuard&) = delete;
+        ReadGuard& operator=(const ReadGuard&) = delete;
+        ReadGuard& operator=(ReadGuard&&) = delete;
     private:
-        Mutex* m_;
+        RWMutex* rw_;
+        GcRootHandle<RWMutex*> gcRoot_;
+        bool locked_;
     };
 
-    Guard acquire() { return Guard(this); }
+    // 写锁守卫：独占，与读写都互斥
+    class WriteGuard {
+    public:
+        explicit WriteGuard(RWMutex* rw)
+            : rw_(rw), gcRoot_(rw_), locked_(false) {
+            // 标记 writer 等待中，让新 reader 让出（写优先，防 starve）
+            rw_->inner_->waiting_writers.fetch_add(1, std::memory_order_acq_rel);
+            while (true) {
+                if (rw_->inner_->m.try_lock()) {
+                    if (rw_->inner_->readers.load(std::memory_order_acquire) == 0
+                        && !rw_->inner_->writer_active.load(std::memory_order_acquire)) {
+                        rw_->inner_->writer_active.store(true, std::memory_order_release);
+                        rw_->inner_->m.unlock();
+                        locked_ = true;
+                        // 已获取写锁，退出"等待中"状态
+                        rw_->inner_->waiting_writers.fetch_sub(1, std::memory_order_acq_rel);
+                        return;
+                    }
+                    rw_->inner_->m.unlock();
+                }
+                gc_safepoint();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        ~WriteGuard() {
+            if (locked_ && rw_) {
+                rw_->inner_->writer_active.store(false, std::memory_order_release);
+                locked_ = false;
+            }
+        }
+        WriteGuard(WriteGuard&& o) noexcept
+            : rw_(o.rw_), gcRoot_(rw_), locked_(o.locked_) {
+            gcRoot_.rebind(rw_);
+            o.rw_ = nullptr;
+            o.locked_ = false;
+        }
+        WriteGuard(const WriteGuard&) = delete;
+        WriteGuard& operator=(const WriteGuard&) = delete;
+        WriteGuard& operator=(WriteGuard&&) = delete;
+    private:
+        RWMutex* rw_;
+        GcRootHandle<RWMutex*> gcRoot_;
+        bool locked_;
+    };
+
+    // r()/w() 返回锁视图（临时对象，由 __acquire_lock 消费）
+    // 构造时即获取锁，move 到 _guard 后由 _guard 析构释放
+    ReadGuard r() { return ReadGuard(this); }
+    WriteGuard w() { return WriteGuard(this); }
 };
 
-// 统一 acquire 入口：lock (m) { } 生成 __acquire_lock(m)
-inline Mutex::Guard __acquire_lock(Mutex* m) { return m->acquire(); }
-
-// 工厂函数：sync.Mutex() 构造调用生成
-inline Mutex* make_mutex() {
-    auto* m = static_cast<Mutex*>(
-        GcHeap::instance().alloc(sizeof(Mutex), &Mutex::_desc));
-    m->m_ = new std::mutex();
-    return m;
+// __acquire_lock 重载：消费 r()/w() 返回的临时 Guard
+inline RWMutex::ReadGuard __acquire_lock(RWMutex::ReadGuard&& v) {
+    return std::move(v);
+}
+inline RWMutex::WriteGuard __acquire_lock(RWMutex::WriteGuard&& v) {
+    return std::move(v);
 }
 
-} // namespace aura_rt
-```
-
-### 1.2 新增文件：runtime/builtin/mutex.cpp
-
-```cpp
-#include "mutex.h"
-
-namespace aura_rt {
-
-// 终结器：GC 回收 Mutex 时释放间接持有的 std::mutex
-// 安全性：finalizer 在 GC STW 期间执行，所有 mutator 线程已暂停，
-//        可安全 delete 同步原语（无并发访问）
-static void mutex_finalizer(GcObject* o) {
-    auto* m = static_cast<Mutex*>(o);
-    delete m->m_;
-    m->m_ = nullptr;
+// 工厂函数：sync.RWMutex() 构造调用生成
+inline RWMutex* make_rwmutex() {
+    auto* rw = static_cast<RWMutex*>(
+        GcHeap::instance().alloc(sizeof(RWMutex), &RWMutex::_desc));
+    rw->inner_ = new RWMutex::Inner();
+    return rw;
 }
 
-// TypeDescriptor：m_ 是裸指针指向非 GC 对象，ptrFieldCount=0
-// GC 不会追踪该指针（指向独立堆内存，由 finalizer 释放）
-const TypeDescriptor Mutex::_desc = {
-    sizeof(Mutex),         // size
-    0,                     // ptrFieldCount（m_ 不是 GC 指针）
-    nullptr,               // ptrFieldOffsets
-    0,                     // inlineArrayFieldCount
-    nullptr,               // inlineArrayFields
-    mutex_finalizer        // finalizer
+// ============================================================
+// Once — 一次性执行
+//
+// 用法：lock (once) { ... }（首次执行块体，后续跳过）
+// 关键设计：不用 std::call_once（内部 mutex 阻塞，无法响应 STW），
+//          改用 atomic<bool> + timed_mutex 双检查 + try_lock 轮询
+// ============================================================
+struct Once : GcObject {
+    std::timed_mutex* m_;        // 间接指针（timed_mutex 不可移动）
+    std::atomic<bool>* done_;    // 间接指针（atomic<bool> 不可移动）
+
+    static const TypeDescriptor _desc;
+
+    template <typename F>
+    void do_(F&& f) {
+        // fast path：已完成直接返回（无锁）
+        if (done_->load(std::memory_order_acquire)) return;
+
+        // 慢路径：try_lock 轮询 + safepoint 响应 STW
+        while (!m_->try_lock()) {
+            if (done_->load(std::memory_order_acquire)) return;
+            gc_safepoint();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // RAII 守卫：异常安全，确保 f() 抛异常时 m_ 也能 unlock
+        // 否则 m_ 永久持有锁 → 其他线程死锁在 try_lock 轮询
+        std::lock_guard<std::timed_mutex> lk(*m_, std::adopt_lock);
+
+        // 双检查：持锁后再检查 done_
+        if (!done_->load(std::memory_order_acquire)) {
+            f();
+            done_->store(true, std::memory_order_release);
+        }
+    }
 };
 
-} // namespace aura_rt
-```
+// 工厂函数：sync.Once() 构造调用生成
+inline Once* make_once() {
+    auto* o = static_cast<Once*>(
+        GcHeap::instance().alloc(sizeof(Once), &Once::_desc));
+    o->m_ = new std::timed_mutex();
+    o->done_ = new std::atomic<bool>(false);
+    return o;
+}
 
-### 1.3 修改：runtime/aura_rt.h
-
-**新增 include**（在 `builtin/channel.h` 后）：
-
-```cpp
-#include "builtin/mutex.h"
-```
-
-### 1.4 修改：runtime/CMakeLists.txt
-
-**第 47-48 行新增源文件**：
-
-```cmake
-add_library(aura_rt STATIC
-    types.cpp
-    gc.cpp
-    task.cpp
-    thread_pool.cpp
-    builtin/io.cpp
-    builtin/string.cpp
-    builtin/mutex.cpp        # 新增
-    win_iocp.cpp
-)
+// 注：WaitGroup 已从 v1.1 移除，推到 v1.2 重新设计
+// 原因：sync_thread_context 析构已自动 waitGroup（thread_pool.cpp:201-203），
+//       sync thread 块结束即等待所有 spawn 完成，WaitGroup 在此设计下冗余。
+//       v1.2 将重新设计（可能引入全局 spawn，让 WaitGroup 成为等待机制）。
 ```
 
 ---
 
-## 二、AST
+## 二、runtime/builtin/mutex.cpp（新增三个终结器 + TypeDescriptor）
 
-### 2.1 修改：src/AST/Stmt.h
-
-**在 SyncStmt（第 218-231 行）后新增 LockStmt**：
+在现有 `Mutex::_desc` 定义之后追加：
 
 ```cpp
-struct LockStmt : Stmt {
-    std::unique_ptr<ASTNode> lockExpr;   // 锁表达式，求值为 Mutex*
-    std::unique_ptr<BlockStmt> body;
-    void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
-        auto n = std::make_unique<LockStmt>();
-        if (lockExpr) n->lockExpr = lockExpr->clone();
-        if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
-        n->line = line; n->col = col;
-        return n;
-    }
+// 终结器：GC 回收 RWMutex 时释放间接持有的 Inner
+static void rwmutex_finalizer(GcObject* o) {
+    auto* rw = static_cast<RWMutex*>(o);
+    delete rw->inner_;
+    rw->inner_ = nullptr;
+}
+
+// 终结器：GC 回收 Once 时释放 m_ 和 done_
+static void once_finalizer(GcObject* o) {
+    auto* once = static_cast<Once*>(o);
+    delete once->m_;
+    delete once->done_;
+    once->m_ = nullptr;
+    once->done_ = nullptr;
+}
+
+const TypeDescriptor RWMutex::_desc = {
+    sizeof(RWMutex), 0, nullptr, 0, nullptr, rwmutex_finalizer
+};
+const TypeDescriptor Once::_desc = {
+    sizeof(Once), 0, nullptr, 0, nullptr, once_finalizer
 };
 ```
 
-**设计说明**：
-- `lockExpr` 是任意表达式（支持 `m` / `obj.mu` / `get_lock()` 等），求值后须为 `Mutex*`
-- `body` 是块语句，作用域独立
-- **无 Mode 字段**：模式由 lockExpr 求值结果类型决定（v1.1 扩展 RWMutex.r()/.w() 时无需改 AST）
-- 类型信息通过 `lockExpr->inferredType`（ASTNode 已有字段）由 Sema 标注
+---
 
-### 2.2 修改：src/ASTPrinter.cpp
+## 三、src/Sema/BuiltinRegistry.h（init() 注册新类型/方法/构造函数）
 
-**在 SyncStmt::print 后（第 352 行后）新增**：
+### 3.1 types_ 初始化列表追加（在 `{"Mutex", ...}` 之后）
 
 ```cpp
-void LockStmt::print(std::ostream& os, int indent) const {
-    printIndent(os, indent);
-    os << "LockStmt\n";
-    if (lockExpr) lockExpr->print(os, indent + 1);
-    if (body) body->print(os, indent + 1);
-}
+{"RWMutex",         {"RWMutex",         true, true, BuiltinPrim::Other, "aura_rt::RWMutex*"}},
+{"Once",            {"Once",            true, true, BuiltinPrim::Other, "aura_rt::Once*"}},
+// 虚拟类型：r()/w() 返回的锁视图，仅用于 Sema 类型推断和 L1 检查
+// 不是堆类型，用户不能直接声明
+{"RWMutexReadView", {"RWMutexReadView", false, false, BuiltinPrim::Other, "aura_rt::RWMutex::ReadGuard"}},
+{"RWMutexWriteView",{"RWMutexWriteView",false, false, BuiltinPrim::Other, "aura_rt::RWMutex::WriteGuard"}},
+```
+
+### 3.2 methods_ 初始化列表追加（在 channel 方法之后）
+
+```cpp
+// --- RWMutex 方法：r()/w() 返回锁视图（无参数）---
+{"RWMutex", "r", {}, ReturnTypeInfo::Named("RWMutexReadView")},
+{"RWMutex", "w", {}, ReturnTypeInfo::Named("RWMutexWriteView")},
+```
+
+### 3.3 functions_ 初始化列表追加（在 `{"sync.Mutex", ...}` 之后）
+
+```cpp
+{"sync.RWMutex",   {}, ReturnTypeInfo::Named("RWMutex")},
+{"sync.Once",      {}, ReturnTypeInfo::Named("Once")},
 ```
 
 ---
 
-## 三、Parser
+## 四、src/Sema/Checker/StmtChecker.cpp（checkLockStmt L1 扩展）
 
-### 3.1 修改：src/Parser/StmtParser.cpp
-
-**第 30 行（`if (check(TokType::Spawn))` 后）新增软关键字 `lock` 识别**：
-
-```cpp
-if (check(TokType::Spawn))    return parseSpawnStmt();
-// lock 软关键字：语句起始位置 + 后续 '(' 时识别为 LockStmt
-// 其他位置仍是普通标识符（如 let lock = ...）
-if (check(TokType::Identifier) && peek().lexeme == "lock"
-    && peekNext().type == TokType::LParen) {
-    return parseLockStmt();
-}
-```
-
-**parseSyncStmt 后（第 198 行后）新增 parseLockStmt 函数**：
-
-```cpp
-std::unique_ptr<Stmt> Parser::parseLockStmt() {
-    auto tok = advance();  // consume 'lock' 标识符
-    auto stmt = std::make_unique<LockStmt>();
-    setNodePos(stmt.get(), tok);
-
-    consume(TokType::LParen, "expected '(' after lock");
-    stmt->lockExpr = parseExpr();
-    consume(TokType::RParen, "expected ')' after lock expression");
-
-    stmt->body = parseBlock();
-    return stmt;
-}
-```
-
-### 3.2 修改：src/Parser.h
-
-**在 parseSyncStmt 声明附近新增 parseLockStmt 声明**：
-
-```cpp
-std::unique_ptr<Stmt> parseSyncStmt();
-std::unique_ptr<Stmt> parseSyncForStmt();
-std::unique_ptr<Stmt> parseSpawnStmt();
-std::unique_ptr<Stmt> parseLockStmt();   // 新增
-```
-
----
-
-## 四、Sema
-
-### 4.1 修改：src/Sema/SemAnalyzer.h
-
-**第 144 行 `inSyncThreadBlock_` 后新增字段**：
-
-```cpp
-bool inSyncThreadBlock_ = false;  // sync thread 块内（禁止嵌套 / 无参 spawn）
-bool inLockBlock_ = false;        // lock 块内（禁止 return/break/continue 跨出）
-```
-
-**在 checkSpawnStmt 声明附近新增 checkLockStmt 声明**：
-
-```cpp
-void checkSpawnStmt(const SpawnStmt& stmt);
-void checkLockStmt(const LockStmt& stmt);   // 新增
-```
-
-### 4.2 修改：src/Sema/SemAnalyzer.cpp
-
-**第 504 行（SpawnStmt 分支后）新增 dispatch**：
-
-```cpp
-if (auto* p = dynamic_cast<const SpawnStmt*>(&stmt))        { checkSpawnStmt(*p);   return; }
-if (auto* l = dynamic_cast<const LockStmt*>(&stmt))         { checkLockStmt(*l);    return; }   // 新增
-```
-
-**第 506-513 行（BreakStmt / ContinueStmt 检查）改为**：
-
-```cpp
-if (auto* br = dynamic_cast<const BreakStmt*>(&stmt)) {
-    if (!insideLoop_) error(*br, "'break' outside of loop");
-    if (inLockBlock_) error(*br, "cannot break out of lock block");     // 新增 L3
-    return;
-}
-if (auto* co = dynamic_cast<const ContinueStmt*>(&stmt)) {
-    if (!insideLoop_) error(*co, "'continue' outside of loop");
-    if (inLockBlock_) error(*co, "cannot continue out of lock block");  // 新增 L3
-    return;
-}
-```
-
-### 4.3 修改：src/Sema/Checker/StmtChecker.cpp
-
-**第 92 行 checkReturnStmt 末尾（第 108 行 `}` 前）新增 L3 检查**：
-
-```cpp
-void SemAnalyzer::checkReturnStmt(const ReturnStmt& stmt) {
-    if (stmt.expr) {
-        // ...（原有逻辑保持不变）
-    }
-    // L3: lock 块内禁止 return 跨出
-    if (inLockBlock_) {
-        error(stmt, "cannot return out of lock block");
-    }
-}
-```
-
-**第 318 行 checkSpawnStmt 末尾新增 L6 检查**：
-
-```cpp
-void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
-    if (!insideSync_) {
-        // ...（原有逻辑）
-        return;
-    }
-
-    // L6: lock 块内禁止 spawn（spawn 不应持锁）
-    if (inLockBlock_) {
-        error(stmt, "cannot spawn inside lock block");
-        return;
-    }
-
-    // R3: sync thread 块内的 spawn 必须显式传参
-    // ...（原有逻辑保持不变）
-}
-```
-
-**文件末尾新增 checkLockStmt 实现**：
+替换 `checkLockStmt` 的 L1 检查部分（第 355-384 行）：
 
 ```cpp
 void SemAnalyzer::checkLockStmt(const LockStmt& stmt) {
-    // L1: lockExpr 类型检查（v1.0 仅允许 Mutex*）
+    // L1: lockExpr 类型检查（v1.1 扩展为 Mutex/RWMutexReadView/RWMutexWriteView/Once）
     if (stmt.lockExpr) {
         auto lockTy = inferExpr(*stmt.lockExpr);
         if (!lockTy) {
             error(*stmt.lockExpr, "cannot infer lock expression type");
             return;
         }
-        // 检查是否为 Mutex* 类型
-        // 通过 canonicalName 匹配（参考 isAssignable / BuiltinRegistry 查询）
-        const std::string& name = lockTy->canonicalName();
-        if (name != "Mutex") {
+        // 识别合法锁类型
+        bool isLockType = false;
+        if (auto* gs = dynamic_cast<const GenericSemType*>(lockTy.get())) {
+            if (gs->name == "Mutex" || gs->name == "RWMutexReadView"
+                || gs->name == "RWMutexWriteView" || gs->name == "Once") {
+                isLockType = true;
+            }
+        }
+        if (!isLockType) {
             error(*stmt.lockExpr,
-                "lock requires sync.Mutex, got '" + lockTy->toString() + "'");
+                "lock requires sync.Mutex/RWMutex.r()/.w()/Once, got '"
+                + lockTy->toString() + "'");
             return;
         }
+        // 标注 lockExpr 的 inferredType（供 CodeGen 读取分派）
+        const_cast<ASTNode*>(stmt.lockExpr.get())->inferredType = lockTy.get();
+        typeStore_.push_back(std::move(lockTy));
     }
 
-    // 进入 lock 块：设置标志
+    // 进入 lock 块：设置标志，检查 body
     bool oldInLock = inLockBlock_;
     inLockBlock_ = true;
     if (stmt.body) checkBlock(*stmt.body);
@@ -318,152 +297,187 @@ void SemAnalyzer::checkLockStmt(const LockStmt& stmt) {
 }
 ```
 
-**说明**：v1.0 仅支持 `Mutex*`，L4（禁止 await）实际通过 `ioSync_ = true` 在 CodeGen 强制（见 §五），Sema 不需单独检测（Aura 无 await 关键字，io 异步方法在 lock 块内会编译失败因为 _guard 析构顺序与协程状态冲突——v1.0 简化为"用户责任"，后续 v1.1 再加严格检测）。
-
 ---
 
-## 五、CodeGen
+## 五、src/CodeGen/StmtGen.cpp（genLockStmt 增加 Once 分派）
 
-### 5.1 修改：src/CodeGen/StmtGen.cpp
-
-**第 53 行（SpawnStmt 分支后）新增 dispatch**：
+替换 `genLockStmt`（第 843-854 行）：
 
 ```cpp
-if (auto* sp = dynamic_cast<const SpawnStmt*>(&stmt))
-    { genSpawnStmt(cpp, *sp, isCoroutine); return; }
-if (auto* l = dynamic_cast<const LockStmt*>(&stmt))
-    { genLockStmt(cpp, *l, isCoroutine); return; }   // 新增
-```
-
-**文件中新增 genLockStmt 实现**（放在 genSpawnStmt 之后）：
-
-```cpp
-// ============================================================
-// lock 语句：lock (lockExpr) { body }
-//
-// v1.0 仅 Mutex 分支：生成 RAII guard，生命周期限制在块作用域内。
-// _guard 构造时 acquire（m->lock()），析构时 release（m->unlock()）。
-// 块结束自动 unlock，无需用户手动操作，且禁止跨函数持有锁。
-// ============================================================
 void CodeGenerator::genLockStmt(std::ostream& cpp, const LockStmt& stmt,
-                                  bool isCoroutine) {
-    // isCoroutine 必须为 false：lock 块内强制 ioSync_ = true，
-    // 不会生成 co_await，块体非协程
-    std::string lockExpr = genExpr(*stmt.lockExpr, false);
+                                  bool /*isCoroutine*/) {
+    std::string lockExpr = stmt.lockExpr ? genExpr(*stmt.lockExpr, false) : "";
 
+    // 由 Sema 推断的 lockExpr 类型分派
+    std::string typeName;
+    if (stmt.lockExpr && stmt.lockExpr->inferredType) {
+        if (auto* gs = dynamic_cast<const GenericSemType*>(stmt.lockExpr->inferredType)) {
+            typeName = gs->name;
+        }
+    }
+
+    if (typeName == "Once") {
+        // lock (once) { body } → once->do_([&] { body })
+        writeLine(cpp, lockExpr + "->do_([&] {");
+        indentLevel_++;
+        if (stmt.body) genBlock(cpp, *stmt.body, false);
+        indentLevel_--;
+        writeLine(cpp, "});");
+        return;
+    }
+
+    // 默认：Mutex / RWMutexReadView / RWMutexWriteView —— RAII guard
     cpp << indentStr() << "{\n";
     indentLevel_++;
     writeLine(cpp, "auto _guard = aura_rt::__acquire_lock(" + lockExpr + ");");
     if (stmt.body) genBlock(cpp, *stmt.body, false);
-    // _guard 在块结束析构，自动 unlock
     indentLevel_--;
     cpp << indentStr() << "}\n";
 }
 ```
 
-### 5.2 修改：src/CodeGen/CodeGen.h
-
-**新增 genLockStmt 声明**（在 genSyncStmt/genSpawnStmt 附近）：
-
-```cpp
-void genSyncStmt(std::ostream& cpp, const SyncStmt& stmt, bool isCoroutine);
-void genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt, bool isCoroutine);
-void genLockStmt(std::ostream& cpp, const LockStmt& stmt, bool isCoroutine);   // 新增
-```
-
-### 5.3 修改：src/CodeGen/ExprGen.cpp
-
-**第 540 行 channel 构造特殊处理后，新增 sync.Mutex 构造特殊处理**：
-
-```cpp
-// channel 构造函数特殊处理：channel(cap) → new Channel<T>(cap)
-if (calleeName == "channel") {
-    std::string targ = expectedTemplateArgs_.empty() ? "int32_t" : expectedTemplateArgs_[0];
-    std::string cap = e.args.empty() ? "0" : genExpr(*e.args[0], isCoroutine);
-    return "(new aura_rt::Channel<" + targ + ">(" + cap + "))";
-}
-
-// sync.Mutex() 构造特殊处理：返回 GC 堆对象 + 间接指针 mutex
-if (calleeName == "sync.Mutex" && e.args.empty()) {
-    return "aura_rt::make_mutex()";
-}
-```
-
-**说明**：调用者（genLetDecl / genAssignExpr）会用 GcRootHandle 包装返回的 Mutex*，与 channel 构造一致。
+注：`GenericSemType` 头文件需要在 StmtGen.cpp 中可见。若未 include，需确认 `#include "../Sema/SemType.h"` 或通过其他头文件间接包含（StmtChecker.cpp 已用此类型，通常已包含）。
 
 ---
 
-## 六、BuiltinRegistry 注册
+## 六、src/CodeGen/ExprGen.cpp（sync.RWMutex/Once 构造调用）
 
-### 6.1 修改：src/Sema/BuiltinRegistry.h
-
-**第 218 行 `types_` 末尾（channel 后）新增 Mutex 类型**：
+在 `genMethodCall` 开头的 sync.Mutex 特判之后（第 654 行后），追加两个构造分派：
 
 ```cpp
-types_ = {
-    // ...（原有类型保持不变）
-    {"channel",{"channel",true,  true, BuiltinPrim::Other,    "aura_rt::Channel*"}},
-    {"Mutex",  {"Mutex",  true,  true, BuiltinPrim::Other,     "aura_rt::Mutex*"}},   // 新增
-};
+// sync.RWMutex() / sync.Once() 构造特殊处理
+if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+    if (id->name == "sync" && e.args.empty()) {
+        if (e.method == "Mutex") {
+            return "aura_rt::make_mutex()";
+        }
+        if (e.method == "RWMutex") {
+            return "aura_rt::make_rwmutex()";
+        }
+        if (e.method == "Once") {
+            return "aura_rt::make_once()";
+        }
+    }
+}
 ```
 
-**第 268 行 `functions_` 末尾（gc_stats 后）新增 sync.Mutex 构造函数**：
+将原第 651-654 行的 `if (id->name == "sync" && e.method == "Mutex" ...)` 替换为上述扩展版本。
 
-```cpp
-functions_ = {
-    // ...（原有函数保持不变）
-    {"gc_stats", {}, ReturnTypeInfo::Named("string")},
-    // sync.Mutex 构造函数（无参数，返回 Mutex*）
-    {"sync.Mutex", {}, ReturnTypeInfo::Named("Mutex")},   // 新增
-};
-```
-
-**注意**：`Mutex` **不注册 `lock`/`unlock` 方法**——用户必须用 `lock (m) { }` 块，强制安全用法。
+注：`rw.r()` / `rw.w()` 走通用方法调用路径，无需特殊处理（生成 `rw->r()` 等）。
 
 ---
 
-## 七、测试
-
-### 7.1 测试文件：example/test.aura
+## 七、example/test.aura（测试代码）
 
 ```aura
 fun main(io: Io) {
-    let counter = [0]
+    # === Test 1: Once 并发一次性执行 ===
+    io.println("=== Test 1: Once ===")
+    let once = sync.Once()
     let m = sync.Mutex()
+    let counter = [0]
 
     sync thread(max = 4) {
-        for i in range(1000) {
-            spawn (io: Io, m: sync.Mutex, counter: [int]) {
-                lock (m) {
-                    counter.append(i)
+        for i in range(100) {
+            spawn (io: Io, once: sync.Once, m: sync.Mutex, counter: [int], i: int) {
+                lock (once) {
+                    lock (m) {
+                        counter.append(i)
+                    }
+                    io.println_sync("init once, i=" + i)
                 }
             }
         }
     }
 
-    io.println("count: " + counter.len())
+    lock (m) {
+        io.println_sync("Test1: counter.len=" + counter.len() + " (once executed)")
+    }
+
+    # === Test 2: RWMutex 读写锁 ===
+    io.println("=== Test 2: RWMutex ===")
+    let rw = sync.RWMutex()
+    let data = [0]
+
+    sync thread(max = 4) {
+        for i in range(100) {
+            spawn (rw: sync.RWMutex, data: [int], i: int) {
+                lock (rw.w()) {
+                    data.append(i)
+                }
+            }
+        }
+    }
+
+    lock (rw.r()) {
+        io.println_sync("Test2: data.len=" + data.len() + " (expect 100)")
+    }
+
+    # === Test 3: RWMutex 公平性（写优先，防 reader starve writer）===
+    io.println("=== Test 3: RWMutex fairness ===")
+    let rw2 = sync.RWMutex()
+    let writeCount = [0]
+
+    sync thread(max = 4) {
+        # 持续读 + 偶尔写，验证 writer 不会被 reader starve
+        for i in range(500) {
+            spawn (rw: sync.RWMutex, writeCount: [int], i: int) {
+                if (i % 50 == 0) {
+                    lock (rw.w()) {
+                        writeCount.append(i)
+                    }
+                } else {
+                    lock (rw.r()) {
+                        # 读操作，空 body（仅验证 reader 能进入）
+                    }
+                }
+            }
+        }
+    }
+
+    io.println_sync("Test3: writeCount.len=" + writeCount.len() + " (expect 10, writer not starved)")
+
+    # === Test 4: 并发 GC 压力测试（Mutex + RWMutex + Once 混合）===
+    io.println("=== Test 4: concurrent GC stress ===")
+    let m4 = sync.Mutex()
+    let rw4 = sync.RWMutex()
+    let once4 = sync.Once()
+    let counter4 = [0]
+
+    sync thread(max = 4) {
+        for i in range(1000) {
+            spawn (m: sync.Mutex, rw: sync.RWMutex, once: sync.Once, counter: [int], i: int) {
+                lock (m) {
+                    counter.append(i)
+                }
+                if (i % 100 == 0) {
+                    lock (rw.w()) {
+                        # 写锁压力
+                    }
+                    lock (once) {
+                        # Once 在 GC 压力下也只执行一次
+                        counter.append(-1)
+                    }
+                    gc_force()
+                }
+            }
+        }
+    }
+
+    lock (m4) {
+        io.println_sync("Test4: counter4.len=" + counter4.len() + " (expect 1000+10, once executed 10 times but only first counted)")
+    }
+
+    io.println_sync("=== All tests done ===")
 }
 ```
 
-**验收标准**：
-- 输出 `count: 1000`（无丢失、无重复）
-- 无 crash、无 ASAN 报错
-- 多次运行结果一致
-
-### 7.2 编译运行流程
-
-```powershell
-# 1. 重新构建编译器和 runtime
-cmake --build build
-cmake --build runtime/build
-
-# 2. 编译测试
-cd example
-.\compile.cmd
-
-# 3. 运行测试
-.\test.exe
-```
+**验收**：
+- Test1：输出 100 行 `init once, i=N`（每个 i 仅一次），`counter.len=100`
+- Test2：`data.len=100`（100 个 spawn，写锁串行 append）
+- Test3：`writeCount.len=10`（500 中 10 个 writer，写优先防 starve）
+- Test4：`counter4.len` ≥ 1000（1000 个 append + Once 仅首次执行）
+- 5 次连续运行无死锁、无 abort、无 ASAN 报错
 
 ---
 
@@ -471,52 +485,61 @@ cd example
 
 | 步骤 | 模块 | 文件 | 依赖 |
 |:---|:---|:---|:---|
-| 1 | 运行时 | `runtime/builtin/mutex.h`（新增）, `mutex.cpp`（新增） | 无 |
-| 2 | 运行时 | `runtime/aura_rt.h`, `runtime/CMakeLists.txt` | 步骤 1 |
-| 3 | Sema | `src/Sema/BuiltinRegistry.h` init() 注册 Mutex 类型 + sync.Mutex 构造 | 步骤 1 |
-| 4 | AST | `src/AST/Stmt.h` 新增 LockStmt, `src/ASTPrinter.cpp` print | 无 |
-| 5 | Parser | `src/Parser/StmtParser.cpp` parseLockStmt + dispatch, `src/Parser.h` 声明 | 步骤 4 |
-| 6 | Sema | `src/Sema/SemAnalyzer.h` 字段 + 声明, `src/Sema/SemAnalyzer.cpp` dispatch + L3, `src/Sema/Checker/StmtChecker.cpp` checkLockStmt + L1 + L3 + L6 | 步骤 4 |
-| 7 | CodeGen | `src/CodeGen/StmtGen.cpp` genLockStmt + dispatch, `src/CodeGen/CodeGen.h` 声明 | 步骤 4 |
-| 8 | CodeGen | `src/CodeGen/ExprGen.cpp` sync.Mutex() 构造调用 | 步骤 3 |
-| 9 | 构建 | `cmake --build build` + `cmake --build runtime/build` | 步骤 1-8 |
-| 10 | 测试 | `example/test.aura` 写入测试，`compile.cmd` 编译，运行 `test.exe` | 步骤 9 |
+| 1 | 运行时 | `runtime/builtin/mutex.h` 续写 RWMutex（含写优先公平性）/ Once | v1.0 完成 |
+| 2 | 运行时 | `runtime/builtin/mutex.cpp` 续写两个终结器 + TypeDescriptor | 步骤 1 |
+| 3 | Sema | `src/Sema/BuiltinRegistry.h` 注册类型/方法/构造函数 | 步骤 1 |
+| 4 | Sema | `src/Sema/Checker/StmtChecker.cpp` checkLockStmt L1 扩展 | 步骤 3 |
+| 5 | CodeGen | `src/CodeGen/StmtGen.cpp` genLockStmt 增加 Once 分派 | 步骤 4 |
+| 6 | CodeGen | `src/CodeGen/ExprGen.cpp` sync.RWMutex/Once 构造调用 | 步骤 3 |
+| 7 | **Safepoint 验收** | `Select-String gc_safepoint runtime/builtin/mutex.h` 期望 Count ≥ 4 | 步骤 1-6 |
+| 8 | 构建 | `cmake --build build` + `cmake --build runtime/build` | 步骤 1-7 |
+| 9 | 测试 | `example/test.aura` 写入测试代码，编译运行 | 步骤 8 |
+| 10 | **稳定性验收** | 连续 5 次运行无死锁、无 abort、无 TSan 警告 | 步骤 9 |
 
 ---
 
-## 九、潜在风险与规避
+## 九、潜在风险与应对
 
-### 9.1 lockExpr 类型推断
+### 9.1 RWMutex 公平性问题（已修复）
+- **风险**：原方案 reader 可能 starve writer（reader 持续进入时 writer 无法获取）
+- **修复**：Inner 新增 `waiting_writers` 原子计数器，实现写优先：
+  - WriteGuard 构造时 `waiting_writers++`，获取锁后 `waiting_writers--`
+  - ReadGuard 进入前检查 `waiting_writers == 0`，若有 writer 等待则让出
+  - 效果：writer 等待时新 reader 会让出，writer 必然能获取锁（不会 starve）
 
-`lockExpr->inferredType` 由 Sema 标注（[ASTNode.h:21](file:///d:/you/Aura/src/AST/ASTNode.h#L21)）。v1.0 仅检测 `Mutex*`，通过 `lockTy->canonicalName() == "Mutex"` 匹配。
+### 9.2 Once 的 do_ 模板与 GC
+- **风险**：`once->do_([&] { body })` 中 lambda 捕获的变量若触发 GC，可能 compact 搬迁
+- **应对**：body 内部的 GC 指针变量已由 CodeGen 包装为 GcRootHandle（与 v1.0 一致），无需特殊处理
 
-**注意**：Mutex 在 BuiltinRegistry 注册为 `isGcObject=true`，Sema 推断的 canonicalName 应为 `"Mutex"`（不含 `*`，与 string/channel 一致）。需测试验证。
+### 9.3 GenericSemType 头文件依赖
+- **风险**：StmtGen.cpp 中 `dynamic_cast<const GenericSemType*>` 需要头文件可见
+- **应对**：若编译报错，添加 `#include "../Sema/SemType.h"`；StmtChecker.cpp 已使用此类型，通常已通过间接包含可见
 
-### 9.2 `lock` 软关键字歧义
+### 9.4 ReadGuard/WriteGuard GcRootHandle 悬垂（已修复）
+- **风险**：原方案 `gcRoot_(rw)` 引用构造函数参数 `rw`（栈临时变量），构造函数结束后 `rw` 销毁，`gcRoot_.ptr_` 悬垂。GC compact 时 `updateAllReferences` 解引用悬垂指针 → UB
+- **修复**：改为 `gcRoot_(rw_)` 引用成员 `rw_`（生命周期与 Guard 一致）。移动构造同样改为 `gcRoot_(rw_)`，并调用 `gcRoot_.rebind(rw_)` 重新绑定
+- **对比**：v1.0 [Mutex::Guard](file:///d:/you/Aura/runtime/builtin/mutex.h#L44) 已正确使用 `gcRoot_(m_)` 引用成员
 
-`lock` 作为普通标识符仍可用（如 `let lock = sync.Mutex()`）。Parser 仅在语句起始位置 + 后续 `(` 时识别为 LockStmt。
+### 9.5 Once::do_ 异常不安全 → 永久死锁（已修复）
+- **风险**：原方案 `f()` 抛异常时 `m_->unlock()` 不执行 → `m_` 永久持有锁 → 其他线程死锁在 `while (!m_->try_lock())` 轮询
+- **修复**：用 `std::lock_guard<std::timed_mutex> lk(*m_, std::adopt_lock)` RAII 保护，确保异常时也能 unlock。`adopt_lock` 表示已持有锁，构造时不再次获取，析构时释放
+- **关键**：`lock_guard` 必须在 `try_lock` 成功后、`f()` 调用前构造
 
-**测试用例**：
+### 9.6 WaitGroup 设计冗余（已移除）
+- **问题**：`sync_thread_context` 析构已自动调用 `waitGroup`（[thread_pool.cpp:201-203](file:///d:/you/Aura/runtime/thread_pool.cpp#L201)），sync thread 块结束即等待所有 spawn 完成，WaitGroup 在此设计下冗余
+- **应对**：v1.1 移除 WaitGroup，推到 v1.2 重新设计（可能引入全局 spawn，让 WaitGroup 成为等待机制）
 
-```aura
-fun main(io: Io) {
-    let lock = sync.Mutex()    # lock 作为变量名
-    lock (lock) {              # 第一个 lock 是关键字，第二个 lock 是变量
-        io.println("ok")
-    }
-}
-```
+---
 
-### 9.3 compact GC 损坏 mutex（已规避）
+## 十、总改动量估算
 
-`std::mutex` 不可移动。Mutex 用间接指针 `std::mutex* m_` 规避：compact 时 Mutex 主体搬迁，m_ 指针的值被正确拷贝，指向同一块堆 mutex。
-
-### 9.4 finalizer 中死锁（已规避）
-
-finalizer 在 GC STW 期间执行，所有 mutator 线程已暂停。不在 finalizer 中获取锁，仅 `delete` 堆内存。
-
-### 9.5 lock 块内 io 异步方法
-
-v1.0 简化处理：lock 块内强制 `isCoroutine = false`（genBlock 第三参数）。若用户在 lock 块内调用 `io.println(...)`（异步协程方法），会因 ioSync_ 不一致生成失败。
-
-**v1.0 策略**：lock 块内必须用 `io.println_sync(...)`（同步版本）。后续 v1.1 增加 Sema L4 检查给出明确错误信息。
+| 文件 | 改动行数 |
+|:---|:---|
+| runtime/builtin/mutex.h | +130 行（RWMutex 含写优先 + Once） |
+| runtime/builtin/mutex.cpp | +20 行（2 个终结器 + TypeDescriptor） |
+| src/Sema/BuiltinRegistry.h | +10 行（types/methods/functions 追加） |
+| src/Sema/Checker/StmtChecker.cpp | +10 行（L1 扩展） |
+| src/CodeGen/StmtGen.cpp | +15 行（Once 分派） |
+| src/CodeGen/ExprGen.cpp | +8 行（2 个构造调用） |
+| example/test.aura | +90 行（测试代码） |
+| **合计** | **~280 行** |

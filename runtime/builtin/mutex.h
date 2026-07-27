@@ -13,6 +13,7 @@
 // ============================================================
 
 #include "../gc.h"
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <thread>
@@ -85,5 +86,182 @@ inline Mutex* make_mutex() {
     m->m_ = new std::timed_mutex();
     return m;
 }
+
+// ============================================================
+// RWMutex — 读写锁（GC 堆对象，写优先防 reader starve writer）
+//
+// 用法：
+//   let rw = sync.RWMutex()
+//   lock (rw.r()) { ... }  // 多读并发
+//   lock (rw.w()) { ... }  // 独占写
+// ============================================================
+struct RWMutex : GcObject {
+    struct Inner {
+        std::timed_mutex m;
+        std::atomic<int>  readers{0};
+        std::atomic<bool> writer_active{false};
+        // 等待中的 writer 数量（写优先：reader 看到 writer 等待时让出，
+        // 防止持续进入的 reader 把 writer 饿死）
+        std::atomic<int>  waiting_writers{0};
+    };
+    Inner* inner_;  // 间接指针，指向 new 出的 Inner
+
+    static const TypeDescriptor _desc;
+
+    // 读锁守卫：多读并发，与读互斥不与写互斥
+    class ReadGuard {
+    public:
+        explicit ReadGuard(RWMutex* rw)
+            : rw_(rw), gcRoot_(rw_), locked_(false) {
+            while (true) {
+                if (rw_->inner_->m.try_lock()) {
+                    // 写优先：若有 writer 等待或活跃，reader 让出
+                    if (!rw_->inner_->writer_active.load(std::memory_order_acquire)
+                        && rw_->inner_->waiting_writers.load(std::memory_order_acquire) == 0) {
+                        rw_->inner_->readers.fetch_add(1, std::memory_order_acq_rel);
+                        rw_->inner_->m.unlock();
+                        locked_ = true;
+                        return;
+                    }
+                    rw_->inner_->m.unlock();
+                }
+                gc_safepoint();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        ~ReadGuard() {
+            if (locked_ && rw_) {
+                rw_->inner_->readers.fetch_sub(1, std::memory_order_acq_rel);
+                locked_ = false;
+            }
+        }
+        ReadGuard(ReadGuard&& o) noexcept
+            : rw_(o.rw_), gcRoot_(rw_), locked_(o.locked_) {
+            gcRoot_.rebind(rw_);
+            o.rw_ = nullptr;
+            o.locked_ = false;
+        }
+        ReadGuard(const ReadGuard&) = delete;
+        ReadGuard& operator=(const ReadGuard&) = delete;
+        ReadGuard& operator=(ReadGuard&&) = delete;
+    private:
+        RWMutex* rw_;
+        GcRootHandle<RWMutex*> gcRoot_;
+        bool locked_;
+    };
+
+    // 写锁守卫：独占，与读写都互斥
+    class WriteGuard {
+    public:
+        explicit WriteGuard(RWMutex* rw)
+            : rw_(rw), gcRoot_(rw_), locked_(false) {
+            // 标记 writer 等待中，让新 reader 让出（写优先，防 starve）
+            rw_->inner_->waiting_writers.fetch_add(1, std::memory_order_acq_rel);
+            while (true) {
+                if (rw_->inner_->m.try_lock()) {
+                    if (rw_->inner_->readers.load(std::memory_order_acquire) == 0
+                        && !rw_->inner_->writer_active.load(std::memory_order_acquire)) {
+                        rw_->inner_->writer_active.store(true, std::memory_order_release);
+                        rw_->inner_->m.unlock();
+                        locked_ = true;
+                        // 已获取写锁，退出"等待中"状态
+                        rw_->inner_->waiting_writers.fetch_sub(1, std::memory_order_acq_rel);
+                        return;
+                    }
+                    rw_->inner_->m.unlock();
+                }
+                gc_safepoint();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        ~WriteGuard() {
+            if (locked_ && rw_) {
+                // 先置 writer_active=false，再减 waiting_writers 已在构造时完成
+                rw_->inner_->writer_active.store(false, std::memory_order_release);
+                locked_ = false;
+            }
+        }
+        WriteGuard(WriteGuard&& o) noexcept
+            : rw_(o.rw_), gcRoot_(rw_), locked_(o.locked_) {
+            gcRoot_.rebind(rw_);
+            o.rw_ = nullptr;
+            o.locked_ = false;
+        }
+        WriteGuard(const WriteGuard&) = delete;
+        WriteGuard& operator=(const WriteGuard&) = delete;
+        WriteGuard& operator=(WriteGuard&&) = delete;
+    private:
+        RWMutex* rw_;
+        GcRootHandle<RWMutex*> gcRoot_;
+        bool locked_;
+    };
+
+    ReadGuard  r() { return ReadGuard(this); }
+    WriteGuard w() { return WriteGuard(this); }
+};
+
+// 工厂函数：sync.RWMutex() 构造调用生成
+inline RWMutex* make_rwmutex() {
+    auto* rw = static_cast<RWMutex*>(
+        GcHeap::instance().alloc(sizeof(RWMutex), &RWMutex::_desc));
+    rw->inner_ = new RWMutex::Inner();
+    return rw;
+}
+
+// ============================================================
+// Once — 一次性执行（GC 堆对象）
+//
+// 用法：
+//   let once = sync.Once()
+//   lock (once) { body }  // body 仅首次执行，后续调用跳过
+//
+// 关键设计：
+//   1. 双检查：fast path 无锁读取 done_；慢路径持锁后再检查
+//   2. try_lock 轮询 + gc_safepoint() 响应 STW
+//   3. std::lock_guard + adopt_lock 保证 f() 抛异常时也能 unlock
+//      （否则 m_ 永久持锁 → 其他线程死锁在 try_lock 轮询）
+// ============================================================
+struct Once : GcObject {
+    std::timed_mutex*    m_;    // 间接指针
+    std::atomic<bool>*   done_; // 间接指针
+
+    static const TypeDescriptor _desc;
+
+    template <typename F>
+    void do_(F&& f) {
+        // fast path：已完成直接返回（无锁）
+        if (done_->load(std::memory_order_acquire)) return;
+
+        // 慢路径：try_lock 轮询 + safepoint 响应 STW
+        while (!m_->try_lock()) {
+            if (done_->load(std::memory_order_acquire)) return;
+            gc_safepoint();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // RAII 守卫：异常安全，确保 f() 抛异常时 m_ 也能 unlock
+        // 否则 m_ 永久持锁 → 其他线程死锁在 try_lock 轮询
+        std::lock_guard<std::timed_mutex> lk(*m_, std::adopt_lock);
+
+        // 双检查：持锁后再检查 done_
+        if (!done_->load(std::memory_order_acquire)) {
+            f();
+            done_->store(true, std::memory_order_release);
+        }
+    }
+};
+
+// 工厂函数：sync.Once() 构造调用生成
+inline Once* make_once() {
+    auto* o = static_cast<Once*>(
+        GcHeap::instance().alloc(sizeof(Once), &Once::_desc));
+    o->m_ = new std::timed_mutex();
+    o->done_ = new std::atomic<bool>(false);
+    return o;
+}
+
+// 注：WaitGroup 已从 v1.1 移除，推到 v1.2 重新设计
+// 原因：sync_thread_context 析构已自动 waitGroup（thread_pool.cpp:201-203），
+//       sync thread 块结束即等待所有 spawn 完成，WaitGroup 在此设计下冗余。
+//       v1.2 将重新设计（可能引入全局 spawn，让 WaitGroup 成为等待机制）。
 
 } // namespace aura_rt

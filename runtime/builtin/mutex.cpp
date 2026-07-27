@@ -22,4 +22,38 @@ const TypeDescriptor Mutex::_desc = {
     mutex_finalizer         // finalizer
 };
 
+// 终结器：GC 回收 RWMutex 时释放间接持有的 Inner
+static void rwmutex_finalizer(GcObject* o) {
+    auto* rw = static_cast<RWMutex*>(o);
+    delete rw->inner_;
+    rw->inner_ = nullptr;
+}
+
+const TypeDescriptor RWMutex::_desc = {
+    sizeof(RWMutex),        // size
+    0,                      // ptrFieldCount（inner_ 不是 GC 指针）
+    nullptr,                // ptrFieldOffsets
+    0,                      // inlineArrayFieldCount
+    nullptr,                // inlineArrayFields
+    rwmutex_finalizer       // finalizer
+};
+
+// 终结器：GC 回收 Once 时释放间接持有的 m_ 和 done_
+static void once_finalizer(GcObject* o) {
+    auto* once = static_cast<Once*>(o);
+    delete once->m_;
+    delete once->done_;
+    once->m_ = nullptr;
+    once->done_ = nullptr;
+}
+
+const TypeDescriptor Once::_desc = {
+    sizeof(Once),           // size
+    0,                      // ptrFieldCount（m_ 和 done_ 都不是 GC 指针）
+    nullptr,                // ptrFieldOffsets
+    0,                      // inlineArrayFieldCount
+    nullptr,                // inlineArrayFields
+    once_finalizer          // finalizer
+};
+
 } // namespace aura_rt
