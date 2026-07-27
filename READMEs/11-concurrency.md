@@ -267,6 +267,14 @@ io.println("count: " + counter.len())   // 1001
 
 `sync.Mutex` 是用户级互斥锁，配合 `lock (m) { ... }` 块语句使用，保护共享数据免受并发修改。`lock` 是软关键字，仅在语句起始位置 + 后续 `(` 时识别，其他位置仍是普通标识符。
 
+Aura 锁族（v1.1）支持三种锁类型，统一通过 `lock` 块使用：
+
+| 类型 | 构造 | `lock` 用法 | 语义 |
+|:---|:---|:---|:---|
+| `sync.Mutex` | `sync.Mutex()` | `lock (m) { }` | 互斥锁，独占 |
+| `sync.RWMutex` | `sync.RWMutex()` | `lock (rw.r()) { }` / `lock (rw.w()) { }` | 读写锁，多读单写 |
+| `sync.Once` | `sync.Once()` | `lock (once) { }` | 一次性执行，body 仅首次执行 |
+
 ### 11.6.1 基本用法
 
 ```aura
@@ -303,24 +311,31 @@ Aura **不暴露** `m.lock()` / `m.unlock()` 方法，强制用户使用 `lock (
 lock (lockExpr) {
     // 临界区
 }
-// lockExpr：求值为 sync.Mutex 的表达式（变量、字段访问、函数调用均可）
+// lockExpr：求值为 sync.Mutex / RWMutexReadView / RWMutexWriteView / Once 的表达式
 ```
 
-`lockExpr` 可以是任意求值结果为 `sync.Mutex` 的表达式：
+`lockExpr` 可以是任意求值结果为合法锁类型的表达式：
 
 ```aura
 let m = sync.Mutex()
+let rw = sync.RWMutex()
+let once = sync.Once()
 
-lock (m) { ... }                      // 变量
+lock (m) { ... }                      // Mutex 变量
 lock (obj.mutex) { ... }              // 字段访问
 lock (get_lock()) { ... }             // 函数调用
+
+lock (rw.r()) { ... }                 // RWMutex 读锁（多读并发）
+lock (rw.w()) { ... }                 // RWMutex 写锁（独占）
+
+lock (once) { ... }                   // Once：body 仅首次执行
 ```
 
 ### 11.6.4 Sema 规则
 
 | 规则 | 内容 | 示例 |
 |:---|:---|:---|
-| **L1** | `lockExpr` 求值结果必须为 `sync.Mutex` 类型 | `lock (123) { }` ❌ |
+| **L1** | `lockExpr` 求值结果必须为 `sync.Mutex` / `RWMutex.r()` / `RWMutex.w()` / `sync.Once` 类型 | `lock (123) { }` ❌ |
 | **L3** | `lock` 块内禁止 `return` / `break` / `continue` 跨出 | 见下方示例 |
 | **L6** | `lock` 块内禁止 `spawn`（不应持锁启动新任务） | 见下方示例 |
 
@@ -360,8 +375,75 @@ lock (lock) {              // 第一个 lock 是关键字，第二个 lock 是�
 }
 ```
 
-### 11.6.6 v1.0 已知限制
+### 11.6.6 `sync.RWMutex` — 读写锁（v1.1）
 
-- 仅支持 `sync.Mutex`，未支持 `RWMutex.r()/.w()` 模式（v1.1 计划）
-- `lock` 块内的 I/O 必须使用同步版本（如 `io.println_sync`）；后续 v1.1 会增加 Sema 检查给出明确错误
-- 不支持 `Once` / `WaitGroup` 的 `lock` 语法（v1.1 计划，见 [mutex_plan.md](../plan/mutex_plan.md) §二 锁族规划）
+读写锁区分读访问和写访问，多读并发、写独占。**写优先**：当 writer 等待时，新进入的 reader 会主动让出，避免 writer 被 reader starve。
+
+```aura
+let cache : [int] = []
+let rw = sync.RWMutex()
+
+sync thread(max = 4) {
+    for i in range(500) {
+        spawn (cache: [int], rw: sync.RWMutex, i: int) {
+            if (i % 50 == 0) {
+                lock (rw.w()) {                 // 写锁：独占
+                    cache.append(i)
+                }
+            } else {
+                lock (rw.r()) {                 // 读锁：多读并发
+                    let _ = cache.len()
+                }
+            }
+        }
+    }
+}
+```
+
+**写优先机制**：
+- `Inner::waiting_writers` 原子计数器，writer 等待时递增
+- `ReadGuard` 进入前检查 `waiting_writers == 0`，有 writer 等待时让出
+- 效果：writer 等待时新 reader 会让出，writer 必然能获取锁
+
+### 11.6.7 `sync.Once` — 一次性执行（v1.1）
+
+`sync.Once` 保证 `lock (once) { body }` 中的 `body` **仅首次执行**，后续调用直接跳过。常用于并发初始化配置、加载缓存等场景。
+
+```aura
+let config : [int] = []
+let once = sync.Once()
+
+sync thread(max = 4) {
+    for i in range(1000) {
+        spawn (config: [int], once: sync.Once, i: int) {
+            lock (once) {                       // 仅首次进入 body
+                config.append(i)
+                config.append(42)                // 模拟配置项
+            }
+        }
+    }
+}
+
+io.println("config.len=" + config.len())         // 2（仅首次执行）
+```
+
+**实现要点**：
+- 双检查：fast path 无锁读取 `done_`；慢路径持锁后再检查
+- `try_lock` 轮询 + `gc_safepoint()` 响应 STW
+- `std::lock_guard` + `adopt_lock` 保证 `body` 抛异常时也能 `unlock`
+
+### 11.6.8 STW safepoint 感知（v1.0+）
+
+所有锁族的 Guard 构造和 wait 操作都**必须** safepoint 感知，避免持锁线程被 STW 暂停时其他线程在 `lock()` 上阻塞无法到达 safepoint（死锁）。
+
+- **Guard 构造**：用 `try_lock()` 轮询 + `gc_safepoint()`
+- **wait 操作**：用 `unlock + sleep_for(1ms) + lock` 轮询 + `gc_safepoint()`
+- **避免 `cv.wait/wait_for`**：GCC 11 TSan 对 `pthread_cond_timedwait` 追踪有 bug，且阻塞期间无法响应 STW
+
+详见 [plan/done/gc_mutex_deadlock_fix_report.md](../plan/done/gc_mutex_deadlock_fix_report.md)。
+
+### 11.6.9 已知限制
+
+- 不支持 `WaitGroup`（v1.1 移除，推到 v1.2 重新设计）
+- `Once` 的 `body` 中若抛异常，`done_` 不会被设置为 `true`，下次仍会重试（符合 Go 语义）
+- `RWMutex` 不支持可重入（同线程重复 `rw.r()` 会死锁）

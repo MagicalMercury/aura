@@ -57,17 +57,25 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
             if (hadStar) base += "*";
         }
         // 命名空间前缀：math.Pair → math::Pair
+        // 注意：sync 是伪模块名（sync.Mutex/RWMutex/Once），
+        // BuiltinRegistry 已注册为 aura_rt::Mutex* 等，无需加 sync:: 前缀
         if (!n->namespacePrefix.empty()) {
-            std::string prefix;
-            for (auto& ns : n->namespacePrefix)
-                prefix += ns + "::";
-            // 跨模块类型都是堆指针，若 base 不是以 * 结尾则追加
-            if (!base.empty() && base.back() != '*')
-                base += "*";
-            if (base.find("aura_rt::") == 0) {
-                base.insert(std::string("aura_rt::").size(), prefix);
-            } else {
-                base = prefix + base;
+            // sync 伪命名空间：跳过，不加前缀
+            bool isSyncBuiltin = (n->namespacePrefix.size() == 1
+                                  && n->namespacePrefix[0] == "sync"
+                                  && base.find("aura_rt::") == 0);
+            if (!isSyncBuiltin) {
+                std::string prefix;
+                for (auto& ns : n->namespacePrefix)
+                    prefix += ns + "::";
+                // 跨模块类型都是堆指针，若 base 不是以 * 结尾则追加
+                if (!base.empty() && base.back() != '*')
+                    base += "*";
+                if (base.find("aura_rt::") == 0) {
+                    base.insert(std::string("aura_rt::").size(), prefix);
+                } else {
+                    base = prefix + base;
+                }
             }
         }
         return base;

@@ -275,14 +275,19 @@ std::unique_ptr<Stmt> Parser::parseSpawnStmt() {
 // lock (lockExpr) { body }
 // lock 是软关键字：仅在语句起始位置 + 后续 '(' 时识别为 LockStmt
 // 其他位置（如 let lock = ...）仍作为普通标识符
+// lock (e1, e2, ...) { body } — v1.2 支持多锁（逗号分隔）
+// 单锁 lock (m) { } 是 lockExprs.size()==1 的特例
 std::unique_ptr<Stmt> Parser::parseLockStmt() {
     auto tok = advance();  // consume 'lock' 标识符
     auto stmt = std::make_unique<LockStmt>();
     setNodePos(stmt.get(), tok);
 
     consume(TokType::LParen, "expected '(' after lock");
-    stmt->lockExpr = parseExpr();
-    consume(TokType::RParen, "expected ')' after lock expression");
+    stmt->lockExprs.push_back(parseExpr());
+    while (match(TokType::Comma)) {
+        stmt->lockExprs.push_back(parseExpr());
+    }
+    consume(TokType::RParen, "expected ')' after lock expression list");
 
     stmt->body = parseBlock();
     return stmt;

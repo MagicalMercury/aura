@@ -346,39 +346,97 @@ void SemAnalyzer::checkExprStmt(const ExprStmt& stmt) {
 }
 
 // ============================================================
-// lock (lockExpr) { body }
+// lock (e1, e2, ...) { body }
 //
-// v1.0 仅支持 Mutex*。lockExpr 求值后须为 Mutex 类型。
-// 进入 body 时设置 inLockBlock_=true，由 checkReturnStmt /
-// checkStmt(break/continue) / checkSpawnStmt 检测 L3/L6 违规。
+// v1.0: Mutex；v1.1: RWMutex/Once；v1.2: 多锁列表
+//
+// 规则：
+//   L1: 每个 lockExpr 必须是 Mutex/RWMutexReadView/RWMutexWriteView/Once
+//   L3: 块内禁止 return/break/continue 跨出（由各 check*Stmt 检查 inLockBlock_）
+//   L4: 块内禁止 await
+//   L6: 块内禁止 spawn
+//   L8: 多锁语句中禁止包含 Once（Once 语义与多锁不兼容）
+//   L9: 多锁语句中编译期可识别的重复锁（同 Identifier 或同字段链）报错
 // ============================================================
+
+// L9 辅助：编译期判断两个锁表达式是否相同（best-effort）
+// 仅识别 Identifier 同名 / MemberAccessExpr 同字段链
+// 其他情况（函数调用、动态索引）返回 false，依赖运行时 L5 检测
+static bool isSameLockExpr(const ASTNode* a, const ASTNode* b) {
+    if (!a || !b) return false;
+    // Identifier 同名
+    if (auto* ia = dynamic_cast<const Identifier*>(a)) {
+        if (auto* ib = dynamic_cast<const Identifier*>(b)) {
+            return ia->name == ib->name;
+        }
+        return false;
+    }
+    // MemberAccessExpr 同字段链
+    if (auto* ma = dynamic_cast<const MemberAccessExpr*>(a)) {
+        if (auto* mb = dynamic_cast<const MemberAccessExpr*>(b)) {
+            return ma->member == mb->member
+                && isSameLockExpr(ma->object.get(), mb->object.get());
+        }
+        return false;
+    }
+    // 其他表达式（函数调用、索引等）编译期无法判断，返回 false
+    return false;
+}
+
 void SemAnalyzer::checkLockStmt(const LockStmt& stmt) {
-    // L1: lockExpr 类型检查（v1.1 扩展为 Mutex/RWMutexReadView/RWMutexWriteView/Once）
-    if (stmt.lockExpr) {
-        auto lockTy = inferExpr(*stmt.lockExpr);
+    // L1 + L8 + L9：遍历所有锁表达式
+    bool hasOnce = false;
+    int onceIdx = -1;
+    for (size_t i = 0; i < stmt.lockExprs.size(); ++i) {
+        auto& e = stmt.lockExprs[i];
+        if (!e) continue;
+        auto lockTy = inferExpr(*e);
         if (!lockTy) {
-            error(*stmt.lockExpr, "cannot infer lock expression type");
+            error(*e, "cannot infer lock expression type");
             return;
         }
         // 识别合法锁类型：
         //   Mutex/RWMutexReadView/RWMutexWriteView/Once 在 BuiltinRegistry 注册为
         //   BuiltinPrim::Other，Sema 推断后为 GenericSemType
         bool isLockType = false;
+        std::string typeName;
         if (auto* gs = dynamic_cast<const GenericSemType*>(lockTy.get())) {
-            if (gs->name == "Mutex" || gs->name == "RWMutexReadView"
-                || gs->name == "RWMutexWriteView" || gs->name == "Once") {
+            typeName = gs->name;
+            if (typeName == "Mutex" || typeName == "RWMutexReadView"
+                || typeName == "RWMutexWriteView" || typeName == "Once") {
                 isLockType = true;
             }
         }
         if (!isLockType) {
-            error(*stmt.lockExpr,
+            error(*e,
                 "lock requires sync.Mutex/RWMutex.r()/.w()/Once, got '"
                 + lockTy->toString() + "'");
             return;
         }
         // 标注 lockExpr 的 inferredType（供 CodeGen 读取分派）
-        const_cast<ASTNode*>(stmt.lockExpr.get())->inferredType = lockTy.get();
+        const_cast<ASTNode*>(e.get())->inferredType = lockTy.get();
         typeStore_.push_back(std::move(lockTy));
+
+        // L8: 记录 Once 出现
+        if (typeName == "Once") {
+            hasOnce = true;
+            onceIdx = (int)i;
+        }
+
+        // L9: 编译期重复锁检测（仅与前序表达式比较）
+        for (size_t j = 0; j < i; ++j) {
+            if (stmt.lockExprs[j] && isSameLockExpr(stmt.lockExprs[j].get(), e.get())) {
+                error(*e, "duplicate lock in multi-lock statement");
+                return;
+            }
+        }
+    }
+
+    // L8: 多锁 + Once 不兼容
+    if (hasOnce && stmt.lockExprs.size() > 1) {
+        error(*stmt.lockExprs[onceIdx],
+            "cannot combine Once with multi-lock statement");
+        return;
     }
 
     // 进入 lock 块：设置标志，检查 body

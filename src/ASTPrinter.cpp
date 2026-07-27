@@ -361,8 +361,8 @@ void SyncForStmt::print(std::ostream& os, int indent) const {
 
 void LockStmt::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "LockStmt\n";
-    if (lockExpr) lockExpr->print(os, indent + 1);
+    os << "LockStmt (n=" << lockExprs.size() << ")\n";
+    for (auto& e : lockExprs) if (e) e->print(os, indent + 1);
     if (body) body->print(os, indent + 1);
 }
 

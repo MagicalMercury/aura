@@ -7,7 +7,7 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-07-24（sync thread 多线程语句已完成 + MinGW shared_mutex bug 规避）
+# 最近更新：2026-07-27（mutex plan v1.2 完成：多锁地址排序 + RWMutex 批量唤醒 + L5 递归检测）
 
 ================================================================
 [ 一 ] 内置 API 与模块（plan/plan11.md）
@@ -101,24 +101,6 @@
 ================================================================
 
 ----------------------------------------------------------------
-GC 晋升机制缺陷修复（基于 plan/gc_promotion_issues.md，2026-07-19）
-----------------------------------------------------------------
-
-[x] P3  缺陷 5：old/young 混布 page（compacting GC）  [2026-07-23 完成]
-      - 实现：Compact GC 单线程稳定，所有 9 类 bug 已修复
-        （Bug A: genGcRootedArgs auto 值拷贝；Bug B: map_tree 未保护 raw 指针；
-         Bug C: for-range 迭代器悬垂；Bug D: compose lambda 悬垂；
-         Bug E: 协程恢复递归栈溢出；Bug F: 非泛型自引用 record sealSelfRefs；
-         Bug G: Error 的 GC 移动适配；以及 hash_set 优化 + compact 暂停计数）
-      - 验证：complex_closure 9 项断言 + Array 7 项测试（含 GC compact 遍历
-        和 200 元素 GC 压力测试）全部通过，ASAN 无报错
-      - 文件：runtime/gc.h, runtime/gc.cpp, runtime/task.cpp, runtime/types.cpp,
-        runtime/builtin/{array.h, io.cpp, io.h, string.h, string.cpp},
-        src/CodeGen/{CodeGen.cpp, ExprGen.cpp, DeclGen.cpp, StmtGen.cpp},
-        src/Sema/Checker/DeclChecker.cpp, src/main.cpp
-      - 对应：plan/gc_features_plan.md §十三 [x] 完成
-
-----------------------------------------------------------------
 GC 其他功能清单（基于 2026-07-19 重新核验）
 ----------------------------------------------------------------
 
@@ -131,35 +113,10 @@ GC 其他功能清单（基于 2026-07-19 重新核验）
         精确扫描。stackRoots_ 的保守扫描仅作协程帧兜底。
       - 远期改进：若 profiling 显示内存占用过高，再做精确扫描
 
-[x] P2  TLAB（Thread-Local Allocation Buffer）  [2026-07-24 完成]
-      - 实现：每线程独立 TLAB（curPage + bumpOffset + localYoung + localYoungBytes）
-        tryAlloc 改造为 TLAB 优先快路径（无锁）+ 全局慢路径（持 allocM_）
-        safepoint 入口 flushTlab 合并 localYoung 到全局 youngObjects_ + 清空 curPage
-        compact 安全：flushTlab 在 GC 操作前执行，避免页释放后 curPage 悬垂
-        大对象（> kPageSize/2）走全局慢路径，避免 TLAB 单页浪费
-        thread_local Tlab* 裸指针，由 registerThread/unregisterThread 显式管理
-      - 配套修复：roots_ (unordered_set) 并发 insert/erase UAF → 新增 rootsM_ 互斥锁
-        worker 线程空闲时 cv_.wait_for 超时定期检查 gcPending_ 响应 STW
-      - 验证：sync thread Test 3（100 次字符串拼接 × 2 worker）ASAN 无报错
-        输出完整（string 0-99 + done），无卡死
-      - 文件：runtime/gc.h, runtime/gc.cpp, runtime/thread_pool.cpp
-      - plan：plan/TLAB_implementation.md
-
 [-] P2  GC 触发策略调优  [2026-07-18 暂不实施]
       - 现状：kYoungThreshold=256KB, kOldThreshold=1MB（写死）
       - 暂不实施原因：当前无配置系统（ConfigDecl 未实现）
       - 远期改进：待 Aura 配置系统完善后再做
-
-[x] P2  对象可移动性（compacting GC）  [2026-07-23 完成]
-      - 实现：mark-compact 算法完成，存活对象拷贝到新页，消除碎片
-        computeForwardingAddresses → copyObjectsToNewLocations →
-        rebuildPageList → updateAllReferences 完整链路
-        roots_ / stack / fields / array 元素 / 协程帧 所有引用自动更新
-      - 配套：GcRootHandle（栈根）、GcGlobalRoot（全局根）、GcSharedRoot（闭包捕获）、
-        GcWeakHandle（弱引用）+ compactSuspendedCount 暂停机制
-      - 验证：见缺陷 5（complex_closure + Array 全量测试，ASAN 无报错）
-      - 文件：runtime/gc.h, runtime/gc.cpp（compact 相关方法）
-      - 对应：plan/gc_features_plan.md §十三 [x] 完成
 
 [ ] P3  并发 GC（concurrent marking）
       - 现状：GC 全程 stop-the-world
@@ -337,12 +294,6 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
 [ 八 ] 代码质量 / 重构（Res.md 屎山报告）
 ================================================================
 
-[x] P1  genFunExpr 抽 4 个内联 walker 到 ASTWalker.h (2026-07-18)
-      - IoDetector / AssignTargetCollector / CallTargetScanner / CaptureArgScanner
-      - 4 个内联 struct → 4 个独立 class，带 static scan/anyMatch/collectMatched 入口
-      - genFunExpr 从 448 行降到 ~290 行
-      - 文件：src/ASTWalker.h:131-351, src/CodeGen/ExprGen.cpp:527-641
-
 [~] P3  Parser 二项式链样板（parseOr/parseAnd/parseEquality/...）
       - Res.md 指出 30.8% 重复率
       - 现状：可读性高，建议保留
@@ -396,28 +347,77 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
               runtime/builtin/io.cpp, runtime/builtin/io.h
       - 后置：plan/channel_plan.md（channel<T> 跨线程通信）
 
-[ ] P2  sync 锁族 + lock 块语句（统一语法）  [2026-07-24 plan 审核通过]
-      - plan：plan/mutex_plan.md
+[x] P2  sync 锁族 + lock 块语句（统一语法）  [v1.0/v1.1/v1.2 已完成]
+      - plan：plan/mutex_plan.md（v1.0/v1.1 已实施完毕）
+              plan/mutex_plan_v1.2.md（v1.2 详细实施方案）
       - 方案：C（统一 lock 块语句，禁止跨函数持有锁）
       - 语法（统一）：
-          lock (m) { ... }          # Mutex 独占（v1.0）
-          lock (rw.r()) { ... }     # RWMutex 读（v1.1）
-          lock (rw.w()) { ... }     # RWMutex 写（v1.1）
-          lock (once) { ... }       # Once 一次性执行（v1.1）
-          lock (wg) { ... }         # WaitGroup 登记（v1.1）
+          lock (m) { ... }          # Mutex 独占（v1.0 ✅）
+          lock (rw.r()) { ... }     # RWMutex 读（v1.1 ✅）
+          lock (rw.w()) { ... }     # RWMutex 写（v1.1 ✅）
+          lock (once) { ... }       # Once 一次性执行（v1.1 ✅）
+          lock (a.mu, b.mu) { ... } # 多锁（v1.2 ✅，全 Mutex 地址排序）
       - 分期：
-          v1.0: sync.Mutex + LockStmt AST/Parser/Sema/CodeGen 全链路
-          v1.1: RWMutex + Once + WaitGroup（复用 LockStmt，零 AST 改动）
-      - 关键设计：
-          * 间接指针持有同步原语（std::mutex 不可移动，规避 compact memcpy 损坏）
+          v1.0 ✅ sync.Mutex + LockStmt AST/Parser/Sema/CodeGen 全链路
+          v1.1 ✅ RWMutex + Once（复用 LockStmt，零 AST 改动，写优先 + adopt_lock 异常安全）
+          v1.2 ✅ 多锁语句 lock (a.mu, b.mu) + RWMutex 批量唤醒 reader + L5 运行时递归检测
+          v1.3 ⏸ sync.Cond / sync.Semaphore（见下条目）
+      - 关键设计（v1.0 死锁修复确立）：
+          * 间接指针持有同步原语（std::timed_mutex 不可移动，规避 compact memcpy 损坏）
           * 终结器释放间接原语（复用现有 GC finalizer 机制）
-          * RWMutex 用 mutex+cv 模拟（规避 MinGW shared_mutex bug）
+          * timed_mutex + try_lock 轮询 + gc_safepoint()（避免 STW 死锁）
+          * RWMutex 用 timed_mutex + atomic 计数模拟（规避 MinGW shared_mutex bug）
+          * Guard 持有 GcRootHandle + locked_ 标志（防 compact 悬垂 + 防 TSan 误报）
+      - v1.2 新增设计：
+          * 多锁语句：全 Mutex 场景按指针地址排序后逐个获取（等价 std::scoped_lock
+            死锁避免效果，但保留 safepoint 轮询感知）；混合场景（含 RWMutex.r()/.w()）
+            按声明顺序获取，用户需自行保证锁序一致
+          * RWMutex 批量唤醒 reader：generation 代际计数器 + 8 次 yield 短自旋，
+            writer 释放时 ++generation 唤醒所有等待 reader，减少逐个 notify 开销
+          * L5 递归持锁检测：Mutex.owner / RWMutex.writer_owner 记录线程 ID，
+            检测到递归持锁抛 Aura Error{RuntimeError, "recursive lock detected"}（非 abort）
+          * 协程 try/catch 无 setupLet 时用 IIFE + std::variant<monostate, Error>
+            模式，规避 C++ 标准禁止 catch handler 内 co_await 的限制
+          * Once::do_ 用 GcRootHandle<Once*> selfRoot 保护 this，防 compact GC 移动后悬垂
       - 依赖：sync thread 实施完成 ✅
-      - 文件：runtime/builtin/mutex.h(新增), mutex.cpp(新增),
+      - 验证（2026-07-27，5 次连续运行全部 PASS，平均 11.6s）：
+          * I1 多锁转账 1000 次（500 次 a→b + 500 次 b→a）total=2000 正确，无死锁
+          * I2 RWMutex 10000 次 spawn（100 次 write + 9900 次 read）counter=101 正确
+          * I3 Mutex L5 检测抛 Aura Error，try/catch 正常捕获
+          * I4 RWMutex L5 检测抛 Aura Error，try/catch 正常捕获
+      - 文件：runtime/builtin/mutex.h, mutex.cpp,
               src/AST/Stmt.h, src/Parser/StmtParser.cpp,
               src/Sema/Checker/StmtChecker.cpp, src/Sema/BuiltinRegistry.h,
-              src/CodeGen/StmtGen.cpp, src/CodeGen/ExprGen.cpp
-      - 细粒度锁：record 内嵌 mu / 分段锁 / per-object 锁（远期）
+              src/CodeGen/StmtGen.cpp, src/CodeGen/ExprGen.cpp,
+              src/CodeGen/TypeMap.cpp, src/CodeGen/CodeGen.h
+
+[ ] P3  sync.WaitGroup 重新设计  [2026-07-27 推迟，待场景验证]
+      - 现状：v1.1 实施过程中发现 sync_thread_context 析构已自动 waitGroup
+        （runtime/thread_pool.cpp:201-203），sync thread 块结束即等待所有
+        spawn 完成，WaitGroup 在此设计下冗余，已从 v1.1 移除
+      - 推迟原因：未在具体项目中验证必要性，过早实现会引入 API 设计风险
+        + 性能开销 + 与现有等待机制重叠
+      - 触发条件（满足任一即可重新启动）：
+          * 跨 sync 块等待：spawn 在 sync thread A 中创建，需要在 sync thread B 中等待
+          * 提前等待某批 spawn：sync thread 块内中途等待某批任务完成
+          * thread 版 channel 配合：sync.Channel<T> 设计需要 WaitGroup 作等待原语
+      - 候选 API 方向（待场景验证后确定）：
+          方向 1：保持 v1.1 原计划的 lock 语法 lock (wg) { body }
+          方向 2：函数式 API wg.add(n) / wg.done() / wg.wait()
+      - plan：plan/mutex_plan_v1.2.md §五（A. WaitGroup 重新设计）
+
+[ ] P3  sync.Cond / sync.Semaphore（v1.3 远期）  [2026-07-27 推迟到 v1.3]
+      - 现状：v1.2 范围已确认不包含，推到 v1.3
+      - 推迟原因：
+          * sync.Cond 实现复杂度高：cv.wait/wait_for 需改为 unlock+sleep+lock
+            轮询 + gc_safepoint()（v1.0 死锁修复确立的 safepoint 原则）
+          * sync.Semaphore 中等复杂度：sem.acquire 需改为 try_acquire_for
+            轮询（参考 thread_pool.cpp:212 sync_thread_context::submit 已实现模式）
+          * 必要性低：生产者-消费者可用 channel<T> 替代 sync.Cond
+      - v1.3 实施要点：
+          * sync.Cond：需 atomic<bool> notified 标志 + 轮询避免丢失唤醒
+          * sync.Semaphore：复用 thread_pool 内部 counting_semaphore + try_acquire_for 模式
+      - plan：plan/mutex_plan_v1.2.md §六（D. sync.Cond / sync.Semaphore）
 
 [ ] P3  线程池 work-stealing 任务队列（待基准测试触发）
       - issue：plan/thread_pool_work_stealing_issue.md [2026-07-23 审核通过]

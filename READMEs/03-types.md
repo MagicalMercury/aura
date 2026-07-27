@@ -34,8 +34,10 @@ Aura 提供若干内置的 GC 堆对象类型，由运行时管理生命周期�
 | `[T]` | `[v1, v2, ...]` | 动态数组，GC 对象 |
 | `channel<T>` | `channel(cap)` | 协程通道（见 [§11.2](11-concurrency.md#112-协程间通信-channelt)） |
 | `sync.Mutex` | `sync.Mutex()` | 互斥锁，配合 `lock` 块（见 [§11.6](11-concurrency.md#116-syncmutex-与-lock-块)） |
+| `sync.RWMutex` | `sync.RWMutex()` | 读写锁，`rw.r()` / `rw.w()` 返回读/写视图（见 [§11.6.6](11-concurrency.md#1166-syncrwmutex--读写锁v11)） |
+| `sync.Once` | `sync.Once()` | 一次性执行，`lock (once) { body }` 中 body 仅首次执行（见 [§11.6.7](11-concurrency.md#1167-synconce--一次性执行v11)） |
 
-> `sync.Mutex` 是 GC 堆对象，生命周期由 GC 管理。`sync` 是伪模块名，用作类型/构造调用的命名空间前缀，运行时等价于裸 `Mutex` 类型。
+> `sync.Mutex` / `sync.RWMutex` / `sync.Once` 是 GC 堆对象，生命周期由 GC 管理。`sync` 是伪模块名，用作类型/构造调用的命名空间前缀，运行时等价于裸 `Mutex` / `RWMutex` / `Once` 类型。`RWMutex.r()` / `rw.w()` 返回的 `ReadGuard` / `WriteGuard` 是虚拟视图类型，仅用于 `lock` 块的类型推断，用户不能直接声明。
 
 ## 3.2 复合类型
 

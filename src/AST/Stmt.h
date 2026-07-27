@@ -230,14 +230,16 @@ struct SyncStmt : Stmt {
     }
 };
 
-// lock (lockExpr) { body } — 互斥锁块语句（v1.0 仅 Mutex）
+// lock (e1, e2, ...) { body } — 锁块语句
+// v1.0: 单锁 Mutex；v1.1: RWMutex/Once；v1.2: 多锁列表
+// lockExprs 至少 1 个；多锁时由 CodeGen 运行时排序后加锁，避免锁序反转死锁
 struct LockStmt : Stmt {
-    std::unique_ptr<ASTNode> lockExpr;   // 锁表达式，求值为 Mutex*
+    std::vector<std::unique_ptr<ASTNode>> lockExprs;  // v1.2：单锁→多锁列表
     std::unique_ptr<BlockStmt> body;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<LockStmt>();
-        if (lockExpr) n->lockExpr = lockExpr->clone();
+        for (auto& e : lockExprs) n->lockExprs.push_back(e ? e->clone() : nullptr);
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
         n->line = line; n->col = col;
         return n;

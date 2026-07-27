@@ -309,6 +309,8 @@ private:
 
     // 原始 try/catch（非协程模式回退，被 genTryCatchStmt 复用）
     void genTryCatchRaw(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
+    // v1.2：协程模式下无 setupLet 的 try/catch 用 IIFE + variant<monostate, Error>
+    void genTryCatchNoSetupIIFE(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
     void genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt, bool isCoroutine);
     void genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt);  // sync thread 内的 spawn
     void genLockStmt(std::ostream& cpp, const LockStmt& stmt, bool isCoroutine);  // lock (m) { }

@@ -494,7 +494,17 @@ void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
     }
 
     if (!setupLet) {
-        genTryCatchRaw(cpp, stmt, isCoroutine);
+        // v1.2 修复：协程模式下无 setupLet 时也用 IIFE + variant 模式
+        // 原因：genTryCatchRaw 会在 catch handler 中生成 co_await，违反 C++ 标准
+        // （catch handler 内禁止 co_await）
+        // 策略：IIFE 执行 try 体所有语句（同步版本），返回 variant<monostate, Error>
+        //       成功分支执行后续语句（无 setupLet 时通常无后续）
+        //       错误分支执行 catchBody（在协程正常流程中，可含 co_await）
+        if (!isCoroutine) {
+            genTryCatchRaw(cpp, stmt, isCoroutine);
+            return;
+        }
+        genTryCatchNoSetupIIFE(cpp, stmt, isCoroutine);
         return;
     }
 
@@ -561,6 +571,57 @@ void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
     cpp << indentStr() << "}\n";
 }
 
+// v1.2 修复：协程模式下无 setupLet 的 try/catch 用 IIFE + variant<monostate, Error>
+// 避免 catch handler 内生成 co_await（C++ 标准禁止）
+// IIFE 内执行 try 体所有语句（同步版本，isCoroutine=false），
+// 成功返回 monostate，失败返回 Error；后续在协程正常流程中处理错误分支
+void CodeGenerator::genTryCatchNoSetupIIFE(std::ostream& cpp,
+                                            const TryCatchStmt& stmt,
+                                            bool isCoroutine) {
+    std::string cv = safeName(stmt.catchVar);
+
+    cpp << indentStr() << "{\n";
+    indentLevel_++;
+
+    // IIFE：普通函数，执行 try 体所有语句（同步版本），返回 variant<monostate, Error>
+    writeLine(cpp, "auto _try = [&]() -> std::variant<std::monostate, aura_rt::Error> {");
+    indentLevel_++;
+    writeLine(cpp, "try {");
+    indentLevel_++;
+    // try 体语句：同步版本（isCoroutine=false，避免生成 co_await）
+    if (stmt.tryBody) {
+        for (auto& s : stmt.tryBody->stmts) {
+            if (s) genStmt(cpp, *s, false);
+        }
+    }
+    writeLine(cpp, "return std::monostate{};");
+    indentLevel_--;
+    writeLine(cpp, "} catch (const aura_rt::Error& _e) {");
+    indentLevel_++;
+    writeLine(cpp, "return _e;");
+    indentLevel_--;
+    writeLine(cpp, "}");
+    indentLevel_--;
+    writeLine(cpp, "}();");
+
+    // 错误分支：在协程正常流程中执行 catchBody（可含 co_await）
+    cpp << indentStr() << "if (std::holds_alternative<aura_rt::Error>(_try)) {\n";
+    indentLevel_++;
+    writeLine(cpp, "auto& " + cv + " = std::get<aura_rt::Error>(_try);");
+    // GC 安全：variant 中的 Error 是值嵌入的，需 GcRootHandle 保护内部指针
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".kind)> _eh_kind(" + cv + ".kind);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".message)> _eh_msg(" + cv + ".message);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".extra)> _eh_extra(" + cv + ".extra);");
+    valueTypeVarNames_.insert(cv);
+    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine);
+    valueTypeVarNames_.erase(cv);
+    indentLevel_--;
+    cpp << indentStr() << "}\n";
+
+    indentLevel_--;
+    cpp << indentStr() << "}\n";
+}
+
 void CodeGenerator::genTryCatchRaw(std::ostream& cpp,
                                     const TryCatchStmt& stmt,
                                     bool isCoroutine) {
@@ -576,7 +637,7 @@ void CodeGenerator::genTryCatchRaw(std::ostream& cpp,
     writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".message)> _eh_msg(" + cv + ".message);");
     writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".extra)> _eh_extra(" + cv + ".extra);");
     valueTypeVarNames_.insert(cv);
-    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, false);
+    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine);
     valueTypeVarNames_.erase(cv);
     indentLevel_--;
     cpp << indentStr() << "}\n";
@@ -842,21 +903,34 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
 // ============================================================
 void CodeGenerator::genLockStmt(std::ostream& cpp, const LockStmt& stmt,
                                   bool /*isCoroutine*/) {
-    std::string lockExpr = stmt.lockExpr ? genExpr(*stmt.lockExpr, false) : "";
+    // v1.2: 多锁 lock (e1, e2, ...) { body }
+    // - 单锁（lockExprs.size()==1）：走简化路径，与 v1.1 行为一致
+    // - 多锁（lockExprs.size()>=2）：按声明顺序构造 variant<Guard>，存入 vector
+    //   完整地址排序推到 v1.3（RWMutex.r()/w() 返回 Guard 临时对象，无法参与排序）
+    //   当前实现等价于手写嵌套 lock(a) { lock(b) { } }，死锁预防由 L5 运行时检测兜底
 
-    // 由 Sema 推断的 lockExpr 类型分派（v1.1 扩展）
-    // - Once：lock (once) { body } → once->do_([&] { body })
-    // - Mutex / RWMutexReadView / RWMutexWriteView：RAII guard
-    std::string typeName;
-    if (stmt.lockExpr && stmt.lockExpr->inferredType) {
-        if (auto* gs = dynamic_cast<const GenericSemType*>(stmt.lockExpr->inferredType)) {
-            typeName = gs->name;
+    // 求值每个锁表达式，读取 Sema 标注的 inferredType
+    struct LockInfo {
+        std::string cppExpr;     // 求值后的 C++ 表达式
+        std::string typeName;    // Mutex / RWMutexReadView / RWMutexWriteView / Once
+    };
+    std::vector<LockInfo> locks;
+    locks.reserve(stmt.lockExprs.size());
+    for (auto& e : stmt.lockExprs) {
+        if (!e) continue;
+        std::string cppExpr = genExpr(*e, false);
+        std::string typeName;
+        if (e->inferredType) {
+            if (auto* gs = dynamic_cast<const GenericSemType*>(e->inferredType)) {
+                typeName = gs->name;
+            }
         }
+        locks.push_back({cppExpr, typeName});
     }
 
-    if (typeName == "Once") {
-        // lock (once) { body } → once->do_([&] { body })
-        writeLine(cpp, lockExpr + "->do_([&] {");
+    // Once 分支（仅单锁，Sema L8 已保证多锁时无 Once）
+    if (locks.size() == 1 && locks[0].typeName == "Once") {
+        writeLine(cpp, locks[0].cppExpr + "->do_([&] {");
         indentLevel_++;
         if (stmt.body) genBlock(cpp, *stmt.body, false);
         indentLevel_--;
@@ -864,35 +938,87 @@ void CodeGenerator::genLockStmt(std::ostream& cpp, const LockStmt& stmt,
         return;
     }
 
-    if (typeName == "RWMutexReadView") {
-        // lock (rw.r()) { body } → auto _guard = rw->r();
-        // rw.r() 本身返回 ReadGuard 并获取锁，_guard 析构时释放
+    // 单锁场景：简化路径，不排序
+    if (locks.size() == 1) {
+        const auto& lk = locks[0];
         cpp << indentStr() << "{\n";
         indentLevel_++;
-        writeLine(cpp, "auto _guard = " + lockExpr + ";");
+        if (lk.typeName == "RWMutexReadView" || lk.typeName == "RWMutexWriteView") {
+            // lock (rw.r()) { } → auto _guard = rw->r();
+            writeLine(cpp, "auto _guard = " + lk.cppExpr + ";");
+        } else {
+            // Mutex 默认
+            writeLine(cpp, "auto _guard = aura_rt::__acquire_lock(" + lk.cppExpr + ");");
+        }
         if (stmt.body) genBlock(cpp, *stmt.body, false);
         indentLevel_--;
         cpp << indentStr() << "}\n";
         return;
     }
 
-    if (typeName == "RWMutexWriteView") {
-        // lock (rw.w()) { body } → auto _guard = rw->w();
+    // 多锁场景
+    // - 全 Mutex：按地址排序后获取（统一锁序，消除锁序反转死锁）
+    //   借鉴 std::scoped_lock 的死锁避免思想，但用 safepoint 感知的 Guard 逐个获取
+    // - 混合（含 RWMutex.r()/.w()）：按声明顺序获取（RWMutex 返回 Guard 临时对象，
+    //   无法参与地址排序；用户需自行保证锁序一致）
+    bool allMutex = true;
+    for (auto& lk : locks) {
+        if (lk.typeName != "Mutex") {
+            allMutex = false;
+            break;
+        }
+    }
+
+    if (allMutex) {
+        // 全 Mutex：地址排序 + 逐个获取
         cpp << indentStr() << "{\n";
         indentLevel_++;
-        writeLine(cpp, "auto _guard = " + lockExpr + ";");
+        // 1. 求值所有锁表达式到数组
+        std::string arrInit = "{";
+        for (size_t i = 0; i < locks.size(); ++i) {
+            if (i > 0) arrInit += ", ";
+            arrInit += locks[i].cppExpr;
+        }
+        arrInit += "}";
+        writeLine(cpp, "aura_rt::Mutex* _ms[] = " + arrInit + ";");
+        // 2. GcRootHandle 保护每个元素（GC compact 时自动更新指针）
+        for (size_t i = 0; i < locks.size(); ++i) {
+            writeLine(cpp, "aura_rt::GcRootHandle<aura_rt::Mutex*> _r" +
+                         std::to_string(i) + "(_ms[" + std::to_string(i) + "]);");
+        }
+        // 3. 按地址排序（std::sort 交换数组元素值，GcRootHandle 仍指向数组地址，正确）
+        writeLine(cpp, "std::sort(std::begin(_ms), std::end(_ms));");
+        // 4. 逐个获取锁（用索引访问，确保读取 GcRootHandle 更新后的最新值）
+        writeLine(cpp, "std::vector<aura_rt::Mutex::Guard> _guards;");
+        writeLine(cpp, "_guards.reserve(" + std::to_string(locks.size()) + ");");
+        writeLine(cpp, "for (size_t _i = 0; _i < sizeof(_ms)/sizeof(_ms[0]); ++_i) {");
+        indentLevel_++;
+        writeLine(cpp, "_guards.emplace_back(aura_rt::__acquire_lock(_ms[_i]));");
+        indentLevel_--;
+        writeLine(cpp, "}");
         if (stmt.body) genBlock(cpp, *stmt.body, false);
+        // _guards 在块结束析构，按逆序释放锁
         indentLevel_--;
         cpp << indentStr() << "}\n";
         return;
     }
 
-    // 默认：Mutex —— RAII guard
+    // 混合场景：按声明顺序获取（无法地址排序，用户需保证锁序一致）
     cpp << indentStr() << "{\n";
     indentLevel_++;
-    writeLine(cpp, "auto _guard = aura_rt::__acquire_lock(" + lockExpr + ");");
+    writeLine(cpp, "std::vector<aura_rt::LockGuardVariant> _guards;");
+    writeLine(cpp, "_guards.reserve(" + std::to_string(locks.size()) + ");");
+    for (size_t i = 0; i < locks.size(); ++i) {
+        const auto& lk = locks[i];
+        if (lk.typeName == "RWMutexReadView" || lk.typeName == "RWMutexWriteView") {
+            writeLine(cpp, "_guards.emplace_back(" + lk.cppExpr + ");");
+        } else {
+            // Mutex
+            writeLine(cpp, "_guards.emplace_back(aura_rt::__acquire_lock(" + lk.cppExpr + "));");
+        }
+    }
     if (stmt.body) genBlock(cpp, *stmt.body, false);
-    // _guard 在块结束析构，自动 unlock
+    // _guards 在块结束析构，按逆序释放锁
     indentLevel_--;
     cpp << indentStr() << "}\n";
 }
