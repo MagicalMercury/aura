@@ -41,7 +41,14 @@ endif()
 
 add_library(aura_rt STATIC
     types.cpp
-    gc.cpp
+    gc/gc.cpp
+    gc/alloc.cpp
+    gc/tlab.cpp
+    gc/roots.cpp
+    gc/safepoint.cpp
+    gc/mark_sweep.cpp
+    gc/compact.cpp
+    gc/los.cpp
     task.cpp
     thread_pool.cpp
     builtin/io.cpp

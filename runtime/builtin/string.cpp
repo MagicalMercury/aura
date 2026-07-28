@@ -148,9 +148,19 @@ static constexpr int32_t kFlatFallbackThreshold = 64;
 
 static GcString* concat_flat(const GcString* a, const GcString* b) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 a/b 及其 data() 内部指针
+    // 额外用 GcRootHandle 保护 a/b，防止 alloc 触发 GC 时对象被回收
+    GcObject* _aptr = const_cast<GcObject*>(static_cast<const GcObject*>(a));
+    GcObject* _bptr = const_cast<GcObject*>(static_cast<const GcObject*>(b));
+    GcRootHandle<GcObject*> _ra(_aptr);
+    GcRootHandle<GcObject*> _rb(_bptr);
     int32_t total = a->length + b->length;
     size_t objSize = sizeof(GcString) + total + 1;
     auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
+    // 关键：r 也必须 root 保护！alloc 后到 return 前，r 尚未被任何外部 root 引用，
+    // 若 alloc 内部触发 GC（虽然本次 alloc 已完成，但 a->data() 调用可能触发 flatten
+    // 进而 alloc），sweep 会回收 r，导致 r->raw_data() 访问已释放内存
+    GcObject* _rPtr = static_cast<GcObject*>(r);
+    GcRootHandle<GcObject*> _rr(_rPtr);
     r->length = total;
     r->u.capacity = total;
     r->parent = nullptr;
@@ -163,10 +173,20 @@ static GcString* concat_flat(const GcString* a, const GcString* b) {
 static GcString* concat_multi_flat_range(const std::vector<const GcString*>& parts,
                                           size_t start, size_t end) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 parts 及其 data()
+    // 额外用 GcRootHandle 保护 parts 中的对象，防止 alloc 触发 GC 时对象被回收
+    std::vector<GcObject*> _objs;
+    std::vector<GcRootHandle<GcObject*>> _guards;
+    for (size_t i = start; i < end; ++i) {
+        _objs.push_back(const_cast<GcObject*>(static_cast<const GcObject*>(parts[i])));
+        _guards.emplace_back(_objs.back());
+    }
     int32_t total = 0;
     for (size_t i = start; i < end; ++i) total += parts[i]->length;
     size_t objSize = sizeof(GcString) + total + 1;
     auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
+    // r 也必须 root 保护，防止后续 parts[i]->data() 触发 GC 时 sweep 回收 r
+    GcObject* _rPtr = static_cast<GcObject*>(r);
+    GcRootHandle<GcObject*> _rr(_rPtr);
     r->length = total;
     r->u.capacity = total;
     r->parent = nullptr;
@@ -182,6 +202,13 @@ static GcString* concat_multi_flat_range(const std::vector<const GcString*>& par
 static GcString* build_balanced_rope(const std::vector<const GcString*>& parts,
                                       size_t start, size_t end) {
     GcCompactSuspendGuard _compactGuard;  // 递归 alloc，保护 parts
+    // 额外用 GcRootHandle 保护 parts 中的对象，防止递归 alloc 触发 GC 时 sweep 回收
+    std::vector<GcObject*> _objs;
+    std::vector<GcRootHandle<GcObject*>> _guards;
+    for (size_t i = start; i < end; ++i) {
+        _objs.push_back(const_cast<GcObject*>(static_cast<const GcObject*>(parts[i])));
+        _guards.emplace_back(_objs.back());
+    }
     if (end - start == 1) return const_cast<GcString*>(parts[start]);
     if (end - start == 0) return GcString::empty();
     int32_t subtreeTotal = 0;
@@ -190,7 +217,12 @@ static GcString* build_balanced_rope(const std::vector<const GcString*>& parts,
         return concat_multi_flat_range(parts, start, end);
     size_t mid = start + (end - start) / 2;
     GcString* left  = build_balanced_rope(parts, start, mid);
+    // 关键：left 必须在 right 递归 alloc 期间 root 保护，防止 sweep 回收 left
+    GcObject* _leftPtr = static_cast<GcObject*>(left);
+    GcRootHandle<GcObject*> _rleft(_leftPtr);
     GcString* right = build_balanced_rope(parts, mid, end);
+    GcObject* _rightPtr = static_cast<GcObject*>(right);
+    GcRootHandle<GcObject*> _rright(_rightPtr);
     int leftDepth  = left->ropeDepth();
     int rightDepth = right->ropeDepth();
     int newDepth   = std::max(leftDepth, rightDepth) + 1;
@@ -230,6 +262,15 @@ GcString* GcString::concat(const GcString& other) const {
 // ============================================================
 GcString* concat_multi(std::initializer_list<const GcString*> parts) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 parts 中的裸指针值拷贝
+    // 额外用 GcRootHandle 保护 parts 中的对象，防止 alloc 触发 GC 时对象被回收
+    std::vector<GcObject*> _objs;
+    std::vector<GcRootHandle<GcObject*>> _guards;
+    for (auto* p : parts) {
+        if (p) {
+            _objs.push_back(const_cast<GcObject*>(static_cast<const GcObject*>(p)));
+            _guards.emplace_back(_objs.back());
+        }
+    }
     int32_t total = 0;
     for (auto* p : parts) {
         if (p) total += p->length;
@@ -238,6 +279,9 @@ GcString* concat_multi(std::initializer_list<const GcString*> parts) {
     if (total < kConcatByCopySize) {
         size_t objSize = sizeof(GcString) + total + 1;
         auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
+        // r 也必须 root 保护，防止后续 s->data() 触发 GC 时 sweep 回收 r
+        GcObject* _rPtr = static_cast<GcObject*>(r);
+        GcRootHandle<GcObject*> _rr(_rPtr);
         r->length = total;
         r->u.capacity = total;
         r->parent = nullptr;
@@ -266,6 +310,9 @@ GcString* GcString::make_with_capacity(size_t len, size_t cap) {
     if (cap < len) cap = len;
     size_t objSize = sizeof(GcString) + cap + 1;
     auto* str = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &_desc));
+    // str 也必须 root 保护，防止 alloc 触发 GC 时 sweep 回收 str
+    GcObject* _strPtr = static_cast<GcObject*>(str);
+    GcRootHandle<GcObject*> _rstr(_strPtr);
     str->length = static_cast<int32_t>(len);
     str->parent = nullptr;
     str->u.capacity = static_cast<int32_t>(cap);
@@ -280,6 +327,11 @@ GcString* GcString::make_with_capacity(size_t len, size_t cap) {
 GcString* GcString::append(const GcString* other) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 this/other 及 alloc 新对象
     if (!other || other->length == 0) return this;
+    // 额外用 GcRootHandle 保护 this/other，防止 alloc 触发 GC 时对象被回收
+    GcObject* _thisPtr = static_cast<GcObject*>(this);
+    GcObject* _otherPtr = const_cast<GcObject*>(static_cast<const GcObject*>(other));
+    GcRootHandle<GcObject*> _rthis(_thisPtr);
+    GcRootHandle<GcObject*> _rother(_otherPtr);
 
     size_t needed = static_cast<size_t>(length) + static_cast<size_t>(other->length);
 
@@ -302,6 +354,9 @@ GcString* GcString::append(const GcString* other) {
         if (newCap < 16) newCap = 16;
         auto* newStr = static_cast<GcString*>(
             GcHeap::instance().alloc(sizeof(GcString) + newCap + 1, &_desc));
+        // newStr 也必须 root 保护，防止后续 data()/other->data() 触发 GC 时 sweep 回收 newStr
+        GcObject* _newPtr = static_cast<GcObject*>(newStr);
+        GcRootHandle<GcObject*> _rnew(_newPtr);
         newStr->length = static_cast<int32_t>(needed);
         newStr->u.capacity = static_cast<int32_t>(newCap);
         newStr->parent = nullptr;
@@ -320,6 +375,9 @@ GcString* GcString::append(const GcString* other) {
         if (newCap < 16) newCap = 16;
         auto* newStr = static_cast<GcString*>(
             GcHeap::instance().alloc(sizeof(GcString) + newCap + 1, &_desc));
+        // newStr 也必须 root 保护
+        GcObject* _newPtr = static_cast<GcObject*>(newStr);
+        GcRootHandle<GcObject*> _rnew(_newPtr);
         newStr->length = static_cast<int32_t>(needed);
         newStr->u.capacity = static_cast<int32_t>(newCap);
         newStr->parent = nullptr;
@@ -392,6 +450,9 @@ GcString* GcString::slice(int32_t start, int32_t len) const {
     auto* s = static_cast<GcString*>(
         GcHeap::instance().alloc(sizeof(GcString), &_desc)
     );
+    // s 也必须 root 保护，防止 alloc 触发 GC 时 sweep 回收 s
+    GcObject* _sPtr = static_cast<GcObject*>(s);
+    GcRootHandle<GcObject*> _rs(_sPtr);
     s->length = len;
     s->parent = const_cast<GcString*>(this);
     s->u.offset = start;
@@ -454,9 +515,17 @@ const TypeDescriptor GcRopeNode::_desc = {
 // ============================================================
 GcRopeNode* GcRopeNode::make(GcString* l, GcString* r) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 l/r
+    // 额外用 GcRootHandle 保护 l/r，防止 alloc 触发 GC 时对象被回收
+    GcObject* _lPtr = static_cast<GcObject*>(l);
+    GcObject* _rPtr = static_cast<GcObject*>(r);
+    GcRootHandle<GcObject*> _rl(_lPtr);
+    GcRootHandle<GcObject*> _rr(_rPtr);
     auto* node = static_cast<GcRopeNode*>(
         GcHeap::instance().alloc(sizeof(GcRopeNode), &_desc)
     );
+    // node 也必须 root 保护，防止后续 l->ropeDepth()/r->ropeDepth() 触发 GC 时 sweep 回收 node
+    GcObject* _nodePtr = static_cast<GcObject*>(node);
+    GcRootHandle<GcObject*> _rnode(_nodePtr);
     node->length = l->length + r->length;
     node->u.capacity = 0;
     node->parent = nullptr;
@@ -476,6 +545,9 @@ GcString* GcRopeNode::flatten() const {
     auto* flat = static_cast<GcString*>(
         GcHeap::instance().alloc(sizeof(GcString) + length + 1, &GcString::_desc)
     );
+    // flat 也必须 root 保护，防止 flatten_recursive 内部 alloc 触发 GC 时 sweep 回收 flat
+    GcObject* _flatPtr = static_cast<GcObject*>(flat);
+    GcRootHandle<GcObject*> _rflat(_flatPtr);
     flat->length = length;
     flat->u.capacity = length;
     flat->parent = nullptr;

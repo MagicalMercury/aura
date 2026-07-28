@@ -8,8 +8,8 @@
 #include "builtin/string.h"
 #ifdef _WIN32
 #include "win_iocp.h"
-#include "event_loop.h"
 #endif
+#include "event_loop.h"
 #include <cstdio>
 #include <cstdlib>
 

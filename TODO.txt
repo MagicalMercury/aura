@@ -7,7 +7,7 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-07-27（mutex plan v1.2 完成：多锁地址排序 + RWMutex 批量唤醒 + L5 递归检测）
+# 最近更新：2026-07-27（mutex v1.2 完成 + Array 优化 issue 提出，分 P0/P1/P2/P3 子项）
 
 ================================================================
 [ 一 ] 内置 API 与模块（plan/plan11.md）
@@ -123,10 +123,160 @@ GC 其他功能清单（基于 2026-07-19 重新核验）
       - 缺：mark 阶段并发执行，仅 sweep 阶段暂停
       - 风险：需要读屏障/写屏障配合，极复杂
 
-[ ] P3  Large Object Space（大对象区）
-      - 现状：大对象（如长 GcString）和小对象共用同一 page
-      - 缺：大对象独立分配，避免 page 碎片
-      - 设计：> 32KB 的对象直接从 OS 分配，独立追踪
+[~] P0  分代分页 GC + 大对象区（LOS）  [2026-07-28 阶段 1 完成]
+      - issue：plan/los_issue.md
+      - plan：plan/generational_paged_gc.md
+      - 背景：Array CAP 翻倍策略触发 GC 越界 bug（cap=1024 时 4KB，cap=2048 时 8KB）
+
+      --- 阶段 1（LOS 骨架）已完成 [2026-07-28] ---
+      * LargeObjectSpace 类：runtime/gc/los.h, runtime/gc/los.cpp
+      * tryAlloc 大对象分支（size > kPageSize/2 走 LOS，不参与 compact）
+      * compact 过滤 LOS 对象（避免 ensureSpace 无限开页）
+      * mark/sweep LOS 对象正确标记和回收
+      * 配套 bug 修复：
+        - tryAlloc 延迟 compact 补执行前先 flushTlab（防 TLAB 页悬垂）
+        - GcString 拼接/append/slice/make_with_capacity/build_balanced_rope/flatten
+          等所有 alloc 路径增加 GcRootHandle 保护新分配对象（防 sweep 回收）
+      * 测试：T1-T5 全部通过（5 次连续运行验收），覆盖：
+        - T1: 大数组 5000 元素（CAP 翻倍触发 LOS）
+        - T2: 大字符串拼接 10000 字符（Flat 扩容触发 LOS）
+        - T3: 混合分配（小对象 + 大对象交错）
+        - T4: GC 统计输出
+        - T5: 重复 GC（LOS sweep 正确性）
+
+      --- 现状（GC 缺陷） ---
+      * GC page 固定 4096 字节（gc.h:233 kPageSize）
+      * bumpAlloc 不支持跨页对象，且无保护（gc.cpp:198-212）
+        size > kPageSize 时 bumpOffset += size 越界写
+      * compact 的 ensureSpace 同样无法处理大对象（gc.cpp:1029-1044）
+        dest + size > destEnd 永真，无限开页 → OOM 放弃整个 compact
+      * allocSize_ 字段是 uint32_t（设计允许大对象），实现未适配
+      * 无任何 LOS / 大对象特殊路径（搜索 large/big/huge/LOS 零命中）
+
+      --- 方案：三级页 + 大对象区 ---
+      页分级（按容量递增）：
+        小页 (SmallPage)  : 4 KB    （保留现有 kPageSize）
+        中页 (MediumPage) : 64 KB   （16 × 小页）
+        大页 (LargePage)  : 1 MB    （16 × 中页）
+        大对象区 (LOS)    : 独立 OS 分配（VirtualAlloc/mmap），单对象一块
+
+      对象分配策略（按 size 路由）：
+        size ≤ 2 KB        → 小页 TLAB 快路径（现有路径保留）
+        2 KB < size ≤ 16 KB → 中页 bump 分配
+        16 KB < size ≤ 256 KB → 大页 bump 分配
+        size > 256 KB      → LOS 直接向 OS 申请
+
+      GC 回收策略（按页级优先级，层级隔离 + 同级压缩）：
+        Minor GC（频繁，小页达阈值触发）：
+          - 扫描小页存活对象
+          - copying 到中页空闲区（单向晋升：小页 → 中页）
+          - 清空小页（变成空闲页，可重用）
+        中页 compact（中页碎片率达阈值触发）：
+          - 滑动窗口多页 compact：多个中页存活对象 bump 到空闲中页
+          - 中页之间搬运，永不晋升到大页
+          - 空闲中页释放回 freeMediumPages 链表
+        Major GC（大页达阈值或显式触发）：
+          - 扫描全部页 + LOS
+          - 大页 mark-sweep（不 compact，避免大对象 memcpy 成本）
+          - LOS mark-sweep：释放未标记的大对象内存
+        LOS 策略：
+          - 不参与 compact（地址固定，指针无需更新）
+          - 仅 mark-sweep 回收
+          - 回收后 munmap 归还 OS（借鉴 Go scavenger）
+
+      --- 确认的设计点 ---
+      1. 大页只接受直接分配，中页永不晋升到大页
+         - 大页稳定，减少大对象 memcpy
+         - 风险：长寿中等对象永远占用中页（可接受，中页 compact 整理碎片）
+      2. age 机制保持不变（young-old 分代 GC）
+         - 对象 header 已有 age 字段（gc.h flags_ bit-packed，kPromotionAge=2）
+         - 现有机制：经历 N 次 minor GC 后 age++，age >= kPromotionAge 时
+           晋升到 old 代（generation: 0 → 1，加入 oldObjects_）
+         - 页级搬运（小页→中页、中页→中页）不改 generation 和 age
+         - 分代晋升（young→old）不改对象位置
+         - 两个概念正交：页级决定分配位置，分代决定 GC 频率
+      3. 大页 GC 用 mark-sweep（非 compact）
+         - 避免大对象 memcpy
+         - 代价：大页产生外部碎片（用 free list 缓解）
+      4. 维护 freeMediumPages 链表，采用"按需申请 + 高水位归还"策略
+         - compact 时从 freeMediumPages 取空闲页，不足则临时 allocPage
+         - compact 完成后，若 freeMediumPages > usedMediumPages / 4，归还多余页给 OS
+         - 不再使用固定比例，避免内存浪费
+
+      --- 中页 compact 算法（滑动窗口多页 compact） ---
+      * 输入：碎片率超阈值的中页集合
+      * 算法：
+        1. 从 freeMediumPages 取一个空闲中页作目标
+        2. 遍历待 compact 中页，bump 分配存活对象到目标中页
+        3. 目标中页满 → 取下一个空闲中页继续
+        4. 原中页全部扫描完 → 释放为空闲中页
+      * 优点：内存利用率高（接近 100%），无半区浪费
+      * 缺点：需要地址反查表（地址→页对象，借鉴 Go mspan 的地址索引）
+
+      --- 借鉴 Go mspan 的部分思路 ---
+      * 地址反查表：page 地址 → Page* 映射（compact 更新引用时需要）
+      * LOS 回收后 munmap 归还 OS（借鉴 Go scavenger）
+      * 中页 sweep 队列：惰性 sweep（仅扫描已 compact 的页）
+      * 不借鉴：非移动 GC（我们是 copying）、Tcmalloc size class（对象变长不适合）
+
+      --- 设计要点 ---
+      * 页结构演进：Page 基类 + SmallPage/MediumPage/LargePage 派生
+        （保留 data[] + bumpOffset + next 字段，新增 pageSize 字段）
+      * TLAB 仅缓存小页（小对象高频分配，TLAB 收益最大）
+      * 中页/大页用全局 mutex 保护的 bump allocator
+      * LOS 用独立链表 + free list（减少碎片）
+      * compact 的 ensureSpace 按页大小路由到对应页级
+        - 小页对象 → 中页空闲区（搬运，不改 generation/age）
+        - 中页对象 → 中页空闲区（同级搬运，不改 generation/age）
+        - 大页对象 → 跳过（不 compact）
+        - LOS 对象 → 跳过（不 compact）
+      * 分代晋升（young→old）与页级搬运正交：
+        - 分代晋升：age >= kPromotionAge 时 generation 0→1，对象位置不变
+        - 页级搬运：compact 时对象跨页移动，generation/age 不变
+      * GcObject header 的 allocSize_ 已支持 uint32_t（最大 4GB），无需改
+
+      --- 优点 ---
+      * 根本解决：alloc + compact 两处越界 bug 一并消除
+      * 性能优势：大对象不 memcpy（LOS 不参与 compact）
+      * 分代收益：小页频繁回收成本低，大页稳定减少搬运开销
+      * 层级隔离：中页不往大页搬，避免中等寿命对象反复跨页搬运
+      * 概念清晰：分代晋升（young→old）与页级搬运（小→中、中→中）正交
+      * 业界主流：JVM Eden/Survivor/Old + LOS，V8 新生代/老年代 + LOS
+      * 内存布局清晰：按对象大小分页，减少外部碎片
+      * 可扩展：为未来大字符串、大缓冲区、大数组 chunk 做好准备
+
+      --- 代价 / 风险 ---
+      * 工程量大：新增 SmallPage/MediumPage/LargePage/LargeObjectSpace 类
+      * 现有 GC 重构：youngObjects_/oldObjects_ 需按页级重组
+      * compact 路径复杂化：需按页级选择目标页
+      * LOS 碎片风险：可用 free list + size class 缓解
+      * 根扫描成本：LOS 需额外遍历（可用单独 vector，成本可控）
+      * 分代一致性：页级决定分配目标，对象年龄决定晋升（两者正交）
+
+      --- 实施分期建议 ---
+      阶段 1（P0，解决 bug）：LOS 骨架
+        - LargeObjectSpace 类 + 分配 + mark-sweep
+        - tryAlloc 的 size > kPageSize/2 分支改为走 LOS
+        - compact 跳过 LOS 对象
+        - 单元测试：大对象分配/回收/不移动
+      阶段 2（P1，分页演进）：中页 + 大页
+        - MediumPage/LargePage 类
+        - 分配路由：按 size 选择页级
+        - 中页滑动窗口多页 compact
+        - freeMediumPages 链表 + 固定比例管理
+      阶段 3（P2，分代优化）：
+        - Minor/Mixed/Major GC 三级触发
+        - 页级搬运策略：小页 → 中页（单向搬运，不改 generation）
+        - 分代晋升策略：保持现有 young→old 机制（age >= kPromotionAge）
+        - 大页 mark-sweep 选项（避免大页 compact 成本）
+
+      --- 触发场景 ---
+      * ArrayChunk<int32_t> cap=1024 达 4KB，cap=2048 达 8KB
+      * ArrayChunk<GcString*> cap=512 达 4KB，cap=1024 达 8KB
+      * 大字符串 concat（Rope flatten 可能产生 > 4KB 的 Flat）
+      * Io::read_file_lines 大文件场景
+
+      - 下一步：按工作场景 2 起草 plan（建议先做阶段 1 LOS 骨架）
 
 [~] P3  GC 日志与统计  [部分完成]
       - ✅ 已完成：gc_stats_string() 返回格式化字符串 + Aura gc_stats() 内置函数
@@ -275,10 +425,79 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
 其他运行时库改进
 ----------------------------------------------------------------
 
-[ ] P2  Array chunked 链表实现
-      - plan/chunk_array_plan.md, plan/array_advise.md 规划
-      - 现状：连续数组，O(n) 插入/删除
-      - 缺：分块链表实现
+[x] P2  Array chunked 链表基础实现  [2026-07-24 完成]
+      - plan：plan/done/chunk_array_plan.md（实施方案）、plan/done/array_advise.md（审查报告）
+      - 实现：runtime/builtin/array.h
+          * 分块双向链表，固定 AURA_ARRAY_CHUNK_CAP=8
+          * Array + ArrayChunk 均派生 GcObject，InlineArrayField 描述内联数据区
+          * append/insert/pop/remove/clear/reserve 全套 API（13 方法注册到 BuiltinRegistry）
+          * maybeCompact 局部 5 窗口合并，迭代器用 GcRootHandle 保护 chunk 指针
+      - 历史：原 TODO 标注"现状：连续数组"为误判，实际已是分块链表实现
+      - 文件：runtime/builtin/array.h, src/Sema/BuiltinRegistry.h:241-254,
+              src/CodeGen/ExprGen.cpp:203-313, 648-805, 819-823
+
+[ ] P2  Array<T> 优化 issue  [2026-07-27 提出，等待起草 plan]
+      - 背景：基于 array.h 代码审查识别的优化空间，分 P0/P1/P2/P3 子项
+      - issue 草案：见本轮对话分析报告（优点/代价缺陷/优先级已分类）
+
+      --- P0 潜在 bug（建议优先修） ---
+      [x] P0  maybeCompact 漏写屏障（array.h:349）  [2026-07-28 修复]
+            - 问题：`if (next == tail) tail = c;` 更新 Array.tail 未触发 gc_write_barrier
+            - 风险：Array 在老年代、新 tail 在新生代时，minor GC 漏标记
+            - 修复：补 gc_write_barrier(this, &tail, reinterpret_cast<GcObject*>(c))
+      [x] P0  insert 写屏障 parent 参数存疑（array.h:230-233）  [2026-07-28 修复]
+            - 问题：chunk->next 已被赋值为 new_chunk 后，gc_write_barrier 的 parent 指向了新 chunk
+            - 修复：先保存 origNext，再 barrier(origNext, &origNext->prev, ...)
+
+      --- P1 性能 / 代码质量 ---
+      [ ] P1  CAP 固定 8，大数组 chunk_count 线性增长
+            - 问题：1024 元素 → 128 chunk，operator[] 最坏 125 次跳转，header 占 55%
+            - 方案 A（低风险）：CAP = max(8, 64/sizeof(T)) 按元素大小调整
+            - 方案 B（中风险）：chunk 容量翻倍 8→16→32→64（chunk_array_plan.md §3.1 原始设计）
+            - 风险：变长 chunk 使 InlineArrayField 偏移动态化困难
+      [ ] P1  operator[] 无跳表索引（array.h:417-441）
+            - 问题：随机访问 O(chunk_count)，无二分索引
+            - 方案：维护稀疏索引 Array<{cumulative_len, chunk_ptr}>，每 ⌈√chunk_count⌉ chunk 一条
+            - 收益：O(n/CAP) → O(log n)
+            - 历史：array_advise.md §6.2 已规划未实施
+      [ ] P1  insert 函数超规（array.h:190-263，73 行 / 5 层）
+            - 违反 edit_rule.md §3（≤50 行 / ≤4 层）
+            - 修复：拆分 insertIntoChunk / insertSplitChunk
+
+      --- P2 中等优先 ---
+      [ ] P2  insert 块满分裂策略低效（array.h:242-260）
+            - 问题：idx=0 时空间利用率仅 12.5%
+            - 修复：改对半分裂
+      [ ] P2  EMPTY() 无单例缓存（array.h:84-86）
+            - 问题：每次 make(0) 分配新对象，与 GcString::empty() 不对称
+            - 修复：GcGlobalRoot<Array<T>> 缓存单例
+      [ ] P2  list 字面量构造低效（ExprGen.cpp:292-312）
+            - 问题：N 次 append + N 次 GcRootHandle 包装
+            - 方案：批量 append_batch(initializer_list<T>) 或 make(N) + set(i, v)
+      [ ] P2  Array::slice 缺失
+            - 现状：GcString 已有零拷贝 slice，Array 无
+            - 风险：chunk 链表 slice 实现复杂，可能需 view 类型
+      [ ] P2  front() 退化为 O(chunk_count)（array.h:280）
+            - 问题：委托 (*this)[0]，本应 O(1)
+            - 修复：直接访问 head 链首 chunk
+
+      --- P3 远期 / 代码质量 ---
+      [ ] P3  魔法数字提取（maybeCompact 的 2/4/5）
+      [ ] P3  operator[] const/非 const 重复（抽 locate(idx) 辅助）
+      [ ] P3  make(0) 强制分配 1 个空 chunk（应延迟分配）
+      [ ] P3  ArrayIterator 禁止拷贝（可放开，GcRootHandle 已支持拷贝）
+      [ ] P3  capacity() int32 溢出风险（改 int64_t）
+      [ ] P3  shrink_to_fit API 新增
+      [ ] P3  .iter() 方法（Iterator<T> 链式 .map/.filter/.collect）
+            - 已在 TODO §二（高级类型）规划，此处仅作关联引用
+
+      - 优点（保留）：
+          * 块链表在 GC 环境下优秀：扩容无大块拷贝，与 GcObject/TypeDescriptor 无缝集成
+          * append 写屏障正确实现（std::is_pointer_v<T> 条件触发）
+          * 迭代器用 GcRootHandle 保护 chunk 指针，防 compact 移动悬垂
+          * InlineArrayField 精确描述内联数据区，GC 精确扫描
+          * API 完整度高（13 方法），错误处理统一（Error{IndexError}）
+      - 下一步：按工作场景 2 起草 plan（建议先 P0 两个 bug 修复，再 P1 性能优化）
 
 ================================================================
 [ 七 ] 诊断 / 编译流程（plan/fix_plan.md）
