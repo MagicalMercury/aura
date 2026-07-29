@@ -830,17 +830,20 @@ std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) 
     std::string target = genExpr(*e.target, isCoroutine);
     std::string value  = genExpr(*e.value, isCoroutine);
 
+    // stripGet 辅助：去掉 GcRootHandle 变量的 ".get()" 后缀，返回裸变量名
+    auto stripGet = [](const std::string& s) -> std::string {
+        if (s.size() > 6 && s.substr(s.size() - 6) == ".get()")
+            return s.substr(0, s.size() - 6);
+        return s;
+    };
+
     // s = s + x 优化：若变量是 string 且赋值为自身 + 单元素，改写为 append
     // 如 s = s + "x" → s.get()->append(make_string("x"))
+    // append 在容量足够时原地修改，避免 concat 每次创建新对象的开销
     if (auto* targetId = dynamic_cast<const Identifier*>(e.target.get())) {
         if (auto* binExpr = dynamic_cast<const BinaryExpr*>(e.value.get())) {
             if (binExpr->op == "+") {
                 if (auto* leftId = dynamic_cast<const Identifier*>(binExpr->left.get())) {
-                    auto stripGet = [](const std::string& s) -> std::string {
-                        if (s.size() > 6 && s.substr(s.size() - 6) == ".get()")
-                            return s.substr(0, s.size() - 6);
-                        return s;
-                    };
                     std::string targetBase = stripGet(targetId->name);
                     std::string leftBase   = stripGet(leftId->name);
                     if (targetBase == leftBase && stringVarNames_.count(targetBase)) {
@@ -848,7 +851,11 @@ std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) 
                         // 用 GcRootHandle 保护 rightExpr 求值期间 targetBase.get() 的裸指针
                         std::vector<std::pair<std::string, const SemType*>> gcArgs;
                         gcArgs.emplace_back(rightExpr, binExpr->right->inferredType);
-                        return genGcRootedArgs(gcArgs,
+                        // 修复 append 返回值丢弃 bug：
+                        // append 容量不足时返回新分配的 GcString*，必须赋回 targetBase.get()
+                        // 否则 s 永远不增长且每次迭代都从同一小基址 realloc
+                        // GcRootHandle::get() 非 const 版本返回 T&（GcString*&），可作赋值左侧
+                        return targetBase + ".get() = " + genGcRootedArgs(gcArgs,
                             targetBase + ".get()->append({0})", isCoroutine);
                     }
                 }
@@ -857,18 +864,21 @@ std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) 
     }
 
     // 如果目标变量是字符串类型且值使用了 concat，更新追踪
-    if (stringVarNames_.count(target)) {
+    // Bug 修复：stripGet 后再查/插，保持 stringVarNames_ 的 key 一致（裸变量名）
+    std::string targetBase = stripGet(target);
+    if (stringVarNames_.count(targetBase)) {
         if (value.find("aura_rt::concat") == std::string::npos &&
-            value.find("aura_rt::make_string") == std::string::npos) {
-            // 不再从 make_string/concat 赋值 — 移除字符串追踪
+            value.find("aura_rt::make_string") == std::string::npos &&
+            value.find("aura_rt::intern_string") == std::string::npos) {
+            // 不再从 make_string/concat/intern_string 赋值 — 移除字符串追踪
             // (但保守起见保留 — 可能是 string + int 产生的 concat 还没替换)
         }
     }
-    // 如果值包含 concat，标记目标为字符串变量
+    // 如果值包含 concat/make_string/intern_string，标记目标为字符串变量
     if (value.find("aura_rt::concat") != std::string::npos ||
         value.find("aura_rt::make_string") != std::string::npos ||
         value.find("aura_rt::intern_string") != std::string::npos) {
-        stringVarNames_.insert(target);
+        stringVarNames_.insert(targetBase);
     }
 
     // 写屏障：GC 对象字段赋值（如 obj.field = newVal）时，

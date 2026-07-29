@@ -103,6 +103,8 @@ private:
 // 字面量 intern：相同内容返回同一指针（注册为 GC 全局根，永不回收）
 GcString* intern_string(const char* s);
 GcString* intern_string(const char* s, size_t len);
+// 清空本线程的 intern L1 缓存（GC compaction 前调用，防止缓存指针悬垂）
+void clear_intern_cache();
 
 // ============================================================
 // ToString — Aura 内置接口

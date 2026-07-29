@@ -1,8 +1,7 @@
-# change.md — 分代分页 GC + LOS（阶段 1：LOS 骨架）
+# change.md — 字符串拼接性能优化
 
-> 本 change.md 仅实现 plan [plan/generational_paged_gc.md](file:///d:/you/Aura/plan/generational_paged_gc.md) 的**阶段 1**：
-> 修复 bumpAlloc 越界写 + compact ensureSpace 无限开页两个 P0 bug，引入 LOS。
-> 阶段 2/3 为后续独立 issue，不在本 change.md 范围内。
+> 本 change.md 实现 plan [plan/string_concat_performance.md](file:///d:/you/Aura/plan/string_concat_performance.md) 的全部 4 项变更。
+> 目标：解决 1000 万次 `s = s + "a"` 奇慢问题，通过修复 append 返回值 bug、调大 GC 阈值、intern 线程局部缓存、GcRootHandle 线程局部链表 4 项优化达成秒级完成。
 
 ---
 
@@ -10,722 +9,717 @@
 
 | 序号 | 文件 | 操作 | 内容 |
 |------|------|------|------|
-| 1 | runtime/gc/los.h | 新增 | LargeObjectSpace 类声明 |
-| 2 | runtime/gc/los.cpp | 新增 | LargeObjectSpace 实现 |
-| 3 | runtime/gc/gc.h | 修改 | 新增 `#include "los.h"` + `LargeObjectSpace los_` 成员 |
-| 4 | runtime/gc/alloc.cpp | 修改 | tryAlloc 的 `size > kPageSize/2` 分支改为走 LOS |
-| 5 | runtime/gc/compact.cpp | 修改 | computeForwardingAddresses 过滤 LOS 对象 |
-| 6 | runtime/gc/mark_sweep.cpp | 修改 | markPhase 保守栈扫描增加 LOS 检查；sweepPhaseYoung/sweepPhaseAll 释放未标记的 LOS 对象 |
-| 7 | runtime/CMakeLists.txt | 修改 | 新增 `gc/los.cpp` 到源文件列表 |
-| 8 | example/test.aura | 修改 | 测试用例（T1/T2/T7/T8 通过 Aura 代码触发 LOS 路径） |
-
-**关键设计决策（相对 plan 的修正）**：
-
-1. **不实现 `los_.markAll()`**：plan §4.1.5 设计的 markAll 会无条件标记所有 LOS 对象，导致不可达对象无法回收。改为在 markPhase 的保守栈扫描中增加 LOS 检查，依赖正常引用链标记。
-2. **不实现 `los_.sweep()`**：改为在 sweepPhaseYoung/sweepPhaseAll 的正常 sweep 循环中调用 `los_.release(obj)` 释放未标记的 LOS 对象。避免 marked 标志被清除后 LOS 对象无法识别。
-3. **LOS 对象仍加入 youngObjects_/oldObjects_**：保持分代一致性，minor GC 正常处理 LOS 对象的晋升/清除。仅内存释放走 `los_.release`。
-4. **LOS 内存布局**：`[LosNode header (24B)] [GcObject header (16B)] [对象数据]`，LosNode::obj() 返回 `this + 1`。
-5. **contains 用 unordered_set**：O(1) 查询，写操作加锁，读操作（STW 期间）不加锁。
+| 1 | src/CodeGen/ExprGen.cpp | 修改 | 修复 append 返回值丢弃 bug：IIFE 结果赋回 `targetBase.get()` |
+| 2 | runtime/gc/gc.h | 修改 | GC 阈值 8x（young 256KB→2MB、old 1MB→8MB） |
+| 3 | runtime/builtin/string.cpp | 修改 | intern_string 新增 thread_local L1 缓存（64 槽 LRU） |
+| 4 | runtime/gc/gc.h | 修改 | 新增 GcRootHandleBase 基类；GcRootHandle 继承之；新增 ThreadRootList；删除 roots_/rootsM_；新增 threadRootLists_/tl_roots_ |
+| 5 | runtime/gc/handles.h | 修改 | 构造/析构/拷贝构造改为链表操作（registerRootThreadLocal） |
+| 6 | runtime/gc/roots.cpp | 修改 | 删除 registerRoot/unregisterRoot；新增 registerRootThreadLocal/unregisterRootThreadLocal/ensureThreadRootList/releaseThreadRootList |
+| 7 | runtime/gc/tlab.cpp | 修改 | registerThread/unregisterThread 新增 ensureThreadRootList/releaseThreadRootList 调用 |
+| 8 | runtime/gc/mark_sweep.cpp | 修改 | markPhase 遍历 threadRootLists_ 替代 roots_ |
+| 9 | runtime/gc/compact.cpp | 修改 | updateAllReferences + updateMediumPageReferences 遍历 threadRootLists_ 替代 roots_ |
 
 ---
 
-## 文件 1：runtime/gc/los.h（新增）
+## 实施顺序
 
+1. 变更 1（append bug）→ 编译验证
+2. 变更 2（GC 阈值）→ 编译验证
+3. 变更 3（intern 缓存）→ 编译验证
+4. 变更 4（GcRootHandle 链表）→ 编译验证
+5. 全量回归测试
+
+各变更相互独立，可单独回滚。
+
+---
+
+## 变更 1：修复 CodeGen append 返回值 bug（P0）
+
+### 文件：src/CodeGen/ExprGen.cpp
+
+**位置**：`genAssignExpr` 中 `s = s + x` 优化分支（约 L854-855）
+
+**修改前**：
 ```cpp
-#pragma once
-// ============================================================
-// aura_rt/gc/los.h ─ Large Object Space（大对象区）
-//
-// 独立的大对象空间，每个大对象直接向 OS 申请一块内存：
-//   [LosNode header] [GcObject header] [对象数据]
-//
-// LOS 对象特点：
-//   - 不参与 compact（地址固定，computeForwardingAddresses 跳过）
-//   - mark 阶段通过正常引用链标记（roots_ → 字段引用 → LOS 对象）
-//     保守栈扫描额外检查 LOS，覆盖栈裸指针
-//   - sweep 阶段在正常 sweep 循环中调用 release() 释放未标记对象
-//
-// 阈值：size > kPageSize/2（2KB）走 LOS
-// ============================================================
+                        std::vector<std::pair<std::string, const SemType*>> gcArgs;
+                        gcArgs.emplace_back(rightExpr, binExpr->right->inferredType);
+                        return genGcRootedArgs(gcArgs,
+                            targetBase + ".get()->append({0})", isCoroutine);
+```
 
-#include "../types.h"
-#include <mutex>
-#include <unordered_set>
+**修改后**：
+```cpp
+                        std::vector<std::pair<std::string, const SemType*>> gcArgs;
+                        gcArgs.emplace_back(rightExpr, binExpr->right->inferredType);
+                        // 修复 append 返回值丢弃 bug：
+                        // append 容量不足时返回新分配的 GcString*，必须赋回 targetBase.get()
+                        // 否则 s 永远不增长且每次迭代都从同一小基址 realloc
+                        // GcRootHandle::get() 非 const 版本返回 T&（GcString*&），可作赋值左侧
+                        return targetBase + ".get() = " + genGcRootedArgs(gcArgs,
+                            targetBase + ".get()->append({0})", isCoroutine);
+```
 
-namespace aura_rt {
+### 安全性分析
+- `targetBase.get()` 返回 `GcString*&`（引用 s 内部 ptr_ 指向的栈变量），可直接作为赋值左侧
+- IIFE 内部 `targetBase.get()->append(x)` 读取旧值并调用 append
+- append 内部有 `GcCompactSuspendGuard`（禁 compact）+ GcRootHandle 保护 this/other/newStr
+- append 返回 this（容量足够）或 newStr（容量不足），IIFE 返回之，外部 `s.get() = 返回值` 赋值
+- 赋值后 s 指向新对象，下次 GC 时 s 在线程局部链表中，被 markPhase 标记
+- **不需要写屏障**：s 是栈上 GcRootHandle，不是 GC 对象字段。每次 markPhase 从链表重新读 `*ptr_ref_`，自然标记到新对象
 
+---
+
+## 变更 2：GC 阈值 8x（P1）
+
+### 文件：runtime/gc/gc.h
+
+**位置**：约 L250-252（`kYoungThreshold` / `kOldThreshold`）
+
+**修改前**：
+```cpp
+    static constexpr size_t  kYoungThreshold  = 256 * 1024;  // 256 KB → minor GC
+    static constexpr size_t  kOldThreshold    = 1024 * 1024; // 1 MB → major GC
+```
+
+**修改后**：
+```cpp
+    static constexpr size_t  kYoungThreshold  = 2 * 1024 * 1024;  // 2 MB → minor GC（8x，降低 STW 频率）
+    static constexpr size_t  kOldThreshold    = 8 * 1024 * 1024; // 8 MB → major GC（8x）
+```
+
+### 边界条件
+- 峰值内存：young 2MB + old 8MB = 10MB（可接受）
+- 阈值调大不影响 GC 正确性，仅降低触发频率
+
+---
+
+## 变更 3：intern_string L1 线程局部缓存（P1）
+
+### 文件：runtime/builtin/string.cpp
+
+**位置**：L612 后（`g_internMutex` 声明后），`intern_string` 函数前 + 函数体内部
+
+**新增**（在 `g_internMutex` 声明之后、`intern_string` 之前插入）：
+```cpp
+    [[gnu::init_priority(105)]] std::mutex g_internMutex;
+
+    // ============================================================
+    // intern_string L1 线程局部缓存（64 槽 LRU）
+    //
+    // 热点字符串字面量无锁命中，消除 1000 万次循环的锁竞争
+    // key 指向 Aura 源码字符串字面量（编译期常量，永久存活），不会失效
+    // 线程间缓存不一致不影响正确性：L1 未命中走全局锁 double-check
+    // ============================================================
+    static thread_local struct {
+        struct Entry { const char* key; size_t keyLen; GcString* val; };
+        Entry entries[64];
+        size_t count;
+    } tl_internCache;
+
+    // L1 缓存插入（LRU 淘汰：新条目放头部，满则淘汰末尾）
+    static void internCacheInsert(const char* s, size_t len, GcString* val) {
+        auto& cache = tl_internCache;
+        // 先查重：若已存在则提前到头部（提升命中率）
+        for (size_t i = 0; i < cache.count; ++i) {
+            if (cache.entries[i].keyLen == len &&
+                std::memcmp(cache.entries[i].key, s, len) == 0) {
+                // 已存在：移到头部
+                if (i != 0) {
+                    Entry tmp = cache.entries[i];
+                    std::memmove(&cache.entries[1], &cache.entries[0], i * sizeof(Entry));
+                    cache.entries[0] = tmp;
+                }
+                return;
+            }
+        }
+        // 不存在：插入头部
+        if (cache.count < 64) {
+            if (cache.count > 0) {
+                std::memmove(&cache.entries[1], &cache.entries[0],
+                             cache.count * sizeof(Entry));
+            }
+            cache.entries[0] = {s, len, val};
+            ++cache.count;
+        } else {
+            // 满：淘汰末尾，新条目放头部
+            std::memmove(&cache.entries[1], &cache.entries[0],
+                         63 * sizeof(Entry));
+            cache.entries[0] = {s, len, val};
+        }
+    }
+}
+```
+
+**修改** `intern_string(const char* s, size_t len)` 函数体：
+
+**修改前**：
+```cpp
+GcString* intern_string(const char* s, size_t len) {
+    std::string key(s, len);
+    // 1. 独占锁查找（替代 shared_lock，规避 MinGW shared_mutex bug）
+    {
+        std::lock_guard lk(g_internMutex);
+        auto it = g_internPool.find(key);
+        if (it != g_internPool.end()) return it->second->get();
+    }
+    // 2. 不持锁 alloc：make → alloc → 可能触发 safepoint/GC
+    //    关键：不能持 g_internMutex 时 alloc，否则 STW 时其他线程
+    //    阻塞在 lock_guard 无法到达 safepoint → 死锁
+    GcString* newly = GcString::make(s, len);
+    // 3. 写锁 double-check insert
+    {
+        std::lock_guard lk(g_internMutex);
+        auto it = g_internPool.find(key);
+        if (it != g_internPool.end()) {
+            // 别人已插入，丢弃 newly（等 GC 回收）
+            return it->second->get();
+        }
+        auto root = std::make_unique<GcGlobalRoot<GcString>>(newly);
+        GcString* result = root->get();
+        g_internPool.emplace(std::move(key), std::move(root));
+        return result;
+    }
+}
+```
+
+**修改后**：
+```cpp
+GcString* intern_string(const char* s, size_t len) {
+    // 0. L1 线程局部缓存查找（无锁，热点字面量快速命中）
+    {
+        auto& cache = tl_internCache;
+        for (size_t i = 0; i < cache.count; ++i) {
+            auto& e = cache.entries[i];
+            if (e.keyLen == len && std::memcmp(e.key, s, len) == 0) {
+                return e.val;  // 命中
+            }
+        }
+    }
+
+    std::string key(s, len);
+    // 1. 独占锁查找（替代 shared_lock，规避 MinGW shared_mutex bug）
+    GcString* found = nullptr;
+    {
+        std::lock_guard lk(g_internMutex);
+        auto it = g_internPool.find(key);
+        if (it != g_internPool.end()) {
+            found = it->second->get();
+        }
+    }
+    if (found) {
+        internCacheInsert(s, len, found);  // 插入 L1 缓存
+        return found;
+    }
+    // 2. 不持锁 alloc：make → alloc → 可能触发 safepoint/GC
+    //    关键：不能持 g_internMutex 时 alloc，否则 STW 时其他线程
+    //    阻塞在 lock_guard 无法到达 safepoint → 死锁
+    GcString* newly = GcString::make(s, len);
+    // 3. 写锁 double-check insert
+    GcString* result;
+    {
+        std::lock_guard lk(g_internMutex);
+        auto it = g_internPool.find(key);
+        if (it != g_internPool.end()) {
+            // 别人已插入，丢弃 newly（等 GC 回收）
+            result = it->second->get();
+        } else {
+            auto root = std::make_unique<GcGlobalRoot<GcString>>(newly);
+            result = root->get();
+            g_internPool.emplace(std::move(key), std::move(root));
+        }
+    }
+    internCacheInsert(s, len, result);  // 插入 L1 缓存
+    return result;
+}
+```
+
+### 安全性分析
+- L1 缓存只缓存 GcString* 指针，不涉及 alloc
+- 缓存的 GcString* 由全局 `g_internPool` 持有（GcGlobalRoot），不会被 GC 回收
+- 线程间缓存不一致不影响正确性：L1 未命中走全局锁，全局池已存在则返回正确结果
+- `key` 指针指向 Aura 源码字符串字面量（编译期常量，永久存活），不会失效
+- 不破坏"不持锁 alloc"约束：L1 查找无锁，alloc 仍不持锁
+
+---
+
+## 变更 4：GcRootHandle 线程局部侵入式链表（P1）
+
+### 4.1 文件：runtime/gc/gc.h — 新增 GcRootHandleBase 基类 + GcRootHandle 继承
+
+**位置**：原 GcRootHandle 声明处（约 L44-77）
+
+**修改前**：
+```cpp
+// 前向声明（GcRootHandle 的构造/析构需要 GcHeap）
 class GcHeap;
 
-class LargeObjectSpace {
+// ============================================================
+// GcRootHandle — 根引用包装
+// ...
+// ============================================================
+template <typename T>
+class GcRootHandle {
 public:
-    LargeObjectSpace() = default;
-    ~LargeObjectSpace();
+    GcRootHandle(T& ref);
+    ~GcRootHandle();
 
-    LargeObjectSpace(const LargeObjectSpace&) = delete;
-    LargeObjectSpace& operator=(const LargeObjectSpace&) = delete;
+    GcRootHandle(const GcRootHandle& other);
+    GcRootHandle& operator=(const GcRootHandle&) = delete;
 
-    // 分配大对象（向 OS 申请独立内存块）
-    // 失败返回 nullptr（调用方走 OOM 路径）
-    // 线程安全：内部持 mtx_
-    GcObject* alloc(size_t size, const TypeDescriptor* desc);
+    // 更新被包装的引用目标（用于移动赋值后）
+    void rebind(T& ref) { ptr_ = &ref; }
 
-    // 释放指定 LOS 对象（GC sweep 调用，STW 期间）
-    // 线程安全：内部持 mtx_
-    void release(GcObject* obj);
-
-    // 地址反查：判断 obj 是否属于 LOS
-    // O(1) 查询，读 objSet_ 不加锁（依赖 STW 语义：contains 仅在 compact/sweep 期间调用）
-    bool contains(GcObject* obj) const { return objSet_.count(obj) > 0; }
-
-    // 统计
-    size_t objectCount() const { return count_; }
-    size_t bytes()       const { return bytes_; }
+    T& operator*()  const { return *ptr_; }
+    T* operator->() const { return ptr_; }
+    T& get()              { return *ptr_; }  // 非 const：返回引用，可作赋值左侧
+    T  get()        const { return *ptr_; }  // const：返回值，兼容读取场景
 
 private:
-    // LOS 节点头：紧跟在 OS 内存块首部，GcObject 紧随其后
-    struct LosNode {
-        size_t   size;    // 对象总大小（含 GcObject header，不含 LosNode）
-        LosNode* next;
-        LosNode* prev;
+    T* ptr_;
+    friend class GcHeap;
+};
+```
 
-        // GcObject 紧跟在 LosNode 之后
-        GcObject* obj() { return reinterpret_cast<GcObject*>(this + 1); }
+**修改后**：
+```cpp
+// 前向声明（GcRootHandle 的构造/析构需要 GcHeap）
+class GcHeap;
+
+// ============================================================
+// GcRootHandleBase — GC 根句柄基类（侵入式链表节点）
+//
+// 所有 GcRootHandle<T> 继承此类，通过 next_/prev_ 组成线程局部链表。
+// ptr_ref_ 指向 GcRootHandle::ptr_（即指向用户栈上 GC 指针变量的地址），
+// GC 通过基类接口统一遍历所有根，无需模板实例化信息。
+//
+// 注：ptr_ref_ 存储 ptr_ 的"值"（即用户变量地址），非 ptr_ 字段地址。
+//     这样 GC 单次解引用 *ptr_ref_ 即得用户变量值（对象指针）。
+// ============================================================
+class GcRootHandleBase {
+public:
+    GcRootHandleBase* next_;
+    GcRootHandleBase* prev_;
+    GcObject**        ptr_ref_;  // 指向用户栈上的 GC 指针变量地址
+
+    GcRootHandleBase() : next_(nullptr), prev_(nullptr), ptr_ref_(nullptr) {}
+};
+
+// ============================================================
+// GcRootHandle — 根引用包装
+//
+// 编译器生成的代码在声明 GC 指针局部变量时，将其包装为
+// GcRootHandle<T*>。该句柄持有指向实际指针的引用，
+// GC 标记阶段通过它发现从栈/寄存器出发的活对象。
+//
+// 构造/析构在 GcHeap 完整定义之后实现（见 handles.h）。
+// ============================================================
+template <typename T>
+class GcRootHandle : public GcRootHandleBase {
+public:
+    GcRootHandle(T& ref);
+    ~GcRootHandle();
+
+    // 允许拷贝：新 GcRootHandle 注册独立 GC 根，ptr_ 指向同一栈地址
+    // 安全前提：原 GcRootHandle 的生命周期覆盖拷贝的生命周期
+    // （sync thread 的 waitGroup 保证 worker 任务完成前主线程栈稳定）
+    GcRootHandle(const GcRootHandle& other);
+    GcRootHandle& operator=(const GcRootHandle&) = delete;
+
+    // 更新被包装的引用目标（用于移动赋值后）
+    // 同步更新 ptr_ref_，保持 GC 遍历一致性
+    void rebind(T& ref) {
+        ptr_ = &ref;
+        ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
+    }
+
+    T& operator*()  const { return *ptr_; }
+    T* operator->() const { return ptr_; }
+    T& get()              { return *ptr_; }  // 非 const：返回引用，可作赋值左侧
+    T  get()        const { return *ptr_; }  // const：返回值，兼容读取场景
+
+private:
+    T* ptr_;
+    friend class GcHeap;
+};
+```
+
+### 4.2 文件：runtime/gc/gc.h — GcHeap 根集合管理接口
+
+**位置**：约 L222-224（`registerRoot` / `unregisterRoot` 声明）
+
+**修改前**：
+```cpp
+    // 根集合管理
+    void registerRoot(GcRootHandle<GcObject*>* root);
+    void unregisterRoot(GcRootHandle<GcObject*>* root);
+```
+
+**修改后**：
+```cpp
+    // 根集合管理（线程局部侵入式链表）
+    // 构造/析构在 mutator 线程无锁操作自己的链表；GC 在 STW 期间遍历所有线程链表
+    void registerRootThreadLocal(GcRootHandleBase* root);
+    void unregisterRootThreadLocal(GcRootHandleBase* root);
+    ThreadRootList* ensureThreadRootList();   // registerThread 时分配（懒分配）
+    void            releaseThreadRootList();  // unregisterThread 时释放
+```
+
+### 4.3 文件：runtime/gc/gc.h — GcHeap 数据成员
+
+**位置 A**：约 L251-252（GC 阈值，已含变更 2，此处不重复）
+
+**位置 B**：约 L402-408（`roots_` / `rootsM_` 声明）
+
+**修改前**：
+```cpp
+    // 根集合
+    // 使用 unordered_set：registerRoot O(1)、unregisterRoot O(1)（原 vector 的 unregister 是 O(n)）
+    // 遍历顺序不重要：markPhase 和 updateAllReferences 对每个 root 独立操作
+    // 指针作 key 安全：活跃 GcRootHandle 地址唯一，析构前必调用 unregisterRoot
+    // 多线程安全：registerRoot/unregisterRoot 用 rootsM_ 保护
+    std::unordered_set<GcRootHandle<GcObject*>*> roots_;
+    std::mutex  rootsM_;
+```
+
+**修改后**：
+```cpp
+    // 根集合：线程局部侵入式链表
+    // 每个线程持有一个 ThreadRootList，GcRootHandle 构造/析构无锁头插/摘除
+    // GC 遍历在 STW 期间聚合所有线程链表，无需锁
+    struct ThreadRootList {
+        GcRootHandleBase* head;
+        ThreadRootList() : head(nullptr) {}
     };
-
-    LosNode* head_ = nullptr;  // 双向链表头
-    LosNode* tail_ = nullptr;  // 双向链表尾
-    size_t   count_ = 0;       // 对象数量
-    size_t   bytes_ = 0;       // 总字节数（不含 LosNode 头）
-
-    // O(1) 地址反查
-    // 写：alloc/release 持 mtx_
-    // 读：contains 不加锁（STW 期间调用）
-    std::unordered_set<GcObject*> objSet_;
-
-    // 保护 alloc/release（mutator 并发分配）
-    mutable std::mutex mtx_;
-};
-
-} // namespace aura_rt
+    std::vector<ThreadRootList*> threadRootLists_;
+    std::mutex                   threadRootLists_m_;
+    // 每线程的链表头指针（与 tlab_ 同生命周期管理，避免 thread_local 析构顺序问题）
+    static thread_local ThreadRootList* tl_roots_;
 ```
 
----
+### 4.4 文件：runtime/gc/handles.h — 构造/析构/拷贝改为链表操作
 
-## 文件 2：runtime/gc/los.cpp（新增）
+**位置**：L20-39（GcRootHandle 模板方法实现）
 
+**修改前**：
+```cpp
+template <typename T>
+GcRootHandle<T>::GcRootHandle(T& ref) : ptr_(&ref) {
+    GcHeap::instance().registerRoot(
+        reinterpret_cast<GcRootHandle<GcObject*>*>(this));
+}
+
+template <typename T>
+GcRootHandle<T>::~GcRootHandle() {
+    if (ptr_) GcHeap::instance().unregisterRoot(
+        reinterpret_cast<GcRootHandle<GcObject*>*>(this));
+}
+
+// 拷贝构造：新 GcRootHandle 注册独立 GC 根，ptr_ 指向同一栈地址
+// 安全前提：原 GcRootHandle 的生命周期覆盖拷贝的生命周期
+// （sync thread 的 waitGroup 保证 worker 任务完成前主线程栈稳定）
+template <typename T>
+GcRootHandle<T>::GcRootHandle(const GcRootHandle& other) : ptr_(other.ptr_) {
+    GcHeap::instance().registerRoot(
+        reinterpret_cast<GcRootHandle<GcObject*>*>(this));
+}
+```
+
+**修改后**：
 ```cpp
 // ============================================================
-// aura_rt/gc/los.cpp ─ Large Object Space 实现
+// GcRootHandle 模板方法实现（必须在 GcHeap 定义之后）
+// ============================================================
+template <typename T>
+GcRootHandle<T>::GcRootHandle(T& ref) : GcRootHandleBase(), ptr_(&ref) {
+    // ptr_ref_ 存储 ptr_ 的值（用户栈上 GC 指针变量的地址）
+    // GC 单次解引用 *ptr_ref_ 即得用户变量值（对象指针）
+    ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
+    GcHeap::instance().registerRootThreadLocal(this);
+}
+
+template <typename T>
+GcRootHandle<T>::~GcRootHandle() {
+    if (ptr_) GcHeap::instance().unregisterRootThreadLocal(this);
+}
+
+// 拷贝构造：新 GcRootHandle 注册独立 GC 根，ptr_ 指向同一栈地址
+// 安全前提：原 GcRootHandle 的生命周期覆盖拷贝的生命周期
+// （sync thread 的 waitGroup 保证 worker 任务完成前主线程栈稳定）
+template <typename T>
+GcRootHandle<T>::GcRootHandle(const GcRootHandle& other) : GcRootHandleBase(), ptr_(other.ptr_) {
+    ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
+    GcHeap::instance().registerRootThreadLocal(this);
+}
+```
+
+### 4.5 文件：runtime/gc/roots.cpp — 删除旧实现，新增链表操作
+
+**位置**：L17-25（`registerRoot` / `unregisterRoot` 实现）
+
+**修改前**：
+```cpp
+void GcHeap::registerRoot(GcRootHandle<GcObject*>* root) {
+    std::lock_guard<std::mutex> lk(rootsM_);
+    roots_.insert(root);
+}
+
+void GcHeap::unregisterRoot(GcRootHandle<GcObject*>* root) {
+    std::lock_guard<std::mutex> lk(rootsM_);
+    roots_.erase(root);
+}
+```
+
+**修改后**：
+```cpp
+// ============================================================
+// 线程局部侵入式链表根集合管理
 //
-// 内存布局：[LosNode (24B)] [GcObject (16B)] [对象数据]
-// LosNode::obj() 返回 this + 1，即 GcObject* 起始地址
+// 构造/析构无锁：每个线程只操作自己的 ThreadRootList（thread_local）
+// GC 遍历在 STW 期间执行，此时所有 mutator 暂停，链表稳定
 // ============================================================
 
-#include "los.h"
+// 静态成员定义
+thread_local GcHeap::ThreadRootList* GcHeap::tl_roots_ = nullptr;
 
-#ifdef _WIN32
-  #include <windows.h>
-#else
-  #include <sys/mman.h>
-#endif
-
-namespace aura_rt {
-
-// ============================================================
-// 析构：释放所有 LOS 对象
-// ============================================================
-LargeObjectSpace::~LargeObjectSpace() {
-    LosNode* node = head_;
-    while (node) {
-        LosNode* next = node->next;
-        size_t totalSize = sizeof(LosNode) + node->size;
-#ifdef _WIN32
-        VirtualFree(node, 0, MEM_RELEASE);
-#else
-        munmap(node, totalSize);
-#endif
-        node = next;
+void GcHeap::registerRootThreadLocal(GcRootHandleBase* root) {
+    ThreadRootList* list = tl_roots_;
+    if (!list) {
+        list = ensureThreadRootList();  // 懒分配（首次创建 GcRootHandle 时）
     }
-    head_ = tail_ = nullptr;
-    count_ = bytes_ = 0;
-    objSet_.clear();
+    // 头插（O(1)，无锁）
+    root->next_ = list->head;
+    root->prev_ = nullptr;
+    if (list->head) list->head->prev_ = root;
+    list->head = root;
 }
 
-// ============================================================
-// alloc — 分配大对象
-//
-// 向 OS 申请 sizeof(LosNode) + size 的独立内存块，
-// 构造 LosNode 并链入双向链表。
-// 注意：不初始化 GcObject header（由调用方 GcHeap::tryAlloc 完成）
-// ============================================================
-GcObject* LargeObjectSpace::alloc(size_t size, const TypeDescriptor* /*desc*/) {
-    std::lock_guard<std::mutex> lk(mtx_);
-
-    size_t totalSize = sizeof(LosNode) + size;
-#ifdef _WIN32
-    void* mem = VirtualAlloc(nullptr, totalSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-#else
-    void* mem = mmap(nullptr, totalSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-#endif
-    if (!mem) return nullptr;
-
-    LosNode* node = static_cast<LosNode*>(mem);
-    node->size = size;
-    node->next = nullptr;
-    node->prev = tail_;
-
-    // 链入双向链表尾部
-    if (tail_) {
-        tail_->next = node;
-    } else {
-        head_ = node;
-    }
-    tail_ = node;
-
-    ++count_;
-    bytes_ += size;
-
-    GcObject* obj = node->obj();
-    objSet_.insert(obj);
-    return obj;
+void GcHeap::unregisterRootThreadLocal(GcRootHandleBase* root) {
+    ThreadRootList* list = tl_roots_;
+    if (!list) return;
+    // 摘除（O(1)，无锁）
+    if (root->prev_) root->prev_->next_ = root->next_;
+    else             list->head = root->next_;
+    if (root->next_) root->next_->prev_ = root->prev_;
 }
 
-// ============================================================
-// release — 释放指定 LOS 对象
-//
-// 从双向链表摘除 + 从 objSet_ 移除 + OS 释放内存
-// 调用方保证 obj 是 LOS 对象（先 contains 检查）
-// ============================================================
-void LargeObjectSpace::release(GcObject* obj) {
-    std::lock_guard<std::mutex> lk(mtx_);
-
-    // 从 GcObject* 反推 LosNode*（GcObject 紧跟在 LosNode 之后）
-    LosNode* node = reinterpret_cast<LosNode*>(
-        reinterpret_cast<char*>(obj) - sizeof(LosNode));
-
-    // 摘除双向链表
-    if (node->prev) node->prev->next = node->next;
-    else            head_ = node->next;
-    if (node->next) node->next->prev = node->prev;
-    else            tail_ = node->prev;
-
-    --count_;
-    bytes_ -= node->size;
-
-    objSet_.erase(obj);
-
-    size_t totalSize = sizeof(LosNode) + node->size;
-#ifdef _WIN32
-    VirtualFree(node, 0, MEM_RELEASE);
-#else
-    munmap(node, totalSize);
-#endif
+ThreadRootList* GcHeap::ensureThreadRootList() {
+    if (tl_roots_) return tl_roots_;
+    auto* list = new ThreadRootList();  // 堆分配，避免 thread_local 析构顺序问题
+    tl_roots_ = list;
+    {
+        std::lock_guard<std::mutex> lk(threadRootLists_m_);
+        threadRootLists_.push_back(list);
+    }
+    return list;
 }
 
-} // namespace aura_rt
-```
-
----
-
-## 文件 3：runtime/gc/gc.h（修改）
-
-### 3.1 新增 include（在 `#include "../types.h"` 之后，其他 include 之前）
-
-在 [gc.h:25](file:///d:/you/Aura/runtime/gc/gc.h#L25) 的 `#include "../types.h"` 之后新增：
-
-```cpp
-#include "../types.h"
-#include "los.h"   // 新增：LargeObjectSpace
-#include <atomic>
-```
-
-### 3.2 新增私有成员（在 `std::vector<Tlab*> tlabList_;` 之后）
-
-在 [gc.h:422](file:///d:/you/Aura/runtime/gc/gc.h#L422) 的 `std::vector<Tlab*> tlabList_;` 之后新增：
-
-```cpp
-    // TLAB 全局列表（用于调试/统计，不参与 GC 扫描）
-    std::mutex                  tlabList_m_;
-    std::vector<Tlab*>          tlabList_;
-
-    // --- Large Object Space ---
-    // 大对象（> kPageSize/2 = 2KB）独立空间，不参与 compact
-    // mark 通过正常引用链 + 保守栈扫描 LOS 检查
-    // sweep 在 sweepPhaseYoung/sweepPhaseAll 中调用 los_.release()
-    LargeObjectSpace            los_;
-};
-```
-
----
-
-## 文件 4：runtime/gc/alloc.cpp（修改）
-
-### 4.1 tryAlloc 的 `size > kPageSize/2` 分支改为走 LOS
-
-**当前代码**（[alloc.cpp:45-49](file:///d:/you/Aura/runtime/gc/alloc.cpp#L45)）：
-
-```cpp
-    // 大对象（> kPageSize/2 = 2KB）走全局慢路径
-    // 原因：TLAB 单页分配会浪费半页，大对象直接用全局 currentPage_
-    if (size > kPageSize / 2) {
-        return tryAllocSlow(size, desc);
+void GcHeap::releaseThreadRootList() {
+    if (!tl_roots_) return;
+    // 注：调用前应保证该线程所有 GcRootHandle 已析构（链表应为空）
+    {
+        std::lock_guard<std::mutex> lk(threadRootLists_m_);
+        auto it = std::find(threadRootLists_.begin(), threadRootLists_.end(), tl_roots_);
+        if (it != threadRootLists_.end()) threadRootLists_.erase(it);
     }
-```
-
-**修改为**：
-
-```cpp
-    // 大对象（> kPageSize/2 = 2KB）走 LOS（Large Object Space）
-    // 原因：bumpAlloc/compact 的 ensureSpace 不支持 size > kPageSize 的对象
-    //       LOS 独立分配 OS 内存块，不参与 compact，地址固定
-    if (size > kPageSize / 2) {
-        // L1 safepoint：检查 GC 暂停请求（必须在 LOS alloc 前处理）
-        if (gcPending_.load() || youngBytes_ >= kYoungThreshold) {
-            gcPending_.store(true);
-            safepoint();
-        }
-
-        GcObject* obj = los_.alloc(size, desc);
-        if (!obj) {
-            // LOS 分配失败，触发 GC 后重试一次
-            gcPending_.store(true);
-            safepoint();
-            obj = los_.alloc(size, desc);
-            if (!obj) throwOutOfMemory();
-        }
-
-        // 初始化 GcObject header（与 tryAllocSlow 保持一致）
-        obj->desc = desc;
-        obj->setMarked(false);
-        obj->setGeneration(0);  // 新生代
-        obj->setFinalized(false);
-        obj->setAllocSize(size);
-
-        if (desc) registeredDescs_.insert(desc);
-
-        youngObjects_.push_back(obj);
-        youngBytes_ += size;
-        allocatedBytes_ += size;
-
-        if (oldBytes_ >= kOldThreshold) {
-            gcPending_.store(true);
-        }
-        return obj;
-    }
-```
-
-**注意**：
-- 原大对象路径走 `tryAllocSlow → bumpAlloc`，bumpAlloc 在 `size > kPageSize` 时会越界写（P0 bug）。
-- 新路径走 `los_.alloc`，直接向 OS 申请独立内存块，绕过 bumpAlloc。
-- GC 触发逻辑与 `tryAllocSlow` 保持一致（先 safepoint，失败后重试）。
-
----
-
-## 文件 5：runtime/gc/compact.cpp（修改）
-
-### 5.1 computeForwardingAddresses 过滤 LOS 对象
-
-**当前代码**（[compact.cpp:61-63](file:///d:/you/Aura/runtime/gc/compact.cpp#L61) All 模式）：
-
-```cpp
-    if (scope == CompactScope::All) {
-        for (auto* obj : youngObjects_) toCompact.push_back(obj);
-        for (auto* obj : oldObjects_)   toCompact.push_back(obj);
-    }
-```
-
-**修改为**：
-
-```cpp
-    if (scope == CompactScope::All) {
-        // LOS 对象地址固定，不参与 compact（避免 ensureSpace 无限开页）
-        for (auto* obj : youngObjects_)
-            if (!los_.contains(obj)) toCompact.push_back(obj);
-        for (auto* obj : oldObjects_)
-            if (!los_.contains(obj)) toCompact.push_back(obj);
-    }
-```
-
-**当前代码**（[compact.cpp:89-92](file:///d:/you/Aura/runtime/gc/compact.cpp#L89) Young 模式）：
-
-```cpp
-        // 只 compact 非 mixed 页上的 young 对象
-        for (auto* obj : youngObjects_) {
-            Page* p = findPage(obj);
-            if (p && !mixedPages.count(p)) toCompact.push_back(obj);
-        }
-```
-
-**修改为**：
-
-```cpp
-        // 只 compact 非 mixed 页上的 young 对象（LOS 对象不在页上，自动跳过）
-        // 显式过滤 LOS 对象，避免 findPage 返回 nullptr 时误判
-        for (auto* obj : youngObjects_) {
-            if (los_.contains(obj)) continue;  // LOS 对象跳过
-            Page* p = findPage(obj);
-            if (p && !mixedPages.count(p)) toCompact.push_back(obj);
-        }
-```
-
----
-
-## 文件 6：runtime/gc/mark_sweep.cpp（修改）
-
-### 6.1 markPhase 保守栈扫描增加 LOS 检查
-
-**当前代码**（[mark_sweep.cpp:81-101](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L81)）：
-
-```cpp
-        for (char* p = start2; p + sizeof(void*) <= stop2; p += sizeof(void*)) {
-            void* candidate = *reinterpret_cast<void**>(p);
-            if (!candidate) continue;
-            // 保守检查：候选指针是否在 GC 页范围内
-            for (Page* page = headPage_; page; page = page->next) {
-                if (candidate >= static_cast<void*>(page->data) &&
-                    candidate < static_cast<void*>(page->data + kPageSize)) {
-                    GcObject* obj = static_cast<GcObject*>(candidate);
-                    // 验证是否为有效的 GC 对象再读取字段
-                    if (!obj->desc) break;
-                    if (registeredDescs_.find(obj->desc) == registeredDescs_.end()) break;
-                    if (obj->desc->size == 0) break;
-                    // 始终标记：markObject 有 marked 守卫，old 对象不会重复扫描
-                    markObject(obj);
-                    break;
-                }
-            }
-        }
-```
-
-**修改为**：
-
-```cpp
-        for (char* p = start2; p + sizeof(void*) <= stop2; p += sizeof(void*)) {
-            void* candidate = *reinterpret_cast<void**>(p);
-            if (!candidate) continue;
-            GcObject* obj = static_cast<GcObject*>(candidate);
-
-            // 路径 1：保守检查候选指针是否在小页范围内
-            bool found = false;
-            for (Page* page = headPage_; page; page = page->next) {
-                if (candidate >= static_cast<void*>(page->data) &&
-                    candidate < static_cast<void*>(page->data + kPageSize)) {
-                    // 验证是否为有效的 GC 对象再读取字段
-                    if (!obj->desc) break;
-                    if (registeredDescs_.find(obj->desc) == registeredDescs_.end()) break;
-                    if (obj->desc->size == 0) break;
-                    markObject(obj);
-                    found = true;
-                    break;
-                }
-            }
-            if (found) continue;
-
-            // 路径 2：检查是否是 LOS 大对象
-            // LOS 对象不在小页范围内，保守扫描会漏掉
-            // 额外检查 los_.contains，覆盖栈裸指针引用 LOS 对象的场景
-            if (los_.contains(obj)) {
-                if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
-                    markObject(obj);
-                }
-            }
-        }
-```
-
-### 6.2 sweepPhaseYoung 释放未标记的 LOS 对象
-
-**当前代码**（[mark_sweep.cpp:217-228](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L217)）：
-
-```cpp
-    // 3. 按年龄门槛晋升：age >= kPromotionAge 的存活对象晋升到老年代，
-    // 其余存活对象 age++ 留在新生代；未标记对象被丢弃。
-    std::vector<GcObject*> survivors;
-    for (auto* obj : youngObjects_) {
-        if (obj->marked()) {
-            obj->incAge();
-            if (obj->age() >= kPromotionAge) {
-                promoteToOld(obj);
-                obj->setMarked(false);
-            } else {
-                survivors.push_back(obj);
-                obj->setMarked(false);
-            }
-        }
-    }
-```
-
-**修改为**：
-
-```cpp
-    // 3. 按年龄门槛晋升：age >= kPromotionAge 的存活对象晋升到老年代，
-    // 其余存活对象 age++ 留在新生代；未标记对象被丢弃。
-    // LOS 对象未标记时，额外调用 los_.release() 释放独立内存块。
-    std::vector<GcObject*> survivors;
-    for (auto* obj : youngObjects_) {
-        if (obj->marked()) {
-            obj->incAge();
-            if (obj->age() >= kPromotionAge) {
-                promoteToOld(obj);
-                obj->setMarked(false);
-            } else {
-                survivors.push_back(obj);
-                obj->setMarked(false);
-            }
-        } else {
-            // 未标记，丢弃：LOS 对象需释放独立内存块（小页对象随页释放，无需额外操作）
-            if (los_.contains(obj)) {
-                los_.release(obj);
-            }
-        }
-    }
-```
-
-### 6.3 sweepPhaseAll 释放未标记的 LOS 对象
-
-**当前代码**（[mark_sweep.cpp:287-302](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L287)）：
-
-```cpp
-    // 3. 调用 finalizer（对未标记且未 finalize 的对象）
-    //    注意：此时 marked 标志尚未清除，finalizer 通过 marked 区分存活/死亡
-    for (auto* obj : youngObjects_) {
-        if (!obj->marked() && !obj->finalized()) {
-            if (obj->desc && obj->desc->finalizer) {
-                obj->desc->finalizer(obj);
-                obj->setFinalized(true);
-            }
-        }
-    }
-    for (auto* obj : oldObjects_) {
-        if (!obj->marked() && !obj->finalized()) {
-            if (obj->desc && obj->desc->finalizer) {
-                obj->desc->finalizer(obj);
-                obj->setFinalized(true);
-            }
-        }
-    }
-```
-
-**修改为**（在 finalizer 循环之后、清除 marked 标志之前，插入 LOS 释放）：
-
-```cpp
-    // 3. 调用 finalizer（对未标记且未 finalize 的对象）
-    //    注意：此时 marked 标志尚未清除，finalizer 通过 marked 区分存活/死亡
-    for (auto* obj : youngObjects_) {
-        if (!obj->marked() && !obj->finalized()) {
-            if (obj->desc && obj->desc->finalizer) {
-                obj->desc->finalizer(obj);
-                obj->setFinalized(true);
-            }
-        }
-    }
-    for (auto* obj : oldObjects_) {
-        if (!obj->marked() && !obj->finalized()) {
-            if (obj->desc && obj->desc->finalizer) {
-                obj->desc->finalizer(obj);
-                obj->setFinalized(true);
-            }
-        }
-    }
-
-    // 3.5 释放未标记的 LOS 对象
-    //     必须在 finalizer 之后（finalizer 可能访问对象字段）
-    //     必须在清除 marked 标志之前（用 marked 区分存活/死亡）
-    //     LOS 对象内存独立，不随页释放，需显式 release
-    for (auto* obj : youngObjects_) {
-        if (!obj->marked() && los_.contains(obj)) {
-            los_.release(obj);
-        }
-    }
-    for (auto* obj : oldObjects_) {
-        if (!obj->marked() && los_.contains(obj)) {
-            los_.release(obj);
-        }
-    }
-```
-
-**注意**：`los_.release(obj)` 释放内存后，obj 指针悬垂。后续代码（清除 marked 标志、`youngObjects_ = std::move(liveYoung)`）只处理存活对象，不会访问已释放的 obj，安全。
-
----
-
-## 文件 7：runtime/CMakeLists.txt（修改）
-
-### 7.1 新增 gc/los.cpp 到源文件列表
-
-**当前代码**（[CMakeLists.txt:42-57](file:///d:/you/Aura/runtime/CMakeLists.txt#L42)）：
-
-```cmake
-add_library(aura_rt STATIC
-    types.cpp
-    gc/gc.cpp
-    gc/alloc.cpp
-    gc/tlab.cpp
-    gc/roots.cpp
-    gc/safepoint.cpp
-    gc/mark_sweep.cpp
-    gc/compact.cpp
-    task.cpp
-    thread_pool.cpp
-    builtin/io.cpp
-    builtin/string.cpp
-    builtin/mutex.cpp
-    win_iocp.cpp
-)
-```
-
-**修改为**：
-
-```cmake
-add_library(aura_rt STATIC
-    types.cpp
-    gc/gc.cpp
-    gc/alloc.cpp
-    gc/tlab.cpp
-    gc/roots.cpp
-    gc/safepoint.cpp
-    gc/mark_sweep.cpp
-    gc/compact.cpp
-    gc/los.cpp
-    task.cpp
-    thread_pool.cpp
-    builtin/io.cpp
-    builtin/string.cpp
-    builtin/mutex.cpp
-    win_iocp.cpp
-)
-```
-
----
-
-## 文件 8：example/test.aura（修改）
-
-测试用例：通过 Aura 代码触发 LOS 路径，验证大对象分配/compact/GC 回收的正确性。
-
-```aura
-# === LOS (Large Object Space) 测试 ===
-# 间接验证：通过 Aura 代码触发大对象分配，验证不崩溃 + 数据完整
-
-io.println("=== T1: Large Array (CAP doubling → LOS) ===")
-arr = [int]
-i = 0
-while i < 5000 {
-    arr.append(i)
-    i = i + 1
+    delete tl_roots_;
+    tl_roots_ = nullptr;
 }
-io.println("Array length: " + arr.len())
-gc_force_major()
-io.println("After GC, array length: " + arr.len())
-io.println("Array[0]: " + arr[0])
-io.println("Array[4999]: " + arr[4999])
+```
 
-io.println("=== T2: Large String concat (> 4KB Flat → LOS) ===")
-s = ""
-i = 0
-while i < 10000 {
-    s = s + "x"
-    i = i + 1
-}
-io.println("String length: " + s.len())
-gc_force_major()
-io.println("After GC, string length: " + s.len())
+同时更新 roots.cpp 顶部文件注释（L4）：
+```cpp
+// 内容：registerRootThreadLocal/unregisterRootThreadLocal、
+//       ensureThreadRootList/releaseThreadRootList、registerStackRoots/unregisterStackRoots、
+//       registerGlobalRoot/unregisterGlobalRoot、registerWeak/unregisterWeak。
+```
 
-io.println("=== T3: Mixed allocation (small + large interleaved) ===")
-arr2 = [int]
-i = 0
-while i < 100 {
-    arr2.append(i)
-    s = s + "y"
-    i = i + 1
-}
-io.println("Array2 length: " + arr2.len())
-io.println("String length: " + s.len())
-gc_force_major()
+### 4.6 文件：runtime/gc/tlab.cpp — registerThread/unregisterThread 集成
 
-io.println("=== T4: GC stats ===")
-io.println(gc_stats())
+**位置**：L62-81（`registerThread` / `unregisterThread`）
 
-io.println("=== T5: Repeated GC (LOS sweep correctness) ===")
-i = 0
-while i < 10 {
-    tmp = [int]
-    j = 0
-    while j < 2000 {
-        tmp.append(j)
-        j = j + 1
+**修改前**：
+```cpp
+void GcHeap::registerThread(std::thread::id id) {
+    {
+        std::lock_guard<std::mutex> lk(threads_m_);
+        registered_threads_.push_back(id);
     }
-    # tmp 离开作用域后应被回收
-    gc_force_major()
-    i = i + 1
+    // 为本线程分配 TLAB
+    ensureTlab();
 }
-io.println("After 10 rounds of alloc + GC:")
-io.println(gc_stats())
 
-io.println("=== All tests passed ===")
+void GcHeap::unregisterThread(std::thread::id id) {
+    // 先 flush + 释放 TLAB（避免 threads_m_ 持锁时调用 allocM_）
+    releaseTlab();
+    {
+        std::lock_guard<std::mutex> lk(threads_m_);
+        auto it = std::find(registered_threads_.begin(), registered_threads_.end(), id);
+        if (it != registered_threads_.end()) {
+            registered_threads_.erase(it);
+        }
+    }
+}
 ```
 
-**验证点**：
-- T1：5000 元素 Array，CAP 翻倍到 cap=2048（8KB）→ LOS 分配，验证不崩溃 + 索引正确
-- T2：10000 字符 concat，产生 > 4KB Flat → LOS 分配，验证不崩溃 + 长度正确
-- T3：混合分配，验证 LOS 与小页分配共存
-- T4：gc_stats 输出，验证 LOS 统计字段（如 allocatedBytes 包含 LOS）
-- T5：重复分配 + GC，验证 LOS sweep 正确回收
+**修改后**：
+```cpp
+void GcHeap::registerThread(std::thread::id id) {
+    {
+        std::lock_guard<std::mutex> lk(threads_m_);
+        registered_threads_.push_back(id);
+    }
+    // 为本线程分配 TLAB
+    ensureTlab();
+    // 为本线程分配 ThreadRootList（确保 GC 能看到本线程的根链表）
+    ensureThreadRootList();
+}
 
-**无法通过 Aura 测试的点**：
-- T6（GcWeakHandle 指向 LOS 对象）：需要 C++ API，Aura 语言未暴露 GcWeakHandle 语法
-- T4（LOS 对象地址不变）：需要直接比较地址，Aura 无法获取对象地址
+void GcHeap::unregisterThread(std::thread::id id) {
+    // 先 flush + 释放 TLAB（避免 threads_m_ 持锁时调用 allocM_）
+    releaseTlab();
+    // 释放 ThreadRootList（前提：该线程所有 GcRootHandle 已析构）
+    releaseThreadRootList();
+    {
+        std::lock_guard<std::mutex> lk(threads_m_);
+        auto it = std::find(registered_threads_.begin(), registered_threads_.end(), id);
+        if (it != registered_threads_.end()) {
+            registered_threads_.erase(it);
+        }
+    }
+}
+```
 
-这些点在 ASAN 模式下间接验证：如果 LOS 对象在 compact 后被误移动，ASAN 会检测到 use-after-free。
+### 4.7 文件：runtime/gc/mark_sweep.cpp — markPhase 遍历改为聚合所有线程链表
+
+**位置**：L63-68（`markPhase` 开头）
+
+**修改前**：
+```cpp
+void GcHeap::markPhase(bool youngOnly) {
+    // 1. 从 GcRootHandle 根出发标记
+    for (auto* rootHandle : roots_) {
+        GcObject* obj = rootHandle->get();
+        if (obj) markObject(obj);
+    }
+```
+
+**修改后**：
+```cpp
+void GcHeap::markPhase(bool youngOnly) {
+    // 1. 从所有线程的 GcRootHandle 链表出发标记
+    //    ptr_ref_ 指向用户栈上 GC 指针变量地址，memcpy 读取该地址处的对象指针
+    //    （用 memcpy 避免 strict-aliasing：实际指向 GcString* 等派生类型）
+    for (auto* list : threadRootLists_) {
+        for (GcRootHandleBase* node = list->head; node; node = node->next_) {
+            GcObject* obj;
+            std::memcpy(&obj, node->ptr_ref_, sizeof(GcObject*));
+            if (obj) markObject(obj);
+        }
+    }
+```
+
+### 4.8 文件：runtime/gc/compact.cpp — updateAllReferences + updateMediumPageReferences 遍历改为聚合所有线程链表
+
+**位置 A**：L303-309（`updateAllReferences` 开头）
+
+**修改前**：
+```cpp
+    // 1. 更新 roots_（GcRootHandle::ptr_ 指向的栈变量）
+    for (auto* rootHandle : roots_) {
+        GcObject** fieldPtr = reinterpret_cast<GcObject**>(rootHandle->ptr_);
+        if (fieldPtr && *fieldPtr) {
+            updatePtr(*fieldPtr);
+        }
+    }
+```
+
+**修改后**：
+```cpp
+    // 1. 更新所有线程的 GcRootHandle 链表
+    //    ptr_ref_ 指向用户栈上 GC 指针变量地址，更新其指向搬运后的新地址
+    for (auto* list : threadRootLists_) {
+        for (GcRootHandleBase* node = list->head; node; node = node->next_) {
+            GcObject** fieldPtr = node->ptr_ref_;
+            if (fieldPtr && *fieldPtr) {
+                updatePtr(*fieldPtr);
+            }
+        }
+    }
+```
+
+**位置 B**：L626-630（`updateMediumPageReferences` 开头）
+
+**修改前**：
+```cpp
+    // 更新 roots_
+    for (auto* rootHandle : roots_) {
+        GcObject** fieldPtr = reinterpret_cast<GcObject**>(rootHandle->ptr_);
+        if (fieldPtr && *fieldPtr) updatePtr(*fieldPtr);
+    }
+```
+
+**修改后**：
+```cpp
+    // 更新所有线程的 GcRootHandle 链表
+    for (auto* list : threadRootLists_) {
+        for (GcRootHandleBase* node = list->head; node; node = node->next_) {
+            GcObject** fieldPtr = node->ptr_ref_;
+            if (fieldPtr && *fieldPtr) updatePtr(*fieldPtr);
+        }
+    }
+```
+
+### 4.9 文件：runtime/gc/gc.h — 清理已废弃的 unordered_set / unordered_map 包含（可选）
+
+`#include <unordered_set>` 仍被 `registeredDescs_` 使用（L461），保留不动。
+
+### 安全性分析
+- **无锁一致性**：每个线程只操作自己的 `tl_roots_` 链表，构造/析构无锁
+- **GC 遍历安全**：markPhase / updateAllReferences 在 STW 期间执行，此时所有 mutator 暂停，`threadRootLists_` 与各链表稳定
+- **线程注册安全**：registerThread 持 `threads_m_` 后才 `ensureThreadRootList`；STW 要求所有 mutator 到达 safepoint，新线程在 registerThread 完成后才会运行用户代码，故 GC 不会看到半初始化的链表
+- **线程退出安全**：unregisterThread 调用 `releaseThreadRootList`，前提是该线程所有 GcRootHandle 已析构（worker 函数返回时栈上对象已析构）
+- **memcpy 避免 strict-aliasing**：`ptr_ref_` 是 `GcObject**`，但实际指向 `GcString*` 等派生类型变量，用 memcpy 读写避免 UB
+- **ptr_ref_ 一致性**：构造时 `ptr_ref_ = ptr_`（用户变量地址）；`s.get() = newObj` 仅改用户变量值，不改 ptr_，ptr_ref_ 保持有效；rebind 同步更新 ptr_ref_
 
 ---
 
-## 验证流程
+## 边界条件处理
 
-按 [AGENTS.md](file:///d:/you/Aura/AGENTS.md) 项目约定：
-
-```powershell
-# 1. 构建 runtime（普通模式）
-cmake --build runtime/build
-
-# 2. 构建编译器
-cmake --build build
-
-# 3. 编译并运行测试
-.\example\compile.cmd
-.\example\test.exe
-```
-
-**ASAN 深度验证**（按 [AGENTS.md AddressSanitizer 深度调试模式](file:///d:/you/Aura/AGENTS.md#L13)）：
-
-```powershell
-# 清空 build 目录重新配置（CMakeCache 会缓存编译器选择）
-Remove-Item -Recurse -Force build, runtime/build
-cmake -S . -B build -DENABLE_ASAN=ON
-cmake -S runtime -B runtime/build -DENABLE_ASAN=ON
-cmake --build build
-cmake --build runtime/build
-
-# 运行测试
-.\build\aurac.exe example/test.aura --cpp example/test.cpp -S
-$env:PATH = "C:/msys64/clang64/bin;" + $env:PATH
-C:/msys64/clang64/bin/clang++.exe -std=gnu++20 -fsanitize=address `
-    -fno-omit-frame-pointer -g -O0 -fuse-ld=lld -w `
-    -I runtime example/test.cpp runtime/build/libaura_rt.a -o example/test.exe
-.\example\test.exe
-```
-
-**验收标准**：
-- 普通模式：test.exe 正常输出 "All tests passed"，无崩溃
-- ASAN 模式：test.exe 无 ASAN 错误（无 heap-buffer-overflow、use-after-free）
-- 5 次连续运行无崩溃、无死锁
+| 边界条件 | 处理策略 |
+|---|---|
+| append 返回 this（容量足够） | `s.get() = s.get()->append(x)` 赋值 this 回 s，无副作用 |
+| append 返回 newStr（容量不足） | `s.get() = newStr`，newStr 被 s 持有，下次 GC 标记 |
+| GC 期间 GcRootHandle 析构 | STW 期间 mutator 暂停，不会析构 |
+| 线程退出链表未清理 | unregisterThread 调用 releaseThreadRootList（前提：GcRootHandle 已析构） |
+| intern L1 缓存 key 失效 | key 指向 Aura 字符串字面量（编译期常量），永久存活 |
+| GC 阈值调大后峰值内存 | young 2MB + old 8MB = 10MB 峰值（可接受） |
+| Slice 模式 append | capacity() 返回 0 强制扩容（原逻辑不变） |
+| ptr_ref_ 与 ptr_ 一致性 | 构造/rebind 同步更新 ptr_ref_，赋值用户变量不改 ptr_ |
+| intern L1 缓存重复插入 | internCacheInsert 先查重，已存在则提前到头部 |
 
 ---
 
-## 回滚方案
+## 测试方案
 
-如发现问题，按以下顺序回滚：
+### 单元测试（example/test.aura）
+- T1: append 正确性（100 万次 `s = s + "a"`，验证 s.length == 1000000）
+- T2: 1000 万次 `s = s + "a"` 性能基准（目标：秒级完成，< 10 秒）
+- T3: intern L1 缓存正确性（多次 intern 相同字面量，返回同一对象）
+- T4: GC 阈值调大后内存监控（youngBytes <= 2MB）
+- T5: 现有 LOS / 分代 GC 测试回归（原 T1-T5 测试全通过）
 
-1. 删除 `runtime/gc/los.h` 和 `runtime/gc/los.cpp`
-2. `runtime/gc/gc.h` 移除 `#include "los.h"` 和 `LargeObjectSpace los_` 成员
-3. `runtime/gc/alloc.cpp` tryAlloc 的 `size > kPageSize/2` 分支恢复为 `return tryAllocSlow(size, desc);`
-4. `runtime/gc/compact.cpp` computeForwardingAddresses 恢复为不过滤 LOS 对象
-5. `runtime/gc/mark_sweep.cpp` 恢复 markPhase 保守栈扫描（移除 LOS 检查）、sweepPhaseYoung/sweepPhaseAll（移除 los_.release 调用）
-6. `runtime/CMakeLists.txt` 移除 `gc/los.cpp`
+### 验收标准
+- T1: s.length == 1000000（正确性）
+- T2: 1000 万次拼接 < 10 秒（性能）
+- T3: intern 返回同一 GcString* 指针
+- T4: 无 OOM，youngBytes 在阈值内
+- T5: 原测试全通过
+
+### 测试流程
+按 [AGENTS.md](file:///d:/you/Aura/AGENTS.md) 项目约定：将测试代码写入 `example/test.aura`，使用 `compile.cmd` 编译（非 ASAN 模式），运行 `example/test.exe`。
+
+---
+
+## Rollback 策略
+- 各变更独立，可单独回滚
+- 变更 4 风险最高，如出问题可单独回退至 `unordered_set + mutex` 实现（保留 git 历史）

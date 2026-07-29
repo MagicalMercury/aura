@@ -1,8 +1,16 @@
 # 分代分页 GC + 大对象区（LOS）Plan — 详细实施方案
 
 > **阶段**：工作场景 3（准备实现 plan，等待审查）
-> **状态**：详细实施方案 v1
+> **状态**：详细实施方案 v1（阶段 1 已实施完成）
 > **范围**：分代分页 GC 架构演进 + LOS（大对象区）
+> **关联**：
+> - [array_optimization.md](file:///d:/you/Aura/plan/array_optimization.md)：Array CAP 翻倍策略触发 GC 越界 bug（本 plan 阶段 1 LOS 的直接触发场景）
+> - [compacting_gc_plan.md](file:///d:/you/Aura/plan/compacting_gc_plan.md)：compact GC 原始方案（本 plan LOS 替代该方案中"大对象 compact"部分）
+> - [gc_features_plan.md](file:///d:/you/Aura/plan/gc_features_plan.md)：GC 功能完整 plan（本 plan 是其 §十三的独立细化与演进）
+> - [done/gc_refactor_split.md](file:///d:/you/Aura/plan/done/gc_refactor_split.md)：GC 模块拆分（本 plan 在此拆分基础上新增 los.h/cpp）
+> - [done/gc_promotion_issues.md](file:///d:/you/Aura/plan/done/gc_promotion_issues.md)：GC 晋升机制缺陷（本 plan 阶段 3 优化方向）
+> - [done/chunk_array_plan.md](file:///d:/you/Aura/plan/done/chunk_array_plan.md)：Array chunk 链表设计（触发 LOS 需求的源头）
+> - [TODO.txt](file:///d:/you/Aura/TODO.txt) §五：LOS 进度跟踪
 
 ---
 

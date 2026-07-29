@@ -3,6 +3,11 @@
 > 对应 README 附录 C.1（有界并发控制）+ C.2（spawn 闭包传参）
 > 日期：2026-06-27
 > 状态：待完成 
+> 关联：
+> - [sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md)：sync thread 多线程语句实施 plan（C.1/C.2 的实现方案）
+> - [channel_thread_issue.md](file:///d:/you/Aura/plan/channel_thread_issue.md)：sync.Channel<T> 设计 issue（§2.2 thread 版 channel）
+> - [done/mutex_plan.md](file:///d:/you/Aura/plan/done/mutex_plan.md)：sync 锁族 + lock 块语句实施 plan
+> - [done/plan-closure-coroutine.md](file:///d:/you/Aura/plan/done/plan-closure-coroutine.md)：闭包协程化 plan（spawn 闭包传参相关）
 
 ---
 

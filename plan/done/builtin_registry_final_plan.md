@@ -1,6 +1,6 @@
 # BuiltinRegistry 集中注册 — 完整实施计划
 
-> 整合来源：`plan/builtin_registry_plan.md`（原始设计）+ `plan/aurai_review.md`（审查修正）
+> 整合来源：`plan/done/builtin_registry_plan.md`（原始设计）+ `plan/done/aurai_review.md`（审查修正）
 > 日期：2026-07-02
 > 状态：Phase 1-4 ✅ 完成
 

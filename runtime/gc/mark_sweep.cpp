@@ -61,10 +61,15 @@ void GcHeap::majorGc() {
 // ============================================================
 
 void GcHeap::markPhase(bool youngOnly) {
-    // 1. 从 GcRootHandle 根出发标记
-    for (auto* rootHandle : roots_) {
-        GcObject* obj = rootHandle->get();
-        if (obj) markObject(obj);
+    // 1. 从所有线程的 GcRootHandle 链表出发标记
+    //    ptr_ref_ 指向用户栈上 GC 指针变量地址，memcpy 读取该地址处的对象指针
+    //    （用 memcpy 避免 strict-aliasing：实际指向 GcString* 等派生类型）
+    for (auto* list : threadRootLists_) {
+        for (GcRootHandleBase* node = list->head; node; node = node->next_) {
+            GcObject* obj;
+            std::memcpy(&obj, node->ptr_ref_, sizeof(GcObject*));
+            if (obj) markObject(obj);
+        }
     }
 
     // 2. 从栈帧根出发标记（保守扫描栈中的指针）
@@ -103,9 +108,23 @@ void GcHeap::markPhase(bool youngOnly) {
             }
             if (found) continue;
 
-            // 路径 2：检查是否是 LOS 大对象
-            // LOS 对象不在小页范围内，保守扫描会漏掉
-            // 额外检查 los_.contains，覆盖栈裸指针引用 LOS 对象的场景
+            // 路径 2：检查是否是中页对象
+            if (findMediumPage(obj)) {
+                if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
+                    markObject(obj);
+                }
+                continue;
+            }
+
+            // 路径 3：检查是否是大页对象
+            if (findLargePage(obj)) {
+                if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
+                    markObject(obj);
+                }
+                continue;
+            }
+
+            // 路径 4：检查是否是 LOS 大对象
             if (los_.contains(obj)) {
                 if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
                     markObject(obj);
@@ -252,6 +271,14 @@ void GcHeap::sweepPhaseYoung() {
         youngBytes_ += obj->allocSize();
     }
     youngObjects_ = std::move(survivors);
+
+    // Bug 2 修复：清除老年代对象的 marked 标志。
+    // markPhase 中 markObject 检查 marked() 为 true 时直接返回，跳过 markFields。
+    // 若不清除 old 对象的 marked，下次 minor GC 时 old 对象 marked=true 持续，
+    // markObject 跳过 markFields → old→young 引用未被标记 → young 子对象被 sweep 回收 → 悬垂指针。
+    for (auto* obj : oldObjects_) {
+        obj->setMarked(false);
+    }
 }
 
 void GcHeap::promoteToOld(GcObject* obj) {
@@ -260,6 +287,48 @@ void GcHeap::promoteToOld(GcObject* obj) {
     oldBytes_ += obj->allocSize();
     if (oldBytes_ >= kOldThreshold) {
         gcPending_.store(true);
+    }
+
+    // Bug 5 修复：晋升时扫描对象的指针字段和内联数组字段，
+    // 若指向新生代对象则将自身加入 rememberedSet_。
+    // 对象在新生代时 young→young 引用无需记忆集（minor GC 从根集合递归标记覆盖），
+    // 晋升为 old 后这些引用变成 old→young，必须被记忆集追踪，
+    // 否则 minor GC 漏标 → young 子对象被 sweep 回收 → 悬垂指针。
+    const TypeDescriptor* desc = obj->desc;
+    if (!desc) return;
+    char* base = reinterpret_cast<char*>(obj);
+
+    // 扫描指针字段
+    bool hasYoungRef = false;
+    if (desc->ptrFieldCount > 0 && desc->ptrFieldOffsets) {
+        for (size_t i = 0; i < desc->ptrFieldCount; ++i) {
+            GcObject** fieldPtr = reinterpret_cast<GcObject**>(base + desc->ptrFieldOffsets[i]);
+            GcObject* child = *fieldPtr;
+            if (child && child->generation() == 0) {
+                hasYoungRef = true;
+                break;
+            }
+        }
+    }
+    // 扫描内联数组字段
+    if (!hasYoungRef && desc->inlineArrayFieldCount > 0 && desc->inlineArrayFields) {
+        for (size_t i = 0; i < desc->inlineArrayFieldCount; ++i) {
+            const InlineArrayField& iaf = desc->inlineArrayFields[i];
+            if (!iaf.isPtrArray) continue;
+            int32_t count = *reinterpret_cast<int32_t*>(base + iaf.lengthOffset);
+            GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
+            for (int32_t j = 0; j < count; ++j) {
+                if (elems[j] && elems[j]->generation() == 0) {
+                    hasYoungRef = true;
+                    break;
+                }
+            }
+            if (hasYoungRef) break;
+        }
+    }
+    if (hasYoungRef) {
+        std::lock_guard<std::mutex> lk(rememberedSetM_);
+        rememberedSet_.insert(obj);
     }
 }
 
@@ -348,10 +417,21 @@ void GcHeap::sweepPhaseAll() {
     // 2. 若大量对象死亡，执行紧缩
     if (compactSuspendedCount_.load() > 0) {
         compactPending_ = true;   // 延迟所有 compact 操作（含 compactAndReclaim）
-    } else if (shouldCompact(CompactScope::All)) {
-        compact(CompactScope::All);
     } else {
-        compactAndReclaim();
+        // 小页 compact
+        if (shouldCompact(CompactScope::All)) {
+            compact(CompactScope::All);
+        } else {
+            compactAndReclaim();
+        }
+        // 阶段 2：中页 compact（滑动窗口搬运）
+        if (shouldCompactMedium()) {
+            compactMediumPages();
+        }
+        // 阶段 2：大页 mark-sweep（分配失败率触发）
+        if (shouldSweepLargePages()) {
+            sweepLargePages();
+        }
     }
 
     // 3. 若老年代仍超阈值，标记需要 GC
@@ -422,6 +502,25 @@ void GcHeap::compactAndReclaim() {
 
     headPage_ = newHead;
     currentPage_ = newTail;
+}
+
+// ============================================================
+// 阶段 3：Mixed GC — 中页 compact + 小页 minor
+// ============================================================
+void GcHeap::mixedGc() {
+    ++mixedGcCount_;
+    // Phase 1: 标记（仅 young + 记忆集）
+    markPhase(/* youngOnly = */ true);
+    // Phase 2: 清除新生代 + 晋升
+    sweepPhaseYoung();
+    // Phase 3: 中页 compact
+    if (shouldCompactMedium()) {
+        if (compactSuspendedCount_.load() > 0) {
+            compactPending_ = true;
+        } else {
+            compactMediumPages();
+        }
+    }
 }
 
 } // namespace aura_rt

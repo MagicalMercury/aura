@@ -1,7 +1,8 @@
 // ============================================================
 // aura_rt/gc/roots.cpp ─ 根集合管理
 //
-// 内容：registerRoot/unregisterRoot、registerStackRoots/unregisterStackRoots、
+// 内容：registerRootThreadLocal/unregisterRootThreadLocal、
+//       ensureThreadRootList/releaseThreadRootList、registerStackRoots/unregisterStackRoots、
 //       registerGlobalRoot/unregisterGlobalRoot、registerWeak/unregisterWeak。
 // 拆分自原 runtime/gc.cpp（L442-490）。
 // ============================================================
@@ -12,16 +13,57 @@
 namespace aura_rt {
 
 // ============================================================
-// 根集合管理
+// 线程局部侵入式链表根集合管理
+//
+// 构造/析构无锁：每个线程只操作自己的 ThreadRootList（thread_local）
+// GC 遍历在 STW 期间执行，此时所有 mutator 暂停，链表稳定
 // ============================================================
-void GcHeap::registerRoot(GcRootHandle<GcObject*>* root) {
-    std::lock_guard<std::mutex> lk(rootsM_);
-    roots_.insert(root);
+
+// 静态成员定义
+thread_local GcHeap::ThreadRootList* GcHeap::tl_roots_ = nullptr;
+
+void GcHeap::registerRootThreadLocal(GcRootHandleBase* root) {
+    ThreadRootList* list = tl_roots_;
+    if (!list) {
+        list = ensureThreadRootList();  // 懒分配（首次创建 GcRootHandle 时）
+    }
+    // 头插（O(1)，无锁）
+    root->next_ = list->head;
+    root->prev_ = nullptr;
+    if (list->head) list->head->prev_ = root;
+    list->head = root;
 }
 
-void GcHeap::unregisterRoot(GcRootHandle<GcObject*>* root) {
-    std::lock_guard<std::mutex> lk(rootsM_);
-    roots_.erase(root);
+void GcHeap::unregisterRootThreadLocal(GcRootHandleBase* root) {
+    ThreadRootList* list = tl_roots_;
+    if (!list) return;
+    // 摘除（O(1)，无锁）
+    if (root->prev_) root->prev_->next_ = root->next_;
+    else             list->head = root->next_;
+    if (root->next_) root->next_->prev_ = root->prev_;
+}
+
+GcHeap::ThreadRootList* GcHeap::ensureThreadRootList() {
+    if (tl_roots_) return tl_roots_;
+    auto* list = new ThreadRootList();  // 堆分配，避免 thread_local 析构顺序问题
+    tl_roots_ = list;
+    {
+        std::lock_guard<std::mutex> lk(threadRootLists_m_);
+        threadRootLists_.push_back(list);
+    }
+    return list;
+}
+
+void GcHeap::releaseThreadRootList() {
+    if (!tl_roots_) return;
+    // 注：调用前应保证该线程所有 GcRootHandle 已析构（链表应为空）
+    {
+        std::lock_guard<std::mutex> lk(threadRootLists_m_);
+        auto it = std::find(threadRootLists_.begin(), threadRootLists_.end(), tl_roots_);
+        if (it != threadRootLists_.end()) threadRootLists_.erase(it);
+    }
+    delete tl_roots_;
+    tl_roots_ = nullptr;
 }
 
 void GcHeap::registerStackRoots(void* begin, void* end) {

@@ -36,6 +36,7 @@ void GcHeap::safepoint() {
     //   2. compact 的 updateAllReferences 能更新所有对象引用
     //   3. compact 释放旧页后 TLAB curPage 不悬垂（已清空为 nullptr）
     flushTlab();
+    clear_intern_cache();  // 防止 compact 移动对象后缓存指针悬垂
 
     // 单线程场景：直接执行 GC
     size_t threadCount;
@@ -46,7 +47,15 @@ void GcHeap::safepoint() {
     if (threadCount <= 1) {
         gcPending_.store(false);
         if (youngBytes_ >= kYoungThreshold / 2) minorGc();
+        // 阶段 3：Mixed GC（中页碎片率高时触发）
+        if (shouldCompactMedium() && !compactSuspendedCount_.load()) {
+            mixedGc();
+        }
         if (oldBytes_ >= kOldThreshold) majorGc();
+        // 阶段 2：大页 mark-sweep（分配失败率高时触发）
+        if (shouldSweepLargePages() && !compactSuspendedCount_.load()) {
+            sweepLargePages();
+        }
         return;
     }
 
@@ -77,7 +86,15 @@ void GcHeap::safepoint() {
         // 所有其他线程已停止，执行 GC
         gcPending_.store(false);
         if (youngBytes_ >= kYoungThreshold / 2) minorGc();
+        // 阶段 3：Mixed GC（中页碎片率高时触发）
+        if (shouldCompactMedium() && !compactSuspendedCount_.load()) {
+            mixedGc();
+        }
         if (oldBytes_ >= kOldThreshold) majorGc();
+        // 阶段 2：大页 mark-sweep（分配失败率高时触发）
+        if (shouldSweepLargePages() && !compactSuspendedCount_.load()) {
+            sweepLargePages();
+        }
 
         // 唤醒所有线程：递增 gc_epoch_ 通知所有等待者
         {
@@ -119,6 +136,7 @@ void GcHeap::forceGc() {
     //   2. compact 释放页后 TLAB curPage 悬垂 → 下次分配写入已释放内存
     // safepoint() 路径已有 flushTlab，forceGc 单线程路径也要补上
     flushTlab();
+    clear_intern_cache();  // 防止 compact 移动对象后缓存指针悬垂
 
     size_t threadCount;
     {
@@ -147,6 +165,16 @@ GcHeap::Stats GcHeap::getStats() const {
     s.liveObjectCount = youngObjects_.size() + oldObjects_.size();
     s.pageCount = 0;
     for (Page* p = headPage_; p; p = p->next) s.pageCount++;
+
+    // 阶段 2 新增
+    s.mediumPages = 0;
+    for (MediumPage* p = mediumPages_; p; p = p->next) s.mediumPages++;
+    s.largePages = 0;
+    for (LargePage* p = largePages_; p; p = p->next) s.largePages++;
+    s.freeMediumPages = freeMediumPages_.size();
+    s.losObjects = los_.objectCount();
+    s.losBytes   = los_.bytes();
+    s.mixedGcCount = mixedGcCount_;
     return s;
 }
 
@@ -164,14 +192,17 @@ static const char* fmtBytes(size_t bytes, char* buf, size_t bufSize) {
 
 GcString* gc_stats_string() {
     auto s = GcHeap::instance().getStats();
-    char abuf[32], ybuf[32], obuf[32];
-    char buf[256];
+    char abuf[32], ybuf[32], obuf[32], lbuf[32];
+    char buf[512];
     std::snprintf(buf, sizeof(buf),
-        "GC: alloc=%s young=%s old=%s gc=%zu minor=%zu live=%zu pages=%zu",
+        "GC: alloc=%s young=%s old=%s gc=%zu minor=%zu mixed=%zu live=%zu pages=%zu "
+        "medium=%zu large=%zu freeMed=%zu los=%zu/%s",
         fmtBytes(s.allocatedBytes, abuf, sizeof(abuf)),
         fmtBytes(s.youngBytes,     ybuf, sizeof(ybuf)),
         fmtBytes(s.oldBytes,       obuf, sizeof(obuf)),
-        s.gcCount, s.minorGcCount, s.liveObjectCount, s.pageCount);
+        s.gcCount, s.minorGcCount, s.mixedGcCount, s.liveObjectCount, s.pageCount,
+        s.mediumPages, s.largePages, s.freeMediumPages,
+        s.losObjects, fmtBytes(s.losBytes, lbuf, sizeof(lbuf)));
     return make_string(buf);
 }
 

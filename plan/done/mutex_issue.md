@@ -1053,7 +1053,7 @@ fun transfer(a: Account, b: Account, amt: int) {
 1. 写入 TODO.txt §十 新增 P2 项：
    ```
    [ ] P2  sync 锁族 + lock 块语句（统一语法）
-         - issue：plan/mutex_issue.md [2026-07-24 审核通过]
+         - issue：plan/done/mutex_issue.md [2026-07-24 审核通过]
          - 方案：C（统一 lock 块语句，禁止跨函数持有锁）
          - 语法（统一）：
              lock (m) { ... }          # Mutex 独占（v1.0）
@@ -1071,5 +1071,5 @@ fun transfer(a: Account, b: Account, amt: int) {
                  src/CodeGen/StmtGen.cpp
    ```
 
-2. 创建 `plan/mutex_plan.md` 详细实施方案（含 AST/Parser/Sema/CodeGen 全链路细节）
+2. 创建 `plan/done/mutex_plan.md` 详细实施方案（含 AST/Parser/Sema/CodeGen 全链路细节）
 3. 启动 Mutex plan 实施（v1.0 先行，v1.1 紧随）

@@ -1,8 +1,13 @@
 # Array<T> 优化 Plan — 详细实施方案
 
 > **阶段**：工作场景 3（准备实现 plan，等待审查）
-> **状态**：详细实施方案 v1
+> **状态**：详细实施方案 v1（P0/P1 已实施完成）
 > **范围**：P0（bug 修复）+ P1（性能/代码质量：A/B/C/D）
+> **关联**：
+> - [done/chunk_array_plan.md](file:///d:/you/Aura/plan/done/chunk_array_plan.md)：原始 chunk 链表设计（P1-A CAP 翻倍策略的源头）
+> - [done/array_advise.md](file:///d:/you/Aura/plan/done/array_advise.md)：v1 审查报告（P1-B 索引表、P1-C insert 拆分的早期建议）
+> - [generational_paged_gc.md](file:///d:/you/Aura/plan/generational_paged_gc.md)：分代分页 GC + LOS（解决 chunk > page 的越界 bug，P0 修复的前置依赖）
+> - [TODO.txt](file:///d:/you/Aura/TODO.txt) §六：Array 优化进度跟踪
 
 ---
 

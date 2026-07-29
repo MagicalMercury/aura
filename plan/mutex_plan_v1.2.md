@@ -3,7 +3,7 @@
 > 类型：详细实施方案（plan，已根据源码细化分析）
 > 日期：2026-07-27
 > 状态：等待审查
-> 前置：[mutex_plan.md](file:///d:/you/Aura/plan/mutex_plan.md)（v1.0 / v1.1 已完成）
+> 前置：[mutex_plan.md](file:///d:/you/Aura/plan/done/mutex_plan.md)（v1.0 / v1.1 已完成）
 > 关联：[plan/done/gc_mutex_deadlock_fix_report.md](file:///d:/you/Aura/plan/done/gc_mutex_deadlock_fix_report.md)（STW 死锁修复经验）
 > 关联 TODO：[TODO.txt](file:///d:/you/Aura/TODO.txt) §十（v1.2 进行中、WaitGroup v1.3、Cond/Semaphore v1.3）
 
@@ -776,7 +776,7 @@ fun main(io: Io) {
 
 ## 七、参考
 
-- [mutex_plan.md](file:///d:/you/Aura/plan/mutex_plan.md)：v1.0 / v1.1 完整实施方案
+- [mutex_plan.md](file:///d:/you/Aura/plan/done/mutex_plan.md)：v1.0 / v1.1 完整实施方案
 - [plan/done/gc_mutex_deadlock_fix_report.md](file:///d:/you/Aura/plan/done/gc_mutex_deadlock_fix_report.md)：v1.0 死锁修复经验（STW safepoint 原则）
 - [TODO.txt](file:///d:/you/Aura/TODO.txt) §十：v1.2/v1.3/WaitGroup 进度跟踪
 - [channel_thread_issue.md](file:///d:/you/Aura/plan/channel_thread_issue.md)：thread 版 channel 设计（可能触发 WaitGroup 需求）

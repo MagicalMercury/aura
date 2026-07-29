@@ -6,7 +6,7 @@
 > 状态：准备实施（等待审查）
 > 关联：
 >   - [sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md)（v1 已完成）
->   - [mutex_plan.md](file:///d:/you/Aura/plan/mutex_plan.md)（v1.0 已完成）
+>   - [mutex_plan.md](file:///d:/you/Aura/plan/done/mutex_plan.md)（v1.0 已完成）
 >   - [change.md](file:///d:/you/Aura/change.md)（v1.0 实施代码，已测试通过）
 
 ---
@@ -297,7 +297,7 @@ lock (lock) {              // 第一个 lock 是关键字，第二个 lock 是�
 
 - 仅支持 `sync.Mutex`，未支持 `RWMutex.r()/.w()` 模式（v1.1 计划）
 - `lock` 块内的 I/O 必须使用同步版本（`io.println_sync`）；后续 v1.1 会增加 Sema 检查给出明确错误
-- 不支持 `Once` / `WaitGroup` 的 `lock` 语法（v1.1 计划，见 [mutex_plan.md](file:///d:/you/Aura/plan/mutex_plan.md) §二 锁族规划）
+- 不支持 `Once` / `WaitGroup` 的 `lock` 语法（v1.1 计划，见 [mutex_plan.md](file:///d:/you/Aura/plan/done/mutex_plan.md) §二 锁族规划）
 ```
 
 #### 3.1.5 章节序号调整
@@ -367,13 +367,13 @@ lock (lock) {              // 第一个 lock 是关键字，第二个 lock 是�
 | `channel<T> 协程通道` ✅ | 保持不变 |
 | `sync for 并行迭代器` ✅ | 保持不变 |
 | —— | **新增**：`sync thread 真线程并发` ✅ 已实现 — [sync_thread_plan.md](plan/sync_thread_plan.md) — 全局 ThreadPool + TLAB |
-| —— | **新增**：`sync.Mutex + lock 块` ✅ 已实现 — [mutex_plan.md](plan/mutex_plan.md) — RAII 强制 + 间接指针 + finalizer |
+| —— | **新增**：`sync.Mutex + lock 块` ✅ 已实现 — [mutex_plan.md](plan/done/mutex_plan.md) — RAII 强制 + 间接指针 + finalizer |
 
 **草稿**：
 
 ```markdown
 | **`sync thread` 真线程并发**（`sync thread(max=N)`） | ✅ 已实现 | [sync_thread_plan.md](plan/sync_thread_plan.md) — 全局 ThreadPool + TLAB + STW |
-| **`sync.Mutex + lock` 块语句**（`lock (m) { }`） | ✅ 已实现 | [mutex_plan.md](plan/mutex_plan.md) — RAII 强制 + 间接指针规避 compact |
+| **`sync.Mutex + lock` 块语句**（`lock (m) { }`） | ✅ 已实现 | [mutex_plan.md](plan/done/mutex_plan.md) — RAII 强制 + 间接指针规避 compact |
 ```
 
 ---
@@ -436,7 +436,7 @@ README 中的 markdown 锚点依赖 GitHub-flavored 规范（小写、空格转�
 
 ### 6.2 与未来 v1.1 文档冲突
 
-[mutex_plan.md](file:///d:/you/Aura/plan/mutex_plan.md) §二 规划了 v1.1 的 `RWMutex` / `Once` / `WaitGroup`。若 v1.1 文档与本 plan 同时进行，会出现章节号冲突。
+[mutex_plan.md](file:///d:/you/Aura/plan/done/mutex_plan.md) §二 规划了 v1.1 的 `RWMutex` / `Once` / `WaitGroup`。若 v1.1 文档与本 plan 同时进行，会出现章节号冲突。
 
 **规避**：本 plan 只写 v1.0 已实现部分，v1.1 仅在"已知限制"中一句话提及并链接到 mutex_plan.md，不展开具体语法。
 

@@ -195,10 +195,12 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                   (init.empty() ? ";" : " = " + init + ";"));
     }
 
-    // 跟踪字符串变量（用于后续 string + T 拼接检测）
+    // 跟踪字符串变量（用于后续 string + T 拼接检测 / s = s + x → append 优化）
+    // 匹配 make_string / concat / intern_string 三种 string 生成路径
     if (!init.empty() &&
         (init.find("aura_rt::make_string") != std::string::npos ||
-         init.find("aura_rt::concat") != std::string::npos)) {
+         init.find("aura_rt::concat") != std::string::npos ||
+         init.find("aura_rt::intern_string") != std::string::npos)) {
         stringVarNames_.insert(varName);
     }
 

@@ -4,7 +4,9 @@
 > 日期：2026-07-20（v2：minor GC 也能触发 compact）
 > 状态：草案（待审核）
 > 前置：[gc_features_plan.md §十三](file:///d:/you/Aura/plan/gc_features_plan.md) 延后项的独立细化方案
-> 关联：[gc_features_plan.md §九 精确栈扫描](file:///d:/you/Aura/plan/gc_features_plan.md)（本 plan 不依赖此项）
+> 关联：
+> - [gc_features_plan.md §九 精确栈扫描](file:///d:/you/Aura/plan/gc_features_plan.md)（本 plan 不依赖此项）
+> - [generational_paged_gc.md](file:///d:/you/Aura/plan/generational_paged_gc.md)：分代分页 GC + LOS（本 plan 中"大对象 compact"部分已被 LOS 方案替代，大对象不再参与 compact）
 
 ---
 

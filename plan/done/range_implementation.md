@@ -2,7 +2,7 @@
 
 > 日期：2026-07-18
 > 状态：基本完成
-> 替代文档：`plan/range_implementation.md`（已废弃）
+> 替代文档：本文件（原 `plan/range_implementation.md` 已迁移至 `plan/done/range_implementation.md`）
 
 ---
 

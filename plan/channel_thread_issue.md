@@ -4,7 +4,7 @@
 > 类型：设计决策 issue
 > 日期：2026-07-24
 > 状态：草案（待审查）
-> 关联：[mutex_plan.md](file:///d:/you/Aura/plan/mutex_plan.md)、[sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md)、[concurrency_lang_spec.md §2.2](file:///d:/you/Aura/plan/concurrency_lang_spec.md)
+> 关联：[mutex_plan.md](file:///d:/you/Aura/plan/done/mutex_plan.md)、[sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md)、[concurrency_lang_spec.md §2.2](file:///d:/you/Aura/plan/concurrency_lang_spec.md)
 
 ---
 
@@ -731,5 +731,5 @@ if ok { io.println(v) }
                  src/Sema/BuiltinRegistry.h, src/CodeGen/ExprGen.cpp
    ```
 
-2. 决策 §九 待定项（D1-D6）后，创建 `plan/channel_thread_plan.md` 详细实施方案
+2. 决策 §九 待定项（D1-D6）后，创建 `plan/channel_thread_plan.md` 详细实施方案（⏳ 计划中未来文件，待决策后创建）
 3. 在 mutex v1.0 完成后启动 channel 实施

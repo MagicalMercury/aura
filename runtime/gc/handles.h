@@ -18,24 +18,25 @@ namespace aura_rt {
 // GcRootHandle 模板方法实现（必须在 GcHeap 定义之后）
 // ============================================================
 template <typename T>
-GcRootHandle<T>::GcRootHandle(T& ref) : ptr_(&ref) {
-    GcHeap::instance().registerRoot(
-        reinterpret_cast<GcRootHandle<GcObject*>*>(this));
+GcRootHandle<T>::GcRootHandle(T& ref) : GcRootHandleBase(), ptr_(&ref) {
+    // ptr_ref_ 存储 ptr_ 的值（用户栈上 GC 指针变量的地址）
+    // GC 单次解引用 *ptr_ref_ 即得用户变量值（对象指针）
+    ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
+    GcHeap::instance().registerRootThreadLocal(this);
 }
 
 template <typename T>
 GcRootHandle<T>::~GcRootHandle() {
-    if (ptr_) GcHeap::instance().unregisterRoot(
-        reinterpret_cast<GcRootHandle<GcObject*>*>(this));
+    if (ptr_) GcHeap::instance().unregisterRootThreadLocal(this);
 }
 
 // 拷贝构造：新 GcRootHandle 注册独立 GC 根，ptr_ 指向同一栈地址
 // 安全前提：原 GcRootHandle 的生命周期覆盖拷贝的生命周期
 // （sync thread 的 waitGroup 保证 worker 任务完成前主线程栈稳定）
 template <typename T>
-GcRootHandle<T>::GcRootHandle(const GcRootHandle& other) : ptr_(other.ptr_) {
-    GcHeap::instance().registerRoot(
-        reinterpret_cast<GcRootHandle<GcObject*>*>(this));
+GcRootHandle<T>::GcRootHandle(const GcRootHandle& other) : GcRootHandleBase(), ptr_(other.ptr_) {
+    ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
+    GcHeap::instance().registerRootThreadLocal(this);
 }
 
 // GcWeakHandleBase 实现（必须在 GcHeap 定义之后）

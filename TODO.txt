@@ -123,7 +123,7 @@ GC 其他功能清单（基于 2026-07-19 重新核验）
       - 缺：mark 阶段并发执行，仅 sweep 阶段暂停
       - 风险：需要读屏障/写屏障配合，极复杂
 
-[~] P0  分代分页 GC + 大对象区（LOS）  [2026-07-28 阶段 1 完成]
+[~] P0  分代分页 GC + 大对象区（LOS）  [2026-07-28 阶段 1 / 2026-07-29 阶段 2-3 完成]
       - issue：plan/los_issue.md
       - plan：plan/generational_paged_gc.md
       - 背景：Array CAP 翻倍策略触发 GC 越界 bug（cap=1024 时 4KB，cap=2048 时 8KB）
@@ -143,6 +143,45 @@ GC 其他功能清单（基于 2026-07-19 重新核验）
         - T3: 混合分配（小对象 + 大对象交错）
         - T4: GC 统计输出
         - T5: 重复 GC（LOS sweep 正确性）
+
+      --- 阶段 2（中页/大页分页演进）已完成 [2026-07-29] ---
+      * 新增 runtime/gc/pages.h：集中所有页相关类型（kPageSize/kMediumPageSize/
+        kLargePageSize/PageClass/Page/MediumPage/LargePage），从 gc.h 迁出
+      * MediumPage/LargePage 类 + allocMediumPage/allocLargePage/freeMediumPage/freeLargePage
+      * 分配路由 tryAllocMedium/tryAllocLarge/tryAllocLOS（按 size 选择页级）
+      * 中页滑动窗口多页 compact（compactMediumPages）+ 空闲中页池（freeMediumPages）
+      * 大页 mark-sweep（sweepLargePages，分配失败率触发）
+      * 地址反查 pageClassOf/findMediumPage/findLargePage
+      * freeMediumPages 按需申请 + 高水位归还策略
+
+      --- 阶段 3（分代优化）已完成 [2026-07-29] ---
+      * Minor/Mixed/Major GC 三级触发（minorGc/mixedGc/majorGc）
+      * 中页 compact 触发 shouldCompactMedium（碎片率 > 阈值）
+      * 大页 mark-sweep 触发 shouldSweepLargePages（分配失败率 > 阈值）
+      * Mixed GC = 中页 compact + 小页 minor
+      * 配套 bug 修复（GC_BugFix_Report.md）：
+        - rebuildPageList 修复（compact.cpp）
+        - sweepPhaseYoung 修复（mark_sweep.cpp）
+        - updateAllReferences 修复
+        - GcRopeNode::flatten 增加 gc_write_barrier
+        - promoteToOld 修复
+        - TLAB 分配 memset 清零
+        - win_iocp.cpp _WIN32 守卫
+        - append/slice 缺少 GcCompactSuspendGuard/GcRootHandle（bugfix-report Bug 2/3）
+        - append(const GcString*) 过早 flatten + 扩容失效（bugfix-report Bug 4）
+        - intern 缓存 compaction 悬垂（bugfix-report Bug 1，clear_intern_cache）
+
+      --- 阶段 1 遗留 TODO（多线程场景） ---
+      [ ] P1  多线程 TLAB flush 补全  [2026-07-28 提出]
+            - 问题：当前 tryAlloc 延迟 compact 补执行前仅 flush 当前线程的 TLAB
+              （runtime/gc/alloc.cpp 调用 flushTlab 本地分支）。多线程场景下，
+              一个线程触发的 compact 会释放其他线程的 TLAB 页，导致其他线程
+              TLAB.curPage 悬垂，后续 bump 分配写入已释放页 → 崩溃。
+            - 当前状态：单线程测试场景下此问题不会触发，T1-T5 全部通过。
+            - 修复方案：在 compact 前遍历 tlabList_，flush 所有线程的 TLAB，
+              统一将本地 young 对象合并到全局 youngObjects_。
+            - 触发条件：sync thread 多线程并发 + 某线程分配触发 compact。
+            - 关联：plan/generational_paged_gc.md §5（阶段 2 TLAB 适配）
 
       --- 现状（GC 缺陷） ---
       * GC page 固定 4096 字节（gc.h:233 kPageSize）
@@ -417,12 +456,178 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
       - 结论：暂不需要在 GC 暂停期做 interning，D1+D3 已覆盖主要场景
 
 [-] P3  单引用原地修改（is_unique）  [不可行]
-      - 前置：GC 配合检测引用数 或 引入引用计数
+      - 前置：GC 配合检测引用数 或 引用引用计数
       - 当前：无引用计数机制
       - 结论：推迟到引入引用计数后
 
 ----------------------------------------------------------------
-其他运行时库改进
+字符串拼接性能优化 issue  [2026-07-29 提出]
+----------------------------------------------------------------
+背景：1000 万次 `s = s + "a"` 循环奇慢。调研定位 4 个独立瓶颈：
+  - 瓶颈 1 (≈60%)：GcRootHandle 全局 mutex，每次拼接 6~8 个 handle → 1.4 亿次 mutex 操作
+  - 瓶颈 2 (≈15%)：intern_string 无 thread_local 缓存，每次字面量都走全局锁
+  - 瓶颈 3 (≈10%)：GC 阈值过小（256KB/1MB），频繁 STW
+  - 瓶颈 4 (≈15%)：Rope 左倾退化藤蔓，Fibonacci 边界每 ~20-30 次强制 flatten，O(n²)
+关联 issue 调研：plan/J_Test_Performance_Optimization.md（瓶颈分析）
+       plan/gcstring_optimization.md §七 D1（intern 池已实施）
+
+--- P0 必须修复（根因 + 正确性 bug） ---
+
+[x] P0  CodeGen append 优化丢弃返回值  [bug，必须修复] [2026-07-29 修复]
+      - 位置：src/CodeGen/ExprGen.cpp:854-855
+      - 现状：`s = s + x` 被改写为 `s.get()->append(...)` 作为表达式语句
+        append 返回值（容量不足时新分配的 GcString*）被丢弃
+      - 后果：
+          * 结果错误：s 永远不增长（容量不足时返回新对象但未赋回 s）
+          * 性能灾难：每次迭代都从同一小基址 realloc，10M 次无用分配
+      - 修复方案：
+          生成 `s.get() = s.get()->append(x)`（IIFE 结果赋回 targetBase.get()）
+          GcRootHandle::get() 非 const 版本返回 T&（GcString*&），可作赋值左侧
+          append 内部已有 GcCompactSuspendGuard + 三重 GcRootHandle 保护（this/other/newStr）
+          赋值后 s 指向新对象，下次 GC 时 s 在线程局部链表中，被 markPhase 标记
+          不需要写屏障：s 是栈上 GcRootHandle，每次 markPhase 从链表重新读 *ptr_ref_
+      - 关联：优化 4（Rope 退化）的修复也依赖此 bug 修复（方案 B，循环拼接走 append 路径）
+
+[x] P0  Rope 左倾退化藤蔓  [设计缺陷，必须修复] [2026-07-29 修复（方案 B）]
+      - 位置：runtime/builtin/string.cpp:257 (GcRopeNode::make)
+      - 现状：concat 永远 `GcRopeNode::make(this, &other)`，把增长的大字符串放左子树、
+        单字符放右子树，形成极度不平衡的左倾链表
+      - 后果：
+          * Fibonacci 边界每 ~20-30 次触发强制 flatten（O(n) 拷贝）
+          * 总 flatten 次数 ~40 万次，总拷贝量 ~2×10¹² 字节 ≈ 200 秒纯 memcpy
+          * 整体复杂度 O(n²)
+      - 修复方案（二选一或组合）：
+          方案 A：concat 时主动重平衡
+            - GcRopeNode::make 检测左右子树深度差 >1 时做旋转
+            - 保持平衡，concat 复杂度回到 O(log n)
+            - 风险：旋转实现复杂，Rope 节点不可变（const concat）需重新分配节点
+          方案 B：修复 append 返回值 bug（见上条）
+            - 循环拼接走 append 路径，amortized O(1)（2 倍扩容）
+            - Rope 退化问题自然消失（不再走 concat）
+            - 风险低，但仅对 `s = s + x` 模式有效，`s = concat(s, x)` 仍退化
+      - 实施决策：采用方案 B（修复 append 返回值 bug），循环拼接走 append amortized O(1)
+      - 测试：1000 万次拼接应在秒级完成（当前数百秒）
+
+--- P1 重要（性能优化） ---
+
+[x] P1  GcRootHandle 改用线程局部侵入式链表（消除 mutex）  [优化 1] [2026-07-29 完成]
+      - 位置：runtime/gc/gc.h:402-408, runtime/gc/roots.cpp:17-25, runtime/gc/handles.h:20-39
+      - 现状：std::unordered_set<GcRootHandle<GcObject*>*> roots_ + std::mutex rootsM_
+        每次构造/析构各持一次锁，1000 万次拼接 → 1.4 亿次 mutex 操作 ≈ 14 秒
+      - 方案：改为 thread_local 侵入式双向链表
+          class GcRootHandleBase {
+              GcRootHandleBase* next_;
+              GcRootHandleBase* prev_;
+              GcObject**        ptr_ref_;
+          };
+          // thread_local 链表头，构造/析构只操作本线程链表（无锁）
+          // markPhase/compact 时遍历所有线程链表
+      - 优点：
+          * 构造/析构从 ~200ns 降到 ~5ns，预期 5~10x 提速
+          * 消除所有 mutex 竞争，多线程场景受益更大
+          * 链表插入/删除 O(1)，比 unordered_set 还快
+      - 代价/风险：
+          * 侵入式链表实现复杂：GcRootHandle 增加两个指针字段（+16 字节/对象）
+          * 线程退出需清理：线程结束时必须把本线程链表合并到全局，否则悬挂指针
+          * GC 遍历需聚合所有线程链表：markPhase 逻辑变复杂
+          * 若 GcRootHandle 析构前 free 底层对象，链表节点悬垂，调试困难
+      - 影响范围：handles.h + roots.cpp + gc.h roots_ 数据结构 + mark_sweep.cpp 遍历
+      - 实现：
+          * 新增 GcRootHandleBase 基类（侵入式链表节点 + ptr_ref_ 指向用户变量地址）
+          * GcRootHandle<T> 继承 GcRootHandleBase，构造时 ptr_ref_ = ptr_（用户变量地址）
+          * registerThread/unregisterThread 集成 ensureThreadRootList/releaseThreadRootList
+          * markPhase / updateAllReferences / updateMediumPageReferences 遍历 threadRootLists_
+          * memcpy 读取 ptr_ref_ 避免 strict-aliasing（实际指向 GcString* 等派生类型）
+
+[x] P1  intern_string 线程局部缓存  [优化 2] [2026-07-29 完成]
+      - 位置：runtime/builtin/string.cpp:615-644 (intern_string 实现)
+      - 现状：g_internPool + g_internMutex（独占锁，因 MinGW shared_mutex bug）
+        CodeGen 对每个字符串字面量都生成 `intern_string("a")`，无 LICM 外提
+        1000 万次循环 = 1000 万次 mutex + unordered_map find
+      - 方案：在 g_internMutex 之前加 L1 thread_local 缓存（64 槽位 LRU）
+          static thread_local struct {
+              Entry entries[64];  // {const char* key, size_t keyLen, GcString* val}
+              size_t count;
+          } tl_internCache;
+          // 命中直接返回，未命中走全局锁 + 插入缓存
+      - 优点：
+          * 热点字面量命中后零锁开销，单字符拼接场景预期 3~5x 提速
+          * 实现简单，只在 intern_string 入口加一层
+          * 不影响 GC 安全性：cache 只是缓存指针，驻留对象仍由全局池持有
+      - 代价/风险：
+          * 缓存一致性：若字面量在别的线程被 intern，本线程 cache 不感知
+            （但全局池已存在，下次未命中走全局锁仍能拿到正确结果，不影响正确性）
+          * 64 槽位 LRU 对循环拼接单字面量足够，多字面量场景可能命中率低
+          * 不解决 CodeGen 缺陷：根本问题是 CodeGen 不做 LICM，每次循环都重新 intern
+      - 备注：未来若实现 LICM（循环不变量外提），L1 缓存收益会下降，但作为 fallback 仍有价值
+      - 实现：
+          * 新增 InternCacheEntry 结构 + tl_internCache（64 槽 LRU）
+          * internCacheInsert：先查重提前到头部，未命中则头部插入，满则淘汰末尾
+          * intern_string 入口先查 L1，未命中走全局锁 double-check，插入后填充 L1
+          * 配套 Bug 1 修复：新增 clear_intern_cache()，在 safepoint/forceGc/compact 延迟路径
+            调用，防止 compaction 后缓存指针悬垂
+
+[x] P1  GC 阈值 8x（256KB → 2MB、1MB → 8MB）  [优化 3] [2026-07-29 完成]
+      - 位置：runtime/gc/gc.h:237-238
+      - 现状：kYoungThreshold = 256KB, kOldThreshold = 1MB
+        1000 万次拼接中频繁触发 minor GC，每次 STW 几十毫秒
+      - 方案：
+          static constexpr size_t kYoungThreshold = 2 * 1024 * 1024;   // 2 MB
+          static constexpr size_t kOldThreshold   = 8 * 1024 * 1024;  // 8 MB
+      - 优点：
+          * minor GC 频率降低 8x，STW 总耗时显著下降
+          * 实现简单，改两个常量
+          * 与现代 GC（V8 young 1~8MB、Go 2~4MB）对齐
+      - 代价/风险：
+          * 峰值内存增加：young 区最大 2MB，old 区最大 8MB，总峰值 ~10MB（原来 ~1.25MB）
+          * 单次 GC 耗时增加：minor GC 扫描的 young 对象更多，单次 STW 时间变长
+          * 延迟敏感场景恶化：交互式应用对单次 STW 时长敏感
+          * 掩盖其他优化机会：调大阈值只是延后 GC，不解决对象分配过频的根本问题
+      - 备注：与 §五 [-] P2 GC 触发策略调优 关联，当前无配置系统故先硬编码 8x
+
+--- P3 远期 ---
+
+[ ] P3  全部内置函数调用改用 GcRootHandle 类型  [2026-07-29 提出，远期计划]
+      - 背景：当前内置函数（io.println / string.append / array.append 等）的 GC 对象参数
+        多以裸 GcObject* / GcString* 传递，函数内部需手动构造 GcRootHandle 保护，
+        导致：
+          * 每次调用重复构造/析构 GcRootHandle（mutex 开销，与优化 1 关联）
+          * 函数签名不统一（部分裸指针、部分 GcRootHandle）
+          * 调用方与被调用方职责不清（谁负责 root？）
+      - 目标：将所有内置函数的 GC 对象参数统一改为 GcRootHandle<T> 类型
+          * 调用方传入 GcRootHandle（已 root，函数内无需重复构造）
+          * 函数签名统一：fn(GcRootHandle<GcString*> s, ...) 而非 fn(GcString* s, ...)
+          * CodeGen 生成调用时自动传递 GcRootHandle（而非裸指针）
+      - 范围：
+          * runtime/builtin/io.h/cpp（io.println / io.read_file 等）
+          * runtime/builtin/string.h/cpp（concat / append / slice / intern_string 等）
+          * runtime/builtin/array.h（Array::append / insert / pop 等）
+          * runtime/builtin/mutex.h/cpp（Mutex / RWMutex / Once 方法）
+          * src/Sema/BuiltinRegistry.h（函数签名表更新）
+          * src/CodeGen/ExprGen.cpp（生成 GcRootHandle 传递而非裸指针）
+      - 前置依赖：
+          * 优化 1（GcRootHandle 线程局部链表）应先实施，否则签名统一后
+            调用频次不变，mutex 开销反而增加（每次调用都构造 GcRootHandle）
+          * GcRootHandle::rebind 语义明确（append 返回值赋回场景）
+      - 优点：
+          * 职责清晰：调用方负责 root，被调用方直接使用
+          * 消除函数内重复 GcRootHandle 构造（与优化 1 协同，收益最大化）
+          * 签名统一，类型安全（编译期保证 GC 对象被 root）
+          * 为未来精确栈扫描铺路（所有 GC 对象引用都通过 GcRootHandle 可追溯）
+      - 代价/风险：
+          * 工程量巨大：涉及所有内置函数签名变更 + CodeGen 改造
+          * 破坏性变更：所有内置函数 ABI 变更，需全量测试
+          * 非 GC 对象参数（int/float/bool）不受影响，需区分处理
+          * 性能风险：若优化 1 未先实施，反而变慢（每次调用都 mutex）
+      - 关联：
+          * 优化 1（GcRootHandle 线程局部链表）：本项的前置依赖
+          * 优化 2（intern_string 线程局部缓存）：intern_string 签名变更需协同
+          * plan/gcstring_optimization.md（GcString 优化历史）
+          * plan/done/codegen_gc_safety_audit.md（CodeGen GC 安全审计）
+      - 触发条件（满足任一即可启动）：
+          * 优化 1 实施完成，GcRootHandle 构造零开销
+          * 出现因裸指针传递导致的 GC 安全 bug（如 compact 期间悬垂）
+
 ----------------------------------------------------------------
 
 [x] P2  Array chunked 链表基础实现  [2026-07-24 完成]

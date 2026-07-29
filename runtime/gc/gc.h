@@ -23,7 +23,8 @@
 // ============================================================
 
 #include "../types.h"
-#include "los.h"   // LargeObjectSpace
+#include "los.h"    // LargeObjectSpace
+#include "pages.h"  // Page / MediumPage / LargePage / PageClass / kPageSize 等
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -42,6 +43,25 @@ namespace aura_rt {
 class GcHeap;
 
 // ============================================================
+// GcRootHandleBase — GC 根句柄基类（侵入式链表节点）
+//
+// 所有 GcRootHandle<T> 继承此类，通过 next_/prev_ 组成线程局部链表。
+// ptr_ref_ 指向用户栈上 GC 指针变量的地址，
+// GC 通过基类接口统一遍历所有根，无需模板实例化信息。
+//
+// 注：ptr_ref_ 存储 ptr_ 的"值"（即用户变量地址），非 ptr_ 字段地址。
+//     这样 GC 单次解引用 *ptr_ref_ 即得用户变量值（对象指针）。
+// ============================================================
+class GcRootHandleBase {
+public:
+    GcRootHandleBase* next_;
+    GcRootHandleBase* prev_;
+    GcObject**        ptr_ref_;  // 指向用户栈上的 GC 指针变量地址
+
+    GcRootHandleBase() : next_(nullptr), prev_(nullptr), ptr_ref_(nullptr) {}
+};
+
+// ============================================================
 // GcRootHandle — 根引用包装
 //
 // 编译器生成的代码在声明 GC 指针局部变量时，将其包装为
@@ -51,7 +71,7 @@ class GcHeap;
 // 构造/析构在 GcHeap 完整定义之后实现（见 handles.h）。
 // ============================================================
 template <typename T>
-class GcRootHandle {
+class GcRootHandle : public GcRootHandleBase {
 public:
     GcRootHandle(T& ref);
     ~GcRootHandle();
@@ -63,7 +83,11 @@ public:
     GcRootHandle& operator=(const GcRootHandle&) = delete;
 
     // 更新被包装的引用目标（用于移动赋值后）
-    void rebind(T& ref) { ptr_ = &ref; }
+    // 同步更新 ptr_ref_，保持 GC 遍历一致性
+    void rebind(T& ref) {
+        ptr_ = &ref;
+        ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
+    }
 
     T& operator*()  const { return *ptr_; }
     T* operator->() const { return ptr_; }
@@ -178,6 +202,11 @@ public:
     // 全局慢路径分配（持 allocM_）：大对象/TLAB 未初始化/TLAB 满时调用
     GcObject* tryAllocSlow(size_t size, const TypeDescriptor* desc);
 
+    // === 阶段 2 新增：中页/大页/LOS 分配入口 ===
+    GcObject* tryAllocMedium(size_t size, const TypeDescriptor* desc);
+    GcObject* tryAllocLarge(size_t size, const TypeDescriptor* desc);
+    GcObject* tryAllocLOS(size_t size, const TypeDescriptor* desc);
+
     // 主动抛出预缓存的 OutOfMemoryError（供外部 tryAlloc 降级路径使用）
     [[noreturn]] void throwOutOfMemory();
 
@@ -203,12 +232,30 @@ public:
         size_t minorGcCount;
         size_t liveObjectCount;
         size_t pageCount;
+        // 阶段 2 新增
+        size_t mediumPages;      // 使用中中页数
+        size_t largePages;       // 使用中大页数
+        size_t freeMediumPages;  // 空闲中页数
+        size_t losObjects;       // LOS 对象数
+        size_t losBytes;          // LOS 字节数
+        size_t mixedGcCount;     // Mixed GC 次数
     };
     Stats getStats() const;
 
-    // 根集合管理
-    void registerRoot(GcRootHandle<GcObject*>* root);
-    void unregisterRoot(GcRootHandle<GcObject*>* root);
+    // 根集合：线程局部侵入式链表
+    // 每个线程持有一个 ThreadRootList，GcRootHandle 构造/析构无锁头插/摘除
+    // GC 遍历在 STW 期间聚合所有线程链表，无需锁
+    struct ThreadRootList {
+        GcRootHandleBase* head;
+        ThreadRootList() : head(nullptr) {}
+    };
+
+    // 根集合管理（线程局部侵入式链表）
+    // 构造/析构在 mutator 线程无锁操作自己的链表；GC 在 STW 期间遍历所有线程链表
+    void registerRootThreadLocal(GcRootHandleBase* root);
+    void unregisterRootThreadLocal(GcRootHandleBase* root);
+    ThreadRootList* ensureThreadRootList();   // registerThread 时分配（懒分配）
+    void            releaseThreadRootList();  // unregisterThread 时释放
 
     // 栈帧根注册：将内存范围 [begin, end) 中的 GC 指针注册为根
     // 用于协程帧等不便于逐个包装 GcRootHandle 的场景
@@ -234,9 +281,9 @@ public:
     GcHeap() = default;
 
     // 分配器内部结构
-    static constexpr size_t  kPageSize        = 4096;
-    static constexpr size_t  kYoungThreshold  = 256 * 1024;  // 256 KB → minor GC
-    static constexpr size_t  kOldThreshold    = 1024 * 1024; // 1 MB → major GC
+    // 注：kPageSize / Page 已搬迁至 pages.h
+    static constexpr size_t  kYoungThreshold  = 2 * 1024 * 1024;  // 2 MB → minor GC（8x，降低 STW 频率）
+    static constexpr size_t  kOldThreshold    = 8 * 1024 * 1024; // 8 MB → major GC（8x）
     static constexpr uint8_t kPromotionAge    = 2;           // 经历 2 次 minor GC 后晋升
 
     // Compacting GC 触发阈值
@@ -245,15 +292,32 @@ public:
     static constexpr size_t kMinorCompactFragmentationThreshold = 60; // Minor: 碎片率 > 60%
     static constexpr size_t kMajorCompactFragmentationThreshold = 30; // Major: 碎片率 > 30%
 
-    struct Page {
-        char   data[kPageSize];
-        size_t bumpOffset = 0;
-        Page*  next = nullptr;
-    };
+    // === 阶段 2 新增：GC 策略阈值（页级路由阈值见 pages.h）===
+
+    // 中页 compact 触发阈值（碎片率）
+    static constexpr size_t kMediumCompactFragmentationThreshold = 60;  // > 60% 触发
+    // 大页 mark-sweep 触发阈值（分配失败率）
+    static constexpr size_t kLargeSweepAllocFailThreshold = 30;  // > 30% 触发
+
+    // freeMediumPages 高水位归还阈值
+    static constexpr size_t kFreeMediumHighWatermarkRatio = 4;  // free > used/4 时归还
 
     Page* allocPage();
     void* bumpAlloc(size_t size);
     void  freeAllPages();
+
+    // === 阶段 2 新增：中页/大页分配 ===
+    MediumPage* allocMediumPage();
+    LargePage*  allocLargePage();
+    void        freeMediumPage(MediumPage* p);
+    void        freeLargePage(LargePage* p);
+    void        freeAllMediumPages();
+    void        freeAllLargePages();
+
+    // 中页 bump 分配（持 allocM_）
+    void* bumpAllocMedium(size_t size);
+    // 大页 bump 分配（持 allocM_）
+    void* bumpAllocLarge(size_t size);
 
     // ============================================================
     // TLAB — 线程局部分配缓冲
@@ -310,6 +374,24 @@ public:
     void  updateObjectFields(GcObject* obj);
     void  updateInlineArrayElements(GcObject* obj);
 
+    // === 阶段 2 新增：中页滑动窗口 compact ===
+    bool  shouldCompactMedium();         // 中页碎片率 > 阈值
+    void  compactMediumPages();          // 滑动窗口搬运存活对象
+    void  updateMediumPageReferences(); // 更新中页搬运后的引用
+
+    // === 阶段 2 新增：大页 mark-sweep ===
+    bool  shouldSweepLargePages();      // 分配失败率 > 阈值
+    void  sweepLargePages();             // 回收大页未标记对象空间（不释放页）
+
+    // === 阶段 3 新增：Mixed GC ===
+    void  mixedGc();                     // 中页 compact + 小页 minor
+
+    // === 阶段 2 新增：地址反查 ===
+    PageClass   pageClassOf(GcObject* obj) const;  // 返回对象所在页级
+    MediumPage* findMediumPage(GcObject* obj) const;
+    LargePage*  findLargePage(GcObject* obj) const;
+    // 小页反查沿用 compact.cpp 内部 pageByData
+
     // compact 暂停计数控制（供 GcCompactSuspendGuard 使用）
     void incCompactSuspend() { ++compactSuspendedCount_; }
     void decCompactSuspend() { --compactSuspendedCount_; }
@@ -329,20 +411,33 @@ public:
 
     Page*   headPage_    = nullptr;
     Page*   currentPage_ = nullptr;
+
+    // === 阶段 2 新增：中页/大页链表 ===
+    MediumPage* mediumPages_         = nullptr;  // 中页链表头
+    MediumPage* currentMediumPage_   = nullptr;  // 中页当前 bump 页
+    LargePage*  largePages_          = nullptr;  // 大页链表头
+    LargePage*  currentLargePage_     = nullptr;  // 大页当前 bump 页
+
+    // 空闲中页池（compact 目标池，按需申请 + 高水位归还）
+    std::vector<MediumPage*> freeMediumPages_;
+
+    // 大页 mark-sweep 统计（分配失败率）
+    size_t largePageAllocFails_    = 0;
+    size_t largePageAllocAttempts_ = 0;
+
     size_t  allocatedBytes_ = 0;
     size_t  youngBytes_     = 0;
     size_t  oldBytes_       = 0;
     size_t  gcCount_        = 0;
     size_t  minorGcCount_   = 0;
+    size_t  mixedGcCount_   = 0;  // 阶段 3 新增：Mixed GC 次数
     std::atomic<bool> gcPending_{false};  // 有 GC 请求待处理（atomic：多线程读写）
 
-    // 根集合
-    // 使用 unordered_set：registerRoot O(1)、unregisterRoot O(1)（原 vector 的 unregister 是 O(n)）
-    // 遍历顺序不重要：markPhase 和 updateAllReferences 对每个 root 独立操作
-    // 指针作 key 安全：活跃 GcRootHandle 地址唯一，析构前必调用 unregisterRoot
-    // 多线程安全：registerRoot/unregisterRoot 用 rootsM_ 保护
-    std::unordered_set<GcRootHandle<GcObject*>*> roots_;
-    std::mutex  rootsM_;
+    // 根集合：线程局部侵入式链表的数据成员（ThreadRootList 定义见上方 public 区）
+    std::vector<ThreadRootList*> threadRootLists_;
+    std::mutex                   threadRootLists_m_;
+    // 每线程的链表头指针（与 tlab_ 同生命周期管理，避免 thread_local 析构顺序问题）
+    static thread_local ThreadRootList* tl_roots_;
 
     // 栈帧根：{begin, end} 对，GC 扫描其中所有对齐的指针
     // 多线程安全：register/unregister 用 stackRootsM_ 保护（mutator 并发）

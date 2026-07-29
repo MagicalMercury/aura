@@ -66,11 +66,15 @@ void GcHeap::registerThread(std::thread::id id) {
     }
     // 为本线程分配 TLAB
     ensureTlab();
+    // 为本线程分配 ThreadRootList（确保 GC 能看到本线程的根链表）
+    ensureThreadRootList();
 }
 
 void GcHeap::unregisterThread(std::thread::id id) {
     // 先 flush + 释放 TLAB（避免 threads_m_ 持锁时调用 allocM_）
     releaseTlab();
+    // 释放 ThreadRootList（前提：该线程所有 GcRootHandle 已析构）
+    releaseThreadRootList();
     {
         std::lock_guard<std::mutex> lk(threads_m_);
         auto it = std::find(registered_threads_.begin(), registered_threads_.end(), id);

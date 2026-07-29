@@ -1,6 +1,6 @@
 # §7 `.aurai` 接口声明文件 — 整理建议
 
-> 来源文件：`plan/builtin_registry_plan.md` §7（行 279-415）
+> 来源文件：`plan/done/builtin_registry_plan.md` §7（行 279-415）
 > 日期：2026-07-02
 
 ---

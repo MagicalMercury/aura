@@ -9,7 +9,7 @@
 >   - **进程级全局线程池**（非块级临时池）
 >   - **无界 sync thread 默认上限 = hardware_concurrency**（强制保护）
 >   - **safepoint 三层插入**：L1 分配点（已有）/ L2 循环回边（新增）/ L3 任务边界（新增）
->   - **TLAB（Thread-Local Allocation Buffer）**：每线程独立分配缓冲，无锁快路径（详见 plan/TLAB_implementation.md）
+>   - **TLAB（Thread-Local Allocation Buffer）**：每线程独立分配缓冲，无锁快路径（详见 plan/done/TLAB_implementation.md）
 
 ---
 
@@ -21,7 +21,7 @@
 - ✅ Phase 2：Sema 检查（R1-R4 全部实现）
 - ✅ Phase 3：运行时线程池（ThreadPool + sync_thread_context + L3 safepoint）
 - ✅ Phase 4：CodeGen（genSyncThreadStmt + genSpawnAsThread + ioSync_ 强制）
-- ✅ TLAB：每线程独立分配缓冲（详见 plan/TLAB_implementation.md）
+- ✅ TLAB：每线程独立分配缓冲（详见 plan/done/TLAB_implementation.md）
 
 ### 配套修复（多线程稳定性）
 1. **GC 并发数据竞争**：
@@ -57,7 +57,7 @@ test.aura 全部 3 个测试通过，退出码 0：
 
 ### 后续工作
 - P3：线程池 work-stealing 任务队列（待基准测试触发，详见 plan/thread_pool_work_stealing_issue.md）
-- P3：channel<T> 跨线程通信（详见 plan/channel_plan.md，待创建）
+- P3：channel<T> 跨线程通信（详见 plan/channel_thread_issue.md，⏳ 计划中未来文件 plan/channel_thread_plan.md 待创建）
 - 审计报告剩余项（P0-P3）：见 out.txt
 
 ---
@@ -739,7 +739,7 @@ fun main(io: Io) {
 
 **验收**：生产者-消费者模式跨线程工作。
 
-**依赖**：Phase 4。详见 `plan/channel_plan.md`（待创建）。
+**依赖**：Phase 4。详见 `plan/channel_thread_issue.md`（issue 已起草，⏳ 详细实施方案 plan/channel_thread_plan.md 待创建）。
 
 ---
 

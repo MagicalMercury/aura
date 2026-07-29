@@ -1,3 +1,7 @@
+// Bug 7 修复：Linux 下 IOCP 整体跳过（无对应 API）
+// 整个文件用 #ifdef _WIN32 包裹，Linux 下编译为空文件
+#ifdef _WIN32
+
 #include "win_iocp.h"
 #include "event_loop.h"
 #include "builtin/string.h"
@@ -84,3 +88,5 @@ DWORD IoAwaitable::await_resume() {
 }
 
 } // namespace aura_rt
+
+#endif // _WIN32
