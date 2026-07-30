@@ -166,15 +166,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
     if (!sym) {
         // 不在符号表中 → 查 BuiltinRegistry 全局函数
         if (auto* fn = BuiltinRegistry::get().findFunction(callee->name, (int)e.args.size())) {
-            auto& ret = fn->returns;
-            switch (ret.kind) {
-                case ReturnTypeInfo::Kind::None:
-                    return NoneSemType::make();
-                case ReturnTypeInfo::Kind::Named:
-                case ReturnTypeInfo::Kind::Generator:
-                case ReturnTypeInfo::Kind::Generic:
-                    return semTypeFromBuiltinReturn(ret);
-            }
+            return semTypeFromBuiltinReturn(fn->returns);
         }
         error(*e.callee, "undefined identifier '" + callee->name + "'");
         return ErrorSemType::make();
@@ -306,15 +298,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
             for (auto& arg : e.args) {
                 if (arg) (void)inferExpr(*arg);
             }
-            auto& ret = fn->returns;
-            switch (ret.kind) {
-                case ReturnTypeInfo::Kind::None:
-                    return NoneSemType::make();
-                case ReturnTypeInfo::Kind::Named:
-                case ReturnTypeInfo::Kind::Generator:
-                case ReturnTypeInfo::Kind::Generic:
-                    return semTypeFromBuiltinReturn(ret);
-            }
+            return semTypeFromBuiltinReturn(fn->returns);
         }
     }
 
@@ -341,14 +325,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
         }
         if (auto* entry = BuiltinRegistry::get().findMethod(typeKey, e.method, (int)e.args.size())) {
             auto& ret = entry->returns;
-            switch (ret.kind) {
-                case ReturnTypeInfo::Kind::None:
-                    return NoneSemType::make();
-                case ReturnTypeInfo::Kind::Named:
-                case ReturnTypeInfo::Kind::Generator:
-                case ReturnTypeInfo::Kind::Generic:
-                    return semTypeFromBuiltinReturn(ret);
-            }
+            return semTypeFromBuiltinReturn(ret, objType.get());
         }
         // 内置类型查表失败 → 报错
         std::string typeName;
@@ -423,6 +400,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
     if (!isAssignable(*targetTy, *valueTy)) {
         error(e, "assignment type mismatch: cannot assign '" + valueTy->toString() + "' to '" + targetTy->toString() + "'");
     }
+
     return valueTy->clone();
 }
 

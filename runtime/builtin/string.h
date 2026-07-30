@@ -44,6 +44,7 @@ struct GcString : GcObject {
     static GcString* from(const char* s, size_t len);
     static GcString* from(const std::string& s);
     static GcString* from(int32_t val);
+    static GcString* from(int64_t val);
     static GcString* from(double val);
     static GcString* from(bool val);
     static GcString* empty();
@@ -154,6 +155,8 @@ inline GcString* concat(GcString* a, GcString* b) {
 // 需用 GcRootHandle 保护 a（防 compact 移动）和 GcString::from(b) 返回的临时对象
 GcString* concat(GcString* a, int32_t b);
 GcString* concat(int32_t a,    GcString* b);
+GcString* concat(GcString* a, int64_t b);
+GcString* concat(int64_t a,    GcString* b);
 GcString* concat(GcString* a, double b);
 GcString* concat(double a,     GcString* b);
 GcString* concat(GcString* a, bool b);

@@ -1,5 +1,6 @@
 目前有几个想法：
 1、Interface改造。用虚函数或者其它什么必须在c++层面做出限制，然后内置几个常见的Interface：
-    to_string、Comparable、
+    to_string、Comparable、Iterator
 2、三元运算符，+=、-=符号
-3、
+3、"#"配置器
+4、一种union，可以用来打包多个返回

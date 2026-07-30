@@ -6,7 +6,7 @@
 //   aurac <input.aura> --cpp <dir>         # multi-file:  output directory for .cpp/.h
 //   aurac <input.aura> --ast <file>        # output AST only
 //   aurac <input.aura> -G0                  # compile with -g -O0 (default)
-//   aurac <input.aura> -G1                  # compile with -O3
+//   aurac <input.aura> -G1                  # compile with -O2 (optimized)
 //   aurac <input.aura> -s                   # compile with -Os (size, overrides -G)
 //
 // Options:
@@ -15,7 +15,7 @@
 //   -S               Stop after generating .cpp (no g++ compile)
 //   -o <dir>         Output directory (default: same as input)
 //   -G0              g++ flags: -g -O0 (debug, default)
-//   -G1              g++ flags: -O3 (optimized)
+//   -G1              g++ flags: -O2 (optimized)
 //   -s               g++ flags: -Os (size-optimized, overrides -G)
 // ============================================================
 
@@ -80,7 +80,7 @@ CliOptions parseArgs(const std::vector<std::string_view>& args) {
 std::string gccFlags(const CliOptions& opts) {
     if (opts.sizeOptimize) return "-Os";
     if (opts.gLevel == 0)  return "-g -O0";
-    return "-O3";
+    return "-O2";
 }
 
 // ============================================================

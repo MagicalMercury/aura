@@ -1,0 +1,428 @@
+# change.md — Array<T> 优化 P2/P3 批次 1 + P2-D（slice 视图）
+
+## 变更 1 (P2-E)：front() 改为 O(1) 直接访问
+
+### 文件：runtime/builtin/array.h
+
+**修改 1a：Array 类声明新增 const front()（L107 附近）**
+
+```cpp
+// 原：
+T& front();
+
+// 改为：
+T& front();
+const T& front() const;
+```
+
+**修改 1b：front() 实现（L541-542）**
+
+```cpp
+// 原：
+template <typename T>
+T& Array<T>::front() { return (*this)[0]; }
+
+// 改为：
+template <typename T>
+T& Array<T>::front() {
+    if (length == 0) {
+        throw Error{make_string("IndexError"), make_string("front from empty array")};
+    }
+    return head->data()[0];
+}
+
+template <typename T>
+const T& Array<T>::front() const {
+    if (length == 0) {
+        throw Error{make_string("IndexError"), make_string("front from empty array")};
+    }
+    return head->data()[0];
+}
+```
+
+---
+
+## 变更 2 (P3-A)：魔法数字提取
+
+### 文件：runtime/builtin/array.h
+
+**修改 2a：shouldCompact 魔法数字（L612-614）**
+
+```cpp
+// 原：
+template <typename T>
+bool Array<T>::shouldCompact() const {
+    return chunk_count > 4 && chunk_count * 8 > length * 2;
+}
+
+// 改为：
+namespace array_constants {
+    constexpr int32_t kCompactMinChunks   = 4;   // chunk 数量下限
+    constexpr int32_t kCompactChunkRatio  = 8;   // chunk_count / length 比值阈值分子
+    constexpr int32_t kCompactLengthRatio = 2;  // 比值阈值分母
+    constexpr int     kMaxMerges          = 10; // maybeCompact 单次最大合并数
+}
+
+template <typename T>
+bool Array<T>::shouldCompact() const {
+    return chunk_count > array_constants::kCompactMinChunks
+        && chunk_count * array_constants::kCompactChunkRatio
+           > length * array_constants::kCompactLengthRatio;
+}
+```
+
+**修改 2b：maybeCompact 中的 kMaxMerges（L662）**
+
+```cpp
+// 原：
+constexpr int kMaxMerges = 10;
+
+// 改为（删除局部 constexpr，使用命名空间常量）：
+// 删除 L662 的 `constexpr int kMaxMerges = 10;`
+// L664 改为：
+while (c && c->next && mergeCount < array_constants::kMaxMerges) {
+```
+
+---
+
+## 变更 3 (P3-B)：operator[] const 去重
+
+### 文件：runtime/builtin/array.h
+
+**修改 3a：Array 类新增私有 locateLinear 方法（L139 附近，private 区）**
+
+```cpp
+// 在 private 区的 locateChunk 声明后新增：
+ChunkLocation<T> locateLinear(int32_t idx) const;
+```
+
+**修改 3b：新增 locateLinear 实现（在 locateChunk 实现之前，L736 附近）**
+
+```cpp
+// P3-B: 提取 const 线性遍历逻辑，供 const operator[] 和 locateChunk 共用
+template <typename T>
+ChunkLocation<T> Array<T>::locateLinear(int32_t idx) const {
+    if (idx <= length / 2) {
+        // 从 head 往后
+        ArrayChunk<T>* c = head;
+        int32_t ci = 0;
+        while (c && idx >= c->used) {
+            idx -= c->used;
+            c = c->next;
+            ++ci;
+        }
+        return {c, idx, ci};
+    } else {
+        // 从 tail 往前
+        int32_t back = length - idx - 1;
+        ArrayChunk<T>* c = tail;
+        int32_t ci = chunk_count - 1;
+        while (c && back >= c->used) {
+            back -= c->used;
+            c = c->prev;
+            --ci;
+        }
+        return {c, c->used - 1 - back, ci};
+    }
+}
+```
+
+**修改 3c：locateChunk 内部线性遍历改用 locateLinear（L742-765）**
+
+```cpp
+// 原（L742-765 的线性遍历分支）：
+if (chunk_count <= 1 || !chunk_index || !chunk_index_valid) {
+    if (idx <= length / 2) { ... }
+    else { ... }
+}
+
+// 改为：
+if (chunk_count <= 1 || !chunk_index || !chunk_index_valid) {
+    return locateLinear(idx);
+}
+```
+
+**修改 3d：const operator[] 改用 locateLinear（L877-889）**
+
+```cpp
+// 原：
+template<typename T>
+const T& Array<T>::operator[](int32_t index) const {
+    if (index < 0 || index >= length) {
+        throw Error{make_string("IndexError"), make_string("index out of range")};
+    }
+    // const 版本：不构建索引表，直接线性遍历
+    ArrayChunk<T>* current_chunk = head;
+    while (current_chunk != nullptr && index >= current_chunk->used) {
+        index -= current_chunk->used;
+        current_chunk = current_chunk->next;
+    }
+    return current_chunk->data()[index];
+}
+
+// 改为：
+template<typename T>
+const T& Array<T>::operator[](int32_t index) const {
+    if (index < 0 || index >= length) {
+        throw Error{make_string("IndexError"), make_string("index out of range")};
+    }
+    auto loc = locateLinear(index);
+    return loc.chunk->data()[loc.local_idx];
+}
+```
+
+---
+
+## 变更 4 (P3-D)：ArrayIterator 放开拷贝
+
+### 文件：runtime/builtin/array.h
+
+**修改（L920-923）**
+
+```cpp
+// 原：
+ArrayIterator(const ArrayIterator&) = delete;
+ArrayIterator& operator=(const ArrayIterator&) = delete;
+ArrayIterator(ArrayIterator&&) = delete;
+ArrayIterator& operator=(ArrayIterator&&) = delete;
+
+// 改为：
+ArrayIterator(const ArrayIterator&) = default;
+ArrayIterator& operator=(const ArrayIterator&) = default;
+ArrayIterator(ArrayIterator&&) = default;
+ArrayIterator& operator=(ArrayIterator&&) = default;
+```
+
+---
+
+## 变更 5 (P3-E)：capacity() 改 int64_t
+
+### 文件：runtime/builtin/array.h
+
+**修改 5a：total_capacity 字段（L85）**
+
+```cpp
+// 原：
+int32_t total_capacity = 0;
+
+// 改为：
+int64_t total_capacity = 0;
+```
+
+**修改 5b：capacity() 声明（L104）**
+
+```cpp
+// 原：
+int32_t capacity() const;
+
+// 改为：
+int64_t capacity() const;
+```
+
+**修改 5c：capacity() 实现（L539）**
+
+```cpp
+// 原：
+template <typename T>
+int32_t Array<T>::capacity() const { return total_capacity; }
+
+// 改为：
+template <typename T>
+int64_t Array<T>::capacity() const { return total_capacity; }
+```
+
+**修改 5d：所有 total_capacity 赋值处需类型兼容**
+
+total_capacity 赋值来自 `int32_t` 的 chunk capacity，int32 → int64 隐式转换安全，无需额外修改。
+
+---
+
+## 变更 6 (P2-D)：新增 ArrayView<T> + Array::slice
+
+### 文件：runtime/builtin/array.h
+
+**修改 6a：新增 ArrayView 类（在 ArrayIterator 之前，L891 附近）**
+
+```cpp
+// ============================================================
+// P2-D: ArrayView<T> — 零拷贝视图（Aura 层透明，视为 [T]）
+//
+// 持有原 Array 的引用 + 起始索引 + 长度。
+// 读写视图：修改视图元素会影响原 Array（Python 切片语义）。
+// GC 安全：ArrayView 是 GcObject，被 GC 追踪。
+// ============================================================
+template<typename T>
+class ArrayView : public GcObject {
+    Array<T>* owner_ = nullptr;   // 持有原 Array（GC 指针字段，需写屏障）
+    int32_t start_ = 0;           // 起始索引（绝对索引）
+    int32_t len_ = 0;             // 视图长度
+
+public:
+    int32_t len() const { return len_; }
+    int32_t size() const { return len_; }
+    bool empty() const { return len_ == 0; }
+
+    // 元素访问：委托 owner 的 operator[]
+    T& operator[](int32_t relIdx) {
+        if (relIdx < 0 || relIdx >= len_) {
+            throw Error{make_string("IndexError"), make_string("view index out of range")};
+        }
+        return (*owner_)[start_ + relIdx];
+    }
+    const T& operator[](int32_t relIdx) const {
+        if (relIdx < 0 || relIdx >= len_) {
+            throw Error{make_string("IndexError"), make_string("view index out of range")};
+        }
+        return (*owner_)[start_ + relIdx];
+    }
+
+    // 首尾访问
+    T& front() {
+        if (len_ == 0) {
+            throw Error{make_string("IndexError"), make_string("front from empty view")};
+        }
+        return (*owner_)[start_];
+    }
+    T& back() {
+        if (len_ == 0) {
+            throw Error{make_string("IndexError"), make_string("back from empty view")};
+        }
+        return (*owner_)[start_ + len_ - 1];
+    }
+
+    // 嵌套 slice
+    ArrayView<T>* slice(int32_t relStart, int32_t subLen) const;
+
+    // GC 类型描述符
+    static const TypeDescriptor& desc();
+
+    // 工厂方法
+    static ArrayView<T>* make(Array<T>* owner, int32_t start, int32_t len) {
+        GcCompactSuspendGuard guard;
+        auto* v = static_cast<ArrayView<T>*>(
+            GcHeap::instance().alloc(sizeof(ArrayView<T>), &desc()));
+        gc_write_barrier(v, &v->owner_, reinterpret_cast<GcObject*>(owner));
+        v->owner_ = owner;
+        v->start_ = start;
+        v->len_ = len;
+        return v;
+    }
+};
+```
+
+**修改 6b：ArrayView::desc 和 ArrayView::slice 实现（在 ArrayView 类之后）**
+
+```cpp
+// P2-D: ArrayView 类型描述符
+// owner_ 是 GC 指针字段（偏移 0），start_/len_ 是标量（无需扫描）
+template<typename T>
+const TypeDescriptor& ArrayView<T>::desc() {
+    static const TypeDescriptor d = {
+        sizeof(ArrayView<T>),
+        1,  // ptrFieldCount
+        []() -> std::vector<PtrField> {
+            return { PtrField{offsetof(ArrayView<T>, owner_), true} };
+        }
+    };
+    return d;
+}
+
+// P2-D: 嵌套 slice
+template<typename T>
+ArrayView<T>* ArrayView<T>::slice(int32_t relStart, int32_t subLen) const {
+    if (relStart < 0 || subLen < 0 || relStart + subLen > len_) {
+        throw Error{make_string("IndexError"), make_string("view slice out of range")};
+    }
+    return make(owner_, start_ + relStart, subLen);
+}
+```
+
+**修改 6c：Array 类新增 slice 方法声明（L117 附近，public 区）**
+
+```cpp
+// 在 operator[] 声明后新增：
+ArrayView<T>* slice(int32_t start, int32_t len) const;
+```
+
+**修改 6d：Array 类新增前向声明（文件顶部，L26 附近）**
+
+```cpp
+// 在 ArrayIterator 前向声明后新增：
+template<typename T>
+class ArrayView;
+```
+
+**修改 6e：Array::slice 实现（在 operator[] 实现之后，L890 附近）**
+
+```cpp
+// ============================================================
+// P2-D: Array::slice — 零拷贝视图
+// ============================================================
+template<typename T>
+ArrayView<T>* Array<T>::slice(int32_t start, int32_t len) const {
+    if (start < 0 || len < 0 || start + len > length) {
+        throw Error{make_string("IndexError"), make_string("slice out of range")};
+    }
+    return ArrayView<T>::make(const_cast<Array<T>*>(this), start, len);
+}
+```
+
+### 文件：src/Sema/BuiltinRegistry.h
+
+**修改 6f：注册 slice 方法（L253 附近，[T] 方法列表末尾）**
+
+```cpp
+// 在 reserve 后新增：
+{"[T]", "slice",    {{"start", "int"}, {"len", "int"}},  ReturnTypeInfo::Generic(0, "[T]")},
+```
+
+---
+
+## 实施顺序
+
+1. 变更 1 (P2-E) — front() O(1)
+2. 变更 2 (P3-A) — 魔法数字提取
+3. 变更 3 (P3-B) — operator[] 去重
+4. 变更 4 (P3-D) — Iterator 拷贝
+5. 变更 5 (P3-E) — capacity int64
+6. 变更 6 (P2-D) — ArrayView + slice
+
+## 测试方案
+
+新建独立测试文件 `example/test.aura`（覆盖原文件，原文件可备份）：
+
+```aura
+// Array<T> 优化 P2/P3 测试
+
+fun main(io: Io) {
+    // K1: front() O(1)
+    let arr: [int] = [1, 2, 3]
+    io.println("=== K1: front() ===")
+    io.println("front: " + arr.front())
+
+    // K2: capacity int64
+    io.println("=== K2: capacity ===")
+    io.println("cap: " + arr.capacity())
+
+    // K3: slice 零拷贝视图
+    io.println("=== K3: slice view ===")
+    let arr2: [int] = []
+    let i: int = 0
+    while i < 10 {
+        arr2.append(i)
+        i = i + 1
+    }
+    let view = arr2.slice(2, 5)
+    io.println("view len: " + view.len())
+    io.println("view[0]: " + view[0])
+    io.println("view[4]: " + view[4])
+    view[0] = 99
+    io.println("after view[0]=99, arr2[2]: " + arr2[2])
+    let view2 = view.slice(1, 3)
+    io.println("nested view len: " + view2.len())
+    io.println("nested view[0]: " + view2[0])
+    gc_force()
+    io.println("After GC, view[0]: " + view[0])
+    io.println("=== All tests passed ===")
+}
+```

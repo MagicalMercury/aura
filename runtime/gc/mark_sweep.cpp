@@ -32,7 +32,7 @@ void GcHeap::minorGc() {
     // Compacting GC 触发点
     if (shouldCompact(CompactScope::Young)) {
         if (compactSuspendedCount_.load() > 0) {
-            compactPending_ = true;   // 延迟 compact
+            compactPending_.store(true, std::memory_order_release);   // 延迟 compact
         } else {
             compact(CompactScope::Young);
         }
@@ -416,7 +416,7 @@ void GcHeap::sweepPhaseAll() {
 
     // 2. 若大量对象死亡，执行紧缩
     if (compactSuspendedCount_.load() > 0) {
-        compactPending_ = true;   // 延迟所有 compact 操作（含 compactAndReclaim）
+        compactPending_.store(true, std::memory_order_release);   // 延迟所有 compact 操作（含 compactAndReclaim）
     } else {
         // 小页 compact
         if (shouldCompact(CompactScope::All)) {
@@ -516,7 +516,7 @@ void GcHeap::mixedGc() {
     // Phase 3: 中页 compact
     if (shouldCompactMedium()) {
         if (compactSuspendedCount_.load() > 0) {
-            compactPending_ = true;
+            compactPending_.store(true, std::memory_order_release);
         } else {
             compactMediumPages();
         }

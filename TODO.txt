@@ -7,7 +7,7 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-07-27（mutex v1.2 完成 + Array 优化 issue 提出，分 P0/P1/P2/P3 子项）
+# 最近更新：2026-07-31（Array P2-D slice 内置视图模式 + P2-E front O(1) 完成）
 
 ================================================================
 [ 一 ] 内置 API 与模块（plan/plan11.md）
@@ -335,102 +335,6 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
         第三阶段 Step 7 Rope 已实施，第四阶段 D1/D2 Intern 已实施
 ----------------------------------------------------------------
 
-[x] P1  GcString::empty() / from(bool) / from(int) 静态缓存  [第一阶段] [2026-07-19 完成]
-      - 实现：empty() 返回全局单例（GcGlobalRoot<GcString>）；from(bool) 返回
-        "true"/"false" 单例；from(int) lazy init 缓存 [-128, 127]
-      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
-      - 详见：plan/gcstring_optimization.md §三 Step 1 / change.md Step 1
-
-[x] P1  concat_multi 运行时支持  [第一阶段] [2026-07-19 完成]
-      - 实现：concat_multi(std::initializer_list<const GcString*>) 一次分配完成多串拼接
-      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
-      - 详见：plan/gcstring_optimization.md §三 Step 2 / change.md Step 2
-
-[x] P1  CodeGen 识别链式 string + string 脱糖为 concat_multi  [第一阶段] [2026-07-19 完成]
-      - 已实现：collectStringChain 递归收集 BinaryExpr(+) 链，≥3 节点时生成 concat_multi({...})
-      - 混合类型链支持：放宽 isStringExpr 判定，非 string 节点用 GcString::from 包装
-      - 文件：src/CodeGen/CodeGen.h:338-340, src/CodeGen/ExprGen.cpp:238-279, 313-325
-      - 详见：plan/gcstring_optimization.md §三 Step 3 / change.md Step 3
-
-[x] P2  GcObject 头部压缩（bit-packed flags + uint32 allocSize）  [第二阶段] [2026-07-20 完成]
-      - 实现：56 → 32 字节，flags_ 1 字节封装 marked/generation/finalized/age
-      - 提供 inline 方法：marked/setMarked/generation/setGeneration/finalized/setFinalized/age/incAge/allocSize/setAllocSize
-      - gc.cpp 14 处字段访问全部改为方法调用
-      - 文件：runtime/types.h:105-139, runtime/gc.cpp
-      - 详见：plan/gcstring_optimization.md §三 Step 4a / change.md Part A
-
-[x] P2  GcString 字段 union（capacity/offset 共用槽位）  [第二阶段] [2026-07-20 完成]
-      - 实现：union { capacity; offset } u + parent 字段
-      - Flat/Slice 模式互斥，通过 parent != nullptr 区分（无需 kind 字段）
-      - 提供 isSlice()/capacity()/offset() inline 方法
-      - data() 自动经 parent->raw_data() + u.offset 解引用 Slice 模式
-      - 文件：runtime/builtin/string.h:26-87
-      - 详见：plan/gcstring_optimization.md §三 Step 4b / change.md Part B
-
-[x] P2  GcString 加 capacity 字段 + make_with_capacity API  [第二阶段] [2026-07-20 完成]
-      - 实现：union { capacity; offset } 共用槽位（Flat/Slice 模式互斥）
-      - make_with_capacity(len, cap) 工厂支持预分配容量
-      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
-      - 详见：plan/gcstring_optimization.md §三 Step 4b / change.md Part C
-
-[-] P2  GcStringBuilder 类型（可变字符串缓冲区）  [2026-07-20 决策不实施]
-      - v2/v3 决策：StringBuilder 不独立，append 注册给 string 类型
-      - 替代方案：string 自身可变方法 + CodeGen 自动优化 s = s + x
-      - 详见：plan/gcstring_optimization.md §三 Step 4 / change.md Part C
-
-[x] P2  GcString 可变方法 append（Go 模式）  [第二阶段] [2026-07-20 完成]
-      - 实现：6 个重载（string/C-string/字节/int/float/bool）
-      - 容量足够时就地修改（零分配），不足时 2 倍扩容分配新对象
-      - concat_multi A 优化：结果对象初始化 u.capacity = total
-      - concat 重构为 concat_multi({this, &other}) 包装（代码 10 行 → 3 行）
-      - BuiltinRegistry 注册 string.append (4 重载)
-      - CodeGen genAssignExpr 自动优化 s = s + x → s.get()->append(x)（单元素）
-      - 文件：runtime/builtin/string.cpp, src/Sema/BuiltinRegistry.h, src/CodeGen/ExprGen.cpp
-      - 详见：plan/gcstring_optimization.md §三 Step 4 / change.md Part C
-
-[x] P2  GcString 子串共享（零拷贝 slice）  [第二阶段] [2026-07-20 完成]
-      - 实现：parent + offset 字段 + slice(start, len) const 方法
-      - 分配 header-only 对象（sizeof(GcString)，无 data 缓冲区）
-      - Slice 模式下 capacity() 返回 0，强制 append 走扩容路径（安全）
-      - TypeDescriptor ptrFieldCount=1（仅 parent）
-      - BuiltinRegistry 注册 string.slice
-      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp, src/Sema/BuiltinRegistry.h
-      - 详见：plan/gcstring_optimization.md §三 Step 5 / change.md Part D
-
-[x] P2  GcString Rope 表示（三层防护自动切换）  [第三阶段] [2026-07-20 完成]
-      - 实现：GcRopeNode : GcString（继承设计，GcString 头部不变 32 字节，Rope 节点 64 字节）
-      - 三层防护（参考 Protobuf RopeByteString）：
-          * kConcatByCopySize=128（小串直接 memcpy）
-          * kMinLengthByDepth[32] 斐波那契深度边界（防树退化）
-          * kMaxRopeDepth=30（超深强制 flatten）
-      - 三个入口接入：concat / append / concat_multi 自动切换 Flat/Rope
-      - concat_multi 大输入走 build_balanced_rope（二分递归建平衡树）
-      - Rope 子树 <64B 自动 flatten（避免小节点开销）
-      - 用 desc 指针比较判断 isRope（isRope = desc == &GcRopeNode::_desc），不增加 kind 字段
-      - flatten() 结果缓存在 mutable flat_cache_ 字段
-      - data() 自动派发 Flat/Slice/Rope，Rope 自动触发 flatten
-      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp
-      - 详见：plan/gcstring_optimization.md §三 Step 7 / §C1
-
-[x] P2  字符串字面量 Intern 池（D1）  [第四阶段] [2026-07-20 完成 / 2026-07-24 修复]
-      - 实现：intern_string(const char*, size_t) + g_internPool（unordered_map<string,
-        unique_ptr<GcGlobalRoot<GcString>>>）+ g_internMutex 双重检查锁定
-      - v2 修复（2026-07-24）：g_internMutex 从 std::shared_mutex 改为 std::mutex
-        原因：MinGW 下 std::shared_mutex 有 bug（msys2/MINGW-packages#25193），
-        lock_shared() 抛 "__ret == 0" 断言。读路径改用独占锁（find() 耗时极小）。
-      - CodeGen 改造：genStringLiteral 改为生成 aura_rt::intern_string("...")
-      - 收益：相同字面量只分配一次（5000 次循环 3 个字面量从 15000 次分配 → 3 次）
-      - 静态对象加 [[gnu::init_priority(105)]]（v6.1 修复析构顺序崩溃）
-      - 文件：runtime/builtin/string.h, runtime/builtin/string.cpp, src/CodeGen/ExprGen.cpp
-      - 详见：plan/gcstring_optimization.md §七 D1
-
-[x] P2  小整数缓存扩展到 [-1024, 1023]（D2）  [第四阶段] [2026-07-20 完成]
-      - 实现：from(int32_t) 静态缓存从 [-128, 127] 扩展到 [-1024, 1023]（2048 个槽位）
-      - 命中率从 2.6%（5000 次循环 [0, 5000]）→ 20.5%
-      - 内存开销：~16KB 静态指针数组 + 实际分配的 GcString
-      - 文件：runtime/builtin/string.cpp
-      - 详见：plan/gcstring_optimization.md §七 D2
-
 [ ] P2  GcString 哈希缓存  [第二阶段]
       - 前置：引入 Map<K, V> 类型（当前无）
       - 现状：string 当 map key 时每次重新计算 hash
@@ -655,17 +559,21 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
             - 修复：先保存 origNext，再 barrier(origNext, &origNext->prev, ...)
 
       --- P1 性能 / 代码质量 ---
-      [ ] P1  CAP 固定 8，大数组 chunk_count 线性增长
+      [x] P1  CAP 固定 8，大数组 chunk_count 线性增长  [2026-07-29 修复]
             - 问题：1024 元素 → 128 chunk，operator[] 最坏 125 次跳转，header 占 55%
             - 方案 A（低风险）：CAP = max(8, 64/sizeof(T)) 按元素大小调整
             - 方案 B（中风险）：chunk 容量翻倍 8→16→32→64（chunk_array_plan.md §3.1 原始设计）
             - 风险：变长 chunk 使 InlineArrayField 偏移动态化困难
-      [ ] P1  operator[] 无跳表索引（array.h:417-441）
+            - 实施：采用方案 B（变长 CAP + 倍增），ArrayChunk::make 接受 cap 参数，
+              last_chunk_cap 跟踪最后一块容量，total_capacity 缓存总容量
+      [x] P1  operator[] 无跳表索引（array.h:417-441）  [2026-07-29 修复]
             - 问题：随机访问 O(chunk_count)，无二分索引
             - 方案：维护稀疏索引 Array<{cumulative_len, chunk_ptr}>，每 ⌈√chunk_count⌉ chunk 一条
             - 收益：O(n/CAP) → O(log n)
             - 历史：array_advise.md §6.2 已规划未实施
-      [ ] P1  insert 函数超规（array.h:190-263，73 行 / 5 层）
+            - 实施：ArrayIndex 前缀和索引表（独立 GcObject 避免 Array<int32_t> 递归），
+              locateChunk 二分查找，operator[]/insert/append 统一走 locateChunk
+      [x] P1  insert 函数超规（array.h:190-263，73 行 / 5 层）  [2026-07-29 修复]
             - 违反 edit_rule.md §3（≤50 行 / ≤4 层）
             - 修复：拆分 insertIntoChunk / insertSplitChunk
 
@@ -679,12 +587,23 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
       [ ] P2  list 字面量构造低效（ExprGen.cpp:292-312）
             - 问题：N 次 append + N 次 GcRootHandle 包装
             - 方案：批量 append_batch(initializer_list<T>) 或 make(N) + set(i, v)
-      [ ] P2  Array::slice 缺失
+      [x] P2  Array::slice 缺失  [2026-07-30 完成（内置视图模式）]
             - 现状：GcString 已有零拷贝 slice，Array 无
             - 风险：chunk 链表 slice 实现复杂，可能需 view 类型
-      [ ] P2  front() 退化为 O(chunk_count)（array.h:280）
+            - 实施：采用内置视图模式（union 共享头部），不新增 Aura 类型
+              * Array 类新增 isView 标志（flags_ bit0），union 合并普通/视图模式字段
+              * view_owner_ 与 normal_.head 共享 offset 16，GC 扫描该偏移两种模式均合法
+              * materialize() 视图模式调用修改方法时深拷贝退化为普通模式
+              * slice 返回类型用 Generic(0, "[T]")，semTypeFromBuiltinReturn 接收 objType
+              * ArrayIterator 重写为统一索引迭代器（Array* + idx 范围）
+              * 测试 K1-K13 全部通过（K11 跳过，待 to_array 实现）
+            - plan：plan/array_optimization_p2_p3.md（原始方案，独立 ArrayView 类）
+                    plan/arrayview_design_conflict_issue.md（内置视图模式替代方案）
+            - 备注：未实现 to_array() 深拷贝 API（待 Iterator 体系完成后补）
+      [x] P2  front() 退化为 O(chunk_count)（array.h:280）  [2026-07-30 修复]
             - 问题：委托 (*this)[0]，本应 O(1)
-            - 修复：直接访问 head 链首 chunk
+            - 修复：直接访问 head 链首 chunk（normal_.head->data()[0]）
+            - 视图模式：委托 owner 的 operator[](view_start_)
 
       --- P3 远期 / 代码质量 ---
       [ ] P3  魔法数字提取（maybeCompact 的 2/4/5）

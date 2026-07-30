@@ -75,6 +75,17 @@ GcString* GcString::from(int32_t val) {
     return make(buf, static_cast<size_t>(len));
 }
 
+GcString* GcString::from(int64_t val) {
+    // int64 不缓存（容量等数值通常较大，缓存命中率低）
+    // 小范围值走 int32_t 缓存路径，避免重复格式化
+    if (val >= INT32_MIN && val <= INT32_MAX) {
+        return from(static_cast<int32_t>(val));
+    }
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(val));
+    return make(buf, static_cast<size_t>(len));
+}
+
 GcString* GcString::from(double val) {
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "%.6g", val);
@@ -101,6 +112,18 @@ GcString* concat(GcString* a, int32_t b) {
     return a_guard.get()->concat(*tmp_guard.get());
 }
 GcString* concat(int32_t a, GcString* b) {
+    GcString* tmp = GcString::from(a);
+    GcRootHandle<GcString*> tmp_guard(tmp);
+    GcRootHandle<GcString*> b_guard(b);
+    return tmp_guard.get()->concat(*b_guard.get());
+}
+GcString* concat(GcString* a, int64_t b) {
+    GcRootHandle<GcString*> a_guard(a);
+    GcString* tmp = GcString::from(b);
+    GcRootHandle<GcString*> tmp_guard(tmp);
+    return a_guard.get()->concat(*tmp_guard.get());
+}
+GcString* concat(int64_t a, GcString* b) {
     GcString* tmp = GcString::from(a);
     GcRootHandle<GcString*> tmp_guard(tmp);
     GcRootHandle<GcString*> b_guard(b);

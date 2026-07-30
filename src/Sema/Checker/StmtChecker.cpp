@@ -44,12 +44,14 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
         }
         inferredType = std::move(declaredType);
     }
+    // 存入 typeStore_ 保持稳定（decl.inferredType 不能指向 sym->type.get()，
+    // 否则后续若 sym->type 被替换会成为悬垂指针）
+    typeStore_.push_back(inferredType->clone());
+    const_cast<LetDecl&>(decl).inferredType = typeStore_.back().get();
     // 更新符号类型为推断后的精确类型
     auto* sym = symtab_.lookup(decl.name);
     if (sym) {
         sym->type = inferredType->clone();
-        // 标注 AST 节点类型，供 CodeGen 读取
-        const_cast<LetDecl&>(decl).inferredType = sym->type.get();
         // 标注初始值表达式类型，传播 canonicalName 到嵌套记录
         if (decl.initializer) {
             propagateCanonicalName(*decl.initializer, sym->type.get());

@@ -52,12 +52,12 @@
 | P1 | forceGc 暴露给 Aura 语言 + 多线程安全 | §十八 | ✅ 已完成 |
 | P2 | 精确栈扫描（替代保守扫描） | §九 | [-] 暂不实施 |
 | P2 | compactAndReclaim 性能优化 | §十 | 待实施 |
-| P2 | TLAB（Thread-Local Allocation Buffer） | §十一 | [~] 延后 |
+| P2 | TLAB（Thread-Local Allocation Buffer） | §十一 | ✅ 已完成 |
 | P2 | GC 触发策略调优 | §十二 | [-] 暂不实施 |
-| P2 | 对象可移动性（compacting GC） | §十三 | [~] 延后 |
+| P2 | 对象可移动性（compacting GC） | §十三 | ✅ 已完成 |
 | P3 | 分代年龄记录 | §十四 | ✅ 已完成 |
 | P3 | 并发 GC（concurrent marking） | §十五 | 远期 |
-| P3 | Large Object Space（大对象区） | §十六 | 远期 |
+| P3 | Large Object Space（大对象区） | §十六 | ✅ 已完成 |
 | P3 | GC 日志与统计 | §十七 | ⚠️ 部分完成（`gc_stats_string` 已有，`verbose_` 开关 + `logGcEvent` 未实施） |
 
 ### 1.4 状态说明（2026-07-19 更新）

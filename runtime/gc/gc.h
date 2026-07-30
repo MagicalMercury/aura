@@ -403,7 +403,8 @@ public:
     // atomic：多线程下 GcCompactSuspendGuard 构造/析构并发 ++/--
     std::atomic<int> compactSuspendedCount_{0};
     // compact 延迟标志：suspend 期间若有 compact 请求，置 true；alloc 入口检查并补执行
-    bool    compactPending_ = false;
+    // atomic：多线程下 tryAlloc 读 / minorGc 写 有数据竞争，改为 atomic 消除
+    std::atomic<bool> compactPending_{false};
 
     // 多线程并发分配保护：bumpAlloc 串行化
     // 单线程下无竞争，开销极低；多线程下避免页链表损坏

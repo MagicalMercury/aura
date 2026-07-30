@@ -801,7 +801,9 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         gcCall << "{" << (i + 1) << "}";
     }
     gcCall << ")";
-    return genGcRootedArgs(gcArgs, gcCall.str(), isCoroutine);
+    std::string callResult = genGcRootedArgs(gcArgs, gcCall.str(), isCoroutine);
+
+    return callResult;
 }
 
 std::string CodeGenerator::genMemberAccess(const MemberAccessExpr& e) {

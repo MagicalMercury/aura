@@ -27,18 +27,16 @@ GcObject* GcHeap::alloc(size_t size, const TypeDescriptor* desc) {
 }
 
 GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
-    // 入口：若 compact 被延迟，先补执行（此时 compactSuspendedCount_.load() == 0）
-    // 关键：必须先 flushTlab 再 compact，否则：
-    //   1. TLAB 的 localYoung 未合并到全局 youngObjects_ → compact 漏标
-    //   2. compact 释放页后 TLAB curPage 悬垂 → 下次分配写入已释放内存
-    if (compactSuspendedCount_.load() == 0 && compactPending_) {
-        compactPending_ = false;
-        flushTlab();  // 必须在 compact 前合并本线程 TLAB
-        clear_intern_cache();  // 防止 compact 移动对象后 intern 缓存指针悬垂
-        if (shouldCompact(CompactScope::Young))
-            compact(CompactScope::Young);
-        else if (shouldCompact(CompactScope::All))
-            compact(CompactScope::All);
+    // 入口：若 compact 被延迟（compactSuspendedCount_ == 0 且 compactPending_），走 safepoint STW
+    // 关键：不能再直接 compact，否则多线程下其他线程 TLAB curPage 悬垂 → 崩溃
+    //   1. 设置 gcPending_ 触发 safepoint
+    //   2. safepoint 内 flushTlab（所有线程）+ STW
+    //   3. safepoint 内双布尔结合判断：needFullGc 优先，否则 needCompactOnly 只 compact
+    // 注：不在此消费 compactPending_，由 safepoint 内 exchange(false) 消费
+    //     若 safepoint 内 minorGc 再次延迟，会重新 store(true)，逻辑自洽
+    if (compactSuspendedCount_.load() == 0 && compactPending_.load()) {
+        gcPending_.store(true);
+        safepoint();
     }
 
     // 首次调用时懒初始化 OOM 错误字符串

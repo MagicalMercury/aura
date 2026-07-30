@@ -252,6 +252,7 @@ private:
             {"[T]", "insert",    {{"idx", "int"}, {"value", "T"}},  ReturnTypeInfo::None()},
             {"[T]", "clear",     {},                                ReturnTypeInfo::None()},
             {"[T]", "reserve",   {{"cap", "int"}},                  ReturnTypeInfo::None()},
+            {"[T]", "slice",     {{"start", "int"}, {"len", "int"}}, ReturnTypeInfo::Generic(0, "[T]")},
             // Io / Path 方法不再硬编码，由 builtins/*.aurai 加载
 
             // --- channel<T> 方法 ---

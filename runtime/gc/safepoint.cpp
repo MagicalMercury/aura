@@ -46,15 +46,35 @@ void GcHeap::safepoint() {
     }
     if (threadCount <= 1) {
         gcPending_.store(false);
-        if (youngBytes_ >= kYoungThreshold / 2) minorGc();
-        // 阶段 3：Mixed GC（中页碎片率高时触发）
-        if (shouldCompactMedium() && !compactSuspendedCount_.load()) {
-            mixedGc();
-        }
-        if (oldBytes_ >= kOldThreshold) majorGc();
-        // 阶段 2：大页 mark-sweep（分配失败率高时触发）
-        if (shouldSweepLargePages() && !compactSuspendedCount_.load()) {
-            sweepLargePages();
+        // A+C 结合：双布尔结合判断
+        // needCompactOnly：compactPending_ 延迟请求（exchange 消费）
+        // needFullGc：GC 阈值/碎片率/分配失败率触发（优先级高于 needCompactOnly）
+        //   - needFullGc 为 true：走正常 GC 路径，minorGc 内 shouldCompact 处理 compact
+        //   - needFullGc 为 false 且 needCompactOnly 为 true：只 compact，跳过 mark-sweep
+        //   - 两者同时 true：needFullGc 优先（compact 由 minorGc 内部处理，不会丢失）
+        bool needCompactOnly = compactPending_.exchange(false, std::memory_order_acq_rel);
+        bool needFullGc = (youngBytes_ >= kYoungThreshold / 2) ||
+                          (oldBytes_ >= kOldThreshold) ||
+                          (shouldCompactMedium() && !compactSuspendedCount_.load()) ||
+                          (shouldSweepLargePages() && !compactSuspendedCount_.load());
+        if (needFullGc) {
+            // 正常 GC 路径：minorGc 内 shouldCompact 会处理 compact
+            // 注：needCompactOnly 已被 exchange 消费，若 minorGc 内 compact 被延迟
+            //     会重新 store(true)，下次 tryAlloc 再次走 safepoint
+            if (youngBytes_ >= kYoungThreshold / 2) minorGc();
+            if (shouldCompactMedium() && !compactSuspendedCount_.load()) mixedGc();
+            if (oldBytes_ >= kOldThreshold) majorGc();
+            if (shouldSweepLargePages() && !compactSuspendedCount_.load()) sweepLargePages();
+        } else if (needCompactOnly) {
+            // A+C 路径：只 compact，跳过 mark-sweep
+            // compact 不依赖 marked 标志，可独立执行（搬运已死对象浪费空间，下次 GC 回收）
+            if (compactSuspendedCount_.load() > 0) {
+                compactPending_.store(true, std::memory_order_release);  // Guard 仍活跃，重新延迟
+            } else if (shouldCompact(CompactScope::Young)) {
+                compact(CompactScope::Young);
+            } else if (shouldCompact(CompactScope::All)) {
+                compact(CompactScope::All);
+            }
         }
         return;
     }
@@ -85,15 +105,25 @@ void GcHeap::safepoint() {
         }
         // 所有其他线程已停止，执行 GC
         gcPending_.store(false);
-        if (youngBytes_ >= kYoungThreshold / 2) minorGc();
-        // 阶段 3：Mixed GC（中页碎片率高时触发）
-        if (shouldCompactMedium() && !compactSuspendedCount_.load()) {
-            mixedGc();
-        }
-        if (oldBytes_ >= kOldThreshold) majorGc();
-        // 阶段 2：大页 mark-sweep（分配失败率高时触发）
-        if (shouldSweepLargePages() && !compactSuspendedCount_.load()) {
-            sweepLargePages();
+        // A+C 结合：双布尔结合判断（与单线程路径一致）
+        bool needCompactOnly = compactPending_.exchange(false, std::memory_order_acq_rel);
+        bool needFullGc = (youngBytes_ >= kYoungThreshold / 2) ||
+                          (oldBytes_ >= kOldThreshold) ||
+                          (shouldCompactMedium() && !compactSuspendedCount_.load()) ||
+                          (shouldSweepLargePages() && !compactSuspendedCount_.load());
+        if (needFullGc) {
+            if (youngBytes_ >= kYoungThreshold / 2) minorGc();
+            if (shouldCompactMedium() && !compactSuspendedCount_.load()) mixedGc();
+            if (oldBytes_ >= kOldThreshold) majorGc();
+            if (shouldSweepLargePages() && !compactSuspendedCount_.load()) sweepLargePages();
+        } else if (needCompactOnly) {
+            if (compactSuspendedCount_.load() > 0) {
+                compactPending_.store(true, std::memory_order_release);
+            } else if (shouldCompact(CompactScope::Young)) {
+                compact(CompactScope::Young);
+            } else if (shouldCompact(CompactScope::All)) {
+                compact(CompactScope::All);
+            }
         }
 
         // 唤醒所有线程：递增 gc_epoch_ 通知所有等待者
@@ -147,6 +177,18 @@ void GcHeap::forceGc() {
     if (threadCount <= 1) {
         gcPending_.store(false);
         majorGc();
+        // 补执行延迟的 compact（majorGc 内 compact 被 Guard 延迟时设置 compactPending_）
+        if (compactPending_.load()) {
+            if (compactSuspendedCount_.load() > 0) {
+                // Guard 仍活跃，保持 compactPending_ = true，下次 tryAlloc 处理
+            } else {
+                compactPending_.store(false, std::memory_order_release);
+                if (shouldCompact(CompactScope::All))
+                    compact(CompactScope::All);
+                else if (shouldCompact(CompactScope::Young))
+                    compact(CompactScope::Young);
+            }
+        }
         return;
     }
 

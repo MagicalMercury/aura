@@ -64,7 +64,9 @@ private:
         const SemType* bReturn, bool bThrows) const;
 
     // 从 BuiltinRegistry 返回类型构造 SemType（在 inferCall/inferMethodCall 三处复用）
-    [[nodiscard]] std::unique_ptr<SemType> semTypeFromBuiltinReturn(const ReturnTypeInfo& ret);
+    // objType: 调用对象类型（用于 Generic 返回类型解析，如 [T].slice → 与 objType 相同列表类型）
+    [[nodiscard]] std::unique_ptr<SemType> semTypeFromBuiltinReturn(
+        const ReturnTypeInfo& ret, const SemType* objType = nullptr);
 
     // 泛型代换：将类型中所有 GenericSemType 替换为具体类型
     [[nodiscard]] std::unique_ptr<SemType> substitute(

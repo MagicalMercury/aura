@@ -112,7 +112,8 @@ bool SemAnalyzer::matchFuncSig(
     return !aReturn && !bReturn;
 }
 
-std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(const ReturnTypeInfo& ret) {
+std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(
+    const ReturnTypeInfo& ret, const SemType* objType) {
     switch (ret.kind) {
         case ReturnTypeInfo::Kind::None:
             return NoneSemType::make();
@@ -143,8 +144,33 @@ std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(const ReturnTypeI
         }
         case ReturnTypeInfo::Kind::Generator:
             return IterSemType::make(intType());
-        case ReturnTypeInfo::Kind::Generic:
+        case ReturnTypeInfo::Kind::Generic: {
+            // Generic(idx, fallback): 从 objType 提取第 idx 个类型参数
+            // fallback 决定返回形状：
+            //   "[T]"  → 返回与 objType 相同的列表类型（如 front/back/pop/remove/slice）
+            //   "string" → 返回 string（如 concat）
+            //   "channel" → 返回 channel 的元素类型（如 receive）
+            if (!objType) return ErrorSemType::make();
+
+            // fallback == "[T]" → 返回与 objType 相同的列表类型
+            if (ret.typeName == "[T]") {
+                if (auto* lt = dynamic_cast<const ListSemType*>(objType)) {
+                    return lt->clone();
+                }
+                return ErrorSemType::make();
+            }
+            // fallback == "string" → 返回 string
+            if (ret.typeName == "string") {
+                return stringType();
+            }
+            // fallback == "channel" → 返回 channel 的元素类型
+            if (ret.typeName == "channel") {
+                // channel<T> 的元素类型：从 objType 提取
+                // GenericSemType("channel") 无元素类型信息，回退到 error
+                return ErrorSemType::make();
+            }
             return ErrorSemType::make();
+        }
     }
     return ErrorSemType::make();
 }
