@@ -60,6 +60,8 @@ sync for(max = 2) item in items {
 
 ## 11.2 协程间通信 `channel<T>`
 
+> 跨线程通信请用 §11.7 `sync.Channel<T>`（sync thread 块内）；本节的 `channel<T>` 仅用于 `sync { }` 协程块内。
+
 ```aura
 // 创建有缓冲通道
 let ch: channel<int> = channel(10)
@@ -261,7 +263,7 @@ io.println("count: " + counter.len())   // 1001
 - ❌ 不支持 `sync thread` 块内 `return` / `break` / `continue` 跨出
 - ❌ 无界 `sync thread` 任务数受 `hardware_concurrency` 限制
 
-后续 v2 计划：work-stealing 任务队列、`sync thread` 内嵌套协程、跨线程 `channel<T>`（见 [channel_thread_issue.md](../plan/channel_thread_issue.md)）。
+后续 v2 计划：work-stealing 任务队列、`sync thread` 内嵌套协程。跨线程通信已通过 `sync.Channel<T>` 实现，详见 §11.7。
 
 ## 11.6 `sync.Mutex` 与 `lock` 块
 
@@ -444,6 +446,188 @@ io.println("config.len=" + config.len())         // 2（仅首次执行）
 
 ### 11.6.9 已知限制
 
-- 不支持 `WaitGroup`（v1.1 移除，推到 v1.2 重新设计）
+- 不支持 `WaitGroup`（等待重新设计）
 - `Once` 的 `body` 中若抛异常，`done_` 不会被设置为 `true`，下次仍会重试（符合 Go 语义）
 - `RWMutex` 不支持可重入（同线程重复 `rw.r()` 会死锁）
+
+## 11.7 `sync.Channel<T>` — 跨线程通信通道（v1.0）
+
+`sync.Channel<T>` 是**真线程**间的阻塞通道，用于 `sync thread` 块内跨线程通信。与 §11.2 的协程 `channel<T>`（基于 `co_await` 挂起）完全独立：
+
+| 维度 | `channel<T>`（§11.2） | `sync.Channel<T>`（§11.7） |
+|:---|:---|:---|
+| 适用场景 | `sync { }` 协程块 | `sync thread { }` 真线程块 |
+| 底层实现 | C++20 协程 `co_await` 挂起 | `std::mutex` + `std::condition_variable` + `std::deque` |
+| 阻塞语义 | 挂起当前协程，让出执行权 | OS 线程阻塞，等待数据/容量 |
+| `receive` 返回 | `T`（关闭后返回默认值） | `Optional<T>`（关闭且空时返回 `None`） |
+| 跨线程安全 | ❌ 协程单线程内使用 | ✅ 多核并行安全 |
+
+### 11.7.1 基本使用
+
+```aura
+let ch: sync.Channel<int> = sync.Channel(10)   // 容量 10
+
+sync thread(max = 2) {
+    // 生产者
+    spawn (ch: sync.Channel<int>) {
+        for i in range(5) {
+            ch.send(i)
+        }
+        ch.close()
+    }
+
+    // 消费者
+    spawn (ch: sync.Channel<int>, io: Io) {
+        let count = 0
+        while true {
+            let v = ch.receive()
+            if v.is_none() { break }       // close 且空 → None
+            count = count + 1
+        }
+        io.println("count: " + count)      // 5
+    }
+}
+```
+
+### 11.7.2 API
+
+| 操作 | 语法 | 行为 |
+|:---|:---|:---|
+| 创建 | `sync.Channel<T>(cap)` 或 `sync.Channel<T>()` | 有缓冲通道；`cap=0` 视为 `cap=1`（近似无缓冲） |
+| 发送 | `ch.send(value)` | 缓冲区满时阻塞；**已关闭时抛 `RuntimeError`** |
+| 接收 | `ch.receive() -> Optional<T>` | 缓冲区空时阻塞；**已关闭且空时返回 `None`** |
+| 关闭 | `ch.close()` | 标记不再发送；唤醒所有阻塞的 send/receive |
+| 查询 | `ch.is_done() -> bool` | 已关闭且缓冲区空 |
+| 迭代 | `for val in ch { ... }` | `sync thread` 块内自动展开为 `while + receive + is_none` |
+
+### 11.7.3 `Optional<T>` — receive 的返回类型
+
+`receive()` 返回 `Optional<T>` 而非直接返回 `T`，以安全表达"通道已关闭且缓冲为空"的语义。
+
+| 方法 | 行为 |
+|:---|:---|
+| `opt.is_none() -> bool` | 是否为 `None`（关闭且空时） |
+| `opt.unwrap() -> T` | 取出值；**对 `None` 调用抛 `RuntimeError`** |
+
+> 注：Aura 已有联合类型 `T | None`，但当 `T` 为 GC 堆类型（`string` / `[T]` / `record*`）时存在 GC 栈扫描破绽。`Optional<T>` 作为 GC 堆对象封装，规避此问题。详见 [plan/done/channel_thread_issue.md](../plan/done/channel_thread_issue.md) §三。
+
+### 11.7.4 `for val in ch` 迭代（sync thread 块内）
+
+在 `sync thread` 块内，`for val in ch` 自动展开为阻塞 `while + receive` 循环，无需手动判断 `is_none`：
+
+```aura
+sync thread(max = 2) {
+    spawn (ch: sync.Channel<int>) {
+        for i in range(10) { ch.send(i) }
+        ch.close()
+    }
+    spawn (ch: sync.Channel<int>, io: Io) {
+        for val in ch {                    // 自动展开为 while + receive + is_none
+            io.println("got " + val)
+        }
+    }
+}
+```
+
+等价于：
+
+```aura
+while true {
+    let _opt = ch.receive()
+    if _opt.is_none() { break }
+    let val = _opt.unwrap()
+    io.println("got " + val)
+}
+```
+
+> 注：`for val in ch` 仅在 `sync thread` 块内支持。在 `sync { }` 协程块内仍走 §11.2 的 `co_await` 路径。
+
+### 11.7.5 错误处理
+
+```aura
+let ch: sync.Channel<int> = sync.Channel(10)
+ch.close()
+
+sync thread(max = 1) {
+    spawn (ch: sync.Channel<int>, io: Io) {
+        try {
+            ch.send(1)                       // ❌ 抛 RuntimeError
+            io.println("no throw")
+        } catch (e) {
+            io.println("caught")             // caught
+        }
+    }
+}
+```
+
+### 11.7.6 fan-out / fan-in 模式
+
+```aura
+let jobs: sync.Channel<int> = sync.Channel(100)
+let results: sync.Channel<int> = sync.Channel(100)
+
+sync thread(max = 5) {
+    // 生产者：投放 20 个任务
+    spawn (jobs: sync.Channel<int>) {
+        for i in range(20) { jobs.send(i) }
+        jobs.close()
+    }
+
+    // worker：消费 jobs，产出 results
+    spawn (jobs: sync.Channel<int>, results: sync.Channel<int>) {
+        while true {
+            let j = jobs.receive()
+            if j.is_none() { break }
+            results.send(j.unwrap() * 2)
+        }
+        results.close()
+    }
+
+    // 汇总者：累加所有结果
+    spawn (results: sync.Channel<int>, io: Io) {
+        let sum = 0
+        while true {
+            let r = results.receive()
+            if r.is_none() { break }
+            sum = sum + r.unwrap()
+        }
+        io.println("sum: " + sum)             // 380
+    }
+}
+```
+
+### 11.7.7 无缓冲通道
+
+`sync.Channel<T>()` 或 `sync.Channel<T>(0)` 创建无缓冲通道（v1.0 实现为 `cap=1` 近似，真正的 rendezvous 直接交接推迟到 v1.1）：
+
+```aura
+let ch: sync.Channel<int> = sync.Channel(0)
+
+sync thread(max = 2) {
+    spawn (ch: sync.Channel<int>) {
+        ch.send(42)                          // 阻塞至 receiver 就绪
+        ch.close()
+    }
+    spawn (ch: sync.Channel<int>, io: Io) {
+        let v = ch.receive()
+        io.println("v: " + v.unwrap())       // 42
+    }
+}
+```
+
+### 11.7.8 实现要点
+
+- **间接指针 `Inner* inner_`**：`std::mutex` 不可移动，但 `GcObject` 在 compact GC 时会被 memcpy 搬迁。间接指针指向 `new` 出的堆对象，规避搬迁冲突（同 §11.6 `Mutex` 模式）
+- **safepoint 协议**：阻塞用 `unlock + gc_safepoint() + sleep_for(1ms) + lock` 轮询，**不用 `cv.wait_for`**，避免 STW 期间锁重获死锁（与 §11.6.8 同原则）
+- **GcRootHandle 防 `this` 悬垂**：每个方法开头构造 `GcRootHandle<ThreadChannel*> selfRoot(self)`，防 compact 搬迁导致 `this` 悬垂
+- **Finalizer**：GC 时 `delete inner_` 防内存泄漏
+- **`Optional<T>::desc()` 用 `if constexpr (std::is_pointer_v<T>)`** 为 GC 指针 T 注册 `value_` offset；非指针 T 无指针字段
+
+### 11.7.9 已知限制（v1.0）
+
+- ❌ `for val in ch` 迭代语法仅在 `sync thread` 块内支持，不能用于 `sync { }` 协程块
+- ❌ 无缓冲通道（`cap=0`）实现为 `cap=1` 近似，真正的 rendezvous 直接交接推迟到 v1.1
+- ❌ 不支持 `select { case ... }` 多路复用语法（v1.2 远期）
+- ❌ `Optional<T>` 暂无 `map` / `and_then` / `or_else` 链式操作（v1.3 远期）
+- ❌ `cv.notify_all` 唤醒后仍走 1ms `sleep_for` 轮询，延迟较高（v1.1 优化为 `try_lock` 快速重获）
+- ❌ 与协程 `channel<T>` 不可互操作（独立类型，跨场景需显式转换）

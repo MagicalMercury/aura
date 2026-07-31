@@ -430,7 +430,9 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
     if (auto* id = dynamic_cast<const Identifier*>(stmt.iterable.get())) {
         if (channelVarNames_.count(id->name)) {
             std::string var = safeName(stmt.itemName);
-            std::string chName = safeName(id->name);
+            // 走 genIdentifier 路径：若 channel 变量被注册为 GcRootHandle（如 sync thread
+            // 块内 spawn 参数），自动生成 .get() 解引用；否则原样使用
+            std::string chName = genIdentifier(*id);
             // sync thread 内：阻塞 while + receive（不调用 is_done()，避免冗余锁）
             // sync.ThreadChannel.receive() 返回 Optional<T>，关闭且空时返回 None
             if (inSyncThreadBlock_) {

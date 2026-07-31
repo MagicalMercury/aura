@@ -32,28 +32,3 @@
 
 > 最后更新：2026-07-18
 
-### C.1 语言 / 运行时特性
-
-| 特性 | 状态 | 计划文档 / 说明 |
-|------|:---:|------|
-| **`range()` 内置函数**（`for i in range(n)`） | ✅ 已实现 | `Iter<T>` 泛型迭代器类型 |
-| **`sync(max=N)` 有界并发** | ✅ 已实现 | [concurrency_lang_spec.md](plan/concurrency_lang_spec.md) — `bounded_sync` |
-| **`channel<T>` 协程通道** | ✅ 已实现 | [concurrency_lang_spec.md](plan/concurrency_lang_spec.md) — send/receive/close/for-in |
-| **`sync for` 并行迭代器** | ✅ 已实现 | [concurrency_lang_spec.md](plan/concurrency_lang_spec.md) — 语法糖展开 |
-| **`sync thread` 真线程并发**（`sync thread(max=N)`） | ✅ 已实现 | [sync_thread_plan.md](plan/sync_thread_plan.md) — 全局 ThreadPool + TLAB + STW |
-| **`sync.Mutex` + `lock` 块语句**（`lock (m) { }`） | ✅ 已实现 | [mutex_plan.md](plan/mutex_plan.md) — RAII 强制 + 间接指针规避 compact |
-| **`sync.RWMutex` 读写锁**（`lock (rw.r()) / rw.w()) { }`，写优先） | ✅ 已实现 | [mutex_plan.md](plan/mutex_plan.md) v1.1 — 多读单写 + waiting_writers 防 starve |
-| **`sync.Once` 一次性执行**（`lock (once) { body }` body 仅首次执行） | ✅ 已实现 | [mutex_plan.md](plan/mutex_plan.md) v1.1 — 双检查 + adopt_lock 异常安全 |
-| **闭包参数类型推断**（`let op: fun(int,int)->int = fun(a,b){...}`） | 🔴 未实现 | 规范 §5.3 已定义 |
-| **异步 I/O**（io_uring / OVERLAPPED / epoll） | 🔴 未实现 | 当前所有 I/O 均为纯阻塞实现 |
-| **接口类型擦除**（`interface` 多态派发） | 🔴 未实现 | — |
-
-### C.2 跨模块可见性
-
-| 特性 | 状态 | 说明 |
-|------|:---:|------|
-| **跨模块 Sema 类型可见性**（Phase A） | ✅ | `ModuleExports` + `importExports` + 拓扑注入 |
-| **`pub` 关键字可见性控制**（Phase B） | ✅ | 前缀修饰符，默认私有 |
-| **`.aurai` 内置接口声明** | ✅ | `builtins/io.aurai` + `builtins/path.aurai` |
-| **多文件模式 Sema** | ✅ | `compileMultiFile` 中每模块运行 SemAnalyzer |
-| **统一诊断引擎**（源码上下文 + fix-hint + 错误码） | ✅ | `DiagnosticEngine` |

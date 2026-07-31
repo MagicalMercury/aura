@@ -146,29 +146,29 @@ std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(
             return IterSemType::make(intType());
         case ReturnTypeInfo::Kind::Optional: {
             // Optional<T>: 从 objType 提取元素类型构造 OptionalSemType
-            // sync.ThreadChannel.receive() 时 objType = GenericSemType("sync.ThreadChannel")
-            //   → 元素类型用占位 GenericSemType("T")
-            // 用户的 sync.ThreadChannel<int> → objType 应携带元素类型信息
+            // sync.Channel<T>.receive() 时 objType 应携带元素类型信息（resolvedName）
             if (!objType) return ErrorSemType::make();
-            // 优先尝试从 GenericSemType 的 resolvedName 提取元素类型（如 "ThreadChannel<int32_t>"）
+            // 优先尝试从 GenericSemType 的 resolvedName 提取元素类型（如 "sync.Channel<int32_t>"）
             if (auto* gs = dynamic_cast<const GenericSemType*>(objType)) {
                 if (!gs->resolvedName.empty()) {
-                    // resolvedName 形如 "sync.ThreadChannel<int32_t>" → 提取 <...> 内的类型名
                     auto lt = gs->resolvedName.find('<');
                     auto rt = gs->resolvedName.rfind('>');
                     if (lt != std::string::npos && rt != std::string::npos && rt > lt) {
                         std::string elemName = gs->resolvedName.substr(lt + 1, rt - lt - 1);
+                        // 将 C++ 类型名映射回 Aura 基础 SemType，避免被 isHeapSemType 误判
+                        if (elemName == "int32_t")        return OptionalSemType::make(intType());
+                        if (elemName == "double")         return OptionalSemType::make(floatType());
+                        if (elemName == "bool")           return OptionalSemType::make(boolType());
+                        if (elemName == "aura_rt::GcString*") return OptionalSemType::make(stringType());
+                        // 其他类型（record* / Array<T>* 等）作为堆对象指针
                         auto elemG = std::make_unique<GenericSemType>();
                         elemG->name = elemName;
-                        elemG->resolvedName = elemName;  // 直接作为 C++ 类型名
+                        elemG->resolvedName = elemName;
                         return OptionalSemType::make(std::move(elemG));
                     }
                 }
             }
-            // fallback: objType 为 GenericSemType 但 resolvedName 为空
-            // （如 sync.Channel<int>(10) 的返回类型，模板参数未保留到 SemType）
-            // v1.0 简化：元素类型默认 int（所有测试用例均为 int channel）
-            // v1.1 需从构造函数调用处传播模板实参到变量类型
+            // fallback: objType 无 resolvedName，元素类型默认 int
             return OptionalSemType::make(intType());
         }
         case ReturnTypeInfo::Kind::Generic: {
@@ -402,18 +402,47 @@ std::unique_ptr<SemType> SemAnalyzer::applyTypeArgs(
 void SemAnalyzer::materializeCanonicalName(
     std::unique_ptr<SemType>& result,
     const NamedType& n) {
-    auto* rec = dynamic_cast<RecordSemType*>(result.get());
-    if (!rec) return;
+    // RecordSemType 分支：用户自定义泛型类型（如 Tree<int>）
+    if (auto* rec = dynamic_cast<RecordSemType*>(result.get())) {
+        if (n.typeArgs.empty()) return;
+        bool allConcrete = true;
+        std::string fullName = rec->canonicalName + "<";
+        for (size_t i = 0; i < n.typeArgs.size(); ++i) {
+            if (i > 0) fullName += ", ";
+            std::string auraName;
+            if (auto* argNt = dynamic_cast<const NamedType*>(n.typeArgs[i].get()))
+                auraName = argNt->name;
+            else if (dynamic_cast<const GenericTypeRef*>(n.typeArgs[i].get())) {
+                allConcrete = false; break;
+            }
+            if (auraName == "int")    fullName += "int32_t";
+            else if (auraName == "float")  fullName += "double";
+            else if (auraName == "bool")   fullName += "bool";
+            else if (auraName == "string") fullName += "aura_rt::GcString*";
+            else fullName += auraName;
+        }
+        fullName += ">";
+        if (allConcrete) {
+            rec->canonicalName = fullName;
+            sealSelfRefs(result, n.name, fullName);
+        }
+        return;
+    }
 
-    bool allConcrete = true;
-    std::string fullName = rec->canonicalName + "<";
+    // GenericSemType 分支：内置泛型类型（如 sync.Channel<int> / channel<int>）
+    // 无 typeArgs 时无需处理；有 typeArgs 时设置 resolvedName 供后续提取元素类型
+    auto* gs = dynamic_cast<GenericSemType*>(result.get());
+    if (!gs || n.typeArgs.empty()) return;
+
+    std::string fullName = gs->name + "<";
     for (size_t i = 0; i < n.typeArgs.size(); ++i) {
         if (i > 0) fullName += ", ";
         std::string auraName;
-        if (auto* argNt = dynamic_cast<const NamedType*>(n.typeArgs[i].get()))
+        if (auto* argNt = dynamic_cast<const NamedType*>(n.typeArgs[i].get())) {
             auraName = argNt->name;
-        else if (dynamic_cast<const GenericTypeRef*>(n.typeArgs[i].get())) {
-            allConcrete = false; break;
+        } else if (dynamic_cast<const GenericTypeRef*>(n.typeArgs[i].get())) {
+            // 泛型形参（如 T），保留原样
+            auraName = dynamic_cast<const GenericTypeRef*>(n.typeArgs[i].get())->name;
         }
         if (auraName == "int")    fullName += "int32_t";
         else if (auraName == "float")  fullName += "double";
@@ -422,11 +451,7 @@ void SemAnalyzer::materializeCanonicalName(
         else fullName += auraName;
     }
     fullName += ">";
-
-    if (allConcrete) {
-        rec->canonicalName = fullName;
-        sealSelfRefs(result, n.name, fullName);
-    }
+    gs->resolvedName = fullName;
 }
 
 // ============================================================

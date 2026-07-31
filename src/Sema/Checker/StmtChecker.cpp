@@ -162,6 +162,29 @@ void SemAnalyzer::checkForStmt(const ForStmt& stmt) {
         sym.type = listTy->elementType ? listTy->elementType->clone() : ErrorSemType::make();
     } else if (auto* iterTy = dynamic_cast<IterSemType*>(iterType.get())) {
         sym.type = iterTy->elementType ? iterTy->elementType->clone() : ErrorSemType::make();
+    } else if (auto* gs = dynamic_cast<GenericSemType*>(iterType.get())) {
+        // sync.Channel<T> / channel<T> 等泛型通道类型：从 resolvedName 提取元素类型
+        // resolvedName 形如 "sync.Channel<int32_t>" 或 "channel<int32_t>"
+        // 无 resolvedName 时回退到 ErrorSemType（运行时 auto 推断兜底）
+        sym.type = ErrorSemType::make();
+        if (!gs->resolvedName.empty()) {
+            auto lt = gs->resolvedName.find('<');
+            auto rt = gs->resolvedName.rfind('>');
+            if (lt != std::string::npos && rt != std::string::npos && rt > lt) {
+                std::string elemName = gs->resolvedName.substr(lt + 1, rt - lt - 1);
+                // 映射回 Aura 基础 SemType，避免被 isHeapSemType 误判
+                if (elemName == "int32_t")            sym.type = intType();
+                else if (elemName == "double")        sym.type = floatType();
+                else if (elemName == "bool")          sym.type = boolType();
+                else if (elemName == "aura_rt::GcString*") sym.type = stringType();
+                else {
+                    auto elem = std::make_unique<GenericSemType>();
+                    elem->name = elemName;
+                    elem->resolvedName = elemName;
+                    sym.type = std::move(elem);
+                }
+            }
+        }
     } else {
         sym.type = ErrorSemType::make();
     }

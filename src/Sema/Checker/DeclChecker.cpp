@@ -187,7 +187,12 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
         if (!n->typeArgs.empty()) {
             auto* sym = symtab_.lookup(fullName);
             if (sym && sym->kind == SymKind::TypeAlias && !sym->typeParams.empty()) {
+                // 用户自定义泛型：applyTypeArgs 替换形参为实参 + materializeCanonicalName
                 result = applyTypeArgs(std::move(result), *sym, n->typeArgs);
+                materializeCanonicalName(result, *n);
+            } else {
+                // 内置泛型（如 sync.Channel<int> / channel<int>）：result 为 GenericSemType
+                // 无 typeParams 可替换，仅设置 resolvedName 供 CodeGen / for-in 提取元素类型
                 materializeCanonicalName(result, *n);
             }
         }
