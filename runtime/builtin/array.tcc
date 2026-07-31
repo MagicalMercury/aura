@@ -51,6 +51,7 @@ inline const TypeDescriptor& ArrayIndex::desc() {
 // ============================================================
 // Array::make — 工厂方法（普通模式）
 // P1-A: 首块用默认 CAP，后续 chunk 翻倍
+// P3-C: size<=0 时不分配 chunk，延迟到首次 append（EMPTY() 协同）
 // ============================================================
 template<typename T>
 Array<T>* Array<T>::make(const int32_t size) {
@@ -66,6 +67,12 @@ Array<T>* Array<T>::make(const int32_t size) {
     arr->normal_.head = nullptr;
     arr->normal_.tail = nullptr;
     arr->normal_.chunk_index = nullptr;
+
+    // P3-C: size<=0 时不分配 chunk，延迟到首次 append
+    // EMPTY() 调用 make(0)，开销仅 32 字节 header，无 chunk 浪费
+    if (size <= 0) {
+        return arr;
+    }
 
     // 首块始终用默认 CAP
     int32_t firstCap = AURA_ARRAY_CHUNK_CAP;
@@ -402,9 +409,13 @@ void Array<T>::insertIntoChunk(ArrayChunk<T>* chunk, int32_t idx, T value) {
 }
 
 // ============================================================
-// P1-C: insertSplitChunk — 块满分裂路径
+// P1-C: insertSplitChunk — 块满分裂路径（P2-A: 对半分裂）
+// [P2-A] 改为对半分裂：搬走 [half, used) 到新 chunk，idx 落点决定在哪个 chunk 插入
+//   - idx <= half：原 chunk 插入（现有 capacity - half 个空位）
+//   - idx > half：新 chunk 插入（相对索引 idx - half）
+//   空间利用率从 12.5%（idx=0 全量搬迁）提升到 50%
 // [P0-B 修正] 保存 origNext，barrier parent 用 origNext
-// [OOM 降级] 新 chunk cap = 原 chunk cap * 2，降级后不得小于 move_count
+// [OOM 降级] 新 chunk cap = 原 chunk cap * 2，minCap = move_count + 1
 // ============================================================
 template <typename T>
 void Array<T>::insertSplitChunk(ArrayChunk<T>* chunk, int32_t idx, T value) {
@@ -414,10 +425,12 @@ void Array<T>::insertSplitChunk(ArrayChunk<T>* chunk, int32_t idx, T value) {
     // P0-B: 在赋值前保存 chunk->next 原值
     ArrayChunk<T>* origNext = chunk->next;
 
-    // 新 chunk 要容纳 move_count 个元素（从原 chunk 搬过来）
-    int32_t move_count = chunk->used - idx;
+    // P2-A: 对半分裂 — 搬走 [half, used) 到新 chunk
+    int32_t half = chunk->used / 2;
+    int32_t move_count = chunk->used - half;
     int32_t desiredCap = chunk->capacity * 2;
-    int32_t minCap = move_count;  // 降级下限：至少容纳搬过来的元素
+    // minCap = move_count + 1：确保新 chunk 能容纳搬过来的元素 + 可能的新插入
+    int32_t minCap = move_count + 1;
 
     // OOM 降级重试（不更新 last_chunk_cap，避免降级影响 append 增长轨迹）
     ArrayChunk<T>* new_chunk = createChunk(desiredCap, minCap, origNext, chunk, false);
@@ -443,24 +456,25 @@ void Array<T>::insertSplitChunk(ArrayChunk<T>* chunk, int32_t idx, T value) {
 
     normal_.chunk_count++;
 
-    // 将 [idx, used) 后半段搬到新 chunk
+    // P2-A: 搬运 [half, used) 到新 chunk
     for (int32_t j = 0; j < move_count; ++j) {
         if constexpr (std::is_pointer_v<T>) {
             gc_write_barrier(new_chunk, &new_chunk->data()[j],
-                             reinterpret_cast<GcObject*>(chunk->data()[idx + j]));
+                             reinterpret_cast<GcObject*>(chunk->data()[half + j]));
         }
-        new_chunk->data()[j] = chunk->data()[idx + j];
+        new_chunk->data()[j] = chunk->data()[half + j];
     }
     new_chunk->used = move_count;
-    chunk->used = idx;
+    chunk->used = half;
 
-    // 在当前块写入新元素
-    if constexpr (std::is_pointer_v<T>) {
-        gc_write_barrier(chunk, &chunk->data()[idx],
-                         reinterpret_cast<GcObject*>(value));
+    // P2-A: 根据 idx 落点决定在哪个 chunk 插入
+    if (idx <= half) {
+        // 在原 chunk 插入（现有 capacity - half 个空位）
+        insertIntoChunk(chunk, idx, value);
+    } else {
+        // 在新 chunk 插入（相对索引 idx - half）
+        insertIntoChunk(new_chunk, idx - half, value);
     }
-    chunk->data()[idx] = value;
-    chunk->used++;
 }
 
 template <typename T>

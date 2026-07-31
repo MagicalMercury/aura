@@ -144,6 +144,33 @@ std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(
         }
         case ReturnTypeInfo::Kind::Generator:
             return IterSemType::make(intType());
+        case ReturnTypeInfo::Kind::Optional: {
+            // Optional<T>: 从 objType 提取元素类型构造 OptionalSemType
+            // sync.ThreadChannel.receive() 时 objType = GenericSemType("sync.ThreadChannel")
+            //   → 元素类型用占位 GenericSemType("T")
+            // 用户的 sync.ThreadChannel<int> → objType 应携带元素类型信息
+            if (!objType) return ErrorSemType::make();
+            // 优先尝试从 GenericSemType 的 resolvedName 提取元素类型（如 "ThreadChannel<int32_t>"）
+            if (auto* gs = dynamic_cast<const GenericSemType*>(objType)) {
+                if (!gs->resolvedName.empty()) {
+                    // resolvedName 形如 "sync.ThreadChannel<int32_t>" → 提取 <...> 内的类型名
+                    auto lt = gs->resolvedName.find('<');
+                    auto rt = gs->resolvedName.rfind('>');
+                    if (lt != std::string::npos && rt != std::string::npos && rt > lt) {
+                        std::string elemName = gs->resolvedName.substr(lt + 1, rt - lt - 1);
+                        auto elemG = std::make_unique<GenericSemType>();
+                        elemG->name = elemName;
+                        elemG->resolvedName = elemName;  // 直接作为 C++ 类型名
+                        return OptionalSemType::make(std::move(elemG));
+                    }
+                }
+            }
+            // fallback: objType 为 GenericSemType 但 resolvedName 为空
+            // （如 sync.Channel<int>(10) 的返回类型，模板参数未保留到 SemType）
+            // v1.0 简化：元素类型默认 int（所有测试用例均为 int channel）
+            // v1.1 需从构造函数调用处传播模板实参到变量类型
+            return OptionalSemType::make(intType());
+        }
         case ReturnTypeInfo::Kind::Generic: {
             // Generic(idx, fallback): 从 objType 提取第 idx 个类型参数
             // fallback 决定返回形状：

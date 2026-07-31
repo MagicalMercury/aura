@@ -7,7 +7,7 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-07-31（Array P2-D slice 内置视图模式 + P2-E front O(1) 完成）
+# 最近更新：2026-07-31（新增联合类型 GC 安全问题 TODO + Optional<T> 实施中）
 
 ================================================================
 [ 一 ] 内置 API 与模块（plan/plan11.md）
@@ -52,10 +52,27 @@
       - 缺：是否引入新 SemType 还是依赖接口结构匹配（建议先做接口扩展）
       - 备注：当前不实现也能用，是"语法糖"性质
 
-[ ] P2  Result<T, E> / Optional<T> 标准库类型
-      - 现状：错误处理走 try/catch + ! 传播
+[ ] P2  Optional<T> 标准库类型
+      - 现状：错误处理走 try/catch + ! 传播，无需 Result<T, E>
       - 设计要点：用 type 别名 + union 实现，无需新 SemType
       - 备注：可作为示例库先在 builtins/ 提供
+
+[ ] P1  联合类型 T | None 的 GC 安全问题（已知缺陷）  [2026-07-31 提出]
+      - 问题：Aura 联合类型 `T | None` 映射为 `std::variant<T, NoneType>`
+        （src/CodeGen/TypeMap.cpp:92-97）。当 T 为 GC 堆类型（string/Array<T>*/record*）
+        时存在致命问题：
+          1. variant 是值语义存于栈上，GC 栈扫描无法安全识别内部指针
+             （NoneType 时 offset 0 为垃圾数据，被误当指针 → 崩溃或误标记）
+          2. isGcPointerType 检查类型字符串是否以 `*` 结尾，variant 不符合
+             → 不会被 GcRootHandle 包装 → 内部 GC 指针失去根保护
+          3. 堆字段的 TypeDescriptor 静态注册无法表达 variant discriminator 动态语义
+      - 当前缓解：新增 `Optional<T>` GC 堆类型作为 `T | None` 的安全封装
+        （见 plan/channel_thread_issue.md §三）
+      - 根本修复方向（远期）：
+          * 方案 A：Sema 层禁止 `T | None` 中 T 为 GC 堆类型，强制用 Optional<T>
+          * 方案 B：CodeGen 为含 GC 栆类型的联合生成特殊的 box 包装（复杂）
+          * 方案 C：精确栈扫描支持 variant discriminator 感知（需 GC 大改）
+      - 关联：project_memory 中联合类型相关约束
 
 ================================================================
 [ 三 ] 跨模块可见性（plan/cross_module_visibility.md）
@@ -578,15 +595,21 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
             - 修复：拆分 insertIntoChunk / insertSplitChunk
 
       --- P2 中等优先 ---
-      [ ] P2  insert 块满分裂策略低效（array.h:242-260）
+      [x] P2  insert 块满分裂策略低效（array.h:242-260）  [2026-07-31 修复]
             - 问题：idx=0 时空间利用率仅 12.5%
-            - 修复：改对半分裂
-      [ ] P2  EMPTY() 无单例缓存（array.h:84-86）
+            - 修复：改对半分裂，搬 [half, used) 到新 chunk，idx 落点决定在哪个 chunk 插入
+            - 空间利用率 12.5% → 50%
+            - 测试：K14（头部插入 + 中间插入）
+      [x] P2  EMPTY() 无单例缓存（array.h:84-86）  [2026-07-31 完成（与 P3-C 协同）]
             - 问题：每次 make(0) 分配新对象，与 GcString::empty() 不对称
-            - 修复：GcGlobalRoot<Array<T>> 缓存单例
-      [ ] P2  list 字面量构造低效（ExprGen.cpp:292-312）
+            - 修复：EMPTY() 保持 make(0)，依赖 P3-C 延迟分配降低开销
+            - 空数组开销从 header+chunk（80 字节）降到 32 字节 header
+            - 测试：K15/K17（空数组属性 + 不污染）
+      [-] P2  list 字面量构造低效（ExprGen.cpp:292-312）  [2026-07-31 跳过]
             - 问题：N 次 append + N 次 GcRootHandle 包装
-            - 方案：批量 append_batch(initializer_list<T>) 或 make(N) + set(i, v)
+            - 跳过理由：GcCompactSuspendGuard 构造为 atomic<int> ++（纳秒级）；
+              genListExpr 的 make(N) 已预分配容量，append 不触发 createChunk；
+              GcRootHandle 无默认构造，不支持数组收集
       [x] P2  Array::slice 缺失  [2026-07-30 完成（内置视图模式）]
             - 现状：GcString 已有零拷贝 slice，Array 无
             - 风险：chunk 链表 slice 实现复杂，可能需 view 类型
@@ -606,12 +629,22 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
             - 视图模式：委托 owner 的 operator[](view_start_)
 
       --- P3 远期 / 代码质量 ---
-      [ ] P3  魔法数字提取（maybeCompact 的 2/4/5）
-      [ ] P3  operator[] const/非 const 重复（抽 locate(idx) 辅助）
-      [ ] P3  make(0) 强制分配 1 个空 chunk（应延迟分配）
-      [ ] P3  ArrayIterator 禁止拷贝（可放开，GcRootHandle 已支持拷贝）
-      [ ] P3  capacity() int32 溢出风险（改 int64_t）
-      [ ] P3  shrink_to_fit API 新增
+      [x] P3  魔法数字提取（maybeCompact 的 2/4/5）  [2026-07-30 完成]
+            - 提取到 array_constants 命名空间（kCompactMinChunks/kCompactChunkRatio/
+              kCompactLengthRatio/kMaxMerges）
+      [x] P3  operator[] const/非 const 重复（抽 locate(idx) 辅助）  [2026-07-30 完成]
+            - 新增 locateLinear const 成员，operator[] const 复用
+      [x] P3  make(0) 强制分配 1 个空 chunk（应延迟分配）  [2026-07-31 完成]
+            - 修复：make(size) 当 size<=0 时不分配 chunk，head/tail = nullptr
+            - 延迟到首次 append 时分配
+            - 测试：K15/K16（空数组 + 首次 append）
+      [x] P3  ArrayIterator 禁止拷贝（可放开，GcRootHandle 已支持拷贝）  [2026-07-30 完成]
+            - 改为默认拷贝/移动（= default）
+            - 迭代器重写为索引迭代器（Array* + idx 范围），无需 GcRootHandle
+      [x] P3  capacity() int32 溢出风险（改 int64_t）  [2026-07-30 完成]
+            - total_capacity 字段 int32 → int64
+            - capacity() 返回 int64_t
+      [-] P3  shrink_to_fit API 新增  [2026-07-31 用户明确不计划]
       [ ] P3  .iter() 方法（Iterator<T> 链式 .map/.filter/.collect）
             - 已在 TODO §二（高级类型）规划，此处仅作关联引用
 

@@ -14,6 +14,8 @@
 #include "builtin/sync.h"
 #include "builtin/channel.h"
 #include "builtin/mutex.h"
+#include "builtin/optional.h"       // Optional<T>
+#include "builtin/thread_channel.h"
 
 #include <functional>
 #include <ranges>

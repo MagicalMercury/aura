@@ -1,1176 +1,582 @@
-# change.md — ArrayView<T> 零拷贝视图（ViewSemType + 隐式深拷贝退化）
+# change.md — sync.ThreadChannel<T> + Optional<T>（v1.0）
 
 ## 概述
 
-实施 [plan/arrayview_design_conflict_issue.md](file:///d:/you/Aura/plan/arrayview_design_conflict_issue.md) 的详细方案：
-- 新增 ViewSemType 绑定 owner 类型（与 owner 等价，Aura 层不暴露 View 类型）
-- slice 返回 ViewSemType，view 调用修改方法时隐式深拷贝并永久退化为 owner 类型
-- view 支持只读方法（len/[]/front/back/slice）和 for-in 迭代
-- view[i] = val 触发深拷贝退化
+实施 [plan/channel_thread_issue.md](file:///d:/you/Aura/plan/channel_thread_issue.md) v1.0：
+- 新增 `sync.ThreadChannel<T>`：sync thread 跨线程通信通道（间接指针 + mutex + deque）
+- 新增 `Optional<T>`：作为 `T | None` 联合类型的 GC 安全封装（定义在 types.h）
+- Sema/CodeGen 三层改造支持类型推断与代码生成
+
+**关键设计**：
+- 阻塞用 `unlock + gc_safepoint() + sleep_for(1ms) + lock` 轮询（不用 `cv.wait_for`，避免 STW 锁重获死锁）
+- 每个方法开头构造 `GcRootHandle<ThreadChannel*> selfRoot(self)` 防 compact 搬迁 this 悬垂
+- cap=0 视为 cap=1（方案 A 近似无缓冲；方案 B rendezvous 推迟 v1.1）
+- `Optional<T>::desc()` 用 `if constexpr (std::is_pointer_v<T>)` 为 GC 指针 T 注册 `value_` offset
 
 ---
 
-## 变更 1：新增 ViewSemType
+## 阶段 1：Runtime 层
 
-### 文件：src/Sema/SemType.h
+### 1.1 `runtime/types.h` — 新增 Optional<T>
 
-**修改 1a：在 IterSemType 之后（L124 附近）新增 ViewSemType 声明**
+**新增位置**：在 `NoneType` 定义之后（约 L53 之后）、`TypeDescriptor` 定义之前插入。
 
 ```cpp
-// 原（L124 附近）：
-//      return "Iter<" + (elementType ? elementType->toString() : "?") + ">";
-//  }
-//  [[nodiscard]] std::unique_ptr<SemType> clone() const override;
-//  static std::unique_ptr<IterSemType> make(std::unique_ptr<SemType> el) {
-//      ...
-//  }
-//};
+// ============================================================
+// Optional<T> — T | None 联合类型的 GC 安全封装
 //
+// Aura 已有联合类型 T | None（映射为 std::variant<T, NoneType>），但当 T 为
+// GC 堆类型时存在栈扫描破绽、GcRootHandle 包装失效、TypeDescriptor 动态语义
+// 无法表达等问题。Optional<T> 作为 GC 堆对象封装，规避上述问题。
+//
+// API：is_none() / unwrap()（is_some 即 !is_none，无需冗余方法）
+// has_value_=false 时 value_ 为 GC 零初始化 nullptr，扫描自动跳过 → 安全
 // ============================================================
-// 工具函数
+template <typename T>
+struct Optional : GcObject {
+    bool has_value_ = false;
+    T value_ = T{};
+
+    // GC 指针 T 注册 value_ offset；非指针 T 无指针字段
+    static const TypeDescriptor& desc() {
+        if constexpr (std::is_pointer_v<T>) {
+            static const size_t offsets[] = { offsetof(Optional<T>, value_) };
+            static const TypeDescriptor d = {
+                sizeof(Optional<T>), 1, offsets, 0, nullptr, nullptr
+            };
+            return d;
+        } else {
+            static const TypeDescriptor d = {
+                sizeof(Optional<T>), 0, nullptr, 0, nullptr, nullptr
+            };
+            return d;
+        }
+    }
+
+    bool is_none() const { return !has_value_; }
+
+    T unwrap() {
+        if (!has_value_) {
+            throw make_runtime_error("unwrap on None");
+        }
+        return value_;
+    }
+};
+
+template <typename T>
+inline Optional<T>* make_optional(T v) {
+    auto* o = static_cast<Optional<T>*>(
+        GcHeap::instance().alloc(sizeof(Optional<T>), &Optional<T>::desc()));
+    o->has_value_ = true;
+    o->value_ = std::move(v);
+    return o;
+}
+
+template <typename T>
+inline Optional<T>* make_none() {
+    auto* o = static_cast<Optional<T>*>(
+        GcHeap::instance().alloc(sizeof(Optional<T>), &Optional<T>::desc()));
+    o->has_value_ = false;
+    o->value_ = T{};
+    return o;
+}
+```
+
+**需要的前向声明**：在 types.h 顶部前向声明区（约 L18-22）新增：
+```cpp
+class GcHeap;  // Optional<T>::desc() 调用 GcHeap::instance().alloc
+```
+
+**需要新增的 include**：types.h 顶部新增（用于 offsetof / is_pointer_v）：
+```cpp
+#include <type_traits>
+```
+`make_runtime_error` 在 error.h 中定义，但 types.h 不应直接 include error.h（避免循环依赖）。`Optional<T>::unwrap()` 在调用时才会抛错，可将 error.h 的 include 放在 aura_rt.h 中（已 include）。若编译报错，则将 unwrap() 改为头文件外定义（模板实例化时再可见 make_runtime_error）。
+
+---
+
+### 1.2 `runtime/builtin/thread_channel.h` — 新增 ThreadChannel<T>
+
+**新增文件**：完整内容如下。
+
+```cpp
+#pragma once
+// ============================================================
+// aura_rt/builtin/thread_channel.h — sync thread 跨线程通信通道
+//
+// 设计要点：
+//   1. 间接指针 Inner* inner_：std::mutex 不可移动，但 GcObject 在 compact GC
+//      时会被 memcpy 搬迁。间接指针指向 new 出的堆对象，规避搬迁问题。
+//      （与 Mutex/RWMutex/Once 同模式，见 mutex.h）
+//   2. 阻塞用 unlock + gc_safepoint() + sleep_for(1ms) + lock 轮询，
+//      不用 cv.wait_for（避免 STW 期间锁重获死锁，参考 gc_mutex_deadlock_fix_report.md）
+//   3. cv.notify_all() 保留用于唤醒提速，但不用 wait_for 等待
+//   4. 每个方法开头构造 GcRootHandle<ThreadChannel*> selfRoot(self)，
+//      防 compact 搬迁 this 悬垂（参考 Once::do_ 修复）
+//   5. cap=0 视为 cap=1（方案 A 近似无缓冲；方案 B rendezvous 推迟 v1.1）
+//
+// 与协程 channel<T>（builtin/channel.h）完全独立：
+//   - ThreadChannel<T>：sync thread 场景，阻塞 mutex+cv
+//   - channel<T>：协程场景，co_await 挂起
 // ============================================================
 
-// 改为（在 IterSemType 之后、工具函数之前新增）：
-//      return "Iter<" + (elementType ? elementType->toString() : "?") + ">";
-//  }
-//  [[nodiscard]] std::unique_ptr<SemType> clone() const override;
-//  static std::unique_ptr<IterSemType> make(std::unique_ptr<SemType> el) {
-//      ...
-//  }
-//};
+#include "../gc.h"
+#include "../types.h"        // Optional<T> / GcObject / TypeDescriptor
+#include "error.h"           // make_runtime_error
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
-// 视图类型 — slice 返回值，绑定 owner 类型（与 owner 在 Aura 层等价）
-// ViewSemType<ListSemType(int)> 在 Aura 层视为 [int]
-// 调用修改方法时隐式深拷贝退化为 owner 类型
-struct ViewSemType : SemType {
-    std::unique_ptr<SemType> ownerType;  // 绑定的 owner 类型（ListSemType / PrimSemType(String) 等）
+namespace aura_rt {
+
+template <typename T>
+struct ThreadChannel : GcObject {
+    struct Inner {
+        std::mutex m;
+        std::condition_variable cv;  // 仅用于 notify_all 唤醒提示，不用 wait_for
+        std::deque<T> buffer;
+        size_t cap = 0;
+        bool closed = false;
+    };
+    Inner* inner_;
+
+    static const TypeDescriptor _desc;
+
+    void send(T v) {
+        // 防 compact 搬迁 this 悬垂（参考 Once::do_ 修复）
+        ThreadChannel* self = this;
+        GcRootHandle<ThreadChannel*> selfRoot(self);
+
+        std::unique_lock<std::mutex> lk(self->inner_->m);
+        while (self->inner_->buffer.size() >= self->inner_->cap && !self->inner_->closed) {
+            // safepoint 协议：unlock + safepoint + sleep + lock 轮询
+            // 不用 cv.wait_for（避免 STW 期间锁重获死锁）
+            lk.unlock();
+            gc_safepoint();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            lk.lock();
+        }
+        if (self->inner_->closed) {
+            throw make_runtime_error("send on closed channel");
+        }
+        self->inner_->buffer.push_back(std::move(v));
+        self->inner_->cv.notify_all();  // 唤醒等待的 receiver
+    }
+
+    template <typename U = T>
+    Optional<U>* receive() {
+        ThreadChannel* self = this;
+        GcRootHandle<ThreadChannel*> selfRoot(self);
+
+        std::unique_lock<std::mutex> lk(self->inner_->m);
+        while (self->inner_->buffer.empty() && !self->inner_->closed) {
+            lk.unlock();
+            gc_safepoint();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            lk.lock();
+        }
+        if (self->inner_->buffer.empty()) {
+            return make_none<U>();  // 已关闭且空
+        }
+        U out = std::move(self->inner_->buffer.front());
+        self->inner_->buffer.pop_front();
+        self->inner_->cv.notify_all();  // 唤醒等待的 sender
+        return make_optional<U>(std::move(out));
+    }
+
+    void close() {
+        ThreadChannel* self = this;
+        GcRootHandle<ThreadChannel*> selfRoot(self);
+
+        std::lock_guard<std::mutex> lk(self->inner_->m);
+        self->inner_->closed = true;
+        self->inner_->cv.notify_all();
+    }
+
+    // is_done() 仅供用户显式查询；for-in 循环不调用（直接用 receive + is_none）
+    bool is_done() const {
+        std::lock_guard<std::mutex> lk(inner_->m);
+        return inner_->closed && inner_->buffer.empty();
+    }
+};
+
+template <typename T>
+const TypeDescriptor ThreadChannel<T>::_desc = {
+    sizeof(ThreadChannel<T>), 0, nullptr, 0, nullptr,
+    [](GcObject* o) {
+        auto* ch = static_cast<ThreadChannel<T>*>(o);
+        delete ch->inner_;
+        ch->inner_ = nullptr;
+    }
+};
+
+template <typename T>
+inline ThreadChannel<T>* make_thread_channel(size_t cap) {
+    auto* ch = static_cast<ThreadChannel<T>*>(
+        GcHeap::instance().alloc(sizeof(ThreadChannel<T>), &ThreadChannel<T>::_desc));
+    ch->inner_ = new typename ThreadChannel<T>::Inner();
+    // cap=0 视为 cap=1（方案 A，近似无缓冲语义；方案 B rendezvous 推迟到 v1.1）
+    ch->inner_->cap = (cap == 0) ? 1 : cap;
+    return ch;
+}
+
+} // namespace aura_rt
+```
+
+---
+
+### 1.3 `runtime/aura_rt.h` — include thread_channel.h
+
+**修改**：在 `#include "builtin/mutex.h"` 之后新增一行。
+
+```cpp
+#include "builtin/mutex.h"
+#include "builtin/thread_channel.h"   // 新增
+```
+
+---
+
+## 阶段 2：Sema 层
+
+### 2.1 `src/Sema/SemType.h` — 新增 OptionalSemType
+
+**新增位置**：在 `IterSemType` 定义之后（约 L124）、工具函数之前（约 L126）插入。
+
+```cpp
+// Optional<T> 类型 — sync.ThreadChannel.receive 等方法的返回类型
+struct OptionalSemType : SemType {
+    std::unique_ptr<SemType> elementType;
     [[nodiscard]] bool equals(const SemType& other) const override;
     [[nodiscard]] std::string toString() const override {
-        return "View<" + (ownerType ? ownerType->toString() : "?") + ">";
+        return "Optional<" + (elementType ? elementType->toString() : "?") + ">";
     }
     [[nodiscard]] std::unique_ptr<SemType> clone() const override;
-    static std::unique_ptr<ViewSemType> make(std::unique_ptr<SemType> owner) {
-        auto v = std::make_unique<ViewSemType>();
-        v->ownerType = std::move(owner);
-        return v;
+    static std::unique_ptr<OptionalSemType> make(std::unique_ptr<SemType> el) {
+        auto n = std::make_unique<OptionalSemType>();
+        n->elementType = std::move(el);
+        return n;
     }
 };
-
-// ============================================================
-// 工具函数
-// ============================================================
 ```
 
-### 文件：src/Sema/SemType.cpp
+---
 
-**修改 1b：在 IterSemType 实现之后新增 ViewSemType 实现（文件末尾 `} // namespace Aura` 之前）**
+### 2.2 `src/Sema/SemType.cpp` — 实现 OptionalSemType
+
+**新增位置**：在 `IterSemType` 相关实现之后追加。
 
 ```cpp
-// ============================================================
-// ViewSemType
-// ============================================================
-bool ViewSemType::equals(const SemType& other) const {
-    // View<View<X>> == View<X>：比较 ownerType
-    if (auto* v = dynamic_cast<const ViewSemType*>(&other)) {
-        if (!ownerType || !v->ownerType) return !ownerType && !v->ownerType;
-        return ownerType->equals(*v->ownerType);
-    }
-    // View<X> == X：与 owner 等价（Aura 层透明）
-    if (ownerType) return ownerType->equals(other);
-    return false;
+bool OptionalSemType::equals(const SemType& other) const {
+    auto* o = dynamic_cast<const OptionalSemType*>(&other);
+    if (!o) return false;
+    return typeEquals(elementType, o->elementType);
 }
-std::unique_ptr<SemType> ViewSemType::clone() const {
-    return make(ownerType ? ownerType->clone() : nullptr);
+
+std::unique_ptr<SemType> OptionalSemType::clone() const {
+    auto n = std::make_unique<OptionalSemType>();
+    n->elementType = elementType ? elementType->clone() : nullptr;
+    return n;
 }
 ```
 
 ---
 
-## 变更 2：ReturnTypeInfo 新增 View kind
+### 2.3 `src/Sema/BuiltinRegistry.h` — ReturnTypeInfo + 类型/方法注册
 
-### 文件：src/Sema/BuiltinRegistry.h
-
-**修改 2a：ReturnTypeInfo 枚举新增 View（L41）**
+**修改 1**：`ReturnTypeInfo` 新增 `Kind::Optional` 和工厂方法（约 L40-50）。
 
 ```cpp
-// 原（L41）：
-enum class Kind { Named, Generic, None, Generator };
+struct ReturnTypeInfo {
+    enum class Kind { Named, Generic, None, Generator, Optional };
+    Kind kind;
+    std::string typeName;
+    int  genericParamIdx = 0;
 
-// 改为：
-enum class Kind { Named, Generic, None, Generator, View };
-```
-
-**修改 2b：ReturnTypeInfo 新增 View 工厂（L49 附近）**
-
-```cpp
-// 原（L49）：
-static ReturnTypeInfo Generator(const std::string& el){ return {Kind::Generator, el, 0}; }
-};
-
-// 改为：
-static ReturnTypeInfo Generator(const std::string& el){ return {Kind::Generator, el, 0}; }
-// View: 返回 ownerTypeName 的视图（slice 专用）
-// typeName 存储 owner 类型名（如 "[T]"、"string"），Sema 根据调用方 objType 构造 ViewSemType
-static ReturnTypeInfo View(const std::string& ownerTypeName) {
-    return {Kind::View, ownerTypeName, 0};
-}
+    static ReturnTypeInfo Named(const std::string& tn)    { return {Kind::Named, tn, 0}; }
+    static ReturnTypeInfo Generic(int idx, const std::string& fb) { return {Kind::Generic, fb, idx}; }
+    static ReturnTypeInfo None()                          { return {Kind::None, "", 0}; }
+    static ReturnTypeInfo Generator(const std::string& el){ return {Kind::Generator, el, 0}; }
+    static ReturnTypeInfo Optional(const std::string& elemType) { return {Kind::Optional, elemType, 0}; }
 };
 ```
 
----
-
-## 变更 3：slice 方法注册改为 View 返回
-
-### 文件：src/Sema/BuiltinRegistry.h
-
-**修改 3a：string.slice 改为 View 返回（L239）**
+**修改 2**：`init()` 的 `types_` 列表新增（约 L209-226 末尾）：
 
 ```cpp
-// 原（L239）：
-{"string", "slice",  {{"start", "int"}, {"len", "int"}}, ReturnTypeInfo::Named("string")},
-
-// 改为：
-{"string", "slice",  {{"start", "int"}, {"len", "int"}}, ReturnTypeInfo::View("string")},
+{"Optional", {"Optional", true, true, BuiltinPrim::Other, "aura_rt::Optional*"}},
+{"sync.ThreadChannel", {"sync.ThreadChannel", true, true, BuiltinPrim::Other, "aura_rt::ThreadChannel*"}},
 ```
 
-**修改 3b：[T].slice 改为 View 返回（L255）**
+**修改 3**：`init()` 的 `methods_` 列表新增（约 L265 `{"RWMutex", "w", ...}` 之后）：
 
 ```cpp
-// 原（L255）：
-{"[T]", "slice",     {{"start", "int"}, {"len", "int"}}, ReturnTypeInfo::Generic(0, "[T]")},
+// --- sync.ThreadChannel<T> 方法 ---
+{"sync.ThreadChannel", "send",    {{"v", "T"}},  ReturnTypeInfo::None()},
+{"sync.ThreadChannel", "receive", {},             ReturnTypeInfo::Optional("T")},
+{"sync.ThreadChannel", "close",   {},             ReturnTypeInfo::None()},
+{"sync.ThreadChannel", "is_done", {},             ReturnTypeInfo::Named("bool")},
 
-// 改为：
-{"[T]", "slice",     {{"start", "int"}, {"len", "int"}}, ReturnTypeInfo::View("[T]")},
+// --- Optional<T> 方法 ---
+{"Optional", "is_none", {}, ReturnTypeInfo::Named("bool")},
+{"Optional", "unwrap",  {}, ReturnTypeInfo::Generic(0, "T")},
 ```
 
----
-
-## 变更 4：semTypeFromBuiltinReturn 处理 View kind
-
-### 文件：src/Sema/SemAnalyzer.h
-
-**修改 4a：semTypeFromBuiltinReturn 签名扩展（L67）**
+**修改 4**：`init()` 的 `functions_` 列表新增（约 L282 `{"sync.Once", ...}` 之后）：
 
 ```cpp
-// 原（L67）：
-[[nodiscard]] std::unique_ptr<SemType> semTypeFromBuiltinReturn(const ReturnTypeInfo& ret);
-
-// 改为：
-// objType: 调用方对象类型（Kind::View 时构造 ViewSemType(ownerType=objType)）
-//          默认 nullptr 保证向后兼容
-[[nodiscard]] std::unique_ptr<SemType> semTypeFromBuiltinReturn(
-    const ReturnTypeInfo& ret, const SemType* objType = nullptr);
+// sync.ThreadChannel 构造函数（带 cap 参数）
+{"sync.ThreadChannel", {{"cap", "int"}}, ReturnTypeInfo::Named("sync.ThreadChannel")},
+// sync.ThreadChannel 无参构造（无缓冲）
+{"sync.ThreadChannel", {},                ReturnTypeInfo::Named("sync.ThreadChannel")},
 ```
-
-### 文件：src/Sema/SemAnalyzer.cpp
-
-**修改 4b：semTypeFromBuiltinReturn 实现（L115-150）**
-
-```cpp
-// 原（L115-150）：
-std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(const ReturnTypeInfo& ret) {
-    switch (ret.kind) {
-        case ReturnTypeInfo::Kind::None:
-            return NoneSemType::make();
-        case ReturnTypeInfo::Kind::Named: {
-            // ... 现有 Named 处理 ...
-        }
-        case ReturnTypeInfo::Kind::Generator:
-            return IterSemType::make(intType());
-        case ReturnTypeInfo::Kind::Generic:
-            return ErrorSemType::make();
-    }
-    return ErrorSemType::make();
-}
-
-// 改为：
-std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(
-    const ReturnTypeInfo& ret, const SemType* objType) {
-    switch (ret.kind) {
-        case ReturnTypeInfo::Kind::None:
-            return NoneSemType::make();
-        case ReturnTypeInfo::Kind::Named: {
-            // ... 现有 Named 处理保持不变 ...
-        }
-        case ReturnTypeInfo::Kind::Generator:
-            return IterSemType::make(intType());
-        case ReturnTypeInfo::Kind::Generic:
-            return ErrorSemType::make();
-        case ReturnTypeInfo::Kind::View: {
-            // View 返回类型：用调用方 objType 构造 ViewSemType
-            // objType 为空时退化为 ErrorSemType（容错）
-            if (!objType) return ErrorSemType::make();
-            auto v = ViewSemType::make(objType->clone());
-            typeStore_.push_back(v->clone());
-            return typeStore_.back()->clone();
-        }
-    }
-    return ErrorSemType::make();
-}
-```
-
-**注意**：`case ReturnTypeInfo::Kind::Named:` 内的完整逻辑保持不变（包括 [T] 类型展开等），仅在 switch 末尾新增 `Kind::View` case。
 
 ---
 
-## 变更 5：inferMethodCall 传递 objType
+### 2.4 `src/Sema/SemAnalyzer.cpp` — semTypeFromBuiltinReturn 新增 Optional 分支
 
-### 文件：src/Sema/Checker/ExprInfer.cpp
-
-**修改 5a：内置模块函数调用处（L316）**
+**修改位置**：`semTypeFromBuiltinReturn` 的 switch（约 L116-175），在 `case Kind::Generic` 之前新增。
 
 ```cpp
-// 原（L309-318）：
-        auto& ret = fn->returns;
-        switch (ret.kind) {
-            case ReturnTypeInfo::Kind::None:
-                return NoneSemType::make();
-            case ReturnTypeInfo::Kind::Named:
-            case ReturnTypeInfo::Kind::Generator:
-            case ReturnTypeInfo::Kind::Generic:
-                return semTypeFromBuiltinReturn(ret);
-        }
-    }
+case ReturnTypeInfo::Kind::Optional: {
+    // 从 objType 提取元素类型，构造 OptionalSemType
+    if (!objType) return ErrorSemType::make();
+    auto elem = objType->clone();
+    return OptionalSemType::make(std::move(elem));
 }
+```
 
-// 改为：
-        auto& ret = fn->returns;
-        switch (ret.kind) {
-            case ReturnTypeInfo::Kind::None:
-                return NoneSemType::make();
-            case ReturnTypeInfo::Kind::Named:
-            case ReturnTypeInfo::Kind::Generator:
-            case ReturnTypeInfo::Kind::Generic:
-                return semTypeFromBuiltinReturn(ret);
-            // View 返回类型在模块函数路径无意义，退化为 Error
-            case ReturnTypeInfo::Kind::View:
-                return ErrorSemType::make();
+**注意**：`OptionalSemType::make` 在 SemType.h 中已定义为静态工厂，返回 `unique_ptr<OptionalSemType>`，需隐式转换为 `unique_ptr<SemType>`（合法的上转型）。
+
+---
+
+## 阶段 3：CodeGen 层
+
+### 3.1 `src/CodeGen/TypeMap.cpp` — mapSemType 支持 OptionalSemType
+
+**修改位置**：`mapSemType` 函数（约 L170-208），在 `ListSemType` 分支之后新增。
+
+```cpp
+if (auto* o = dynamic_cast<const OptionalSemType*>(&semType)) {
+    std::string elem = o->elementType ? mapSemType(*o->elementType) : "void";
+    return "aura_rt::Optional<" + elem + ">*";
+}
+```
+
+---
+
+### 3.2 `src/CodeGen/StmtGen.cpp` — genLetStmt + for-in sync.ThreadChannel
+
+**修改 1**：`genLetStmt` 中识别 OptionalSemType（约 L81-94，在 `GenericSemType` 分支之后新增）：
+
+```cpp
+} else if (auto* os = dynamic_cast<const OptionalSemType*>(decl.inferredType)) {
+    type = mapSemType(*os);
+}
+```
+
+**修改 2**：for-in channel 分支新增 sync thread 阻塞路径（约 L427-441，替换原 `channelVarNames_.count(id->name)` 分支）：
+
+```cpp
+// 检测 channel 遍历：for val in ch → while + receive 循环
+if (auto* id = dynamic_cast<const Identifier*>(stmt.iterable.get())) {
+    if (channelVarNames_.count(id->name)) {
+        std::string var = safeName(stmt.itemName);
+        std::string chName = safeName(id->name);
+        // sync thread 内：阻塞 while + receive（不调用 is_done()，避免冗余锁）
+        if (inSyncThreadBlock_) {
+            cpp << indentStr() << "while (true) {\n";
+            indentLevel_++;
+            writeLine(cpp, "auto _opt = " + chName + "->receive();");
+            writeLine(cpp, "if (_opt->is_none()) break;");
+            writeLine(cpp, "auto " + var + " = _opt->unwrap();");
+            if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+            writeLine(cpp, "aura_rt::gc_safepoint();");
+            indentLevel_--;
+            cpp << indentStr() << "}\n";
+            return;
         }
+        // 协程路径（原有）
+        cpp << indentStr() << "while (true) {\n";
+        indentLevel_++;
+        writeLine(cpp, "if (" + chName + "->is_done()) break;");
+        writeLine(cpp, "auto " + var + " = co_await " + chName + "->receive();");
+        if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+        writeLine(cpp, "aura_rt::gc_safepoint();");
+        indentLevel_--;
+        cpp << indentStr() << "}\n";
+        return;
     }
 }
 ```
 
-**修改 5b：内置类型方法调用处（L342-351）**
+---
+
+### 3.3 `src/CodeGen/ExprGen.cpp` — sync.ThreadChannel 构造分支
+
+**修改位置**：`genMethodCall` 中 sync 分支（约 L648-663）。
+
+**问题**：当前 `if (id->name == "sync" && e.args.empty())` 要求 args 为空，但 ThreadChannel 需要 cap 参数。需拆分条件。
+
+**修改后**：
 
 ```cpp
-// 原（L342-352）：
-        if (auto* entry = BuiltinRegistry::get().findMethod(typeKey, e.method, (int)e.args.size())) {
-            auto& ret = entry->returns;
-            switch (ret.kind) {
-                case ReturnTypeInfo::Kind::None:
-                    return NoneSemType::make();
-                case ReturnTypeInfo::Kind::Named:
-                case ReturnTypeInfo::Kind::Generator:
-                case ReturnTypeInfo::Kind::Generic:
-                    return semTypeFromBuiltinReturn(ret);
+// sync.Mutex() / sync.RWMutex() / sync.Once() / sync.ThreadChannel<T>(cap) 构造特殊处理
+if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+    if (id->name == "sync") {
+        // 无参构造
+        if (e.args.empty()) {
+            if (e.method == "Mutex")   return "aura_rt::make_mutex()";
+            if (e.method == "RWMutex") return "aura_rt::make_rwmutex()";
+            if (e.method == "Once")    return "aura_rt::make_once()";
+            // sync.ThreadChannel() 无参 → cap=0（视为 cap=1）
+            if (e.method == "ThreadChannel") {
+                std::string targ = expectedTemplateArgs_.empty() ? "int32_t" : expectedTemplateArgs_[0];
+                return "aura_rt::make_thread_channel<" + targ + ">(0)";
             }
-        }
-
-// 改为：
-        if (auto* entry = BuiltinRegistry::get().findMethod(typeKey, e.method, (int)e.args.size())) {
-            auto& ret = entry->returns;
-            switch (ret.kind) {
-                case ReturnTypeInfo::Kind::None:
-                    return NoneSemType::make();
-                case ReturnTypeInfo::Kind::Named:
-                case ReturnTypeInfo::Kind::Generator:
-                case ReturnTypeInfo::Kind::Generic:
-                    return semTypeFromBuiltinReturn(ret);
-                case ReturnTypeInfo::Kind::View: {
-                    // View 返回类型：用 objType 构造 ViewSemType
-                    // 注意：ViewSemType + 修改方法会在变更 6 中处理退化
-                    auto viewType = semTypeFromBuiltinReturn(ret, objType.get());
-                    // 修改方法触发类型退化
-                    if (dynamic_cast<const ViewSemType*>(viewType.get())
-                        && isViewMutatingMethod(e.method)) {
-                        return handleViewMutation(e, viewType);
-                    }
-                    return viewType;
-                }
-            }
-        }
-```
-
-**修改 5c：新增辅助函数 isViewMutatingMethod（ExprInfer.cpp 文件顶部，inferMethodCall 之前）**
-
-```cpp
-// 判断方法是否是视图修改方法（触发深拷贝退化）
-// 修改方法：append/pop/insert/remove/clear/reserve
-// 注意：view[i] = val 不走 inferMethodCall，在 inferAssign 中处理
-static bool isViewMutatingMethod(const std::string& method) {
-    return method == "append" || method == "pop" || method == "insert"
-        || method == "remove" || method == "clear" || method == "reserve";
-}
-```
-
----
-
-## 变更 6：ViewSemType 修改方法触发类型退化
-
-### 文件：src/Sema/Checker/ExprInfer.cpp
-
-**修改 6a：新增 handleViewMutation 方法声明（SemAnalyzer.h 私有方法区）**
-
-```cpp
-// 在 SemAnalyzer.h 私有方法区（L113 inferExpr 附近）新增：
-private:
-    // View 修改方法处理：深拷贝退化，返回 ownerType 并更新 symtab 中变量类型
-    [[nodiscard]] std::unique_ptr<SemType> handleViewMutation(
-        const MethodCallExpr& e, std::unique_ptr<SemType> viewType);
-```
-
-**修改 6b：handleViewMutation 实现（ExprInfer.cpp，inferMethodCall 之后）**
-
-```cpp
-std::unique_ptr<SemType> SemAnalyzer::handleViewMutation(
-    const MethodCallExpr& e, std::unique_ptr<SemType> viewType) {
-    auto* v = dynamic_cast<const ViewSemType*>(viewType.get());
-    if (!v || !v->ownerType) return ErrorSemType::make();
-
-    // 返回 ownerType（ListSemType / PrimSemType(String) 等）
-    auto ownerType = v->ownerType->clone();
-
-    // 更新 symtab 中变量类型：view 变量永久退化为 owner 类型
-    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
-        if (auto* sym = symtab_.lookup(id->name)) {
-            sym->updateType(ownerType->clone());
-        }
-    }
-
-    return ownerType;
-}
-```
-
----
-
-## 变更 7：Symbol 新增 updateType 方法
-
-### 文件：src/Sema/Symbol.h
-
-**修改 7a：Symbol 新增 updateType（L52 之前，结构体末尾）**
-
-```cpp
-// 原（L29-53）：
-struct Symbol {
-    SymKind  kind;
-    std::string name;
-    std::unique_ptr<SemType> type; // 符号的类型
-    // ... 其他字段 ...
-    std::string belongsToModule;
-    bool isPublic = true;
-};
-
-// 改为（在 isPublic 之后新增 updateType 方法）：
-struct Symbol {
-    SymKind  kind;
-    std::string name;
-    std::unique_ptr<SemType> type; // 符号的类型
-    bool isConst = false;
-
-    std::vector<SymParam> params;
-    bool throws = false;
-
-    std::vector<std::string> typeParams;
-
-    std::vector<SymParam> ctorParams;
-    std::unique_ptr<SemType> ctorReturnType;
-
-    std::vector<InterfaceSemType::MethodSig> interfaceMethods;
-
-    std::string belongsToModule;
-    bool isPublic = true;
-
-    // View 类型退化：替换符号的类型（unique_ptr 不能直接赋值）
-    void updateType(std::unique_ptr<SemType> t) { type = std::move(t); }
-};
-```
-
----
-
-## 变更 8：mapSemType 处理 ViewSemType
-
-### 文件：src/CodeGen/TypeMap.cpp
-
-**修改 8a：mapSemType 新增 ViewSemType 分支（L182 ListSemType 之后）**
-
-```cpp
-// 原（L182-184）：
-    if (auto* l = dynamic_cast<const ListSemType*>(&semType)) {
-        return "aura_rt::Array<" + mapSemType(*l->elementType) + ">*";
-    }
-
-// 改为：
-    if (auto* l = dynamic_cast<const ListSemType*>(&semType)) {
-        return "aura_rt::Array<" + mapSemType(*l->elementType) + ">*";
-    }
-    // ViewSemType：映射为 ArrayView<T>*（owner 是 ListSemType 时）
-    if (auto* v = dynamic_cast<const ViewSemType*>(&semType)) {
-        if (!v->ownerType) return "auto";
-        if (auto* l = dynamic_cast<const ListSemType*>(v->ownerType.get())) {
-            return "aura_rt::ArrayView<" + mapSemType(*l->elementType) + ">*";
-        }
-        // 未来：string → GcStringView*（暂不支持，退化为 auto）
-        return "auto";
-    }
-```
-
----
-
-## 变更 9：isGcPointerType 识别 ArrayView*
-
-### 文件：src/CodeGen/TypeMap.cpp
-
-**修改 9a：isGcPointerType 保持现状即可（L32-39）**
-
-```cpp
-// 现有实现（无需修改）：
-bool CodeGenerator::isGcPointerType(const std::string& cppType) const {
-    if (cppType.empty() || cppType.back() != '*') return false;
-    if (cppType == "int32_t*" || cppType == "double*" || cppType == "bool*")
-        return false;
-    if (cppType == "const char*") return false;
-    if (cppType == "auto") return false;
-    return true;  // ArrayView<T>* 自动识别为 GC 指针
-}
-```
-
-**说明**：`ArrayView<T>*` 以 `*` 结尾且不在排除列表中，自动被识别为 GC 指针，会被 GcRootHandle 包装。
-
----
-
-## 变更 10：genLetStmt 识别 ViewSemType
-
-### 文件：src/CodeGen/StmtGen.cpp
-
-**修改 10a：genLetStmt 推断类型分支新增 ViewSemType（L90 附近）**
-
-```cpp
-// 原（L73-94）：
-    if (auto* rs = dynamic_cast<const RecordSemType*>(decl.inferredType)) {
-        // ... Record 处理 ...
-    } else if (auto* gs = dynamic_cast<const GenericSemType*>(decl.inferredType)) {
-        // ... Generic 处理 ...
-    } else if (auto* ls = dynamic_cast<const ListSemType*>(decl.inferredType)) {
-        type = mapSemType(*ls);
-    } else if (auto* ps = dynamic_cast<const PrimSemType*>(decl.inferredType)) {
-        type = mapSemType(*ps);
-    }
-
-// 改为：
-    if (auto* rs = dynamic_cast<const RecordSemType*>(decl.inferredType)) {
-        // ... Record 处理不变 ...
-    } else if (auto* gs = dynamic_cast<const GenericSemType*>(decl.inferredType)) {
-        // ... Generic 处理不变 ...
-    } else if (auto* ls = dynamic_cast<const ListSemType*>(decl.inferredType)) {
-        type = mapSemType(*ls);
-    } else if (auto* ps = dynamic_cast<const PrimSemType*>(decl.inferredType)) {
-        type = mapSemType(*ps);
-    } else if (auto* vs = dynamic_cast<const ViewSemType*>(decl.inferredType)) {
-        // View 类型：映射为 ArrayView<T>*
-        type = mapSemType(*vs);
-    }
-```
-
-**说明**：通过 mapSemType 得到 `aura_rt::ArrayView<T>*`，isGcPointerType 自动包装为 GcRootHandle。
-
----
-
-## 变更 11：genMethodCall 修改方法生成重新绑定
-
-### 文件：src/CodeGen/ExprGen.cpp
-
-**修改 11a：genMethodCall 中检测 ViewSemType + 修改方法（L750 oss << ")" 之后）**
-
-```cpp
-// 原（L750-760）：
-    oss << ")";
-    std::string callExpr = oss.str();
-
-    // Io 调用、值类型对象...
-
-// 改为：
-    oss << ")";
-    std::string callExpr = oss.str();
-
-    // View 修改方法：生成 view = view->method(args) 重新绑定
-    // Sema 已将 view 变量类型退化为 owner，但 CodeGen 时 view 底层仍是 ArrayView<T>*
-    // 通过 rebind 将 view 指针指向深拷贝返回的新 Array<T>*
-    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
-        if (e.object->inferredType
-            && dynamic_cast<const ViewSemType*>(e.object->inferredType)) {
-            // 此时 view 变量已通过 GcRootHandle 包装，使用 .get() 赋值
-            std::string varName = safeName(id->name);
-            if (gcRootVarNames_.count(varName)) {
-                // view.get() = view.get()->method(args)
-                // 通过 genGcRootedArgs 保护参数
-                std::vector<std::pair<std::string, const SemType*>> gcArgs;
-                gcArgs.emplace_back(obj, e.object->inferredType);  // {0} = obj
-                for (size_t i = 0; i < mArgExprs.size(); ++i)
-                    gcArgs.emplace_back(mArgExprs[i], e.args[i]->inferredType);
-                std::ostringstream gcCall;
-                gcCall << "{0}" << access << safeName(e.method) << "(";
-                for (size_t i = 0; i < mArgExprs.size(); ++i) {
-                    if (i > 0) gcCall << ", ";
-                    gcCall << "{" << (i + 1) << "}";
-                }
-                gcCall << ")";
-                return varName + ".get() = " + genGcRootedArgs(gcArgs, gcCall.str(), isCoroutine);
-            }
-        }
-    }
-
-    // Io 调用、值类型对象...
-```
-
-**注意**：`e.object->inferredType` 在 Sema 阶段已被设置为 ViewSemType（slice 返回值推断）。修改方法调用后 Sema 将变量类型更新为 owner，但 `e.object->inferredType` 仍是调用时的类型（ViewSemType）。
-
-**修正**：实际上 Sema 在 handleViewMutation 中更新的是 symtab 中 Symbol::type，而 ASTNode::inferredType 保持为 ViewSemType。但 CodeGen 的 genMethodCall 通过 `e.object->inferredType` 判断的是调用时类型，**仍是 ViewSemType**。因此此处的判断正确。
-
----
-
-## 变更 12：genAssignExpr view[i]=val 触发深拷贝
-
-### 文件：src/CodeGen/ExprGen.cpp
-
-**修改 12a：genAssignExpr 新增 view 索引赋值处理（L829 附近，s = s + x 优化之后）**
-
-```cpp
-// 原（L829-864）：
-std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) {
-    std::string target = genExpr(*e.target, isCoroutine);
-    std::string value  = genExpr(*e.value, isCoroutine);
-
-    // stripGet 辅助
-    auto stripGet = ...
-
-    // s = s + x 优化
-    if (auto* targetId = dynamic_cast<const Identifier*>(e.target.get())) {
-        if (auto* binExpr = dynamic_cast<const BinaryExpr*>(e.value.get())) {
-            // ... s = s + x 优化 ...
-        }
-    }
-    // ... 后续处理 ...
-
-// 改为（在 s = s + x 优化之后、string 追踪之前新增 view[i] = val 处理）：
-std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) {
-    std::string target = genExpr(*e.target, isCoroutine);
-    std::string value  = genExpr(*e.value, isCoroutine);
-
-    // stripGet 辅助
-    auto stripGet = ...
-
-    // s = s + x 优化（保持不变）
-    if (auto* targetId = dynamic_cast<const Identifier*>(e.target.get())) {
-        if (auto* binExpr = dynamic_cast<const BinaryExpr*>(e.value.get())) {
-            // ... s = s + x 优化不变 ...
-        }
-    }
-
-    // view[i] = val 深拷贝退化
-    // 检测：target 是 IndexExpr，object 是 view 变量
-    if (auto* idxExpr = dynamic_cast<const IndexExpr*>(e.target.get())) {
-        if (auto* viewId = dynamic_cast<const Identifier*>(idxExpr->object.get())) {
-            // 通过 symtab 推断的 objType 是否是 ViewSemType
-            // 注意：此时 view 变量类型已可能退化（如果之前调用了修改方法）
-            // 但 Sema 推断 IndexExpr 时 objType 仍是 ViewSemType（未退化）
-            if (idxExpr->object->inferredType
-                && dynamic_cast<const ViewSemType*>(idxExpr->object->inferredType)) {
-                std::string viewVar = safeName(viewId->name);
-                if (gcRootVarNames_.count(viewVar)) {
-                    std::string idxExprStr = genExpr(*idxExpr->index, false);
-                    // view.get() = view.get()->set(idx, val)
-                    // ArrayView::set 深拷贝后赋值并返回新 Array*
-                    std::vector<std::pair<std::string, const SemType*>> gcArgs;
-                    gcArgs.emplace_back(viewVar, idxExpr->object->inferredType);  // {0} = view
-                    gcArgs.emplace_back(idxExprStr, idxExpr->index->inferredType);  // {1} = idx
-                    gcArgs.emplace_back(value, e.value->inferredType);  // {2} = val
-                    return viewVar + ".get() = " + genGcRootedArgs(gcArgs,
-                        "{0}->set({1}, {2})", isCoroutine);
-                }
-            }
-        }
-    }
-
-    // ... 后续 string 追踪等保持不变 ...
-```
-
-**说明**：ArrayView 需新增 `set(int32_t idx, T value)` 方法（见变更 13）。
-
----
-
-## 变更 13：ArrayView 新增修改方法 + ViewIterator
-
-### 文件：runtime/builtin/array.h
-
-**修改 13a：ArrayView 类新增修改方法声明（L993 之前，工厂方法之前）**
-
-```cpp
-// 原（L988-1003）：
-    // 嵌套 slice
-    ArrayView<T>* slice(int32_t relStart, int32_t subLen) const;
-
-    // GC 类型描述符
-    static const TypeDescriptor& desc();
-
-    // 工厂方法
-    static ArrayView<T>* make(Array<T>* owner, int32_t start, int32_t len) {
-        // ...
-    }
-};
-
-// 改为：
-    // 嵌套 slice
-    ArrayView<T>* slice(int32_t relStart, int32_t subLen) const;
-
-    // ===== 修改方法：深拷贝退化为 owner（返回新 Array<T>*) =====
-    // CodeGen 生成：view = view->method(args)
-    // Sema 同步将 view 变量类型退化为 ListSemType
-    Array<T>* append(T value) const;
-    Array<T>* pop() const;
-    Array<T>* pop(int32_t idx) const;
-    Array<T>* insert(int32_t idx, T value) const;
-    Array<T>* remove(int32_t idx) const;
-    Array<T>* clear() const;
-    Array<T>* reserve(int32_t cap) const;
-    // view[i] = val 深拷贝退化
-    Array<T>* set(int32_t relIdx, T value) const;
-
-    // ===== for-in 迭代 =====
-    using Iterator = ArrayViewIterator<T>;
-    Iterator begin();
-    Iterator end();
-
-    // GC 类型描述符
-    static const TypeDescriptor& desc();
-
-    // 工厂方法
-    static ArrayView<T>* make(Array<T>* owner, int32_t start, int32_t len) {
-        // ... 保持不变 ...
-    }
-};
-```
-
-**修改 13b：ArrayView 修改方法 + ViewIterator 实现（ArrayView::slice 实现之后）**
-
-```cpp
-// ============================================================
-// P2-D: ArrayView 修改方法 — 深拷贝退化为 Array<T>
-// ============================================================
-template<typename T>
-Array<T>* ArrayView<T>::append(T value) const {
-    GcCompactSuspendGuard guard;
-    Array<T>* arr = Array<T>::make(len_);
-    for (int32_t i = 0; i < len_; ++i) {
-        arr->append((*owner_)[start_ + i]);
-    }
-    arr->append(value);
-    return arr;
-}
-
-template<typename T>
-Array<T>* ArrayView<T>::pop() const {
-    GcCompactSuspendGuard guard;
-    Array<T>* arr = Array<T>::make(len_ > 0 ? len_ - 1 : 0);
-    for (int32_t i = 0; i < len_; ++i) {
-        arr->append((*owner_)[start_ + i]);
-    }
-    if (arr->len() > 0) arr->pop();
-    return arr;
-}
-
-template<typename T>
-Array<T>* ArrayView<T>::pop(int32_t idx) const {
-    GcCompactSuspendGuard guard;
-    Array<T>* arr = Array<T>::make(len_ > 0 ? len_ - 1 : 0);
-    for (int32_t i = 0; i < len_; ++i) {
-        if (i != idx) arr->append((*owner_)[start_ + i]);
-    }
-    return arr;
-}
-
-template<typename T>
-Array<T>* ArrayView<T>::insert(int32_t idx, T value) const {
-    GcCompactSuspendGuard guard;
-    Array<T>* arr = Array<T>::make(len_ + 1);
-    for (int32_t i = 0; i < idx; ++i) {
-        arr->append((*owner_)[start_ + i]);
-    }
-    arr->append(value);
-    for (int32_t i = idx; i < len_; ++i) {
-        arr->append((*owner_)[start_ + i]);
-    }
-    return arr;
-}
-
-template<typename T>
-Array<T>* ArrayView<T>::remove(int32_t idx) const {
-    GcCompactSuspendGuard guard;
-    Array<T>* arr = Array<T>::make(len_ > 0 ? len_ - 1 : 0);
-    for (int32_t i = 0; i < len_; ++i) {
-        if (i != idx) arr->append((*owner_)[start_ + i]);
-    }
-    return arr;
-}
-
-template<typename T>
-Array<T>* ArrayView<T>::clear() const {
-    return Array<T>::make(0);
-}
-
-template<typename T>
-Array<T>* ArrayView<T>::reserve(int32_t cap) const {
-    GcCompactSuspendGuard guard;
-    Array<T>* arr = Array<T>::make(cap > len_ ? cap : len_);
-    for (int32_t i = 0; i < len_; ++i) {
-        arr->append((*owner_)[start_ + i]);
-    }
-    return arr;
-}
-
-template<typename T>
-Array<T>* ArrayView<T>::set(int32_t relIdx, T value) const {
-    GcCompactSuspendGuard guard;
-    Array<T>* arr = Array<T>::make(len_);
-    for (int32_t i = 0; i < len_; ++i) {
-        if (i == relIdx) {
-            arr->append(value);
         } else {
-            arr->append((*owner_)[start_ + i]);
-        }
-    }
-    return arr;
-}
-
-// ============================================================
-// P2-D: ArrayViewIterator — for-in 迭代器
-// 限制范围 [start_, start_+len_)
-// ============================================================
-template<typename T>
-class ArrayViewIterator {
-    Array<T>* owner_;
-    int32_t cur_;   // 当前绝对索引
-    int32_t end_;   // 终止绝对索引（start_ + len_）
-
-public:
-    ArrayViewIterator(Array<T>* owner, int32_t cur, int32_t end)
-        : owner_(owner), cur_(cur), end_(end) {}
-
-    T& operator*() { return (*owner_)[cur_]; }
-    T* operator->() { return &(*owner_)[cur_]; }
-
-    ArrayViewIterator& operator++() {
-        ++cur_;
-        return *this;
-    }
-
-    bool operator!=(const ArrayViewIterator& o) const {
-        return cur_ != o.cur_;
-    }
-
-    // 默认拷贝/移动（Iterator 需要可拷贝）
-    ArrayViewIterator(const ArrayViewIterator&) = default;
-    ArrayViewIterator& operator=(const ArrayViewIterator&) = default;
-    ArrayViewIterator(ArrayViewIterator&&) = default;
-    ArrayViewIterator& operator=(ArrayViewIterator&&) = default;
-};
-
-template<typename T>
-typename ArrayView<T>::Iterator ArrayView<T>::begin() {
-    return {owner_, start_, start_ + len_};
-}
-
-template<typename T>
-typename ArrayView<T>::Iterator ArrayView<T>::end() {
-    return {owner_, start_ + len_, start_ + len_};
-}
-```
-
-**注意**：ArrayViewIterator 需要在 ArrayView 类定义之前前向声明，或放在 ArrayView 之前。
-
-**修改 13c：ArrayViewIterator 前向声明（ArrayView 之前）**
-
-在 `class ArrayView` 定义之前新增：
-
-```cpp
-template<typename T>
-class ArrayViewIterator;
-```
-
----
-
-## 变更 14：inferIndexExpr + genIndexExpr 识别 ViewSemType
-
-### 文件：src/Sema/Checker/ExprInfer.cpp
-
-**修改 14a：inferIndexExpr 支持 ViewSemType（L401-408）**
-
-```cpp
-// 原（L401-408）：
-std::unique_ptr<SemType> SemAnalyzer::inferIndexExpr(const IndexExpr& e) {
-    auto objType = inferExpr(*e.object);
-    if (auto* list = dynamic_cast<const ListSemType*>(objType.get())) {
-        return list->elementType ? list->elementType->clone() : ErrorSemType::make();
-    }
-    return ErrorSemType::make();
-}
-
-// 改为：
-std::unique_ptr<SemType> SemAnalyzer::inferIndexExpr(const IndexExpr& e) {
-    auto objType = inferExpr(*e.object);
-    if (auto* list = dynamic_cast<const ListSemType*>(objType.get())) {
-        return list->elementType ? list->elementType->clone() : ErrorSemType::make();
-    }
-    // ViewSemType：索引返回 owner 的元素类型
-    if (auto* view = dynamic_cast<const ViewSemType*>(objType.get())) {
-        if (auto* list = dynamic_cast<const ListSemType*>(view->ownerType.get())) {
-            return list->elementType ? list->elementType->clone() : ErrorSemType::make();
-        }
-    }
-    return ErrorSemType::make();
-}
-```
-
-### 文件：src/CodeGen/ExprGen.cpp
-
-**修改 14b：genIndexExpr 保持现状（L819-823）**
-
-```cpp
-// 现有实现（无需修改）：
-std::string CodeGenerator::genIndexExpr(const IndexExpr& e, bool isCoroutine) {
-    std::string obj   = genExpr(*e.object, false);
-    std::string idx   = genExpr(*e.index, isCoroutine);
-    return "(*" + obj + ")[" + idx + "]";
-}
-```
-
-**说明**：`(*view)[i]` 调用 ArrayView::operator[]，已实现。
-
----
-
-## 变更 15：for-in 迭代识别 ViewSemType
-
-### 文件：src/Sema/Checker/StmtChecker.cpp
-
-**修改 15a：checkForStmt 支持 ViewSemType（L150-170）**
-
-```cpp
-// 原（L150-170）：
-void SemAnalyzer::checkForStmt(const ForStmt& stmt) {
-    auto iterType = inferExpr(*stmt.iterable);
-    bool prev = insideLoop_; insideLoop_ = true;
-    symtab_.enterScope();
-    Symbol sym;
-    sym.kind = SymKind::Variable;
-    sym.name = stmt.itemName;
-    if (auto* listTy = dynamic_cast<ListSemType*>(iterType.get())) {
-        sym.type = listTy->elementType ? listTy->elementType->clone() : ErrorSemType::make();
-    } else if (auto* iterTy = dynamic_cast<IterSemType*>(iterType.get())) {
-        sym.type = iterTy->elementType ? iterTy->elementType->clone() : ErrorSemType::make();
-    } else {
-        sym.type = ErrorSemType::make();
-    }
-    symtab_.define(std::move(sym));
-    if (stmt.body) checkBlock(*stmt.body);
-    symtab_.exitScope();
-    insideLoop_ = prev;
-}
-
-// 改为：
-void SemAnalyzer::checkForStmt(const ForStmt& stmt) {
-    auto iterType = inferExpr(*stmt.iterable);
-    bool prev = insideLoop_; insideLoop_ = true;
-    symtab_.enterScope();
-    Symbol sym;
-    sym.kind = SymKind::Variable;
-    sym.name = stmt.itemName;
-    if (auto* listTy = dynamic_cast<ListSemType*>(iterType.get())) {
-        sym.type = listTy->elementType ? listTy->elementType->clone() : ErrorSemType::make();
-    } else if (auto* iterTy = dynamic_cast<IterSemType*>(iterType.get())) {
-        sym.type = iterTy->elementType ? iterTy->elementType->clone() : ErrorSemType::make();
-    } else if (auto* viewTy = dynamic_cast<ViewSemType*>(iterType.get())) {
-        // ViewSemType：元素类型 = owner 的元素类型
-        if (auto* list = dynamic_cast<const ListSemType*>(viewTy->ownerType.get())) {
-            sym.type = list->elementType ? list->elementType->clone() : ErrorSemType::make();
-        } else {
-            sym.type = ErrorSemType::make();
-        }
-    } else {
-        sym.type = ErrorSemType::make();
-    }
-    symtab_.define(std::move(sym));
-    if (stmt.body) checkBlock(*stmt.body);
-    symtab_.exitScope();
-    insideLoop_ = prev;
-}
-```
-
-### 文件：src/CodeGen/StmtGen.cpp
-
-**修改 15b：genForStmt 默认数组遍历支持 view（L443-450）**
-
-```cpp
-// 原（L443-450）：
-    // 默认：数组/列表遍历
-    std::string iter = genExpr(*stmt.iterable, isCoroutine);
-    cpp << indentStr() << "for (auto " << safeName(stmt.itemName)
-        << " : *" << iter << ") {\n";
-    if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
-    writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
-    cpp << indentStr() << "}\n";
-}
-
-// 改为（无需修改，view 的 begin/end 已实现）：
-    // 默认：数组/列表遍历
-    // view 遍历同样用 *view 解引用（ArrayView 实现了 begin/end）
-    std::string iter = genExpr(*stmt.iterable, isCoroutine);
-    cpp << indentStr() << "for (auto " << safeName(stmt.itemName)
-        << " : *" << iter << ") {\n";
-    if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
-    writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
-    cpp << indentStr() << "}\n";
-}
-```
-
-**说明**：`for (auto x : *view)` 会调用 ArrayView::begin/end，返回 ArrayViewIterator，遍历范围 `[start_, start_+len_)`。
-
----
-
-## 变更 16：inferAssign 中 view 类型退化后处理
-
-### 文件：src/Sema/Checker/ExprInfer.cpp
-
-**修改 16a：inferAssign 中处理 view[i] = val（L410-427）**
-
-```cpp
-// 原（L410-427）：
-std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
-    // const 绑定不可重新赋值
-    if (auto* id = dynamic_cast<const Identifier*>(e.target.get())) {
-        if (auto* sym = symtab_.lookup(id->name)) {
-            if (sym->isConst) {
-                error(e, DiagCode::E015_ConstReassign,
-                      "cannot reassign to const binding '" + id->name + "'",
-                      "use 'let' instead of 'const' if you need to reassign");
+            // sync.ThreadChannel<T>(cap) 带参构造
+            if (e.method == "ThreadChannel") {
+                std::string targ = expectedTemplateArgs_.empty() ? "int32_t" : expectedTemplateArgs_[0];
+                std::string cap = e.args.empty() ? "0" : genExpr(*e.args[0], isCoroutine);
+                return "aura_rt::make_thread_channel<" + targ + ">(" + cap + ")";
             }
         }
     }
-    auto targetTy = inferExpr(*e.target);
-    auto valueTy  = inferExpr(*e.value);
-    if (!isAssignable(*targetTy, *valueTy)) {
-        error(e, "assignment type mismatch: ...");
-    }
-    return valueTy->clone();
-}
-
-// 改为（新增 view[i] = val 类型退化处理）：
-std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
-    // const 绑定不可重新赋值
-    if (auto* id = dynamic_cast<const Identifier*>(e.target.get())) {
-        if (auto* sym = symtab_.lookup(id->name)) {
-            if (sym->isConst) {
-                error(e, DiagCode::E015_ConstReassign,
-                      "cannot reassign to const binding '" + id->name + "'",
-                      "use 'let' instead of 'const' if you need to reassign");
-            }
-        }
-    }
-    auto targetTy = inferExpr(*e.target);
-    auto valueTy  = inferExpr(*e.value);
-    if (!isAssignable(*targetTy, *valueTy)) {
-        error(e, "assignment type mismatch: ...");
-    }
-
-    // view[i] = val 触发深拷贝退化
-    // 检测：target 是 IndexExpr，object 是 view 变量（ViewSemType）
-    if (auto* idxExpr = dynamic_cast<const IndexExpr*>(e.target.get())) {
-        if (idxExpr->object->inferredType
-            && dynamic_cast<const ViewSemType*>(idxExpr->object->inferredType)) {
-            if (auto* viewId = dynamic_cast<const Identifier*>(idxExpr->object.get())) {
-                if (auto* sym = symtab_.lookup(viewId->name)) {
-                    // 退化为 owner 类型（ListSemType）
-                    auto* viewType = dynamic_cast<const ViewSemType*>(
-                        idxExpr->object->inferredType);
-                    if (viewType && viewType->ownerType) {
-                        sym->updateType(viewType->ownerType->clone());
-                    }
-                }
-            }
-        }
-    }
-
-    return valueTy->clone();
 }
 ```
 
+**channelVarNames_ 检测**：`init.find("Channel<")`（StmtGen.cpp:239）已覆盖 `make_thread_channel<int>`（含 `ThreadChannel<` 子串），自动识别。无需修改。
+
 ---
 
-## 变更 17：isHeapSemType 识别 ViewSemType
+## 阶段 4：测试
 
-### 文件：src/CodeGen/ExprGen.cpp
+### 4.1 编译命令
 
-**修改 17a：isHeapSemType 识别 ViewSemType（L12-30）**
-
-```cpp
-// 原（L12-30）：
-bool CodeGenerator::isHeapSemType(const SemType* type) const {
-    if (!type) return false;
-    if (auto* p = dynamic_cast<const PrimSemType*>(type))
-        return p->kind == PrimSemType::String;
-    if (dynamic_cast<const NoneSemType*>(type)) return false;
-    if (dynamic_cast<const ErrorSemType*>(type)) return false;
-    if (dynamic_cast<const InterfaceSemType*>(type)) return false;
-    if (dynamic_cast<const FuncSemType*>(type)) return false;
-    if (auto* u = dynamic_cast<const UnionSemType*>(type)) {
-        for (auto& v : u->variants)
-            if (isHeapSemType(v.get())) return true;
-        return false;
-    }
-    return true;
-}
-
-// 改为：
-bool CodeGenerator::isHeapSemType(const SemType* type) const {
-    if (!type) return false;
-    if (auto* p = dynamic_cast<const PrimSemType*>(type))
-        return p->kind == PrimSemType::String;
-    if (dynamic_cast<const NoneSemType*>(type)) return false;
-    if (dynamic_cast<const ErrorSemType*>(type)) return false;
-    if (dynamic_cast<const InterfaceSemType*>(type)) return false;
-    if (dynamic_cast<const FuncSemType*>(type)) return false;
-    if (auto* u = dynamic_cast<const UnionSemType*>(type)) {
-        for (auto& v : u->variants)
-            if (isHeapSemType(v.get())) return true;
-        return false;
-    }
-    // ViewSemType：堆类型（ArrayView 是 GcObject）
-    if (dynamic_cast<const ViewSemType*>(type)) return true;
-    return true;
-}
+```powershell
+cmake --build build
+cmake --build runtime/build
 ```
 
-**说明**：实际上 ViewSemType 会落入最后的 `return true`，但显式添加分支更清晰。
+### 4.2 测试代码
 
----
-
-## 测试方案
-
-新建独立测试文件 `example/test.aura`（覆盖原文件）：
+在 `example/test.aura` 中追加 K18-K22：
 
 ```aura
-// ArrayView<T> 零拷贝视图测试
-
-fun main(io: Io) {
-    // K1: slice 基本读访问
-    io.println("=== K1: slice read ===")
-    let arr: [int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    let view = arr.slice(2, 5)
-    io.println("view len: " + view.len())
-    io.println("view[0]: " + view[0])
-    io.println("view[4]: " + view[4])
-
-    // K2: 嵌套 slice
-    io.println("=== K2: nested slice ===")
-    let view2 = view.slice(1, 3)
-    io.println("nested view len: " + view2.len())
-    io.println("nested view[0]: " + view2[0])
-    io.println("nested view[2]: " + view2[2])
-
-    // K3: GC 后 view 引用有效
-    io.println("=== K3: GC safety ===")
-    gc_force()
-    io.println("after GC, view[0]: " + view[0])
-    io.println("after GC, view2[2]: " + view2[2])
-
-    // K4: 空 slice
-    io.println("=== K4: empty slice ===")
-    let emptyView = arr.slice(0, 0)
-    io.println("empty view len: " + emptyView.len())
-    io.println("empty view empty: " + emptyView.empty())
-
-    // K5: front/back
-    io.println("=== K5: front/back ===")
-    io.println("view front: " + view.front())
-    io.println("view back: " + view.back())
-
-    // K6: for-in 迭代
-    io.println("=== K6: for-in iteration ===")
-    let sum: int = 0
-    for x in view {
-        sum = sum + x
+    // ---------- K18: sync.ThreadChannel 基础收发 ----------
+    io.println("=== K18: channel basic ===")
+    let ch18 = sync.ThreadChannel<int>(10)
+    sync thread(max = 2) {
+        spawn (ch18: sync.ThreadChannel<int>) {
+            for i in range(5) {
+                ch18.send(i)
+            }
+            ch18.close()
+        }
+        spawn (ch18: sync.ThreadChannel<int>, io: Io) {
+            var count = 0
+            while true {
+                let v = ch18.receive()
+                if v.is_none() { break }
+                count += 1
+            }
+            io.println("count: " + count)  // 5
+        }
     }
-    io.println("sum of view: " + sum)
 
-    // K7: view.append 触发深拷贝退化
-    io.println("=== K7: view.append degradation ===")
-    let view3 = arr.slice(1, 3)
-    io.println("before append, view3 len: " + view3.len())
-    view3.append(99)
-    io.println("after append, view3 len: " + view3.len())
-    io.println("view3[3]: " + view3[3])
-    view3.append(100)
-    io.println("view3[4]: " + view3[4])
-    io.println("arr len unchanged: " + arr.len())
-
-    // K8: view[i] = val 触发深拷贝
-    io.println("=== K8: view[i] = val ===")
-    let view4 = arr.slice(0, 3)
-    view4[0] = 999
-    io.println("view4[0]: " + view4[0])
-    io.println("arr[0] unchanged: " + arr[0])
-
-    // K9: 函数参数传递（view 与 [int] 等价）
-    io.println("=== K9: function param ===")
-    processView(view)
-
-    // K10: 大数组 slice + 多次 GC
-    io.println("=== K10: large slice + GC ===")
-    let big: [int] = []
-    let i: int = 0
-    while i < 100 {
-        big.append(i)
-        i = i + 1
+    // ---------- K19: sync.ThreadChannel 无缓冲 ----------
+    io.println("=== K19: unbuffered ===")
+    let ch19 = sync.ThreadChannel<int>(0)
+    sync thread(max = 2) {
+        spawn (ch19: sync.ThreadChannel<int>) {
+            ch19.send(42)
+            ch19.close()
+        }
+        spawn (ch19: sync.ThreadChannel<int>, io: Io) {
+            let v = ch19.receive()
+            io.println("v: " + v.unwrap())  // 42
+        }
     }
-    let bigView = big.slice(10, 50)
-    gc_force()
-    gc_force()
-    io.println("bigView len: " + bigView.len())
-    io.println("bigView[0]: " + bigView[0])
-    io.println("bigView[49]: " + bigView[49])
 
-    // K11: view 修改方法后 GC
-    io.println("=== K11: post-mutation GC ===")
-    let view5 = arr.slice(2, 4)
-    view5.append(77)
-    gc_force()
-    io.println("view5[4]: " + view5[4])
+    // ---------- K20: sync.ThreadChannel send 到已关闭抛错 ----------
+    io.println("=== K20: send on closed ===")
+    let ch20 = sync.ThreadChannel<int>(10)
+    ch20.close()
+    sync thread(max = 1) {
+        spawn (ch20: sync.ThreadChannel<int>, io: Io) {
+            try {
+                ch20.send(1)
+                io.println("no throw")
+            } catch {
+                io.println("caught")  // caught
+            }
+        }
+    }
 
-    io.println("=== All tests passed ===")
-}
+    // ---------- K21: sync.ThreadChannel fan-out/fan-in ----------
+    io.println("=== K21: fan-out/fan-in ===")
+    let jobs = sync.ThreadChannel<int>(100)
+    let results = sync.ThreadChannel<int>(100)
+    sync thread(max = 5) {
+        spawn (jobs: sync.ThreadChannel<int>) {
+            for i in range(20) { jobs.send(i) }
+            jobs.close()
+        }
+        spawn (jobs: sync.ThreadChannel<int>, results: sync.ThreadChannel<int>) {
+            while true {
+                let j = jobs.receive()
+                if j.is_none() { break }
+                results.send(j.unwrap() * 2)
+            }
+            results.close()
+        }
+        spawn (results: sync.ThreadChannel<int>, io: Io) {
+            var sum = 0
+            while true {
+                let r = results.receive()
+                if r.is_none() { break }
+                sum += r.unwrap()
+            }
+            io.println("sum: " + sum)  // 0+2+...+38 = 380
+        }
+    }
 
-fun processView(items: [int]) {
-    io.println("processView len: " + items.len())
-    io.println("processView first: " + items[0])
-}
+    // ---------- K22: Optional 基础（close 后 receive 返回 None）----------
+    io.println("=== K22: Optional ===")
+    let ch22 = sync.ThreadChannel<int>(5)
+    ch22.close()
+    let v22 = ch22.receive()
+    io.println("is_none: " + v22.is_none())  # true
 ```
+
+### 4.3 编译并运行
+
+```powershell
+.\aurac.exe example\test.aura --cpp example\test.cpp -o example\test.exe
+.\example\test.exe
+```
+
+### 4.4 验收
+
+- K18：count=5（无丢失）
+- K19：v=42（无缓冲同步握手）
+- K20：caught（send 到已关闭抛错）
+- K21：sum=380（fan-out/fan-in 正确）
+- K22：is_none=true（关闭后 receive 返回 None）
 
 ---
 
 ## 实施顺序
 
-1. 变更 1 — ViewSemType（SemType.h + .cpp）
-2. 变更 2 — ReturnTypeInfo View kind（BuiltinRegistry.h）
-3. 变更 3 — slice 注册改 View（BuiltinRegistry.h）
-4. 变更 7 — Symbol::updateType（Symbol.h）
-5. 变更 4 — semTypeFromBuiltinReturn 扩展（SemAnalyzer.h + .cpp）
-6. 变更 5 — inferMethodCall 传递 objType（ExprInfer.cpp）
-7. 变更 6 — handleViewMutation（SemAnalyzer.h + ExprInfer.cpp）
-8. 变更 16 — inferAssign view 退化（ExprInfer.cpp）
-9. 变更 14 — inferIndexExpr ViewSemType（ExprInfer.cpp）
-10. 变更 15 — checkForStmt ViewSemType（StmtChecker.cpp）
-11. 变更 8 — mapSemType ViewSemType（TypeMap.cpp）
-12. 变更 17 — isHeapSemType ViewSemType（ExprGen.cpp）
-13. 变更 10 — genLetStmt ViewSemType（StmtGen.cpp）
-14. 变更 11 — genMethodCall 重新绑定（ExprGen.cpp）
-15. 变更 12 — genAssignExpr view[i]=val（ExprGen.cpp）
-16. 变更 13 — ArrayView 修改方法 + ViewIterator（array.h）
-17. 编译 + 测试
+1. **Runtime**：1.1 types.h → 1.2 thread_channel.h → 1.3 aura_rt.h（编译 runtime）
+2. **Sema**：2.1 SemType.h → 2.2 SemType.cpp → 2.3 BuiltinRegistry.h → 2.4 SemAnalyzer.cpp（编译 aurac）
+3. **CodeGen**：3.1 TypeMap.cpp → 3.2 StmtGen.cpp → 3.3 ExprGen.cpp（编译 aurac）
+4. **测试**：4.2 追加测试代码 → 4.3 编译运行 → 4.4 验收
+
+## 风险点
+
+- `Optional<T>::unwrap()` 调用 `make_runtime_error`：types.h 不 include error.h（避免循环依赖）。unwrap() 是模板内联函数，调用点（用户代码生成的 .cpp）必然已 include aura_rt.h（含 error.h）。若编译报错，将 unwrap() 改为头文件外定义模板特化。
+- `Optional<T>` 的 `T{}` 默认初始化：对 `GcString*` 等指针类型为 nullptr，安全；对基础类型为 0/false，可接受。
+- `is_pointer_v<T>` 判断：`int32_t`/`double`/`bool` 为 false，`GcString*`/`Array<T>*` 为 true。覆盖所有 T 场景。

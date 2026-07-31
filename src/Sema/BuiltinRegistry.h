@@ -38,15 +38,17 @@ struct ParamInfo {
 };
 
 struct ReturnTypeInfo {
-    enum class Kind { Named, Generic, None, Generator };
+    enum class Kind { Named, Generic, None, Generator, Optional };
     Kind kind;
-    std::string typeName;       // Named 时 / Generic fallback / Generator 元素类型
+    std::string typeName;       // Named 时 / Generic fallback / Generator 元素类型 / Optional 元素类型占位
     int  genericParamIdx = 0;   // Generic 时：引用第几个参数的类型（0-based）
 
     static ReturnTypeInfo Named(const std::string& tn)    { return {Kind::Named, tn, 0}; }
     static ReturnTypeInfo Generic(int idx, const std::string& fb) { return {Kind::Generic, fb, idx}; }
     static ReturnTypeInfo None()                          { return {Kind::None, "", 0}; }
     static ReturnTypeInfo Generator(const std::string& el){ return {Kind::Generator, el, 0}; }
+    // Optional: 元素类型由 objType 推断（ typeName 是占位 "T"，semTypeFromBuiltinReturn 用 objType->clone() ）
+    static ReturnTypeInfo Optional(const std::string& elemType) { return {Kind::Optional, elemType, 0}; }
 };
 
 struct BuiltinGlobalFn {
@@ -219,6 +221,11 @@ private:
             // v1.1: RWMutex / Once（堆对象，可分配在 GC 堆）
             {"RWMutex", {"RWMutex", true, true, BuiltinPrim::Other,     "aura_rt::RWMutex*"}},
             {"Once",    {"Once",    true, true, BuiltinPrim::Other,     "aura_rt::Once*"}},
+            // sync.Channel<T>：sync thread 跨线程通信通道（堆对象）
+            // Aura 暴露名 sync.Channel，C++ Runtime 仍叫 ThreadChannel<T> 以与协程 Channel<T> 区分
+            {"sync.Channel", {"sync.Channel", true, true, BuiltinPrim::Other, "aura_rt::ThreadChannel*"}},
+            // Optional<T>：T | None 联合类型的 GC 安全封装（堆对象）
+            {"Optional", {"Optional", true, true, BuiltinPrim::Other, "aura_rt::Optional*"}},
             // 虚拟类型：r()/w() 返回的锁视图，仅用于 Sema 类型推断和 L1 检查
             // 不是堆类型，用户不能直接声明
             {"RWMutexReadView",  {"RWMutexReadView",  false, false, BuiltinPrim::Other, "aura_rt::RWMutex::ReadGuard"}},
@@ -263,6 +270,18 @@ private:
             // --- RWMutex 方法：r()/w() 返回锁视图（无参数）---
             {"RWMutex", "r", {}, ReturnTypeInfo::Named("RWMutexReadView")},
             {"RWMutex", "w", {}, ReturnTypeInfo::Named("RWMutexWriteView")},
+
+            // --- sync.Channel<T> 方法（Aura 暴露名；C++ Runtime: ThreadChannel<T>）---
+            // send(v: T)：满时阻塞；关闭后 send 抛 RuntimeError
+            {"sync.Channel", "send",    {{"v", "T"}},  ReturnTypeInfo::None()},
+            // receive()：空时阻塞；关闭且空时返回 None（Optional<T>）
+            {"sync.Channel", "receive", {},             ReturnTypeInfo::Optional("T")},
+            {"sync.Channel", "close",   {},             ReturnTypeInfo::None()},
+            {"sync.Channel", "is_done", {},             ReturnTypeInfo::Named("bool")},
+
+            // --- Optional<T> 方法 ---
+            {"Optional", "is_none", {}, ReturnTypeInfo::Named("bool")},
+            {"Optional", "unwrap",  {}, ReturnTypeInfo::Generic(0, "T")},
         };
 
         // ============================================================
@@ -280,6 +299,10 @@ private:
             // v1.1: sync.RWMutex / sync.Once 构造函数
             {"sync.RWMutex", {}, ReturnTypeInfo::Named("RWMutex")},
             {"sync.Once",    {}, ReturnTypeInfo::Named("Once")},
+            // sync.Channel 构造函数（带 cap 参数）
+            {"sync.Channel", {{"cap", "int"}}, ReturnTypeInfo::Named("sync.Channel")},
+            // sync.Channel 无参构造（cap=0，视为 cap=1，近似无缓冲）
+            {"sync.Channel", {},                ReturnTypeInfo::Named("sync.Channel")},
             // GC 内建函数
             {"gc_force", {}, ReturnTypeInfo::None()},
             {"gc_stats", {}, ReturnTypeInfo::Named("string")},

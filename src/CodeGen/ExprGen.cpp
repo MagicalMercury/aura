@@ -646,18 +646,44 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
 }
 
 std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCoroutine) {
-    // sync.Mutex() / sync.RWMutex() / sync.Once() 构造特殊处理：sync 是内置伪模块
-    // 解析为 MethodCallExpr(object=Identifier("sync"), method="Mutex"/"RWMutex"/"Once")
+    // sync.Mutex() / sync.RWMutex() / sync.Once() / sync.Channel<T>(cap) 构造特殊处理
+    // 解析为 MethodCallExpr(object=Identifier("sync"), method="Mutex"/.../"Channel")
+    // Aura 暴露 sync.Channel<T>，C++ Runtime 仍叫 ThreadChannel<T>（与协程 Channel<T> 区分）
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
-        if (id->name == "sync" && e.args.empty()) {
-            if (e.method == "Mutex") {
-                return "aura_rt::make_mutex()";
-            }
-            if (e.method == "RWMutex") {
-                return "aura_rt::make_rwmutex()";
-            }
-            if (e.method == "Once") {
-                return "aura_rt::make_once()";
+        if (id->name == "sync") {
+            // 无参构造：Mutex / RWMutex / Once / Channel()
+            if (e.args.empty()) {
+                if (e.method == "Mutex") {
+                    return "aura_rt::make_mutex()";
+                }
+                if (e.method == "RWMutex") {
+                    return "aura_rt::make_rwmutex()";
+                }
+                if (e.method == "Once") {
+                    return "aura_rt::make_once()";
+                }
+                // sync.Channel() 无参 → cap=0（运行时视为 cap=1）
+                if (e.method == "Channel") {
+                    std::string targ = expectedTemplateArgs_.empty() ? "int32_t" : expectedTemplateArgs_[0];
+                    std::string result = "aura_rt::make_thread_channel<" + targ + ">(0)";
+                    // 跟踪为 channel 变量（for-in 展开用）
+                    if (!currentLetName_.empty()) {
+                        channelVarNames_.insert(currentLetName_);
+                    }
+                    return result;
+                }
+            } else {
+                // sync.Channel<T>(cap) 带参构造
+                if (e.method == "Channel") {
+                    std::string targ = expectedTemplateArgs_.empty() ? "int32_t" : expectedTemplateArgs_[0];
+                    std::string cap = genExpr(*e.args[0], isCoroutine);
+                    std::string result = "aura_rt::make_thread_channel<" + targ + ">(" + cap + ")";
+                    // 跟踪为 channel 变量（for-in 展开用）
+                    if (!currentLetName_.empty()) {
+                        channelVarNames_.insert(currentLetName_);
+                    }
+                    return result;
+                }
             }
         }
     }
@@ -694,10 +720,16 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
     bool needAwait = isIoCall && isCoroutine
                      && BuiltinRegistry::get().methodHasAsync("Io", e.method);
 
-    // channel.send / channel.receive 需要 co_await
+    // channel.send / channel.receive 需要 co_await（协程 channel 专用）
+    // sync.ThreadChannel 的 send/receive 是阻塞调用，非协程 awaitable
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
         if (channelVarNames_.count(id->name) && (e.method == "send" || e.method == "receive")) {
-            needAwait = needAwait || isCoroutine;
+            bool isSyncChannel = false;
+            auto it = gcRootTypes_.find(id->name);
+            if (it != gcRootTypes_.end() && it->second.find("ThreadChannel") != std::string::npos)
+                isSyncChannel = true;
+            if (!isSyncChannel)
+                needAwait = needAwait || isCoroutine;
         }
     }
 

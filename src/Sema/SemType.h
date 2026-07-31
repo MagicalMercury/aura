@@ -123,6 +123,22 @@ struct IterSemType : SemType {
     }
 };
 
+// Optional<T> 类型 — sync.ThreadChannel.receive 等方法的返回类型
+// 与 runtime/types.h 的 aura_rt::Optional<T> 对应
+struct OptionalSemType : SemType {
+    std::unique_ptr<SemType> elementType;
+    [[nodiscard]] bool equals(const SemType& other) const override;
+    [[nodiscard]] std::string toString() const override {
+        return "Optional<" + (elementType ? elementType->toString() : "?") + ">";
+    }
+    [[nodiscard]] std::unique_ptr<SemType> clone() const override;
+    static std::unique_ptr<OptionalSemType> make(std::unique_ptr<SemType> el) {
+        auto n = std::make_unique<OptionalSemType>();
+        n->elementType = std::move(el);
+        return n;
+    }
+};
+
 // ============================================================
 // 工具函数
 // ============================================================

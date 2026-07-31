@@ -91,6 +91,9 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
             type = mapSemType(*ls);
         } else if (auto* ps = dynamic_cast<const PrimSemType*>(decl.inferredType)) {
             type = mapSemType(*ps);
+        } else if (auto* os = dynamic_cast<const OptionalSemType*>(decl.inferredType)) {
+            // Optional<T> 推断类型 → 映射为 aura_rt::Optional<T>*
+            type = mapSemType(*os);
         }
     }
 
@@ -423,11 +426,26 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
         }
     }
 
-    // 检测 channel 遍历：for val in ch → while + co_await receive 循环
+    // 检测 channel 遍历：for val in ch → while + receive 循环
     if (auto* id = dynamic_cast<const Identifier*>(stmt.iterable.get())) {
         if (channelVarNames_.count(id->name)) {
             std::string var = safeName(stmt.itemName);
             std::string chName = safeName(id->name);
+            // sync thread 内：阻塞 while + receive（不调用 is_done()，避免冗余锁）
+            // sync.ThreadChannel.receive() 返回 Optional<T>，关闭且空时返回 None
+            if (inSyncThreadBlock_) {
+                cpp << indentStr() << "while (true) {\n";
+                indentLevel_++;
+                writeLine(cpp, "auto _opt = " + chName + "->receive();");
+                writeLine(cpp, "if (_opt->is_none()) break;");
+                writeLine(cpp, "auto " + var + " = _opt->unwrap();");
+                if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+                writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
+                indentLevel_--;
+                cpp << indentStr() << "}\n";
+                return;
+            }
+            // 协程路径（原有）：co_await receive
             cpp << indentStr() << "while (true) {\n";
             indentLevel_++;
             writeLine(cpp, "if (" + chName + "->is_done()) break;");
@@ -1042,7 +1060,9 @@ void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
     // 此处 stmt.params 非空
 
     bool oldIoSync = ioSync_;
-    ioSync_ = true;  // 强制 io 方法用 _sync 版本（不能用 co_await）
+    bool oldCoroutine = currentFunctionIsCoroutine_;
+    ioSync_ = true;                     // 强制 io 方法用 _sync 版本（不能用 co_await）
+    currentFunctionIsCoroutine_ = false; // sync thread lambda 不是协程，禁止 co_await
 
     // 生成捕获列表：显式参数按值捕获
     // io 特殊处理：引用捕获（Io 通常不可拷贝，且共享底层 iocp）
@@ -1082,6 +1102,7 @@ void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
     cpp << indentStr() << "});\n";
 
     ioSync_ = oldIoSync;
+    currentFunctionIsCoroutine_ = oldCoroutine;
 }
 
 // ============================================================
