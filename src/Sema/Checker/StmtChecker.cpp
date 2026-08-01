@@ -111,6 +111,10 @@ void SemAnalyzer::checkReturnStmt(const ReturnStmt& stmt) {
     if (inLockBlock_) {
         error(stmt, "cannot return out of lock block");
     }
+    // sync/spawn 块内禁止 return 跨出（跳过 when_all / waitGroup）
+    if (!syncBoundaryStack_.empty()) {
+        error(stmt, "cannot return out of " + syncBoundaryStack_.back().kind + " block");
+    }
     // 无表达式的 return 允许（void 等价）
 }
 
@@ -144,15 +148,15 @@ void SemAnalyzer::checkWhileStmt(const WhileStmt& stmt) {
     if (!isAssignable(*boolType(), *condType)) {
         error(*stmt.condition, "while condition must be bool, got '" + condType->toString() + "'");
     }
-    bool prev = insideLoop_; insideLoop_ = true;
+    int prev = loopDepth_; loopDepth_++;
     if (stmt.body) checkBlock(*stmt.body);
-    insideLoop_ = prev;
+    loopDepth_ = prev;
 }
 
 void SemAnalyzer::checkForStmt(const ForStmt& stmt) {
     auto iterType = inferExpr(*stmt.iterable);
     // 迭代类型默认合法（运行时检查），这里只确保表达式无错误
-    bool prev = insideLoop_; insideLoop_ = true;
+    int prev = loopDepth_; loopDepth_++;
     symtab_.enterScope();
     Symbol sym;
     sym.kind = SymKind::Variable;
@@ -191,13 +195,13 @@ void SemAnalyzer::checkForStmt(const ForStmt& stmt) {
     symtab_.define(std::move(sym));
     if (stmt.body) checkBlock(*stmt.body);
     symtab_.exitScope();
-    insideLoop_ = prev;
+    loopDepth_ = prev;
 }
 
 void SemAnalyzer::checkLoopStmt(const LoopStmt& stmt) {
-    bool prev = insideLoop_; insideLoop_ = true;
+    int prev = loopDepth_; loopDepth_++;
     if (stmt.body) checkBlock(*stmt.body);
-    insideLoop_ = prev;
+    loopDepth_ = prev;
 }
 
 void SemAnalyzer::checkMatchStmt(const MatchStmt& stmt) {
@@ -267,7 +271,9 @@ void SemAnalyzer::checkSyncStmt(const SyncStmt& stmt) {
         bool oldInThread = inSyncThreadBlock_;
         insideSync_ = true;          // spawn 合法
         inSyncThreadBlock_ = true;   // 多线程模式
+        syncBoundaryStack_.push_back({"sync thread", loopDepth_});
         if (stmt.body) checkBlock(*stmt.body);
+        syncBoundaryStack_.pop_back();
         insideSync_ = oldInSync;
         inSyncThreadBlock_ = oldInThread;
         return;
@@ -281,7 +287,9 @@ void SemAnalyzer::checkSyncStmt(const SyncStmt& stmt) {
         }
     }
     insideSync_ = true;
+    syncBoundaryStack_.push_back({"sync", loopDepth_});
     if (stmt.body) checkBlock(*stmt.body);
+    syncBoundaryStack_.pop_back();
     insideSync_ = false;
 }
 
@@ -313,7 +321,29 @@ void SemAnalyzer::checkSyncForStmt(const SyncForStmt& stmt) {
         sym.type = std::move(elemType);
         symtab_.define(std::move(sym));
     }
-    if (stmt.body) checkBlock(*stmt.body);
+
+    if (stmt.isThread) {
+        // R1: 禁止嵌套 sync thread
+        if (inSyncThreadBlock_) {
+            error(stmt, "nested sync thread not allowed");
+            symtab_.exitScope();
+            insideSync_ = false;
+            return;
+        }
+        bool oldInSync = insideSync_;
+        bool oldInThread = inSyncThreadBlock_;
+        insideSync_ = true;
+        inSyncThreadBlock_ = true;
+        syncBoundaryStack_.push_back({"sync thread for", loopDepth_});
+        if (stmt.body) checkBlock(*stmt.body);
+        syncBoundaryStack_.pop_back();
+        insideSync_ = oldInSync;
+        inSyncThreadBlock_ = oldInThread;
+    } else {
+        syncBoundaryStack_.push_back({"sync for", loopDepth_});
+        if (stmt.body) checkBlock(*stmt.body);
+        syncBoundaryStack_.pop_back();
+    }
     symtab_.exitScope();
     insideSync_ = false;
 }
@@ -332,36 +362,43 @@ void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
         return;
     }
 
-    // R3: sync thread 块内的 spawn 必须显式传参（避免隐式捕获导致数据竞争）
-    if (inSyncThreadBlock_ && stmt.params.empty()) {
-        error(stmt, "spawn in sync thread must have explicit params"
-                    " (use 'spawn (io: Io, x: int) { ... }' form in sync thread block)");
+    // === 调用形态：spawn func(args) ===
+    // 无 body、无 params 作用域；callee/参数匹配由 inferExpr 保证；
+    // R3 天然满足：args 中标识符显式可见，无隐式捕获
+    if (stmt.callExpr) {
+        auto _ = inferExpr(*stmt.callExpr);
+        return;
+    }
+
+    // === 空参数闭包拒绝：旧式自动捕获已删除 ===
+    // spawn () { ... } 无显式参数，若放行会落入 CodeGen 空路径（静默丢语句）
+    if (stmt.params.empty()) {
+        error(stmt, "spawn closure must have explicit params"
+                    " (use 'spawn (io: Io, x: int) { ... }' or 'spawn func(args)')");
         return;
     }
 
     // 显式传参：将参数注册到 spawn 作用域（参数只读）
-    if (!stmt.params.empty()) {
-        symtab_.enterScope();
-        for (auto& p : stmt.params) {
-            Symbol sym;
-            sym.kind = SymKind::Variable;
-            sym.name = p.name;
-            sym.type = p.type ? resolveType(*p.type) : nullptr;
-            sym.isConst = true;  // spawn 参数只读
-            symtab_.define(std::move(sym));
-        }
+    symtab_.enterScope();
+    for (auto& p : stmt.params) {
+        Symbol sym;
+        sym.kind = SymKind::Variable;
+        sym.name = p.name;
+        sym.type = p.type ? resolveType(*p.type) : nullptr;
+        sym.isConst = true;  // spawn 参数只读
+        symtab_.define(std::move(sym));
     }
 
     // 处理 spawn 体
     symtab_.enterScope();
+    syncBoundaryStack_.push_back({"spawn", loopDepth_});
     for (auto& s : stmt.body) {
         if (s) checkStmt(*s);
     }
+    syncBoundaryStack_.pop_back();
     symtab_.exitScope();
 
-    if (!stmt.params.empty()) {
-        symtab_.exitScope();
-    }
+    symtab_.exitScope();
 }
 
 void SemAnalyzer::checkExprStmt(const ExprStmt& stmt) {

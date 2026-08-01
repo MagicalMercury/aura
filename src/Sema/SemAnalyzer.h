@@ -142,11 +142,20 @@ private:
     // 当前正在检查的函数的返回类型（用于 return 检查）
     std::unique_ptr<SemType> currentReturnType_;
     bool currentFunctionThrows_ = false;
-    bool insideLoop_ = false; // break/continue 仅在循环内合法
+    int  loopDepth_ = 0;      // 循环嵌套深度（替代 insideLoop_ 的 bool，配合同步块边界栈判定 break/continue 跨出）
     bool insideSync_ = false; // spawn 仅在 sync 块内合法
     bool inSyncThreadBlock_ = false;  // sync thread 块内（禁止嵌套 / 无参 spawn）
     bool inLockBlock_ = false;        // lock 块内（禁止 return/break/continue 跨出）
     int  insideTry_  = 0;    // try 块嵌套深度（>0 时 ! 不报 non-throwing）
+
+    // ============ 同步块边界栈 ============
+    // 记录进入 sync/spawn 块时的循环深度，用于拦截 return/break/continue 跨出块
+    // （生成代码会跳过 co_await when_all / _stx waitGroup 析构）
+    struct SyncBoundary {
+        std::string kind;       // "sync" / "sync thread" / "sync for" / "sync thread for" / "spawn"
+        int loopDepthAtEntry;   // 进入块时的 loopDepth_
+    };
+    std::vector<SyncBoundary> syncBoundaryStack_;
 
     // ============ 递归类型解析 ============
     void propagateCanonicalName(const ASTNode& expr, const SemType* type);

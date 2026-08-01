@@ -239,7 +239,8 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
 // ============================================================
 
 void SemAnalyzer::checkFunBody(const FunDecl& decl) {
-    insideLoop_ = false;
+    loopDepth_ = 0;
+    syncBoundaryStack_.clear();
 
     symtab_.enterScope(ScopeKind::Function);
 
@@ -267,7 +268,8 @@ void SemAnalyzer::checkFunBody(const FunDecl& decl) {
 }
 
 void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
-    insideLoop_ = false;
+    loopDepth_ = 0;
+    syncBoundaryStack_.clear();
 
     symtab_.enterScope(ScopeKind::Function);
 

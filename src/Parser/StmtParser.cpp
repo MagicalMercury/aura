@@ -182,17 +182,33 @@ std::unique_ptr<Stmt> Parser::parseTryCatchStmt() {
 
 std::unique_ptr<Stmt> Parser::parseSyncStmt() {
     auto tok = advance(); // sync
-    auto stmt = std::make_unique<SyncStmt>();
-    setNodePos(stmt.get(), tok);
-
     // 检测 thread 软关键字：sync thread { ... } 或 sync thread(max=N) { ... }
     // 'thread' 在此位置作为关键字识别，其他位置仍是普通标识符
     if (check(TokType::Identifier) && peek().lexeme == "thread") {
         advance();  // consume 'thread'
+        // 新增：sync thread for → 转发共享解析（thread 模式）
+        if (check(TokType::For)) {
+            advance(); // for
+            return parseSyncForRest(tok, true);
+        }
+        auto stmt = std::make_unique<SyncStmt>();
+        setNodePos(stmt.get(), tok);
         stmt->isThread = true;
+        // 可选参数：sync thread(max = expr) { ... }
+        if (check(TokType::LParen)) {
+            advance(); // (
+            consume(TokType::Identifier, "expected 'max' after 'sync('");
+            consume(TokType::Assign, "expected '=' after 'max'");
+            stmt->maxExpr = parseExpr();
+            consume(TokType::RParen, "expected ')' after sync max expression");
+        }
+        stmt->body = parseBlock();
+        return stmt;
     }
 
-    // 可选参数：sync(max = expr) { ... } 或 sync thread(max = expr) { ... }
+    // 原有 sync 协程逻辑
+    auto stmt = std::make_unique<SyncStmt>();
+    setNodePos(stmt.get(), tok);
     if (check(TokType::LParen)) {
         advance(); // (
         consume(TokType::Identifier, "expected 'max' after 'sync('");
@@ -200,18 +216,25 @@ std::unique_ptr<Stmt> Parser::parseSyncStmt() {
         stmt->maxExpr = parseExpr();
         consume(TokType::RParen, "expected ')' after sync max expression");
     }
-
     stmt->body = parseBlock();
     return stmt;
 }
 
 std::unique_ptr<Stmt> Parser::parseSyncForStmt() {
-    auto tok = advance(); // sync
-    advance();            // skip 'for'
-    auto stmt = std::make_unique<SyncForStmt>();
-    setNodePos(stmt.get(), tok);
+    auto syncTok = advance(); // sync
+    advance();                // for
+    return parseSyncForRest(syncTok, false);
+}
 
-    // 可选参数：sync for(max = expr)
+// 共享：sync for / sync thread for 公共解析
+// isThread=false 入口：parseSyncForStmt()（消费 sync+for 后调用）
+// isThread=true  入口：parseSyncStmt()（消费 sync+thread+for 后调用）
+std::unique_ptr<Stmt> Parser::parseSyncForRest(Token& syncTok, bool isThread) {
+    auto stmt = std::make_unique<SyncForStmt>();
+    setNodePos(stmt.get(), syncTok);
+    stmt->isThread = isThread;
+
+    // 可选参数：for(max = expr)
     if (check(TokType::LParen)) {
         advance(); // (
         consume(TokType::Identifier, "expected 'max' after 'sync for('");
@@ -225,7 +248,25 @@ std::unique_ptr<Stmt> Parser::parseSyncForStmt() {
     stmt->itemName = itemTok.lexeme;
     consume(TokType::Identifier, "expected 'in' after loop variable");
     stmt->iterable = parseExpr();
-    stmt->body = parseBlock();
+
+    // === 省略花括号（Feature 3）：仅允许函数/方法调用 ===
+    if (check(TokType::LBrace)) {
+        stmt->body = parseBlock();
+    } else {
+        auto expr = parseExpr();
+        if (!expr) return nullptr;
+        if (!dynamic_cast<CallExpr*>(expr.get())
+            && !dynamic_cast<MethodCallExpr*>(expr.get())) {
+            error("expected function call after 'sync for ... in ...' "
+                  "(wrap complex bodies in braces)");
+            return nullptr;
+        }
+        auto block = std::make_unique<BlockStmt>();
+        auto es = std::make_unique<ExprStmt>();
+        es->expr = std::move(expr);
+        block->stmts.push_back(std::move(es));
+        stmt->body = std::move(block);
+    }
     return stmt;
 }
 
@@ -234,41 +275,52 @@ std::unique_ptr<Stmt> Parser::parseSpawnStmt() {
     auto stmt = std::make_unique<SpawnStmt>();
     setNodePos(stmt.get(), tok);
 
-    // 可选参数列表：spawn (io: Io, n: int) { ... }
+    // 分支判定：spawn ( → 闭包形态；spawn 其他 → 调用形态
     if (check(TokType::LParen)) {
+        // === 闭包形态：spawn (io: Io, n: int) { ... } [可选显式实参] ===
         advance(); // consume '('
         if (!check(TokType::RParen))
             stmt->params = parseParams();
         consume(TokType::RParen, "expected ')' after spawn parameters");
-    }
+        consume(TokType::LBrace, "expected '{' after spawn parameters");
 
-    // 向后兼容：无参数列表时允许旧式 spawn { ... }
-    consume(TokType::LBrace, "expected '{' after 'spawn'");
+        while (!check(TokType::RBrace) && !atEnd()) {
+            auto s = parseStmt();
+            if (s) {
+                stmt->body.push_back(std::move(s));
+            } else {
+                // 错误恢复：同步到下一个安全恢复点，避免死循环
+                synchronize();
+            }
+        }
+        consume(TokType::RBrace, "expected '}' after spawn body");
 
-    while (!check(TokType::RBrace) && !atEnd()) {
-        auto s = parseStmt();
-        if (s) {
-            stmt->body.push_back(std::move(s));
-        } else {
-            // 错误恢复：同步到下一个安全恢复点，避免死循环
-            synchronize();
+        // 可选的显式实参：spawn (x: int) { ... }(arg)
+        if (check(TokType::LParen)) {
+            advance(); // (
+            while (!check(TokType::RParen) && !atEnd()) {
+                auto arg = parseExpr();
+                if (arg) stmt->args.push_back(std::move(arg));
+                if (!check(TokType::RParen))
+                    consume(TokType::Comma, "expected ',' between spawn arguments");
+            }
+            consume(TokType::RParen, "expected ')' after spawn arguments");
+        }
+    } else {
+        // === 调用形态：spawn func(args) / spawn obj.method(args) ===
+        if (check(TokType::LBrace)) {
+            error("old-style 'spawn { ... }' is removed; "
+                  "use 'spawn func(args)' or 'spawn (params) { ... }'");
+            return nullptr;   // 直接返回，避免 parseExpr 吞掉块 token 造成级联错误
+        }
+        stmt->callExpr = parseExpr();
+        if (!stmt->callExpr) return nullptr;
+        if (!dynamic_cast<CallExpr*>(stmt->callExpr.get())
+            && !dynamic_cast<MethodCallExpr*>(stmt->callExpr.get())) {
+            error("expected function call after 'spawn', got non-call expression");
+            return nullptr;
         }
     }
-
-    consume(TokType::RBrace, "expected '}' after spawn body");
-
-    // 可选的显式实参调用：...(arg1, arg2)
-    if (check(TokType::LParen)) {
-        advance(); // (
-        while (!check(TokType::RParen) && !atEnd()) {
-            auto arg = parseExpr();
-            if (arg) stmt->args.push_back(std::move(arg));
-            if (!check(TokType::RParen))
-                consume(TokType::Comma, "expected ',' between spawn arguments");
-        }
-        consume(TokType::RParen, "expected ')' after spawn arguments");
-    }
-
     return stmt;
 }
 

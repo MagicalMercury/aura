@@ -583,13 +583,19 @@ void SemAnalyzer::checkStmt(const Stmt& stmt) {
     if (auto* l = dynamic_cast<const LockStmt*>(&stmt))         { checkLockStmt(*l);    return; }
     if (auto* e = dynamic_cast<const ExprStmt*>(&stmt))         { checkExprStmt(*e);    return; }
     if (auto* br = dynamic_cast<const BreakStmt*>(&stmt)) {
-        if (!insideLoop_) error(*br, "'break' outside of loop");
+        if (loopDepth_ == 0) error(*br, "'break' outside of loop");
         if (inLockBlock_) error(*br, "cannot break out of lock block");
+        if (!syncBoundaryStack_.empty()
+            && loopDepth_ <= syncBoundaryStack_.back().loopDepthAtEntry)
+            error(*br, "cannot break out of " + syncBoundaryStack_.back().kind + " block");
         return;
     }
     if (auto* co = dynamic_cast<const ContinueStmt*>(&stmt)) {
-        if (!insideLoop_) error(*co, "'continue' outside of loop");
+        if (loopDepth_ == 0) error(*co, "'continue' outside of loop");
         if (inLockBlock_) error(*co, "cannot continue out of lock block");
+        if (!syncBoundaryStack_.empty()
+            && loopDepth_ <= syncBoundaryStack_.back().loopDepthAtEntry)
+            error(*co, "cannot continue out of " + syncBoundaryStack_.back().kind + " block");
         return;
     }
 }

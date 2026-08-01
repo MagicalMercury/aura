@@ -354,6 +354,7 @@ void SyncStmt::print(std::ostream& os, int indent) const {
 void SyncForStmt::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << "SyncForStmt";
+    if (isThread) os << " thread";
     if (maxExpr) os << " (max)";
     os << " item=" << itemName << '\n';
     if (body) body->print(os, indent + 1);
@@ -369,6 +370,11 @@ void LockStmt::print(std::ostream& os, int indent) const {
 void SpawnStmt::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << "SpawnStmt" << '\n';
+    if (callExpr) {                                  // 调用形态
+        printIndent(os, indent + 1);
+        os << "call:\n";
+        callExpr->print(os, indent + 2);
+    }
     for (auto& s : body) {
         if (s) s->print(os, indent + 1);
     }

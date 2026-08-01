@@ -396,6 +396,31 @@ void CodeGenerator::genWhileStmt(std::ostream& cpp, const WhileStmt& stmt,
 
 void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
                                 bool isCoroutine) {
+    // 迭代变量在循环体内以值方式引用：临时移出 GC 根集合/类型集合
+    // （修复：gcRootVarNames_ 无作用域清理，与其他作用域同名 GcRootHandle 变量
+    //   状态残留会导致迭代变量被误判生成 .get()；循环结束后恢复）
+    struct IterVarGuard {
+        std::set<std::string>& roots;
+        std::unordered_map<std::string, std::string>& types;
+        std::string name;
+        bool wasRoot;
+        bool hadType;
+        std::string savedType;
+        IterVarGuard(std::set<std::string>& r,
+                     std::unordered_map<std::string, std::string>& t,
+                     const std::string& n)
+            : roots(r), types(t), name(n),
+              wasRoot(r.erase(n) > 0), hadType(false) {
+            auto it = t.find(n);
+            if (it != t.end()) { savedType = it->second; t.erase(it); hadType = true; }
+        }
+        ~IterVarGuard() {
+            if (wasRoot) roots.insert(name);
+            if (hadType) types[name] = savedType;
+        }
+    };
+    IterVarGuard iterGuard(gcRootVarNames_, gcRootTypes_, safeName(stmt.itemName));
+
     // 检测 range() 调用 — 展开为 std::views::iota 或 step 循环
     if (auto* call = dynamic_cast<const CallExpr*>(stmt.iterable.get())) {
         auto* id = dynamic_cast<const Identifier*>(call->callee.get());
@@ -447,7 +472,26 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
                 cpp << indentStr() << "}\n";
                 return;
             }
-            // 协程路径（原有）：co_await receive
+            // 协程路径：区分 coroutine channel（co_await receive）与 sync.ThreadChannel（阻塞 receive）
+            // sync.ThreadChannel 的 receive() 返回 Optional<T>*（同步阻塞），非协程 awaitable
+            bool isSyncChannel = false;
+            auto git = gcRootTypes_.find(id->name);
+            if (git != gcRootTypes_.end()
+                && git->second.find("ThreadChannel") != std::string::npos)
+                isSyncChannel = true;
+            if (isSyncChannel) {
+                cpp << indentStr() << "while (true) {\n";
+                indentLevel_++;
+                writeLine(cpp, "auto _opt = " + chName + "->receive();");
+                writeLine(cpp, "if (_opt->is_none()) break;");
+                writeLine(cpp, "auto " + var + " = _opt->unwrap();");
+                if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+                writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
+                indentLevel_--;
+                cpp << indentStr() << "}\n";
+                return;
+            }
+            // 协程 channel<T>（原有）：co_await receive
             cpp << indentStr() << "while (true) {\n";
             indentLevel_++;
             writeLine(cpp, "if (" + chName + "->is_done()) break;");
@@ -738,11 +782,93 @@ void CodeGenerator::genSyncThreadStmt(std::ostream& cpp, const SyncStmt& stmt) {
     cpp << indentStr() << "}\n";
 }
 
-void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt,
-                                    bool /*isCoroutine*/) {
+void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, bool) {
     std::string var = safeName(stmt.itemName);
     bool hasMax = stmt.maxExpr != nullptr;
 
+    // === 线程版：sync thread for ===
+    if (stmt.isThread) {
+        cpp << indentStr() << "{\n";
+        indentLevel_++;
+        std::string maxArg = hasMax ? genExpr(*stmt.maxExpr, false) : "0";
+        writeLine(cpp, "aura_rt::sync_thread_context _stx(" + maxArg + ");");
+        writeLine(cpp, "aura_rt::ThreadPool::instance().ensureStarted();");
+
+        // for 循环头（复用协程版的 range/数组遍历生成逻辑）
+        bool isRangeCall = false;
+        if (auto* call = dynamic_cast<const CallExpr*>(stmt.iterable.get())) {
+            auto* id = dynamic_cast<const Identifier*>(call->callee.get());
+            if (id && id->name == "range") {
+                isRangeCall = true;
+                if (call->args.size() == 1) {
+                    std::string end = genExpr(*call->args[0], false);
+                    cpp << indentStr() << "for (auto " << var
+                        << " : std::views::iota(0, " << end << ")) {\n";
+                } else if (call->args.size() == 2) {
+                    std::string start = genExpr(*call->args[0], false);
+                    std::string end   = genExpr(*call->args[1], false);
+                    cpp << indentStr() << "for (auto " << var
+                        << " : std::views::iota(" << start << ", " << end << ")) {\n";
+                }
+            }
+        }
+        if (!isRangeCall) {
+            std::string iter = genExpr(*stmt.iterable, false);
+            cpp << indentStr() << "for (auto " << var
+                << " : *" << iter << ") {\n";
+        }
+        indentLevel_++;
+
+        // body 自由变量收集（修复：引用外部变量必须显式捕获）
+        std::set<std::string> allRefs;
+        IdRefCollector idCol(allRefs);
+        if (stmt.body) idCol.collectStmt(*stmt.body);
+        std::set<std::string> declared;
+        DeclaredCollector declCol(declared);
+        if (stmt.body) declCol.collectStmt(*stmt.body);
+        std::set<std::string> builtins = {"io", "_tasks"};
+        std::vector<std::string> freeVars;
+        bool ioUsed = false;
+        for (auto& name : allRefs) {
+            if (name == stmt.itemName) continue;    // 迭代变量已值捕获
+            if (declared.count(name)) continue;      // body 内局部声明
+            if (name == "io") { ioUsed = true; continue; }
+            if (builtins.count(name)) continue;
+            if (registeredTypes_.count(name)) continue;  // 函数名/类型名
+            freeVars.push_back(name);
+        }
+
+        // spawn body：普通 lambda + _stx.submit（var + freeVars 值捕获 + io 引用捕获）
+        // 注：外部变量在主线程作用域仍存活（如 let ch27 的 GcRootHandle），
+        //     worker 线程执行期间对象不会被回收，与闭包形态线程版语义一致
+        bool oldIoSync = ioSync_;
+        bool oldCoroutine = currentFunctionIsCoroutine_;
+        ioSync_ = true;                       // 强制 io 方法 _sync 版本
+        currentFunctionIsCoroutine_ = false;  // 普通 lambda，禁止 co_await
+        cpp << indentStr() << "_stx.submit([" << var;
+        for (auto& v : freeVars) cpp << ", " << safeName(v);
+        if (ioUsed) cpp << ", &io";
+        cpp << "]() mutable {\n";
+        indentLevel_++;
+        insideSpawn_ = true;
+        if (stmt.body) genBlock(cpp, *stmt.body, false);   // 非协程！
+        insideSpawn_ = false;
+        indentLevel_--;
+        writeLine(cpp, "});");
+        ioSync_ = oldIoSync;
+        currentFunctionIsCoroutine_ = oldCoroutine;
+
+        // 回边 safepoint
+        writeLine(cpp, "aura_rt::gc_safepoint();");
+        indentLevel_--;
+        cpp << indentStr() << "}\n";   // close for
+        // _stx 析构自动 waitGroup
+        indentLevel_--;
+        cpp << indentStr() << "}\n";   // close block
+        return;
+    }
+
+    // === 协程版（现有逻辑 + 自由变量捕获修复） ===
     // 1. Open sync block
     if (hasMax) {
         std::string maxN = genExpr(*stmt.maxExpr, false);
@@ -781,9 +907,28 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt,
     }
     indentLevel_++;
 
-    // 3. Generate spawn lambda
-    cpp << indentStr() << "_tasks.push_back([](auto " << var
-        << ", aura_rt::Io& io, std::vector<aura_rt::task<void>>& _tasks"
+    // 3. body 自由变量收集（修复：现有版本 body 引用外部变量编译失败）
+    std::set<std::string> allRefs;
+    IdRefCollector idCol(allRefs);
+    if (stmt.body) idCol.collectStmt(*stmt.body);
+    std::set<std::string> declared;
+    DeclaredCollector declCol(declared);
+    if (stmt.body) declCol.collectStmt(*stmt.body);
+    std::set<std::string> builtins = {"io", "_tasks"};
+    std::vector<std::string> freeVars;
+    for (auto& name : allRefs) {
+        if (name == stmt.itemName) continue;   // 迭代变量已有参数
+        if (declared.count(name)) continue;     // body 内局部声明
+        if (builtins.count(name)) continue;
+        if (registeredTypes_.count(name)) continue;  // 函数名/类型名
+        freeVars.push_back(name);
+    }
+
+    // 4. Generate spawn lambda：[] 空捕获 + 显式参数（var + freeVars + io + _tasks）
+    //    安全模式与旧式 spawn 一致：协程帧在创建时拷贝参数，无 this 野指针 UB
+    cpp << indentStr() << "_tasks.push_back([](auto " << var;
+    for (auto& v : freeVars) cpp << ", auto " << safeName(v);
+    cpp << ", aura_rt::Io& io, std::vector<aura_rt::task<void>>& _tasks"
         << ") -> aura_rt::task<void> {\n";
     indentLevel_++;
     insideSpawn_ = true;
@@ -791,16 +936,16 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt,
     insideSpawn_ = false;
     writeLine(cpp, "co_return;");
     indentLevel_--;
-    writeLine(cpp, "}(" + var + ", io, _tasks));");
+    cpp << indentStr() << "}(" << var;
+    for (auto& v : freeVars) cpp << ", " << safeName(v);
+    cpp << ", io, _tasks));\n";
 
-    // L2 safepoint：sync for 循环回边
+    // 5. L2 safepoint：sync for 循环回边
     writeLine(cpp, "aura_rt::gc_safepoint();");
-
-    // 4. Close for loop
     indentLevel_--;
-    cpp << indentStr() << "}\n";
+    cpp << indentStr() << "}\n";   // close for
 
-    // 5. Close sync block
+    // 6. Close sync block
     writeLine(cpp, "aura_rt::gc_safepoint();");
     if (hasMax) {
         writeLine(cpp, "co_await _sync.wait_all();");
@@ -808,11 +953,20 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt,
         writeLine(cpp, "co_await aura_rt::when_all(std::move(_tasks));");
     }
     indentLevel_--;
-    cpp << indentStr() << "}\n";
+    cpp << indentStr() << "}\n";   // close sync block
 }
 
 void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
                                   bool /*isCoroutine*/) {
+    // === 调用形态：spawn func(args) / spawn obj.method(args) ===
+    if (stmt.callExpr) {
+        if (inSyncThreadBlock_)
+            genSpawnCallAsThread(cpp, stmt);
+        else
+            genSpawnCallAsCoro(cpp, stmt);
+        return;
+    }
+
     // sync thread 块内的 spawn：分派到线程版本
     if (inSyncThreadBlock_) {
         genSpawnAsThread(cpp, stmt);
@@ -820,86 +974,25 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
     }
 
     // === 显式传参模式（spawn (io: Io, n: int) { ... }） ===
-    if (!stmt.params.empty()) {
-        // 检查用户是否已声明 io / _tasks
-        bool hasIo = false;
-        bool hasTasks = false;
-        for (auto& p : stmt.params) {
-            if (p.name == "io") hasIo = true;
-            if (p.name == "_tasks") hasTasks = true;
-        }
-
-        // 生成 lambda 签名为显式参数
-        cpp << indentStr() << "_tasks.push_back([](";
-        for (size_t i = 0; i < stmt.params.size(); ++i) {
-            if (i > 0) cpp << ", ";
-            cpp << (stmt.params[i].type ? mapParamType(*stmt.params[i].type) : "auto")
-                << " " << safeName(stmt.params[i].name);
-        }
-        // 自动追加 io 和 _tasks（如果用户未声明）
-        if (!hasIo) cpp << ", aura_rt::Io& io";
-        if (!hasTasks) cpp << ", std::vector<aura_rt::task<void>>& _tasks";
-        cpp << ") -> aura_rt::task<void> {\n";
-        insideSpawn_ = true;
-
-        for (auto& s : stmt.body)
-            if (s) genStmt(cpp, *s, true);
-
-        insideSpawn_ = false;
-        cpp << indentStr() << "    co_return;\n";
-        cpp << indentStr() << "}(";
-
-        // 实参：同名自动绑定 or 显式传入
-        if (!stmt.args.empty()) {
-            for (size_t i = 0; i < stmt.args.size(); ++i) {
-                if (i > 0) cpp << ", ";
-                cpp << genExpr(*stmt.args[i], true);
-            }
-        } else {
-            for (size_t i = 0; i < stmt.params.size(); ++i) {
-                if (i > 0) cpp << ", ";
-                cpp << safeName(stmt.params[i].name); // 同名自动绑定
-            }
-        }
-        if (!hasIo) cpp << ", io";
-        if (!hasTasks) cpp << ", _tasks";
-        cpp << "));\n";
-        return;
+    // 检查用户是否已声明 io / _tasks
+    bool hasIo = false;
+    bool hasTasks = false;
+    for (auto& p : stmt.params) {
+        if (p.name == "io") hasIo = true;
+        if (p.name == "_tasks") hasTasks = true;
     }
 
-    // === 旧式语法（向后兼容：spawn { ... }，自动检测自由变量） ===
-    // === plan3 修复：协程 + lambda 按值捕获 = UB ===
-    // 协程帧只存 this 指针而非拷贝捕获值，lambda 析构后 this 野指针。
-    // 正确做法：[] 空捕获 + 显式参数传值，让协程帧在创建时就拷贝参数。
-
-    // 1. 收集 spawn 体中所有 Identifier 引用
-    std::set<std::string> allRefs;
-    IdRefCollector idCol(allRefs);
-    for (auto& s : stmt.body)
-        if (s) idCol.collectStmt(*s);
-
-    // 2. 收集 spawn 体内局部声明的变量
-    std::set<std::string> declared;
-    DeclaredCollector declCol(declared);
-    for (auto& s : stmt.body)
-        if (s) declCol.collectStmt(*s);
-
-    // 3. 自由变量 = 引用 - 声明 - 内置 - 已知函数/类型
-    std::set<std::string> builtins = {"io", "_tasks"};
-    std::vector<std::string> freeVars;
-    for (auto& name : allRefs) {
-        if (declared.count(name)) continue;
-        if (builtins.count(name)) continue;
-        if (registeredTypes_.count(name)) continue;  // 函数名/类型名不需要捕获
-        freeVars.push_back(name);
-    }
-
-    // 4. 生成 lambda：[] 空捕获 + 显式参数
+    // 生成 lambda 签名为显式参数
     cpp << indentStr() << "_tasks.push_back([](";
-    for (auto& v : freeVars)
-        cpp << "auto " << safeName(v) << ", ";
-    cpp << "aura_rt::Io& io, std::vector<aura_rt::task<void>>& _tasks"
-        << ") -> aura_rt::task<void> {\n";
+    for (size_t i = 0; i < stmt.params.size(); ++i) {
+        if (i > 0) cpp << ", ";
+        cpp << (stmt.params[i].type ? mapParamType(*stmt.params[i].type) : "auto")
+            << " " << safeName(stmt.params[i].name);
+    }
+    // 自动追加 io 和 _tasks（如果用户未声明）
+    if (!hasIo) cpp << ", aura_rt::Io& io";
+    if (!hasTasks) cpp << ", std::vector<aura_rt::task<void>>& _tasks";
+    cpp << ") -> aura_rt::task<void> {\n";
     insideSpawn_ = true;
 
     for (auto& s : stmt.body)
@@ -908,9 +1001,101 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
     insideSpawn_ = false;
     cpp << indentStr() << "    co_return;\n";
     cpp << indentStr() << "}(";
+
+    // 实参：同名自动绑定 or 显式传入
+    if (!stmt.args.empty()) {
+        for (size_t i = 0; i < stmt.args.size(); ++i) {
+            if (i > 0) cpp << ", ";
+            cpp << genExpr(*stmt.args[i], true);
+        }
+    } else {
+        for (size_t i = 0; i < stmt.params.size(); ++i) {
+            if (i > 0) cpp << ", ";
+            cpp << safeName(stmt.params[i].name); // 同名自动绑定
+        }
+    }
+    if (!hasIo) cpp << ", io";
+    if (!hasTasks) cpp << ", _tasks";
+    cpp << "));\n";
+}
+
+// 调用形态（协程 sync 块内）：spawn func(args)
+// 生成：_tasks.push_back([](auto fv..., Io& io, taskvec& _tasks)
+//           -> task<void> { 调用; co_return; }(fv..., io, _tasks));
+void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt) {
+    // 1. 自由变量 = 调用表达式中所有 Identifier - 函数/类型名 - 内置
+    std::set<std::string> allRefs;
+    IdRefCollector idCol(allRefs);
+    idCol.collectExpr(*stmt.callExpr);   // 含 callee + args
+    std::set<std::string> builtins = {"io", "_tasks"};
+    std::vector<std::string> freeVars;
+    for (auto& name : allRefs) {
+        if (builtins.count(name)) continue;
+        if (registeredTypes_.count(name)) continue;  // 函数名/类型名不捕获
+        freeVars.push_back(name);
+    }
+
+    // 2. 协程 lambda：[] 空捕获 + 显式参数（复用旧式 spawn 的安全模式）
+    cpp << indentStr() << "_tasks.push_back([](";
+    for (auto& v : freeVars)
+        cpp << "auto " << safeName(v) << ", ";
+    cpp << "aura_rt::Io& io, std::vector<aura_rt::task<void>>& _tasks"
+        << ") -> aura_rt::task<void> {\n";
+    indentLevel_++;
+    insideSpawn_ = true;
+    // isCoroutine=true：若 callee 为协程函数，genExpr 自动加 co_await；返回值丢弃
+    writeLine(cpp, genExpr(*stmt.callExpr, true) + ";");
+    insideSpawn_ = false;
+    writeLine(cpp, "co_return;");
+    indentLevel_--;
+    cpp << indentStr() << "}(";
     for (auto& v : freeVars)
         cpp << safeName(v) << ", ";
     cpp << "io, _tasks));\n";
+}
+
+// 调用形态（sync thread 块内）：spawn func(args)
+// 生成：_stx.submit([fv..., &io]() mutable { 调用; });
+void CodeGenerator::genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
+    bool oldIoSync = ioSync_;
+    bool oldCoroutine = currentFunctionIsCoroutine_;
+    ioSync_ = true;                      // 强制 io 方法 _sync 版本
+    currentFunctionIsCoroutine_ = false; // 普通 lambda，禁止 co_await
+
+    // 1. 自由变量 + io 使用检测
+    std::set<std::string> allRefs;
+    IdRefCollector idCol(allRefs);
+    idCol.collectExpr(*stmt.callExpr);
+    std::set<std::string> builtins = {"io", "_tasks"};
+    std::vector<std::string> freeVars;
+    bool ioUsed = false;
+    for (auto& name : allRefs) {
+        if (name == "io") { ioUsed = true; continue; }
+        if (builtins.count(name)) continue;
+        if (registeredTypes_.count(name)) continue;
+        freeVars.push_back(name);
+    }
+
+    // 2. 捕获列表：freeVars 值捕获 + io 引用捕获
+    cpp << indentStr() << "_stx.submit([";
+    for (size_t i = 0; i < freeVars.size(); ++i) {
+        if (i > 0) cpp << ", ";
+        cpp << safeName(freeVars[i]);
+    }
+    if (ioUsed) {
+        if (!freeVars.empty()) cpp << ", ";
+        cpp << "&io";
+    }
+    cpp << "]() mutable {";
+    indentLevel_++;
+    insideSpawn_ = true;
+    writeLine(cpp, genExpr(*stmt.callExpr, false) + ";");
+    insideSpawn_ = false;
+    indentLevel_--;
+    cpp << "\n" << indentStr() << "});\n";
+
+    ioSync_ = oldIoSync;
+    currentFunctionIsCoroutine_ = oldCoroutine;
 }
 
 // ============================================================
@@ -1059,7 +1244,7 @@ void CodeGenerator::genLockStmt(std::ostream& cpp, const LockStmt& stmt,
 // ============================================================
 void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
     // R3 由 Sema 保证：sync thread 内 spawn 必须显式传参
-    // 此处 stmt.params 非空
+    // 此处 stmt.params 非空（调用形态已由 genSpawnStmt 分派到 genSpawnCallAsThread）
 
     bool oldIoSync = ioSync_;
     bool oldCoroutine = currentFunctionIsCoroutine_;

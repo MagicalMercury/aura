@@ -1,172 +1,71 @@
-# Plan：spawn / sync for 语法糖三合一优化
+# Plan：spawn / sync for 语法糖三合一优化（详细实施方案）
 
 ## 4.1 标题与元数据
 
 - **Plan 标题**：spawn / sync for 语法糖三合一优化
 - **日期**：2026-07-31
-- **关联模块**：Parser、AST、Sema、CodeGen、CoroDecide、ASTWalker
+- **关联模块**：AST、Parser、Sema、CodeGen、ASTWalker、ASTPrinter
 - **关联 TODO**：TODO.txt §十 [P1] spawn 语法激进简化 + [P1] sync thread for + [P2] 省略花括号
+- **附带修复**：sync/spawn 块内 return/break/continue 跨出边界检查（当前无 Sema 拦截的潜在缺陷）
 
 ---
 
 ## 4.2 目标
 
-统一简化 `spawn`、`sync for`、`sync thread for` 三条语句链路，允许**直接调用函数**替代强制花括号块体，对齐 Go 语言 `go func()` 风格。同时新增 `sync thread for` 组合语法，填补多线程并行迭代的语法空白。
+1. **spawn 调用形态**：`spawn func(args)` / `spawn obj.method(args)` 直接启动任务（类 Go `go func()`），删除旧式 `spawn { }` 自动捕获，保留 `spawn (params) { body }` 闭包形态。
+2. **sync thread for**：新增 `sync thread for x in iter { body }` 多线程并行迭代语法糖。
+3. **省略花括号**：`sync for i in range(10) process(i)` 单调用语句无需 `{ }`。
+4. **修复潜在缺陷**：
+   - `return` / `break` / `continue` 跨出 sync/spawn 块边界时 Sema 报错（当前无检查，生成 C++ 语义错位或编译期才失败）。
+   - sync for / sync thread for body 引用外部变量时 C++ 编译失败（现有协程版 lambda 仅捕获 var/io/_tasks）→ 协程版与线程版统一加入自由变量收集。
 
 ---
 
 ## 4.3 现状总结
 
-### 4.3.1 spawn 现状（[StmtParser.cpp:232-273](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L232-L273)）
-
-三种形式，其中旧式将删除：
-
-| 形式 | 语法 | 状态 |
+| 组件 | 现状 | 位置 |
 |------|------|------|
-| 旧式自动捕获 | `spawn { body }` | **删除** |
-| 闭包形态 | `spawn (params) { body }` | **保留** |
-| 调用形态 | `spawn func(args)` | **新增** |
+| SpawnStmt | 仅 params+args+body，无调用形态字段 | [Stmt.h:249-271](file:///d:/you/Aura/src/AST/Stmt.h#L249-L271) |
+| parseSpawnStmt | 强制 `{ }` 块体 + 旧式自动捕获分支 | [StmtParser.cpp:232-273](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L232-L273) |
+| genSpawnStmt | 旧式分支用 IdRefCollector/DeclaredCollector 收集自由变量 | [StmtGen.cpp:870-914](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L870-L914) |
+| genSpawnAsThread | 闭包形态：`_stx.submit([captures]() mutable { body })`，io 引用捕获 | [StmtGen.cpp:1060-1108](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1060-L1108) |
+| SyncForStmt | 无 isThread 字段；协程版 `_tasks.push_back(co_await lambda)` | [Stmt.h:273-289](file:///d:/you/Aura/src/AST/Stmt.h#L273-L289) |
+| parseSyncStmt | 消费 thread 后无 for 转发 | [StmtParser.cpp:183-206](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L183-L206) |
+| checkSpawnStmt | E018 + L6 + R3 + params 注册 + body 检查 | [StmtChecker.cpp:321-365](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L321-L365) |
+| checkSyncForStmt | 无 isThread 分支 | [StmtChecker.cpp:288-319](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L288-L319) |
+| break/continue | 仅检查 insideLoop_ + inLockBlock_，无 sync/spawn 边界 | [SemAnalyzer.cpp:585-594](file:///d:/you/Aura/src/Sema/SemAnalyzer.cpp#L585-L594) |
+| return | 仅检查 inLockBlock_ | [StmtChecker.cpp:110-113](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L110-L113) |
+| CoroScanner | SyncStmt/SyncForStmt/SpawnStmt 恒返回 true（协程） | [CoroDecide.cpp:61-72](file:///d:/you/Aura/src/CodeGen/CoroDecide.cpp#L61-L72) |
+| 协程函数尾 | 自动补 `co_return;`，无 co_await 也能编译 | [DeclGen.cpp:289-294](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L289-L294) |
+| 自由变量收集 | 复用 IdRefCollector.collectExpr + registeredTypes_ 过滤 | [CodeGen.h:122-166](file:///d:/you/Aura/src/CodeGen/CodeGen.h#L122-L166) |
 
-现有 `SpawnStmt`（[Stmt.h:249-271](file:///d:/you/Aura/src/AST/Stmt.h#L249-L271)）：
-- `params` — 显式参数列表
-- `args` — 可选的显式实参（异名传递）
-- `body` — `std::vector<std::unique_ptr<Stmt>>`
-
-旧式自动捕获的 CodeGen 逻辑在 [StmtGen.cpp:870-914](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L870-L914)（`IdRefCollector` + `DeclaredCollector` 自由变量推导），将被删除。
-
-Sema R3 规则（[StmtChecker.cpp:336](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L336)）：`inSyncThreadBlock_ && stmt.params.empty()` → 报错。对于调用形态 `spawn func(args)`，args 中的标识符显式可见，天然满足 R3。
-
-### 4.3.2 sync for 现状（[StmtParser.cpp:208-230](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L208-L230)）
-
-仅支持协程版 `sync for`，语法为 `sync for(max=N) x in iter { body }`。展开为协程 `_tasks.push_back(co_await lambda)`。
-
-`SyncForStmt`（[Stmt.h:273-289](file:///d:/you/Aura/src/AST/Stmt.h#L273-L289)）仅有 `maxExpr`、`itemName`、`iterable`、`body` 四个字段，无 `isThread` 标志。
-
-### 4.3.3 sync thread 现状（[StmtParser.cpp:183-206](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L183-L206)）
-
-`sync thread(max=N) { body }` 是独立块语句，内部 `spawn` 通过 `genSpawnAsThread()` 分派到线程池。`SyncStmt.isThread = true` 时 Sema 设置 `inSyncThreadBlock_ = true`。
-
-`sync thread` 与 `for` 不组合。当前多线程迭代需三层嵌套：
-```aura
-sync thread {
-    for x in arr {
-        spawn (x: int) { process(x) }
-    }
-}
-```
-
-### 4.3.4 Parser 分派逻辑（[StmtParser.cpp:24-31](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L24-L31)）
-
-```cpp
-if (check(TokType::Sync)) {
-    if (peekNext().type == TokType::For)       // sync for
-        return parseSyncForStmt();
-    if (peekNext().type == TokType::Dot)        // sync.Mutex()
-        return parseExprStmt();
-    return parseSyncStmt();                     // sync / sync thread
-}
-```
-
-仅支持 2-token lookahead（`peek()`+`peekNext()`）。`sync thread for` 需要 3-token lookahead。
-
-### 4.3.5 核心文件依赖图
-
-```
-parseStmt()                     Parser/StmtParser.cpp
-  ├── parseSpawnStmt()          → SpawnStmt
-  ├── parseSyncStmt()           → SyncStmt
-  └── parseSyncForStmt()        → SyncForStmt
-        │
-checkSpawnStmt()                Sema/Checker/StmtChecker.cpp
-checkSyncStmt()                 Sema/Checker/StmtChecker.cpp
-checkSyncForStmt()              Sema/Checker/StmtChecker.cpp
-        │
-genSpawnStmt() / genSpawnAsThread()   CodeGen/StmtGen.cpp
-genSyncStmt() / genSyncThreadStmt()   CodeGen/StmtGen.cpp
-genSyncForStmt()                      CodeGen/StmtGen.cpp
-        │
-CoroScanner (CoroDecide.cpp)    判断函数是否需为协程
-ASTWalker (ASTWalker.h)         IdRefCollector/DeclaredCollector 等
-```
+**关键既有机制（可直接复用）**：
+- `IdRefCollector::collectExpr()` 递归收集表达式中所有 Identifier（含 callee 与 args）→ 调用形态自由变量收集零新增。
+- `registeredTypes_` 包含所有函数名（[CodeGen.cpp:90-91](file:///d:/you/Aura/src/CodeGen/CodeGen.cpp#L90-L91) `registerTypeName(f->name, false)`）→ 函数名天然被过滤，不捕获。
+- `io`/`_tasks` 在 builtins 集合 → io 不捕获，协程版自动注入 lambda 参数、线程版引用捕获。
+- genExpr 对协程函数调用自动加 `co_await`（isCoroutine=true 时）→ 调用形态 lambda 体内直接 `genExpr(callExpr, true)` 即可。
 
 ---
 
 ## 4.4 拟议变更
 
-### 变更 1：SpawnStmt AST 新增 callExpr 字段
+### 变更 C1：AST 新增字段
 
-**位置**：[Stmt.h:249-271](file:///d:/you/Aura/src/AST/Stmt.h#L249-L271)
-
-**改动**：在 `SpawnStmt` 中新增 `std::unique_ptr<ASTNode> callExpr`。
+**[Stmt.h:249-271](file:///d:/you/Aura/src/AST/Stmt.h#L249-L271) SpawnStmt**：
 
 ```cpp
 struct SpawnStmt : Stmt {
-    std::vector<Param> params;
-    std::vector<std::unique_ptr<ASTNode>> args;
-    std::vector<std::unique_ptr<Stmt>> body;
-    std::unique_ptr<ASTNode> callExpr;  // NEW: spawn func(args) 形态
-    // ...
+    std::vector<Param> params;                     // 闭包形态：参数列表（显式传参）
+    std::vector<std::unique_ptr<ASTNode>> args;    // 闭包形态：可选的显式实参（异名传递）
+    std::vector<std::unique_ptr<Stmt>> body;       // 闭包形态：语句体
+    std::unique_ptr<ASTNode> callExpr;             // NEW 调用形态：spawn func(args)
+    // clone() 追加：n->callExpr = callExpr ? callExpr->clone() : nullptr;
 };
 ```
 
-**互斥语义**：`callExpr` 非空 ↔ 调用形态；`callExpr` 为空 → 闭包形态（params + body）。两者不同时存在。
+互斥语义：`callExpr` 非空 ↔ 调用形态；为空 → 闭包形态（params+body）。
 
-**clone() 同步更新**。
-
----
-
-### 变更 2：Parser parseSpawnStmt() 重写
-
-**位置**：[StmtParser.cpp:232-273](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L232-L273)
-
-**核心逻辑**：
-
-```
-spawn → advance
-  if 下一个 token 不是 '(' → 报错（旧式 spawn { } 不支持）
-  if 下一个 token 是 '(' →
-    lookahead 括号内容：
-      if 包含 name: Type 模式（含冒号）→ 闭包形态：
-        params = parseParams()
-        consume(')')
-        consume('{')
-        body = parseStmt()* 直至 '}'
-        consume('}')
-      else → 调用形态：
-        callExpr = parseExpr()  // 这将解析 func(args) 调用链
-```
-
-**关键歧义消解**：`spawn (` 后的括号内容决定走向：
-- `spawn (io: Io, x: int) { ... }` — 有 `name: Type` 模式 → 闭包
-- `spawn (x) { ... }` — 有 `name` 后逗号或 `)`（无冒号但更像参数） → 闭包（因为后面有 `{`）
-- `spawn func(args)` — 函数调用链 → 调用形态
-
-实际上最可靠的区分方式：解析括号内容后看下一个 token：
-- 若是 `{` → 闭包形态（`spawn (params) { }`）
-- 否则 → 调用形态（`spawn func(args)` 已由 parseExpr 完整消费）
-
-**为什么**：`spawn (` 后的 `parseParams()` 吃掉了 `name: Type, ...`，然后遇到 `)`。出括号后如果是 `{`，说明是闭包形态。如果括号内容不含冒号，`parseParams()` 第一个 Param 的 `parseParam()` 会在读取 `name` 后期待 `:` 或 `,` 或 `)`。若没有 `:`，`parseParam()` 会将类型设为 nullptr，这在闭包形态中合法（类型可选）。所以 `spawn (x) { }` 仍然是闭包形态。
-
-**对于调用形态**：`spawn func(args)` 中 `spawn ` 后没有 `(`，直接是 Identifier → 这是一个 CallExpr 的起始。所以更准确的分派是：
-
-```
-spawn → advance
-  if check('(') → 闭包形态（不管括号内有没有冒号，有 '(' 就是参数声明）
-  else → 调用形态：callExpr = parseExpr()
-```
-
-这比 lookahead 冒号更简单！`spawn (` 总是引入参数声明（现有语法），`spawn func` 是函数调用。
-
-删除部分：
-- `consume(TokType::LBrace, ...)` 的旧式路径
-- 旧式 `spawn { }` 代码块（第 245-258 行中无参数路径）
-- 尾部的显式实参覆盖（`args` 字段仍保留，用于闭包形态）
-
----
-
-### 变更 3：SyncForStmt AST 新增 isThread 字段
-
-**位置**：[Stmt.h:273-289](file:///d:/you/Aura/src/AST/Stmt.h#L273-L289)
+**[Stmt.h:273-289](file:///d:/you/Aura/src/AST/Stmt.h#L273-L289) SyncForStmt**：
 
 ```cpp
 struct SyncForStmt : Stmt {
@@ -174,260 +73,702 @@ struct SyncForStmt : Stmt {
     std::string itemName;
     std::unique_ptr<ASTNode> iterable;
     std::unique_ptr<BlockStmt> body;
-    bool isThread = false;  // NEW: true = sync thread for
+    bool isThread = false;             // NEW: true = sync thread for
+    // clone() 追加：n->isThread = isThread;
 };
 ```
 
-**clone() 同步更新**。
-
 ---
 
-### 变更 4：Parser sync thread for 分派
+### 变更 C2：Parser
 
-**位置**：[StmtParser.cpp:24-31](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L24-L31)
-
-**方案**：在 `parseSyncStmt()` 内部做二次转发。消费 `thread` 后检测当前 token 是否为 `For`：
+#### C2.1 parseSpawnStmt() 重写（[StmtParser.cpp:232-273](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L232-L273)）
 
 ```cpp
-// parseSyncStmt() 内，第 190 行附近：
-if (check(TokType::Identifier) && peek().lexeme == "thread") {
-    advance(); // thread
-    if (check(TokType::For)) {
-        return parseSyncThreadForStmt();  // 新函数
+std::unique_ptr<Stmt> Parser::parseSpawnStmt() {
+    auto tok = advance(); // spawn
+    auto stmt = std::make_unique<SpawnStmt>();
+    setNodePos(stmt.get(), tok);
+
+    // 分支判定：spawn ( → 闭包形态；spawn 其他 → 调用形态
+    if (check(TokType::LParen)) {
+        // === 闭包形态：spawn (io: Io, n: int) { ... } [可选显式实参] ===
+        advance(); // consume '('
+        if (!check(TokType::RParen))
+            stmt->params = parseParams();
+        consume(TokType::RParen, "expected ')' after spawn parameters");
+        consume(TokType::LBrace, "expected '{' after spawn parameters");
+
+        while (!check(TokType::RBrace) && !atEnd()) {
+            auto s = parseStmt();
+            if (s) stmt->body.push_back(std::move(s));
+            else synchronize();
+        }
+        consume(TokType::RBrace, "expected '}' after spawn body");
+
+        // 可选的显式实参：spawn (x: int) { ... }(arg)
+        if (check(TokType::LParen)) {
+            advance(); // (
+            while (!check(TokType::RParen) && !atEnd()) {
+                auto arg = parseExpr();
+                if (arg) stmt->args.push_back(std::move(arg));
+                if (!check(TokType::RParen))
+                    consume(TokType::Comma, "expected ',' between spawn arguments");
+            }
+            consume(TokType::RParen, "expected ')' after spawn arguments");
+        }
+    } else {
+        // === 调用形态：spawn func(args) / spawn obj.method(args) ===
+        if (check(TokType::LBrace))
+            error("old-style 'spawn { ... }' is removed; "
+                  "use 'spawn func(args)' or 'spawn (params) { ... }'");
+        stmt->callExpr = parseExpr();
+        if (!stmt->callExpr) return nullptr;
+        if (!dynamic_cast<CallExpr*>(stmt->callExpr.get())
+            && !dynamic_cast<MethodCallExpr*>(stmt->callExpr.get())) {
+            error("expected function call after 'spawn', got non-call expression");
+            return nullptr;
+        }
     }
-    stmt->isThread = true;
+    return stmt;
 }
 ```
 
-`parseSyncThreadForStmt()` 是新增函数，与 `parseSyncForStmt()` 几乎相同，区别是：
-1. 不消费 `sync`（已被 parseSyncStmt 消费）
-2. 消费 `for`
-3. 设置 `stmt->isThread = true`
+要点：
+- 删除旧式 `spawn { }` 路径；`spawn { ... }` 显式报错提示新语法（诊断友好）。
+- 调用形态校验限 CallExpr / MethodCallExpr（拒绝 `spawn x`、`spawn 1+2` 等）。
 
-或者：重构 `parseSyncForStmt()` 接受一个 `bool isThread` 参数 + 一个 `bool consumedSync` 标志，避免代码重复。
-
----
-
-### 变更 5：sync for 省略花括号
-
-**位置**：[StmtParser.cpp:228](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L228)
-
-`stmt->body = parseBlock()` 之前做 lookahead：
+#### C2.2 parseSyncStmt() 转发 sync thread for（[StmtParser.cpp:183-206](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L183-L206)）
 
 ```cpp
-if (check(TokType::LBrace)) {
+std::unique_ptr<Stmt> Parser::parseSyncStmt() {
+    auto tok = advance(); // sync
+    // 检测 thread 软关键字
+    if (check(TokType::Identifier) && peek().lexeme == "thread") {
+        advance(); // thread
+        if (check(TokType::For)) {
+            advance(); // for
+            return parseSyncForRest(tok, true);   // 新入口（thread 模式）
+        }
+        auto stmt = std::make_unique<SyncStmt>();
+        setNodePos(stmt.get(), tok);
+        stmt->isThread = true;
+        // === 原有 max + body 逻辑（第 195-205 行）不变 ===
+        if (check(TokType::LParen)) {
+            advance();
+            consume(TokType::Identifier, "expected 'max' after 'sync('");
+            consume(TokType::Assign, "expected '=' after 'max'");
+            stmt->maxExpr = parseExpr();
+            consume(TokType::RParen, "expected ')' after sync max expression");
+        }
+        stmt->body = parseBlock();
+        return stmt;
+    }
+    // === 原有非 thread 逻辑（第 195-205 行）不变 ===
+    auto stmt = std::make_unique<SyncStmt>();
+    setNodePos(stmt.get(), tok);
+    if (check(TokType::LParen)) {
+        advance();
+        consume(TokType::Identifier, "expected 'max' after 'sync('");
+        consume(TokType::Assign, "expected '=' after 'max'");
+        stmt->maxExpr = parseExpr();
+        consume(TokType::RParen, "expected ')' after sync max expression");
+    }
     stmt->body = parseBlock();
-} else {
-    // 解析 CallExpr，包装为 BlockStmt
-    auto expr = parseExpr();
-    if (!dynamic_cast<CallExpr*>(expr.get())) {
-        error("expected function call after 'sync for ... in ...'");
-        return nullptr;
-    }
-    auto block = std::make_unique<BlockStmt>();
-    auto exprStmt = std::make_unique<ExprStmt>();
-    exprStmt->expr = std::move(expr);
-    block->stmts.push_back(std::move(exprStmt));
-    stmt->body = std::move(block);
+    return stmt;
 }
 ```
 
-**限制**：仅允许 `CallExpr`（函数/方法调用），拒绝 `if`/`match`/`loop` 等控制流。
+#### C2.3 parseSyncForRest() 共享解析 + 省略花括号（[StmtParser.cpp:208-230](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L208-L230)）
+
+```cpp
+// 共享：sync for / sync thread for 公共解析
+// isThread=false 入口：parseSyncForStmt()（消费 sync+for 后调用）
+// isThread=true  入口：parseSyncStmt()（消费 sync+thread+for 后调用）
+std::unique_ptr<Stmt> Parser::parseSyncForRest(Token& syncTok, bool isThread) {
+    auto stmt = std::make_unique<SyncForStmt>();
+    setNodePos(stmt.get(), syncTok);
+    stmt->isThread = isThread;
+
+    // 可选参数：for(max = expr)
+    if (check(TokType::LParen)) {
+        advance(); // (
+        consume(TokType::Identifier, "expected 'max' after 'sync for('");
+        consume(TokType::Assign, "expected '=' after 'max'");
+        stmt->maxExpr = parseExpr();
+        consume(TokType::RParen, "expected ')' after sync for max expression");
+    }
+
+    // 循环变量
+    auto& itemTok = consume(TokType::Identifier, "expected loop variable after 'for'");
+    stmt->itemName = itemTok.lexeme;
+    consume(TokType::Identifier, "expected 'in' after loop variable");
+    stmt->iterable = parseExpr();
+
+    // === 省略花括号（Feature 3）：仅允许函数/方法调用 ===
+    if (check(TokType::LBrace)) {
+        stmt->body = parseBlock();
+    } else {
+        auto expr = parseExpr();
+        if (!expr) return nullptr;
+        if (!dynamic_cast<CallExpr*>(expr.get())
+            && !dynamic_cast<MethodCallExpr*>(expr.get())) {
+            error("expected function call after 'sync for ... in ...' "
+                  "(wrap complex bodies in braces)");
+            return nullptr;
+        }
+        auto block = std::make_unique<BlockStmt>();
+        auto es = std::make_unique<ExprStmt>();   // Stmt.h:71-80，字段 expr
+        es->expr = std::move(expr);
+        block->stmts.push_back(std::move(es));
+        stmt->body = std::move(block);
+    }
+    return stmt;
+}
+
+std::unique_ptr<Stmt> Parser::parseSyncForStmt() {
+    auto syncTok = advance(); // sync
+    advance();                // for
+    return parseSyncForRest(syncTok, false);
+}
+```
+
+**[Parser.h:66](file:///d:/you/Aura/src/Parser.h#L66) 新增声明**：
+
+```cpp
+std::unique_ptr<Stmt> parseSyncForRest(Token& syncTok, bool isThread);
+```
 
 ---
 
-### 变更 6：Sema checkSpawnStmt() 适配
+### 变更 C3：Sema
 
-**位置**：[StmtChecker.cpp:321-365](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L321-L365)
+#### C3.1 SemAnalyzer.h 状态（[SemAnalyzer.h:145-149](file:///d:/you/Aura/src/Sema/SemAnalyzer.h#L145-L149)）
 
-新增调用形态分支：
+```cpp
+bool insideSync_ = false;          // spawn 仅在 sync 块内合法（保留）
+bool inSyncThreadBlock_ = false;   // sync thread 块内（保留）
+bool inLockBlock_ = false;         // lock 块内（保留）
+
+// NEW：循环深度计数器（替代 insideLoop_ 的 bool）
+int loopDepth_ = 0;
+
+// NEW：同步块边界栈 — 记录进入 sync/spawn 块时的循环深度
+struct SyncBoundary {
+    std::string kind;       // "sync" / "sync thread" / "sync for" / "sync thread for" / "spawn"
+    int loopDepthAtEntry;   // 进入块时的 loopDepth_
+};
+std::vector<SyncBoundary> syncBoundaryStack_;
+```
+
+`insideLoop_` → `loopDepth_` 替换点：
+- checkWhileStmt（[StmtChecker.cpp:147-149](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L147-L149)）：`int prev = loopDepth_; loopDepth_++; ... loopDepth_ = prev;`
+- checkForStmt（[StmtChecker.cpp:155,194](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L155)）：同上
+- checkLoopStmt（[StmtChecker.cpp:198-200](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L198-L200)）：同上
+- checkStmt break/continue（[SemAnalyzer.cpp:585-594](file:///d:/you/Aura/src/Sema/SemAnalyzer.cpp#L585-L594)）：`if (loopDepth_ == 0)` 判定
+- **函数入口重置**（[DeclChecker.cpp:242,270](file:///d:/you/Aura/src/Sema/Checker/DeclChecker.cpp#L242-L270)）：`insideLoop_ = false` → `loopDepth_ = 0; syncBoundaryStack_.clear();`（防御性：错误路径下保证状态不跨函数残留）
+
+#### C3.2 边界栈 push/pop
+
+**checkSyncStmt**（[StmtChecker.cpp:250-286](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L250-L286)）：
+
+```cpp
+void SemAnalyzer::checkSyncStmt(const SyncStmt& stmt) {
+    if (stmt.isThread) {
+        if (inSyncThreadBlock_) { error(stmt, "nested sync thread not allowed"); return; }
+        if (stmt.maxExpr) { /* int 检查不变 */ }
+        bool oldInSync = insideSync_;
+        bool oldInThread = inSyncThreadBlock_;
+        insideSync_ = true;
+        inSyncThreadBlock_ = true;
+        syncBoundaryStack_.push_back({"sync thread", loopDepth_});   // NEW
+        if (stmt.body) checkBlock(*stmt.body);
+        syncBoundaryStack_.pop_back();                               // NEW
+        insideSync_ = oldInSync;
+        inSyncThreadBlock_ = oldInThread;
+        return;
+    }
+    // 协程 sync
+    if (stmt.maxExpr) { /* int 检查不变 */ }
+    insideSync_ = true;
+    syncBoundaryStack_.push_back({"sync", loopDepth_});              // NEW
+    if (stmt.body) checkBlock(*stmt.body);
+    syncBoundaryStack_.pop_back();                                   // NEW
+    insideSync_ = false;
+}
+```
+
+**checkSyncForStmt**（[StmtChecker.cpp:288-319](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L288-L319)）：
+
+```cpp
+void SemAnalyzer::checkSyncForStmt(const SyncForStmt& stmt) {
+    if (stmt.maxExpr) { /* int 检查不变 */ }
+    auto iterType = inferExpr(*stmt.iterable);
+    std::unique_ptr<SemType> elemType = /* 现有推导逻辑不变 */;
+
+    symtab_.enterScope();
+    { Symbol sym; sym.kind = SymKind::Variable; sym.name = stmt.itemName;
+      sym.type = std::move(elemType); symtab_.define(std::move(sym)); }
+
+    if (stmt.isThread) {
+        if (inSyncThreadBlock_) {   // R1: 禁止嵌套 sync thread
+            error(stmt, "nested sync thread not allowed");
+            symtab_.exitScope();
+            return;
+        }
+        bool oldInSync = insideSync_;
+        bool oldInThread = inSyncThreadBlock_;
+        insideSync_ = true;
+        inSyncThreadBlock_ = true;
+        syncBoundaryStack_.push_back({"sync thread for", loopDepth_});  // NEW
+        if (stmt.body) checkBlock(*stmt.body);
+        syncBoundaryStack_.pop_back();                                  // NEW
+        inSyncThreadBlock_ = oldInThread;
+        insideSync_ = oldInSync;
+    } else {
+        insideSync_ = true;
+        syncBoundaryStack_.push_back({"sync for", loopDepth_});         // NEW
+        if (stmt.body) checkBlock(*stmt.body);
+        syncBoundaryStack_.pop_back();                                  // NEW
+        insideSync_ = false;
+    }
+    symtab_.exitScope();
+}
+```
+
+**checkSpawnStmt**（[StmtChecker.cpp:321-365](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L321-L365)）：
 
 ```cpp
 void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
-    // E018 + L6 检查不变
+    if (!insideSync_) {
+        error(stmt, DiagCode::E018_SpawnOutsideSync,
+          "'spawn' can only be used inside a 'sync' block",
+          "wrap the spawn statement in 'sync { ... }'");
+        return;
+    }
+    if (inLockBlock_) {
+        error(stmt, "cannot spawn inside lock block");
+        return;
+    }
 
-    // NEW: 调用形态 spawn func(args)
+    // === 调用形态：spawn func(args) ===
     if (stmt.callExpr) {
-        // R3: sync thread 内调用形态天然满足显式传参（args 已显式）
-        // 不需要注册 params 作用域
-        auto* call = dynamic_cast<CallExpr*>(stmt.callExpr.get());
-        if (!call) error(...);  // 应不可达（Parser 保证）
+        // 无 body、无 params 作用域；仅类型检查（callee/参数匹配由 checkExpr 保证）
+        // R3 天然满足：args 中标识符显式可见，无隐式捕获
         checkExpr(*stmt.callExpr);
         return;
     }
 
-    // 闭包形态（现有逻辑不变）
-    // R3 + params 注册 + body 检查 ...
-}
-```
-
-R3 规则调整：`inSyncThreadBlock_ && stmt.params.empty()` 在原逻辑中不变。调用形态走新分支，不需要此检查（args 显式可见）。
-
----
-
-### 变更 7：Sema checkSyncForStmt() 适配
-
-**位置**：[StmtChecker.cpp:288-319](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L288-L319)
-
-新增 `isThread` 分支：
-
-```cpp
-if (stmt.isThread) {
-    // 禁止嵌套 sync thread
-    if (inSyncThreadBlock_) { error(...); return; }
-    
-    insideSync_ = true;
-    inSyncThreadBlock_ = true;
-    // 注册 itemName 到作用域（与协程版相同）
-    // body 在 sync thread 上下文中检查（禁止 co_await，禁止嵌套 spawn）
-    if (stmt.body) checkBlock(*stmt.body);
-    inSyncThreadBlock_ = false;
-    insideSync_ = false;
-    return;
-}
-// 原有协程版逻辑不变
-```
-
----
-
-### 变更 8：CodeGen genSpawnStmt() 重写
-
-**位置**：[StmtGen.cpp:814-914](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L814-L914)
-
-**删除**：第 870-914 行旧式自动捕获分支（`IdRefCollector`/`DeclaredCollector`/自由变量推导）。
-
-**新增**：调用形态分支（在 inSyncThreadBlock_ 分派和闭包形态之间）：
-
-```cpp
-// 调用形态 spawn func(args)
-if (stmt.callExpr) {
-    if (inSyncThreadBlock_) {
-        genSpawnCallAsThread(cpp, stmt);  // 线程版
-    } else {
-        genSpawnCallAsCoro(cpp, stmt);    // 协程版
+    // === 闭包形态（现有逻辑） ===
+    if (inSyncThreadBlock_ && stmt.params.empty()) {
+        error(stmt, "spawn in sync thread must have explicit params"
+                    " (use 'spawn (io: Io, x: int) { ... }' form in sync thread block)");
+        return;
     }
+    if (!stmt.params.empty()) {
+        symtab_.enterScope();
+        for (auto& p : stmt.params) { /* 现有注册逻辑不变 */ }
+    }
+    symtab_.enterScope();
+    syncBoundaryStack_.push_back({"spawn", loopDepth_});               // NEW
+    for (auto& s : stmt.body) if (s) checkStmt(*s);
+    syncBoundaryStack_.pop_back();                                     // NEW
+    symtab_.exitScope();
+    if (!stmt.params.empty()) symtab_.exitScope();
+}
+```
+
+#### C3.3 潜在缺陷修复：break/continue 边界检查（[SemAnalyzer.cpp:585-594](file:///d:/you/Aura/src/Sema/SemAnalyzer.cpp#L585-L594)）
+
+```cpp
+if (auto* br = dynamic_cast<const BreakStmt*>(&stmt)) {
+    if (loopDepth_ == 0) error(*br, "'break' outside of loop");
+    if (inLockBlock_) error(*br, "cannot break out of lock block");
+    if (!syncBoundaryStack_.empty()
+        && loopDepth_ <= syncBoundaryStack_.back().loopDepthAtEntry)   // NEW
+        error(*br, "cannot break out of " + syncBoundaryStack_.back().kind + " block");
+    return;
+}
+if (auto* co = dynamic_cast<const ContinueStmt*>(&stmt)) {
+    if (loopDepth_ == 0) error(*co, "'continue' outside of loop");
+    if (inLockBlock_) error(*co, "cannot continue out of lock block");
+    if (!syncBoundaryStack_.empty()
+        && loopDepth_ <= syncBoundaryStack_.back().loopDepthAtEntry)   // NEW
+        error(*co, "cannot continue out of " + syncBoundaryStack_.back().kind + " block");
     return;
 }
 ```
 
-**genSpawnCallAsCoro**：遍历 `CallExpr` 参数收集自由变量（被调用函数名不捕获），生成：
+**判定原理**：`loopDepth_ <= 最内层边界.loopDepthAtEntry` ⟺ 最内层循环在进入该块**之前**已开启 ⟺ break/continue 将跨出该块（生成代码会跳过 `co_await when_all` / `_stx` waitGroup 析构）。块内新开启循环时 `loopDepth_` 已增长 → 合法放行（如 spawn 体内 `while true { break }`，K18/K21 现有测试合法）。
+
+#### C3.4 潜在缺陷修复：return 边界检查（[StmtChecker.cpp:110-113](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L110-L113)）
+
 ```cpp
-_tasks.push_back([capturedVars..., aura_rt::Io& io,
-                   std::vector<aura_rt::task<void>>& _tasks]
-    -> aura_rt::task<void> {
-    callee(capturedVars...);
-    co_return;
-}(capturedVars..., io, _tasks));
+    // L3: lock 块内禁止 return 跨出
+    if (inLockBlock_) {
+        error(stmt, "cannot return out of lock block");
+    }
+    // NEW: sync/spawn 块内禁止 return 跨出（跳过 when_all / waitGroup）
+    if (!syncBoundaryStack_.empty()) {
+        error(stmt, "cannot return out of " + syncBoundaryStack_.back().kind + " block");
+    }
 ```
-
-**genSpawnCallAsThread**：类似，生成：
-```cpp
-_stx.submit([capturedVars..., &io]() mutable {
-    callee(capturedVars...);
-});
-```
-
-**自由变量收集**：遍历 `CallExpr` 参数表达式（`args`），从中提取 `Identifier` 节点。函数名（`callee`）本身不捕获。`io` 特殊处理：若被引用，协程版作为 lambda 参数隐式传递，线程版作为引用捕获。
-
-**闭包形态 genSpawnStmt**（第 822-867 行）保持不变。
 
 ---
 
-### 变更 9：CodeGen genSpawnAsThread() 适配
+### 变更 C4：CodeGen
 
-**位置**：[StmtGen.cpp:1060-1108](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1060-L1108)
-
-当前 assumes `stmt.params` 非空。对于调用形态，`params` 为空但 `callExpr` 非空。调用形态的分派已在 `genSpawnStmt()` 中处理（调用 `genSpawnCallAsThread`），不会走到 `genSpawnAsThread`。故 `genSpawnAsThread` 本身无需改动。
-
-但为了安全性，在 `genSpawnAsThread` 顶部添加 `assert(!stmt.params.empty())` 确认只有闭包形态进入此函数。
-
----
-
-### 变更 10：CodeGen genSyncForStmt() 新增 isThread 分支
-
-**位置**：[StmtGen.cpp:741-812](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L741-L812)
+#### C4.1 CodeGen.h 声明（[CodeGen.h:314-315](file:///d:/you/Aura/src/CodeGen/CodeGen.h#L314-L315)）
 
 ```cpp
-if (stmt.isThread) {
-    // 线程版展开
-    cpp << indentStr() << "{\n";
+void genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt, bool isCoroutine);
+void genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt);       // 闭包形态（线程版）
+void genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt);     // NEW 调用形态（协程版）
+void genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stmt);   // NEW 调用形态（线程版）
+```
+
+#### C4.2 genSpawnStmt() 重写（[StmtGen.cpp:814-914](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L814-L914)）
+
+```cpp
+void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt, bool) {
+    // === 调用形态：spawn func(args) ===
+    if (stmt.callExpr) {
+        if (inSyncThreadBlock_)
+            genSpawnCallAsThread(cpp, stmt);
+        else
+            genSpawnCallAsCoro(cpp, stmt);
+        return;
+    }
+
+    // sync thread 块内的闭包形态：分派到线程版本
+    if (inSyncThreadBlock_) {
+        genSpawnAsThread(cpp, stmt);
+        return;
+    }
+
+    // === 显式传参模式（spawn (params) { ... }） ===
+    if (!stmt.params.empty()) {
+        // === 第 822-867 行现有逻辑原样保留 ===
+    }
+    // 旧式语法分支（870-914 行）删除：无 params 的 spawn 已被 Parser/Sema 拒绝
+}
+```
+
+#### C4.3 genSpawnCallAsCoro（新增）
+
+```cpp
+// 调用形态（协程 sync 块内）：spawn func(args)
+// 生成：_tasks.push_back([](auto fv..., Io& io, taskvec& _tasks)
+//           -> task<void> { 调用; co_return; }(fv..., io, _tasks));
+void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt) {
+    // 1. 自由变量 = 调用表达式中所有 Identifier - 函数/类型名 - 内置
+    std::set<std::string> allRefs;
+    IdRefCollector idCol(allRefs);
+    idCol.collectExpr(*stmt.callExpr);   // 含 callee + args
+    std::set<std::string> builtins = {"io", "_tasks"};
+    std::vector<std::string> freeVars;
+    for (auto& name : allRefs) {
+        if (builtins.count(name)) continue;
+        if (registeredTypes_.count(name)) continue;  // 函数名/类型名不捕获
+        freeVars.push_back(name);
+    }
+
+    // 2. 协程 lambda：[] 空捕获 + 显式参数（复用旧式 spawn 的安全模式）
+    cpp << indentStr() << "_tasks.push_back([](";
+    for (auto& v : freeVars)
+        cpp << "auto " << safeName(v) << ", ";
+    cpp << "aura_rt::Io& io, std::vector<aura_rt::task<void>>& _tasks"
+        << ") -> aura_rt::task<void> {\n";
     indentLevel_++;
-    writeLine(cpp, "aura_rt::sync_thread_context _stx(" 
-        + (hasMax ? genExpr(*stmt.maxExpr, false) : "0") + ");");
-    writeLine(cpp, "aura_rt::ThreadPool::instance().ensureStarted();");
+    insideSpawn_ = true;
+    // isCoroutine=true：若 callee 为协程函数，genExpr 自动加 co_await；返回值丢弃
+    writeLine(cpp, genExpr(*stmt.callExpr, true) + ";");
+    insideSpawn_ = false;
+    writeLine(cpp, "co_return;");
+    indentLevel_--;
+    cpp << indentStr() << "}(";
+    for (auto& v : freeVars)
+        cpp << safeName(v) << ", ";
+    cpp << "io, _tasks));\n";
+}
+```
 
-    // for loop（复用现有 iterable 生成逻辑，range 优化 / *iter）
-    // ...（同协程版的 for 循环头）...
+#### C4.4 genSpawnCallAsThread（新增）
 
-    // spawn body：生成普通 lambda + _stx.submit()
+```cpp
+// 调用形态（sync thread 块内）：spawn func(args)
+// 生成：_stx.submit([fv..., &io]() mutable { 调用; });
+void CodeGenerator::genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
     bool oldIoSync = ioSync_;
     bool oldCoroutine = currentFunctionIsCoroutine_;
-    ioSync_ = true;
-    currentFunctionIsCoroutine_ = false;
-    cpp << indentStr() << "_stx.submit([" << var << "]() mutable {\n";
+    ioSync_ = true;                      // 强制 io 方法 _sync 版本
+    currentFunctionIsCoroutine_ = false; // 普通 lambda，禁止 co_await
+
+    // 1. 自由变量 + io 使用检测
+    std::set<std::string> allRefs;
+    IdRefCollector idCol(allRefs);
+    idCol.collectExpr(*stmt.callExpr);
+    std::set<std::string> builtins = {"io", "_tasks"};
+    std::vector<std::string> freeVars;
+    bool ioUsed = false;
+    for (auto& name : allRefs) {
+        if (name == "io") { ioUsed = true; continue; }
+        if (builtins.count(name)) continue;
+        if (registeredTypes_.count(name)) continue;
+        freeVars.push_back(name);
+    }
+
+    // 2. 捕获列表：freeVars 值捕获 + io 引用捕获
+    cpp << indentStr() << "_stx.submit([";
+    for (size_t i = 0; i < freeVars.size(); ++i) {
+        if (i > 0) cpp << ", ";
+        cpp << safeName(freeVars[i]);
+    }
+    if (ioUsed) {
+        if (!freeVars.empty()) cpp << ", ";
+        cpp << "&io";
+    }
+    cpp << "]() mutable {";
     indentLevel_++;
-    if (stmt.body) genBlock(cpp, *stmt.body, false);  // 非协程！
+    insideSpawn_ = true;
+    writeLine(cpp, genExpr(*stmt.callExpr, false) + ";");
+    insideSpawn_ = false;
     indentLevel_--;
-    writeLine(cpp, "});");
+    cpp << "\n" << indentStr() << "});\n";
+
     ioSync_ = oldIoSync;
     currentFunctionIsCoroutine_ = oldCoroutine;
-
-    writeLine(cpp, "aura_rt::gc_safepoint();");
-    indentLevel_--;
-    cpp << indentStr() << "}\n";  // close for
-    indentLevel_--;
-    cpp << indentStr() << "}\n";  // close sync thread block
-    return;
 }
-// 原有协程版逻辑不变 ...
 ```
 
-**关键差异**：
-- 不使用 `bounded_sync` / `_tasks` / `when_all`
-- 使用 `sync_thread_context`（RAII 自动 waitGroup）
-- item 值捕获（非引用），lambda 为 `mutable`
-- body 以 `isCoroutine=false` 生成
-- `ioSync_ = true` 确保 body 内 io 走 `_sync` 版本
+#### C4.5 genSyncForStmt() 重写：isThread 分支 + 自由变量捕获（[StmtGen.cpp:741-812](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L741-L812)）
+
+**潜在缺陷修复（本次新增）**：现有协程版 genSyncForStmt 的 lambda 仅接收 `(var, io, _tasks)`，body 引用任何外部变量（如 `sync for i in range(5) { ch.send(i) }`）都会生成 C++ 编译错误 `'ch' was not captured in this lambda`。本次协程版与线程版统一加入 body 自由变量收集（IdRefCollector + DeclaredCollector，机制与旧式 spawn 相同）。
+
+```cpp
+void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, bool) {
+    std::string var = safeName(stmt.itemName);
+    bool hasMax = stmt.maxExpr != nullptr;
+
+    // === 线程版：sync thread for ===
+    if (stmt.isThread) {
+        cpp << indentStr() << "{\n";
+        indentLevel_++;
+        std::string maxArg = hasMax ? genExpr(*stmt.maxExpr, false) : "0";
+        writeLine(cpp, "aura_rt::sync_thread_context _stx(" + maxArg + ");");
+        writeLine(cpp, "aura_rt::ThreadPool::instance().ensureStarted();");
+
+        // for 循环头（复用协程版的 range/数组遍历生成逻辑）
+        bool isRangeCall = false;
+        if (auto* call = dynamic_cast<const CallExpr*>(stmt.iterable.get())) {
+            auto* id = dynamic_cast<const Identifier*>(call->callee.get());
+            if (id && id->name == "range") {
+                isRangeCall = true;
+                if (call->args.size() == 1) {
+                    std::string end = genExpr(*call->args[0], false);
+                    cpp << indentStr() << "for (auto " << var
+                        << " : std::views::iota(0, " << end << ")) {\n";
+                } else if (call->args.size() == 2) {
+                    std::string start = genExpr(*call->args[0], false);
+                    std::string end   = genExpr(*call->args[1], false);
+                    cpp << indentStr() << "for (auto " << var
+                        << " : std::views::iota(" << start << ", " << end << ")) {\n";
+                }
+            }
+        }
+        if (!isRangeCall) {
+            std::string iter = genExpr(*stmt.iterable, false);
+            cpp << indentStr() << "for (auto " << var
+                << " : *" << iter << ") {\n";
+        }
+        indentLevel_++;
+
+        // body 自由变量收集（修复：引用外部变量必须显式捕获）
+        std::set<std::string> allRefs;
+        IdRefCollector idCol(allRefs);
+        if (stmt.body) idCol.collectStmt(*stmt.body);
+        std::set<std::string> declared;
+        DeclaredCollector declCol(declared);
+        if (stmt.body) declCol.collectStmt(*stmt.body);
+        std::set<std::string> builtins = {"io", "_tasks"};
+        std::vector<std::string> freeVars;
+        bool ioUsed = false;
+        for (auto& name : allRefs) {
+            if (name == stmt.itemName) continue;    // 迭代变量已值捕获
+            if (declared.count(name)) continue;      // body 内局部声明
+            if (name == "io") { ioUsed = true; continue; }
+            if (builtins.count(name)) continue;
+            if (registeredTypes_.count(name)) continue;  // 函数名/类型名
+            freeVars.push_back(name);
+        }
+
+        // spawn body：普通 lambda + _stx.submit（var + freeVars 值捕获 + io 引用捕获）
+        // 注：外部变量在主线程作用域仍存活（如 let ch27 的 GcRootHandle），
+        //     worker 线程执行期间对象不会被回收，与闭包形态线程版语义一致
+        bool oldIoSync = ioSync_;
+        bool oldCoroutine = currentFunctionIsCoroutine_;
+        ioSync_ = true;                       // 强制 io 方法 _sync 版本
+        currentFunctionIsCoroutine_ = false;  // 普通 lambda，禁止 co_await
+        cpp << indentStr() << "_stx.submit([" << var;
+        for (auto& v : freeVars) cpp << ", " << safeName(v);
+        if (ioUsed) cpp << ", &io";
+        cpp << "]() mutable {\n";
+        indentLevel_++;
+        insideSpawn_ = true;
+        if (stmt.body) genBlock(cpp, *stmt.body, false);   // 非协程！
+        insideSpawn_ = false;
+        indentLevel_--;
+        writeLine(cpp, "});");
+        ioSync_ = oldIoSync;
+        currentFunctionIsCoroutine_ = oldCoroutine;
+
+        // 回边 safepoint
+        writeLine(cpp, "aura_rt::gc_safepoint();");
+        indentLevel_--;
+        cpp << indentStr() << "}\n";   // close for
+        // _stx 析构自动 waitGroup
+        indentLevel_--;
+        cpp << indentStr() << "}\n";   // close block
+        return;
+    }
+
+    // === 协程版（现有逻辑 + 自由变量捕获修复） ===
+    // 1. Open sync block
+    if (hasMax) {
+        std::string maxN = genExpr(*stmt.maxExpr, false);
+        cpp << indentStr() << "{\n";
+        indentLevel_++;
+        writeLine(cpp, "aura_rt::bounded_sync _sync(" + maxN + ");");
+        writeLine(cpp, "auto& _tasks = _sync.tasks();");
+    } else {
+        cpp << indentStr() << "{\n";
+        indentLevel_++;
+        writeLine(cpp, "std::vector<aura_rt::task<void>> _tasks;");
+    }
+
+    // 2. Generate for loop over iterable
+    bool isRangeCall = false;
+    if (auto* call = dynamic_cast<const CallExpr*>(stmt.iterable.get())) {
+        auto* id = dynamic_cast<const Identifier*>(call->callee.get());
+        if (id && id->name == "range") {
+            isRangeCall = true;
+            if (call->args.size() == 1) {
+                std::string end = genExpr(*call->args[0], true);
+                cpp << indentStr() << "for (auto " << var
+                    << " : std::views::iota(0, " << end << ")) {\n";
+            } else if (call->args.size() == 2) {
+                std::string start = genExpr(*call->args[0], true);
+                std::string end   = genExpr(*call->args[1], true);
+                cpp << indentStr() << "for (auto " << var
+                    << " : std::views::iota(" << start << ", " << end << ")) {\n";
+            }
+        }
+    }
+    if (!isRangeCall) {
+        std::string iter = genExpr(*stmt.iterable, true);
+        cpp << indentStr() << "for (auto " << var
+            << " : *" << iter << ") {\n";
+    }
+    indentLevel_++;
+
+    // 3. body 自由变量收集（修复：现有版本 body 引用外部变量编译失败）
+    std::set<std::string> allRefs;
+    IdRefCollector idCol(allRefs);
+    if (stmt.body) idCol.collectStmt(*stmt.body);
+    std::set<std::string> declared;
+    DeclaredCollector declCol(declared);
+    if (stmt.body) declCol.collectStmt(*stmt.body);
+    std::set<std::string> builtins = {"io", "_tasks"};
+    std::vector<std::string> freeVars;
+    for (auto& name : allRefs) {
+        if (name == stmt.itemName) continue;   // 迭代变量已有参数
+        if (declared.count(name)) continue;     // body 内局部声明
+        if (builtins.count(name)) continue;
+        if (registeredTypes_.count(name)) continue;  // 函数名/类型名
+        freeVars.push_back(name);
+    }
+
+    // 4. Generate spawn lambda：[] 空捕获 + 显式参数（var + freeVars + io + _tasks）
+    //    安全模式与旧式 spawn 一致：协程帧在创建时拷贝参数，无 this 野指针 UB
+    cpp << indentStr() << "_tasks.push_back([](auto " << var;
+    for (auto& v : freeVars) cpp << ", auto " << safeName(v);
+    cpp << ", aura_rt::Io& io, std::vector<aura_rt::task<void>>& _tasks"
+        << ") -> aura_rt::task<void> {\n";
+    indentLevel_++;
+    insideSpawn_ = true;
+    if (stmt.body) genBlock(cpp, *stmt.body, true);
+    insideSpawn_ = false;
+    writeLine(cpp, "co_return;");
+    indentLevel_--;
+    cpp << indentStr() << "}(" << var;
+    for (auto& v : freeVars) cpp << ", " << safeName(v);
+    cpp << ", io, _tasks));\n";
+
+    // 5. L2 safepoint：sync for 循环回边
+    writeLine(cpp, "aura_rt::gc_safepoint();");
+    indentLevel_--;
+    cpp << indentStr() << "}\n";   // close for
+
+    // 6. Close sync block
+    writeLine(cpp, "aura_rt::gc_safepoint();");
+    if (hasMax) {
+        writeLine(cpp, "co_await _sync.wait_all();");
+    } else {
+        writeLine(cpp, "co_await aura_rt::when_all(std::move(_tasks));");
+    }
+    indentLevel_--;
+    cpp << indentStr() << "}\n";   // close sync block
+}
+```
+
+**GC 安全性说明**（协程版 freeVars / 线程版值捕获）：
+- 协程版：`auto ch28` 参数推断为外部变量类型（GcRootHandle），`ch28.get()->send(i)` 由 genIdentifier 的 `gcRootVarNames_` 匹配自动生成，与旧式 spawn 捕获机制完全一致。
+- 线程版：值捕获 GcRootHandle，worker 执行期间外部作用域仍持有引用，对象不回收；`ch27->send(i)` 走 GcRootHandle::operator->（[gc.h:146](file:///d:/you/Aura/runtime/gc/gc.h#L146)）。
+
+#### C4.6 genSpawnAsThread() 加固（[StmtGen.cpp:1060-1108](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1060-L1108)）
+
+函数体顶部追加防御性断言（调用形态已被 genSpawnStmt 分流）：
+
+```cpp
+void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
+    // 仅闭包形态进入（调用形态由 genSpawnCallAsThread 处理）
+    assert(!stmt.callExpr);
+    // ... 现有逻辑不变 ...
+}
+```
 
 ---
 
-### 变更 11：CoroDecide 适配
+### 变更 C5：CoroDecide — 无改动
 
-**位置**：[CoroDecide.cpp:65-72](file:///d:/you/Aura/src/CodeGen/CoroDecide.cpp#L65-L72)
-
-`SyncForStmt` 的 visitor 需要根据 `isThread` 返回不同的值：
-- `isThread = false`（协程版）→ 返回 `true`（需要协程上下文）
-- `isThread = true`（线程版）→ 返回 `false`（不需要协程上下文）
-
-`SpawnStmt` 的 visitor → 仍返回 `true`（spawn 在协程 sync 块内需要协程上下文；在 sync thread 块内由 inSyncThreadBlock_ 控制分发，不经过协程判定）。
+`visit(const SyncForStmt&)` 保持返回 `true`，与 `SyncStmt`（含 sync thread）行为一致。理由：
+- 协程函数尾有 `co_return` 兜底（[DeclGen.cpp:289-294](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L289-L294)），无 co_await 也能编译（与现有 sync thread 行为一致）。
+- sync thread for 生成代码中无 co_await，函数标记为协程无害。
 
 ---
 
-### 变更 12：ASTWalker 适配
+### 变更 C6：ASTWalker 适配
 
-**位置**：[ASTWalker.h](file:///d:/you/Aura/src/ASTWalker.h) 各 Walker + [CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) IdRefCollector/DeclaredCollector
+各 Walker 的 `visit(const SpawnStmt&)` 增加调用形态分支（callExpr 非空时遍历 callExpr）：
 
-`visit(SpawnStmt)` 在各 Walker 中遍历 `body`。需新增逻辑：若 `callExpr` 非空，遍历 `callExpr` 而非 `body`。
+| Walker | 文件:行 | 改动 |
+|--------|---------|------|
+| IdRefCollector | [CodeGen.h:138](file:///d:/you/Aura/src/CodeGen/CodeGen.h#L138) | `if (n.callExpr) return self.collectExpr(*n.callExpr);` 否则遍历 body |
+| DeclaredCollector | [CodeGen.h:181](file:///d:/you/Aura/src/CodeGen/CodeGen.h#L181) | `if (n.callExpr) return false;`（调用表达式无声明）否则遍历 body |
+| AssignTargetCollector | [ASTWalker.h:211](file:///d:/you/Aura/src/ASTWalker.h#L211) | `if (n.callExpr) return false;` 否则遍历 body |
+| CallTargetScanner | [ASTWalker.h:261](file:///d:/you/Aura/src/ASTWalker.h#L261) | `if (n.callExpr) return self.scanExpr(*n.callExpr);` 否则遍历 body |
+| CaptureArgScanner | [ASTWalker.h:328](file:///d:/you/Aura/src/ASTWalker.h#L328) | `if (n.callExpr) return self.scanExpr(*n.callExpr);` 否则遍历 body |
+| IoDetector | [ASTWalker.h:175](file:///d:/you/Aura/src/ASTWalker.h#L175) | 保持 `return false;`（spawn 不在闭包协程化判定范围） |
 
-具体影响的 Walker：
-
-| Walker | 文件 | 改动 |
-|--------|------|------|
-| IdRefCollector | CodeGen.h:138 | 调用形态下遍历 callExpr 的参数而非 body |
-| DeclaredCollector | CodeGen.h:181 | 同上 |
-| AssignTargetCollector | ASTWalker.h:212 | 同上 |
-| CallTargetScanner | ASTWalker.h:261 | 同上 |
-| CaptureArgScanner | ASTWalker.h:328 | 同上 |
-| IoDetector | ASTWalker.h:175 | 调用形态可能含 io 引用，需遍历 callExpr |
-| CoroScanner | 无独立 SpawnStmt visit | 不变 |
+`SyncForStmt.isThread` 不改变各 Walker 行为（都按 body/iterable 遍历，无差别）。
 
 ---
 
-### 变更 13：ASTPrinter 适配
+### 变更 C7：ASTPrinter 适配
 
-**位置**：[ASTPrinter.cpp](file:///d:/you/Aura/src/ASTPrinter.cpp)
+**[ASTPrinter.cpp:354-360](file:///d:/you/Aura/src/ASTPrinter.cpp#L354-L360) SyncForStmt::print**：追加 `if (isThread) os << " thread";`
 
-`SpawnStmt::print()` 和 `SyncForStmt::print()` 更新以反映新字段。
+**[ASTPrinter.cpp:369-375](file:///d:/you/Aura/src/ASTPrinter.cpp#L369-L375) SpawnStmt::print**：追加 `if (callExpr) { printIndent(os, indent+1); os << "call:\n"; callExpr->print(os, indent+2); }`
 
 ---
 
@@ -435,28 +776,29 @@ if (stmt.isThread) {
 
 ### 受影响组件
 
-| 组件 | 文件 | 影响程度 |
-|------|------|----------|
-| AST | Stmt.h | 中 — 2 个结构体新增字段 |
-| Parser | StmtParser.cpp | 高 — 3 个函数重写/修改 |
-| Parser | Parser.h | 低 — 新增 parseSyncThreadForStmt() 声明 |
-| Sema | StmtChecker.cpp | 中 — 3 个函数新增分支 |
-| CodeGen | StmtGen.cpp | 高 — 删除旧分支 + 2 个新增分支 |
-| CodeGen | CodeGen.h | 低 — 新增 genSpawnCallAsCoro/Thread 声明 |
-| CoroDecide | CoroDecide.cpp | 低 — SyncForStmt 条件返回值 |
-| ASTWalker | ASTWalker.h | 低 — 5 个 Walker 适配 |
-| ASTPrinter | ASTPrinter.cpp | 低 — 打印适配 |
+| 组件 | 文件 | 影响程度 | 变更 |
+|------|------|----------|------|
+| AST | Stmt.h | 中 | SpawnStmt+callExpr、SyncForStmt+isThread（含 clone） |
+| Parser | StmtParser.cpp | 高 | parseSpawnStmt 重写、parseSyncStmt 转发、parseSyncForRest 新增 |
+| Parser | Parser.h | 低 | 新增 parseSyncForRest 声明 |
+| Sema | StmtChecker.cpp | 中 | checkSpawnStmt/checkSyncForStmt 分支 + return 边界检查 |
+| Sema | SemAnalyzer.h | 低 | insideLoop_→loopDepth_ + syncBoundaryStack_ |
+| Sema | SemAnalyzer.cpp | 低 | break/continue 边界检查 |
+| CodeGen | StmtGen.cpp | 高 | genSpawnStmt 重写 + 2 新增函数 + genSyncForStmt 分支 |
+| CodeGen | CodeGen.h | 低 | 2 个新函数声明 + IdRefCollector/DeclaredCollector 适配 |
+| ASTWalker | ASTWalker.h | 低 | 4 个 Walker 的 SpawnStmt visit 适配 |
+| ASTPrinter | ASTPrinter.cpp | 低 | 2 个 print 适配 |
 
 ### 破坏性变更
 
-- **BREAKING**：`spawn { }` 旧式自动捕获删除。audit 结果显示当前无测试使用此形式，实际破坏性为零。
-- 闭包形态 `spawn (params) { body }` 完全保留，无破坏。
-- `sync for` 现有语法完全保留，无破坏。
+- **BREAKING**：旧式 `spawn { }` 删除（Parser 报错提示新语法）。audit 确认 `example/test.aura`、`example/test_gc_mutex.aura` 均用闭包形态，无破坏。
+- **BREAKING**：`return`/`break`/`continue` 跨出 sync/spawn 块从"编译期 C++ 报错或静默语义错位"变为"Sema 期明确报错"。现有合法代码（块内循环的 break）不受影响。
+- 闭包形态 `spawn (params) { body }`、`sync for`、`sync thread` 语法全部保留。
 
 ### 兼容性
 
-- 所有现有测试 `example/test.aura` 中的 spawn 均使用闭包形态（`spawn (ch: sync.Channel<int>) { }`），无需修改。
-- `example/used/test_sync_for.aura` 中的 `sync for` 使用花括号，无需修改。
+- 现有测试的 spawn 均为闭包形态，Parser 新分支下行为不变。
+- 协程函数尾 `co_return` 兜底保证 sync thread for 生成无 co_await 的协程函数可编译。
 
 ---
 
@@ -464,120 +806,126 @@ if (stmt.isThread) {
 
 | 边界条件 | 当前处理 | 计划处理 | 测试策略 |
 |----------|----------|----------|----------|
-| `spawn` 后无 `(` 也无 `{` | Parser 报错 "expected '{'" | 报错 "expected '(' or '{{' after spawn" | 语法错误测试 |
-| `spawn (` 括号内空 `spawn () { }` | Parser 接受（空 params） | 不变 | 空参数测试 |
-| `spawn func`（Identifier 后无 `(`） | 不存在 | parseExpr 正常解析为 Identifier 引用 | 无（无意义调用） |
-| `sync thread for` body 内用 co_await | 不存在 | Sema 应报错（非协程上下文） | 负向测试 |
-| `sync thread for` body 内写 spawn | 不存在 | Sema 报错（隐式 spawn 内禁止嵌套） | 负向测试 |
-| `sync for i in range(10) if cond { }` | 不存在 | Parser 报错 "expected function call" | 负向测试 |
-| `sync for(max=0)` | Parser 接受（0→无界） | 不变 | 边界值测试 |
-| `spawn func(a, b)` 中 a 是字面量 | 不存在 | 字面量不捕获，直接传值 | 字面量参数测试 |
-| `spawn io.println("hello")` io 未被变量引用 | 不存在 | Sema 从外层作用域解析 io | io 隐式传递测试 |
-| 闭包形态 params 含 `io` | 现有：自动追加 io | 不变 | 现有测试覆盖 |
+| `spawn { }` 旧式语法 | 解析为自动捕获 | Parser 报错提示新语法 | 负向测试 |
+| `spawn x`（非调用表达式） | 解析为 ExprStmt 引用 | Parser 报错 "expected function call" | 负向测试 |
+| `spawn func()` 无参调用 | 不存在 | 正常解析 CallExpr | 正向测试 |
+| `spawn io.println(...)` | 不存在 | io 在 builtins 不捕获，协程版注入 lambda 参数、线程版 &io 捕获 | 正向测试 |
+| `spawn obj.method(x)` | 不存在 | callee=obj 被捕获，MethodCallExpr 在 lambda 内生成 | 正向测试 |
+| spawn 调用形态参数含字面量 | 不存在 | 字面量无 Identifier，不捕获 | 正向测试 |
+| `spawn (params) { }` 闭包形态 | 正常 | 原样保留 | 回归测试 |
+| `sync thread for` 嵌套 sync thread | 不存在 | Sema R1 报错 | 负向测试 |
+| `sync thread for` body 内 co_await | 不存在 | 非协程上下文，io 走 _sync；协程函数调用由 C++ 兜底报错 | 负向测试 |
+| `sync for x in arr if ...`（省略花括号遇控制流） | 不存在 | Parser 报错提示用花括号 | 负向测试 |
+| `sync for x in arr process(x)` | 不存在 | 解析 CallExpr 包装 ExprStmt | 正向测试 |
+| sync for body 引用外部变量（`ch.send(i)`） | C++ 编译错误（现有协程版仅捕获 var/io/_tasks） | 协程版/线程版均加自由变量收集（IdRefCollector+DeclaredCollector） | 正向测试 K27/K28 |
+| sync thread for 无 io 引用 | 不存在 | ioUsed 检测：body 未用 io 时不捕获 &io（函数无 io 参数也可编译） | 正向测试 K27 |
+| 块内循环 break（spawn 体内 while+break） | 合法 | 边界栈判定 loopDepth_>entry → 放行 | 回归测试 K18/K21 |
+| break/continue/return 跨出 sync/spawn | 无检查（C++ 期错位） | Sema 报错 "cannot break/continue/return out of X block" | 负向测试 |
+| `sync for(max=0)` | 接受（0→无界） | 不变 | 边界值测试 |
 
 ---
 
 ## 4.7 测试方案
 
-### 单元测试（写入 example/test.aura）
+### 正向测试（写入 example/test.aura，追加 K24+）
 
-```
-// === K24: spawn 调用形态（协程版） ===
-io.println("=== K24: spawn call ===")
-let sum24 = 0
+```aura
+// 顶部新增全局函数（供 K25 调用形态测试）
+fun spawnWorker(n: int, io: Io) {
+    io.println("spawnWorker: " + n)
+}
+
+// === K24: spawn 调用形态（协程版，方法调用） ===
+io.println("=== K24: spawn call coro ===")
+let ch24: sync.Channel<int> = sync.Channel(10)
 sync {
-    spawn process(1, sum24)
+    spawn ch24.send(42)          // 方法调用形态
 }
-// 验证 sum24 被修改
+let v24 = ch24.receive()
+io.println("v24: " + v24.unwrap())  // 42
 
-// === K25: spawn 调用形态（线程版） ===
-io.println("=== K25: spawn call thread ===")
+// === K25: spawn 调用形态（协程版，全局函数 + 参数捕获） ===
+// 自由变量 = ∅（worker/spawnWorker 是函数名被过滤，io 是 builtins），
+// 验证 genSpawnCallAsCoro 的空捕获路径
+io.println("=== K25: spawn call global fun ===")
+sync {
+    spawn spawnWorker(1, io)
+    spawn spawnWorker(2, io)
+}
+io.println("K25 done")
+
+// === K26: sync thread 块内 spawn（闭包形态保留 + 调用形态） ===
+io.println("=== K26: spawn in sync thread ===")
+let ch26: sync.Channel<int> = sync.Channel(10)
 sync thread {
-    spawn (io: Io) io.println_sync("from thread")
+    spawn (io: Io) { io.println_sync("thread-a") }   // 闭包形态保留
+    spawn ch26.send(100)                             // 调用形态（线程版）
 }
-
-// === K26: spawn 闭包形态（保留） ===
-// 复用现有 K18-K23 测试，确认未破坏
+ch26.close()
+let v26 = 0
+for v in ch26 { v26 = v }
+io.println("v26: " + v26)   // 100
 
 // === K27: sync thread for ===
 io.println("=== K27: sync thread for ===")
-let arr27 = [1, 2, 3, 4, 5]
-let sum27 = 0
-sync thread for x in arr27 {
-    // 线程安全累加（简化测试）
+let ch27: sync.Channel<int> = sync.Channel(100)
+sync thread for i in range(10) {
+    ch27.send(i)
 }
-io.println("sum27: " + sum27)  // 15
+ch27.close()
+let sum27 = 0
+for v in ch27 { sum27 = sum27 + v }
+io.println("sum27: " + sum27)   // 0+...+9 = 45
 
 // === K28: sync for 省略花括号 ===
 io.println("=== K28: sync for no braces ===")
-let arr28 = [10, 20, 30]
-sync for x in arr28 io.println(x)
-
-// === K29: sync for 省略花括号被拒绝 ===
-// sync for x in arr28 if true { }  → 编译错误
-
-// === K30: spawn 调用形态自由变量 ===
-let n = 42
-sync {
-    spawn double(n)  // n 作为参数传递
-}
+let ch28: sync.Channel<int> = sync.Channel(50)
+sync for i in range(5) ch28.send(i)
+ch28.close()
+let sum28 = 0
+for v in ch28 { sum28 = sum28 + v }
+io.println("sum28: " + sum28)   // 0+1+2+3+4 = 10
 ```
 
-### 集成测试
+### 负向测试（编译期断言）
 
-- 编译 `test.aura` → 运行 `test.exe`，所有 K1-K30 通过
-- 编译 `used/test_sync_for.aura` → 确认现有 `sync for` 语法不受影响
+- `spawn { io.println("x") }` → "old-style 'spawn { ... }' is removed"
+- `spawn x`（x 为变量）→ "expected function call after 'spawn'"
+- `sync for i in range(3) if true { }` → "expected function call ... wrap complex bodies in braces"
+- 外层 `for` + `sync thread { break }` → "cannot break out of sync thread block"
+- `sync { return }` → "cannot return out of sync block"
+- spawn 体内 `break`（指向 spawn 外循环）→ "cannot break out of spawn block"
 
-### 回归风险
+### 回归验证
 
-- 所有现有 spawn 测试（K18-K23）依赖闭包形态，Parser 改动后需确认不受影响
-- `sync for` 协程版（现有）需确认 isThread 默认 false 的正确性
+- 现有 K18-K23（闭包形态 + 块内 while/break）全通过 → 确认边界栈不误伤块内合法 break。
+- `used/test_sync_for.aura` 现有 `sync for` 语法通过（body 仅用迭代变量 + io，自由变量收集为空路径）。
+- K27/K28 的 `ch27.send(i)`/`ch28.send(i)` 通过 → 确认外部变量捕获（协程版 + 线程版）。
+- 编译命令：`compile.cmd`（非 ASAN）→ 运行 `test.exe`。
 
 ---
 
 ## 4.8 实施步骤（有序）
 
-### 阶段 A：AST + Parser 基础（无功能变更，仅新增解析能力）
+| 阶段 | 步骤 | 内容 | 验证 |
+|------|------|------|------|
+| A | A1 | Stmt.h：SpawnStmt+callExpr、SyncForStmt+isThread（含 clone） | `cmake --build build` |
+| A | A2 | StmtParser.cpp：parseSpawnStmt 重写 + parseSyncForRest + parseSyncStmt 转发；Parser.h 声明 | 编译通过 |
+| A | A3 | ASTPrinter.cpp：SpawnStmt/SyncForStmt print 适配 | 编译通过 |
+| B | B1 | SemAnalyzer.h：insideLoop_→loopDepth_ + syncBoundaryStack_ | 编译通过 |
+| B | B2 | StmtChecker.cpp：3 个 check 函数边界 push/pop + 调用形态分支 + return 检查 | 编译通过 |
+| B | B3 | SemAnalyzer.cpp：break/continue 边界检查 | 编译通过 |
+| C | C1 | CodeGen.h：2 个新函数声明 + IdRefCollector/DeclaredCollector 适配 | 编译通过 |
+| C | C2 | StmtGen.cpp：genSpawnStmt 重写 + genSpawnCallAsCoro/Thread 新增 | 编译通过 |
+| C | C3 | StmtGen.cpp：genSyncForStmt 重写（isThread 分支 + 自由变量捕获修复）+ genSpawnAsThread 断言 | 编译通过 |
+| D | D1 | ASTWalker.h：4 个 Walker SpawnStmt visit 适配 | 编译通过 |
+| E | E1 | test.aura 追加 K24-K28 正向测试 | compile.cmd 编译 |
+| E | E2 | 负向测试逐条验证报错信息 | 编译期断言 |
+| E | E3 | 运行 test.exe 全量回归（K1-K28） | 全部通过 |
 
-| 步骤 | 内容 | 验证 |
-|------|------|------|
-| A1 | Stmt.h: SpawnStmt 新增 callExpr，SyncForStmt 新增 isThread | 编译通过 |
-| A2 | StmtParser.cpp: parseSpawnStmt() 重写（新增调用形态，删除旧式） | 编译通过 |
-| A3 | StmtParser.cpp: parseSyncStmt() 新增 thread for 转发 | 编译通过 |
-| A4 | StmtParser.cpp: parseSyncForStmt() + 新增 parseSyncThreadForStmt() | 编译通过 |
-| A5 | StmtParser.cpp: parseSyncForStmt() 省略花括号 CallExpr 包装 | 编译通过 |
-| A6 | ASTPrinter.cpp 打印适配 | 编译通过 |
+**依赖关系**：A（AST+Parser）→ B（Sema）→ C（CodeGen）→ D（Walker）→ E（测试）。阶段内步骤可合并提交。
 
-### 阶段 B：Sema 适配
-
-| 步骤 | 内容 | 验证 |
-|------|------|------|
-| B1 | checkSpawnStmt() 新增 callExpr 分支 | 编译通过 |
-| B2 | checkSyncForStmt() 新增 isThread 分支 | 编译通过 |
-
-### 阶段 C：CodeGen 适配
-
-| 步骤 | 内容 | 验证 |
-|------|------|------|
-| C1 | genSpawnStmt(): 删除旧式分支 + 新增 callExpr → genSpawnCallAsCoro | 编译通过 |
-| C2 | genSpawnCallAsThread(): 新增线程版 callExpr 生成 | 编译通过 |
-| C3 | genSyncForStmt(): 新增 isThread 分支 | 编译通过 |
-
-### 阶段 D：辅助适配
-
-| 步骤 | 内容 | 验证 |
-|------|------|------|
-| D1 | CoroDecide: SyncForStmt 条件返回值 | 编译通过 |
-| D2 | ASTWalker: 各 Walker 的 SpawnStmt visit 适配 callExpr | 编译通过 |
-| D3 | CodeGen.h: IdRefCollector/DeclaredCollector 适配 | 编译通过 |
-
-### 阶段 E：测试
-
-| 步骤 | 内容 | 验证 |
-|------|------|------|
-| E1 | 写入 K24-K30 测试代码到 test.aura | — |
-| E2 | compile.cmd 编译 → test.exe 运行 | K24-K30 全通过 |
-| E3 | 运行 used/test_sync_for.aura | 现有测试不受影响 |
+**回滚**：各阶段独立可逆；若 E2/E3 失败，优先检查 C2 自由变量收集与 B2 边界栈 push/pop 配对。
 
 ---
 
@@ -585,9 +933,11 @@ sync {
 
 | 风险 | 概率 | 影响 | 缓解措施 |
 |------|------|------|----------|
-| `spawn (` 括号内歧义：类型注解含冒号的函数调用 vs 参数声明 | 低 | 编译错误 | Parser 以是否有 `name: Type` 模式区分；若有歧义报清晰错误 |
-| 自由变量收集遗漏：调用形态的参数中嵌套表达式含未捕获变量 | 中 | 运行时悬垂引用 | CodeGen 阶段遍历整个 CallExpr 子树提取所有 Identifier |
-| `sync thread for` body 中 io 方法错误调用异步版本 | 中 | 运行时崩溃 | `ioSync_ = true` 在 thread for 分支中设置，与现有 sync thread 一致 |
-| 闭包形态 params + callExpr 同时非空 | 低 | 未定义行为 | Sema 添加互斥检查 `assert(!(params && callExpr))` |
-| 旧式 `spawn {}` 实际被使用 | 低 | 编译错误 | audit 确认无使用；若有则先改写为闭包形态 |
-| CoroDecide 漏判 sync thread for | 中 | 函数标记为协程（无害但多余） | CoroScanner 显式处理 isThread 分支 |
+| 调用形态自由变量遗漏（嵌套表达式未捕获） | 低 | 运行时悬垂 | IdRefCollector.collectExpr 递归全子树，与旧式 spawn 同一机制 |
+| sync thread 调用形态调用协程函数 | 低 | C++ 编译错误 | 与现有闭包形态行为一致，C++ 兜底；plan 记录为已知限制 |
+| 边界栈 push/pop 失配（异常路径 return） | 低 | 栈污染 | 各 check 函数单一出口/显式 pop；Sema 无异常抛出 |
+| 空 params 闭包 `spawn () { }` 与调用形态歧义 | 无 | — | `spawn (` 恒走闭包形态，`spawn func` 恒走调用形态，无歧义 |
+| `spawn obj.method()` 的 obj 捕获 GC 安全性 | 中 | 与闭包形态同等级风险 | 与现有 `spawn (obj: T) { obj.method() }` 语义等价，不新增风险 |
+| sync for 自由变量收集遗漏（body 嵌套表达式） | 低 | 运行时悬垂 | IdRefCollector.collectStmt 递归全子树（与旧式 spawn 同一机制），DeclaredCollector 排除局部声明 |
+| sync for 捕获的 GcRootHandle 跨线程（线程版值捕获） | 低 | 与闭包形态同等级 | 外部作用域持有引用保证存活；与 genSpawnAsThread 显式参数捕获语义一致 |
+| 旧式 `spawn { }` 被误用 | 低 | 编译错误 | 明确报错信息指引新语法 |

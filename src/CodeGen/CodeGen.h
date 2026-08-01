@@ -135,7 +135,7 @@ public:
         bool visit(const TryCatchStmt& n, IdRefCollector& self) { if (n.tryBody) self.collectStmt(*n.tryBody); if (n.catchBody) self.collectStmt(*n.catchBody); return false; }
         bool visit(const SyncStmt& n, IdRefCollector& self)   { if (n.body) self.collectStmt(*n.body); return false; }
         bool visit(const SyncForStmt& n, IdRefCollector& self) { if (n.iterable) self.collectExpr(*n.iterable); if (n.body) self.collectStmt(*n.body); return false; }
-        bool visit(const SpawnStmt& n, IdRefCollector& self)  { for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
+        bool visit(const SpawnStmt& n, IdRefCollector& self)  { if (n.callExpr) return self.collectExpr(*n.callExpr); for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
         bool visit(const MatchStmt& n, IdRefCollector& self) { if (n.expr) self.collectExpr(*n.expr); for (auto& c : n.cases) { if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) self.collectStmt(*cb); else self.collectExpr(*c.body); } } return false; }
         bool visit(const ExprStmt& n, IdRefCollector& self)   { if (n.expr) self.collectExpr(*n.expr); return false; }
         bool visit(const LetDecl& n, IdRefCollector& self)    { if (n.initializer) self.collectExpr(*n.initializer); return false; }
@@ -178,7 +178,7 @@ public:
         bool visit(const BlockStmt& n, DeclaredCollector& self){ for (auto& s : n.stmts) if (s) self.collectStmt(*s); return false; }
         bool visit(const SyncStmt& n, DeclaredCollector& self) { if (n.body) for (auto& sb : n.body->stmts) if (sb) self.collectStmt(*sb); return false; }
         bool visit(const SyncForStmt& n, DeclaredCollector& self){ out_.insert(n.itemName); if (n.body) for (auto& sb : n.body->stmts) if (sb) self.collectStmt(*sb); return false; }
-        bool visit(const SpawnStmt& n, DeclaredCollector& self){ for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
+        bool visit(const SpawnStmt& n, DeclaredCollector& self){ if (n.callExpr) return false; for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
         bool visit(const ReturnStmt&,  DeclaredCollector&) { return false; }
         bool visit(const ThrowStmt&,   DeclaredCollector&) { return false; }
         bool visit(const IfStmt&,      DeclaredCollector&) { return false; }
@@ -313,6 +313,8 @@ private:
     void genTryCatchNoSetupIIFE(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
     void genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt, bool isCoroutine);
     void genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt);  // sync thread 内的 spawn
+    void genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt);   // 调用形态（协程版）：spawn func(args)
+    void genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stmt); // 调用形态（线程版）：spawn func(args)
     void genLockStmt(std::ostream& cpp, const LockStmt& stmt, bool isCoroutine);  // lock (m) { }
     void genMatchStmt(std::ostream& cpp, const MatchStmt& stmt, bool isCoroutine);
     void genExprStmt(std::ostream& cpp, const ExprStmt& stmt, bool isCoroutine);

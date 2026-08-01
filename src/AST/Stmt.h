@@ -247,9 +247,10 @@ struct LockStmt : Stmt {
 };
 
 struct SpawnStmt : Stmt {
-    std::vector<Param> params;                     // spawn 参数列表（显式传参）
-    std::vector<std::unique_ptr<ASTNode>> args;    // 可选的显式实参（异名时使用）
-    std::vector<std::unique_ptr<Stmt>> body;
+    std::vector<Param> params;                     // 闭包形态：spawn 参数列表（显式传参）
+    std::vector<std::unique_ptr<ASTNode>> args;    // 闭包形态：可选的显式实参（异名时使用）
+    std::vector<std::unique_ptr<Stmt>> body;       // 闭包形态：语句体
+    std::unique_ptr<ASTNode> callExpr;             // 调用形态：spawn func(args) / spawn obj.method(args)
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<SpawnStmt>();
@@ -265,6 +266,7 @@ struct SpawnStmt : Stmt {
             if (s) n->body.emplace_back(static_cast<Stmt*>(s->clone().release()));
             else n->body.push_back(nullptr);
         }
+        if (callExpr) n->callExpr = callExpr->clone();
         n->line = line; n->col = col;
         return n;
     }
@@ -276,6 +278,7 @@ struct SyncForStmt : Stmt {
     std::string itemName;
     std::unique_ptr<ASTNode> iterable;
     std::unique_ptr<BlockStmt> body;
+    bool isThread = false;             // true 表示 sync thread for（多线程），false 表示 sync for（协程）
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<SyncForStmt>();
@@ -283,6 +286,7 @@ struct SyncForStmt : Stmt {
         n->itemName = itemName;
         n->iterable = iterable ? iterable->clone() : nullptr;
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
+        n->isThread = isThread;
         n->line = line; n->col = col;
         return n;
     }

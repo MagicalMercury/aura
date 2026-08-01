@@ -297,7 +297,7 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
 [ 十 ] 并发与多线程（plan/sync_thread_plan.md）
 ================================================================
 
-[ ] P1  spawn 语法激进简化  [2026-07-31 提出]
+[x] P1  spawn 语法激进简化  [2026-07-31 提出] [2026-08-01 完成]
       - 目标：`spawn func(args)` 直接调用函数/方法（类 Go 语言 go 关键字）
       - 删除：旧式 `spawn { }`（自动捕获自由变量，IdRefCollector 分支）
       - 保留：`spawn (params) { body }` 作为闭包形态（多语句场景 fallback）
@@ -306,12 +306,15 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
       - CodeGen：遍历 CallExpr 参数收集自由变量（而非 stmt.body），复用现有 lambda 生成模式
       - 协程模式：`_tasks.push_back([captures](...) -> task<void> { callee(args); co_return; })`
       - 线程模式：`_stx.submit([captures]() mutable { callee(args); })`
-      - 歧义处理：`spawn (` 后检测括号内是否有 `name: Type` 模式（含冒号）
-        → 有冒号 = `spawn (params) { }` 闭包形态，无冒号 = `spawn func(args)` 调用形态
+      - 歧义处理：`spawn (` 恒走闭包形态（现有语法），`spawn func` 恒走调用形态（无歧义）
       - 涉及文件：Parser/StmtParser.cpp, Sema/Checker/StmtChecker.cpp, CodeGen/StmtGen.cpp,
         CodeGen/CodeGen.h, CodeGen/CoroDecide.cpp, AST/Stmt.h
+      - 实现摘要：SpawnStmt 新增 callExpr 字段；parseSpawnStmt 重写（`spawn { }` 报错 removed、
+        空参数闭包 Sema 拒绝）；genSpawnStmt 调用形态分派 genSpawnCallAsCoro/Thread；
+        syncBoundaryStack_ 边界检查（return/break/continue 跨出报错）；
+        测试 K24/K25（协程调用形态：方法调用 + 全局函数）、K26（sync thread 内混合形态）
 
-[ ] P1  sync thread for 语句  [2026-07-31 提出]
+[x] P1  sync thread for 语句  [2026-07-31 提出] [2026-08-01 完成]
       - 目标：`sync thread for x in arr { body }` 多线程并行迭代语法糖
       - AST：SyncForStmt 新增 `bool isThread = false` 字段
       - Parser：`parseSyncStmt()` 消费 `thread` 后检测当前 token 为 `for` → 转向新函数解析
@@ -320,7 +323,7 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
         ```
         { sync_thread_context _stx; ThreadPool::ensureStarted();
           for (auto x : *iter) {
-            _stx.submit([x]() mutable { body });
+            _stx.submit([x, freeVars..., &io]() mutable { body });
             gc_safepoint();
           }
         }
@@ -329,14 +332,19 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
       - body 是非协程上下文，io 方法强制 _sync 版本（现有 ioSync_ 机制覆盖）
       - 涉及文件：AST/Stmt.h, Parser/StmtParser.cpp, Parser/Parser.h,
         Sema/Checker/StmtChecker.cpp, CodeGen/StmtGen.cpp, CodeGen/CodeGen.h
+      - 实现摘要：parseSyncForRest 共享解析（协程/线程两入口）；线程版 submit 捕获自由变量
+        （IdRefCollector+DeclaredCollector 修复 body 引用外部变量编译失败）；R1 嵌套检查；
+        测试 K27（sum=45 验证 10 线程并发累加）
 
-[ ] P2  sync for / sync thread for 省略花括号  [2026-07-31 提出]
+[x] P2  sync for / sync thread for 省略花括号  [2026-07-31 提出] [2026-08-01 完成]
       - 目标：`sync for i in range(10) process(i)` / `sync thread for x in arr process(x)`
       - Parser：解析完 `itemName in iterable` 后检测下一个 token：
         → `{` = 块体（现有），否则 = 解析 CallExpr，包装为单语句 BlockStmt
       - 限制：仅允许 CallExpr（函数调用），拒绝 if/match/loop 等复杂控制流
       - AST/Sema/CodeGen 零改动（body 仍是 BlockStmt，Sema/CodeGen 透明）
       - 涉及文件：仅 Parser/StmtParser.cpp
+      - 实现摘要：parseSyncForRest 省略花括号分支（CallExpr/MethodCallExpr 包装 ExprStmt）；
+        非调用表达式报错；测试 K28（sum=10 验证协程并行 send 5 个元素）
 
 [ ] P3  sync.WaitGroup 重新设计  [2026-07-27 推迟，待场景验证]
       - 现状：v1.1 实施过程中发现 sync_thread_context 析构已自动 waitGroup
