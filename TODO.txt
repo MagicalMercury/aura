@@ -286,6 +286,24 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
       - 现状：可读性高，建议保留
       - 文件：src/Parser/ExprParser.cpp:47-158
 
+[x] P1  Sema 硬编码提取与逻辑混乱重构  [2026-08-01 提出] [2026-08-01 完成]
+      - 来源：plan/sema_code_review.md §十二（2026-08-01 补充审查）
+      - 背景：Sema 区域存在 5 处 Aura↔C++ 类型名映射重复（未复用
+        BuiltinRegistry.types_ 权威表）、3 处 TypeExpr 树遍历平行重复、
+        inferCall 三处参数检查重复（约 70 行）等硬编码；另有 9 处逻辑混乱点
+      - 实施：plan/sema_refactor_issue.md（详细方案）+ change.md（实现清单）
+      - 实现摘要：P0-1 semTypeFromAuraName/semTypeFromCppName/cppNameOf 统一 5 处
+        映射 + findByCppType 反向查找；P0-2/3 elemTypeOf 提取（顺带修复 sync for
+        遍历 channel 元素类型缺失）；P0-4 forEachGenericRef 统一 TypeExpr 遍历；
+        P0-5 checkCallArgs/checkThrowsContext/applyGenericMap；P1-1 importFuncSymbol/
+        buildFuncExport；P1-2 rejectStandaloneNone/checkSyncMax；P1-3 SyncBoundaryGuard/
+        ScopedValue/FnCtxGuard RAII；P2-1 死分支清理；P2-2 泛型冲突报错；P2-4 null
+        防御 + 未知操作符报错；P2-5 kSyncIoMethods 白名单
+      - 测试：K1-K29 全量回归通过 + N1-N4 负向断言（泛型冲突/跨块 return/E017/E016+
+        参数数量）+ example/used/test_sync_for.aura 回归
+      - 文件：src/Sema/SemAnalyzer.cpp, Checker/StmtChecker.cpp, Checker/ExprInfer.cpp,
+        Checker/DeclChecker.cpp, BuiltinRegistry.h
+
 ================================================================
 [ 九 ] 文档与示例
 ================================================================

@@ -38,6 +38,9 @@ public:
     void importExports(const std::string& alias, const ModuleExports& exports);
     [[nodiscard]] ModuleExports extractExports() const;
 
+    // importExports 辅助：将一个导出函数/构造函数导入为 Function 符号
+    void importFuncSymbol(const std::string& name, const FuncExport& f);
+
     // 错误列表
     const std::vector<std::string>& errors() const { return diag_.errorMessages(); }
 
@@ -52,6 +55,14 @@ private:
     // AST 类型 → 语义类型
     [[nodiscard]] std::unique_ptr<SemType> resolveType(const TypeExpr& astType);
     [[nodiscard]] std::unique_ptr<SemType> resolveNamedType(const std::string& name);
+
+    // 从 Aura 类型名构造 SemType（int→intType；其他注册类型→GenericSemType；None/未知→Error）
+    [[nodiscard]] std::unique_ptr<SemType> semTypeFromAuraName(const std::string& name);
+    // 从 C++ 类型名映射回 Aura SemType（供 resolvedName 元素类型提取）
+    [[nodiscard]] std::unique_ptr<SemType> semTypeFromCppName(const std::string& cppName);
+
+    // 从迭代器/列表/泛型通道类型推导元素类型（for / sync for 迭代变量类型）
+    [[nodiscard]] std::unique_ptr<SemType> elemTypeOf(const SemType* iterType);
 
     // 类型等价性
     [[nodiscard]] bool isAssignable(const SemType& target, const SemType& source) const;
@@ -75,9 +86,28 @@ private:
         const SemType& concrete);
 
     // 从一对 (形参类型, 实参类型) 中递归收集泛型→具体映射
+    // conflict: 同一泛型变量被绑定到不兼容类型时置 true（保留第一个绑定，由调用方报错）
     void collectGenericMapping(
         const SemType& formal, const SemType& actual,
-        std::map<std::string, std::unique_ptr<SemType>>& map) const;
+        std::map<std::string, std::unique_ptr<SemType>>& map,
+        bool& conflict) const;
+
+    // 调用参数检查：数量 + 逐参数类型 + 泛型映射收集（inferCall/inferMethodCall 4 处复用）
+    void checkCallArgs(
+        const ASTNode& callNode,                         // 错误定位（CallExpr / MethodCallExpr）
+        const std::string& calleeName,
+        const std::string& role,                         // 错误文案："function" / "constructor"
+        const std::vector<const SemType*>& formalTypes,  // 形参类型（nullptr = 无标注，跳过）
+        const std::vector<std::unique_ptr<ASTNode>>& args,
+        std::map<std::string, std::unique_ptr<SemType>>& genericMap);
+
+    // throws 兼容性检查：非 throws 上下文调用 throws 函数（E016）
+    void checkThrowsContext(const ASTNode& callNode, const std::string& calleeName, bool calleeThrows);
+
+    // 将泛型映射代换到返回类型
+    [[nodiscard]] std::unique_ptr<SemType> applyGenericMap(
+        std::unique_ptr<SemType> result,
+        const std::map<std::string, std::unique_ptr<SemType>>& genericMap);
 
     // ============ 声明注册（第 1 遍） ============
     void declareTopLevel(const Program& program);
@@ -89,9 +119,6 @@ private:
     void checkFunBody(const FunDecl& decl);
     void checkMethodBody(const MethodDecl& decl);
     void checkStmt(const Stmt& stmt);
-
-    // 注册泛型参数（双向绑定符号表）
-    void registerGenericParams(const TypeExpr& type);
 
     // ============ 语句检查 ============
     void checkBlock(const BlockStmt& stmt);
@@ -110,6 +137,11 @@ private:
     void checkSpawnStmt(const SpawnStmt& stmt);
     void checkLockStmt(const LockStmt& stmt);   // lock (m) { } 块语句
     void checkExprStmt(const ExprStmt& stmt);
+
+    // None 不能作为独立类型标注（E017）
+    bool rejectStandaloneNone(const Decl& decl, const TypeExpr* type);
+    // sync 系 max 表达式类型检查（"sync" / "sync thread" / "sync for"）
+    void checkSyncMax(const ASTNode& maxExpr, const std::string& kindName);
 
     // ============ 表达式类型推断 ============
     [[nodiscard]] std::unique_ptr<SemType> inferExpr(const ASTNode& expr);
@@ -156,6 +188,57 @@ private:
         int loopDepthAtEntry;   // 进入块时的 loopDepth_
     };
     std::vector<SyncBoundary> syncBoundaryStack_;
+
+    // RAII：进入/退出同步块边界（push/pop syncBoundaryStack_）
+    class SyncBoundaryGuard {
+    public:
+        SyncBoundaryGuard(SemAnalyzer& sema, std::string kind)
+            : sema_(sema) {
+            sema_.syncBoundaryStack_.push_back({std::move(kind), sema_.loopDepth_});
+        }
+        ~SyncBoundaryGuard() { sema_.syncBoundaryStack_.pop_back(); }
+        SyncBoundaryGuard(const SyncBoundaryGuard&) = delete;
+        SyncBoundaryGuard& operator=(const SyncBoundaryGuard&) = delete;
+    private:
+        SemAnalyzer& sema_;
+    };
+
+    // RAII：保存并临时设置一个标量成员，析构恢复
+    // （loopDepth_/insideSync_/inSyncThreadBlock_/inLockBlock_）
+    template <typename T>
+    class ScopedValue {
+    public:
+        ScopedValue(T& var, T newVal) : var_(var), old_(var) { var_ = newVal; }
+        ~ScopedValue() { var_ = old_; }
+        ScopedValue(const ScopedValue&) = delete;
+        ScopedValue& operator=(const ScopedValue&) = delete;
+    private:
+        T& var_;
+        T old_;
+    };
+
+    // RAII：函数体检查上下文（保存/恢复 currentReturnType_ + currentFunctionThrows_）
+    // 支持闭包体检查嵌套在外部函数体检查中时，外层返回类型不被内层覆盖
+    class FnCtxGuard {
+    public:
+        FnCtxGuard(SemAnalyzer& s, std::unique_ptr<SemType> ret, bool throws)
+            : s_(s) {
+            oldRet_   = std::move(s_.currentReturnType_);
+            oldThrows_ = s_.currentFunctionThrows_;
+            s_.currentReturnType_ = std::move(ret);
+            s_.currentFunctionThrows_ = throws;
+        }
+        ~FnCtxGuard() {
+            s_.currentReturnType_ = std::move(oldRet_);
+            s_.currentFunctionThrows_ = oldThrows_;
+        }
+        FnCtxGuard(const FnCtxGuard&) = delete;
+        FnCtxGuard& operator=(const FnCtxGuard&) = delete;
+    private:
+        SemAnalyzer& s_;
+        std::unique_ptr<SemType> oldRet_;
+        bool oldThrows_;
+    };
 
     // ============ 递归类型解析 ============
     void propagateCanonicalName(const ASTNode& expr, const SemType* type);

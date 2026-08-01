@@ -1,43 +1,50 @@
 #include "Sema/SemAnalyzer.h"
 
+#include <functional>
+
 namespace Aura {
 
 // ============================================================
-// 辅助：收集 TypeExpr 中所有泛型类型引用名称
+// 辅助：遍历 TypeExpr 树，对每个泛型类型引用回调 fn(name)
+// （统一 collectGenericRefs / registerGenericParams 的 6 分支遍历）
 // ============================================================
-void collectGenericRefs(const TypeExpr& type, std::set<std::string>& out) {
-    if (auto* g = dynamic_cast<const GenericTypeRef*>(&type)) {
-        out.insert(g->name);
-        return;
-    }
+static void forEachGenericRef(const TypeExpr& type,
+                              const std::function<void(const std::string&)>& fn) {
+    if (auto* g = dynamic_cast<const GenericTypeRef*>(&type)) { fn(g->name); return; }
     if (auto* n = dynamic_cast<const NamedType*>(&type)) {
-        for (auto& arg : n->typeArgs) {
-            if (arg) collectGenericRefs(*arg, out);
-        }
+        for (auto& arg : n->typeArgs)
+            if (arg) forEachGenericRef(*arg, fn);
         return;
     }
     if (auto* l = dynamic_cast<const ListType*>(&type)) {
-        if (l->elementType) collectGenericRefs(*l->elementType, out);
+        if (l->elementType) forEachGenericRef(*l->elementType, fn);
         return;
     }
     if (auto* r = dynamic_cast<const RecordType*>(&type)) {
-        for (auto& f : r->fields) {
-            if (f.type) collectGenericRefs(*f.type, out);
-        }
+        for (auto& f : r->fields)
+            if (f.type) forEachGenericRef(*f.type, fn);
         return;
     }
     if (auto* u = dynamic_cast<const UnionType*>(&type)) {
-        for (auto& v : u->types) {
-            if (v) collectGenericRefs(*v, out);
-        }
+        for (auto& v : u->types)
+            if (v) forEachGenericRef(*v, fn);
         return;
     }
-    if (auto* fn = dynamic_cast<const FunctionType*>(&type)) {
-        for (auto& p : fn->paramTypes) {
-            if (p) collectGenericRefs(*p, out);
-        }
-        if (fn->returnType) collectGenericRefs(*fn->returnType, out);
+    if (auto* fnT = dynamic_cast<const FunctionType*>(&type)) {
+        for (auto& p : fnT->paramTypes)
+            if (p) forEachGenericRef(*p, fn);
+        if (fnT->returnType) forEachGenericRef(*fnT->returnType, fn);
     }
+}
+
+// 注册 TypeExpr 中所有泛型引用为 GenericParam 符号（checkFunBody/checkMethodBody 复用）
+static void registerTypeGenerics(SymbolTable& symtab, const TypeExpr& type) {
+    forEachGenericRef(type, [&](const std::string& g) {
+        Symbol sym;
+        sym.kind = SymKind::GenericParam;
+        sym.name = g;
+        symtab.define(std::move(sym));
+    });
 }
 
 // ============================================================
@@ -73,7 +80,7 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         if (t->type) {
             // 检查类型表达式中使用的泛型参数是否都已声明
             std::set<std::string> usedGenerics;
-            collectGenericRefs(*t->type, usedGenerics);
+            forEachGenericRef(*t->type, [&](const std::string& g) { usedGenerics.insert(g); });
             for (const std::string& g : usedGenerics) {
                 bool declared = false;
                 for (const std::string& tp : t->typeParams) {
@@ -133,9 +140,9 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         // 再解析参数类型和返回类型，这样 Tree<U> 中的 U 才能正确解析。
         symtab_.enterScope(ScopeKind::Function);
         for (auto& p : f->params) {
-            if (p.type) registerGenericParams(*p.type);
+            if (p.type) registerTypeGenerics(symtab_, *p.type);
         }
-        if (f->returnType) registerGenericParams(*f->returnType);
+        if (f->returnType) registerTypeGenerics(symtab_, *f->returnType);
 
         for (auto& p : f->params) {
             sym.params.push_back({p.name, p.type ? resolveType(*p.type) : ErrorSemType::make()});
@@ -246,9 +253,9 @@ void SemAnalyzer::checkFunBody(const FunDecl& decl) {
 
     // 1. 先注册泛型参数（后续类型解析需要能查到 T）
     for (auto& p : decl.params) {
-        if (p.type) registerGenericParams(*p.type);
+        if (p.type) registerTypeGenerics(symtab_, *p.type);
     }
-    if (decl.returnType) registerGenericParams(*decl.returnType);
+    if (decl.returnType) registerTypeGenerics(symtab_, *decl.returnType);
 
     // 2. 注册参数（此时泛型已可解析）
     for (auto& p : decl.params) {
@@ -260,8 +267,9 @@ void SemAnalyzer::checkFunBody(const FunDecl& decl) {
     }
 
     // 3. 解析返回类型（泛型已注册，T 可正确解析为 GenericSemType）
-    currentReturnType_ = decl.returnType ? resolveType(*decl.returnType) : nullptr;
-    currentFunctionThrows_ = decl.throws;
+    //    用 FnCtxGuard 保存/恢复外层上下文（支持闭包体嵌套检查）
+    FnCtxGuard fc(*this, decl.returnType ? resolveType(*decl.returnType) : nullptr,
+                  decl.throws);
 
     if (decl.body) checkBlock(*decl.body);
     symtab_.exitScope();
@@ -283,9 +291,9 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
 
     // 2. 注册参数泛型 + 返回类型泛型
     for (auto& p : decl.params) {
-        if (p.type) registerGenericParams(*p.type);
+        if (p.type) registerTypeGenerics(symtab_, *p.type);
     }
-    if (decl.returnType) registerGenericParams(*decl.returnType);
+    if (decl.returnType) registerTypeGenerics(symtab_, *decl.returnType);
 
     // 3. 注册接收者 self
     {
@@ -305,9 +313,9 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
         symtab_.define(std::move(sym));
     }
 
-    // 5. 解析返回类型
-    currentReturnType_ = decl.returnType ? resolveType(*decl.returnType) : nullptr;
-    currentFunctionThrows_ = decl.throws;
+    // 5. 解析返回类型（用 FnCtxGuard 保存/恢复外层上下文）
+    FnCtxGuard fc(*this, decl.returnType ? resolveType(*decl.returnType) : nullptr,
+                  decl.throws);
 
     if (decl.body) checkBlock(*decl.body);
     symtab_.exitScope();
@@ -360,39 +368,6 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
                       "' has no method '" + decl.name + "'");
             }
         }
-    }
-}
-
-// ============================================================
-// 注册泛型参数
-// ============================================================
-
-void SemAnalyzer::registerGenericParams(const TypeExpr& type) {
-    if (auto* g = dynamic_cast<const GenericTypeRef*>(&type)) {
-        Symbol sym;
-        sym.kind = SymKind::GenericParam;
-        sym.name = g->name;
-        symtab_.define(std::move(sym));
-    }
-    if (auto* n = dynamic_cast<const NamedType*>(&type)) {
-        for (auto& a : n->typeArgs)
-            if (a) registerGenericParams(*a);
-    }
-    if (auto* l = dynamic_cast<const ListType*>(&type)) {
-        if (l->elementType) registerGenericParams(*l->elementType);
-    }
-    if (auto* f = dynamic_cast<const FunctionType*>(&type)) {
-        for (auto& p : f->paramTypes)
-            if (p) registerGenericParams(*p);
-        if (f->returnType) registerGenericParams(*f->returnType);
-    }
-    if (auto* u = dynamic_cast<const UnionType*>(&type)) {
-        for (auto& v : u->types)
-            if (v) registerGenericParams(*v);
-    }
-    if (auto* r = dynamic_cast<const RecordType*>(&type)) {
-        for (auto& f : r->fields)
-            if (f.type) registerGenericParams(*f.type);
     }
 }
 

@@ -1,324 +1,780 @@
-# Change：spawn / sync for 语法糖三合一优化（实现清单）
+# change.md — Sema 硬编码提取与逻辑混乱重构（实现清单）
 
-- **来源 Plan**：`plan/spawn_sync_for_syntax_sugar.md`（4.1-4.9 详细实施方案）
-- **日期**：2026-08-01
-- **目标**：① spawn 调用形态 `spawn func(args)`/`spawn obj.method(args)`；② `sync thread for`；③ `sync for`/`sync thread for` 省略花括号；④ 附带修复 return/break/continue 跨出边界 + sync for body 自由变量捕获
-- **破坏性变更**：旧式 `spawn { }` 删除；`spawn () { }` 空参数闭包被 Sema 拒绝
-
----
-
-## C1 AST（Stmt.h）
-
-### C1.1 SpawnStmt 新增 callExpr 字段（[Stmt.h:249-271](file:///d:/you/Aura/src/AST/Stmt.h#L249-L271)）
-
-新增字段：
-
-```cpp
-struct SpawnStmt : Stmt {
-    std::vector<Param> params;                     // 闭包形态：参数列表（显式传参）
-    std::vector<std::unique_ptr<ASTNode>> args;    // 闭包形态：可选的显式实参（异名传递）
-    std::vector<std::unique_ptr<Stmt>> body;       // 闭包形态：语句体
-    std::unique_ptr<ASTNode> callExpr;             // NEW 调用形态：spawn func(args)
-    ...
-```
-
-clone() 在 `n->line = line; n->col = col;` 前追加：
-
-```cpp
-        if (callExpr) n->callExpr = callExpr->clone();
-```
-
-互斥语义：`callExpr` 非空 ↔ 调用形态；为空 → 闭包形态（params+body）。
-
-### C1.2 SyncForStmt 新增 isThread 字段（[Stmt.h:273-289](file:///d:/you/Aura/src/AST/Stmt.h#L273-L289)）
-
-```cpp
-struct SyncForStmt : Stmt {
-    std::unique_ptr<ASTNode> maxExpr;  // 可选：sync for(max=N) 中的 N
-    std::string itemName;
-    std::unique_ptr<ASTNode> iterable;
-    std::unique_ptr<BlockStmt> body;
-    bool isThread = false;             // NEW: true = sync thread for
-    ...
-```
-
-clone() 在 `n->line = line; n->col = col;` 前追加：
-
-```cpp
-        n->isThread = isThread;
-```
+> 对应 plan：`plan/sema_refactor_issue.md`（2026-08-01 详细实施方案，已审查批准）
+> 覆盖 TODO §八 P1 issue 全部 13 个子项
+> 涉及文件：`src/Sema/BuiltinRegistry.h`、`src/Sema/SemAnalyzer.h`、`src/Sema/SemAnalyzer.cpp`、
+> `src/Sema/Checker/StmtChecker.cpp`、`src/Sema/Checker/ExprInfer.cpp`、`src/Sema/Checker/DeclChecker.cpp`、
+> `example/test.aura`
 
 ---
 
-## C2 Parser（Parser.h / StmtParser.cpp）
+## C1 阶段 1：P0-1 Aura↔C++ 类型映射统一
 
-### C2.1 Parser.h 新增声明（[Parser.h:66](file:///d:/you/Aura/src/Parser.h#L66)）
+### C1.1 BuiltinRegistry.h 新增 findByCppType（反向查找）
+
+位置：`findType`（L82-85）之后。
 
 ```cpp
-    std::unique_ptr<Stmt> parseSyncForStmt();
-    std::unique_ptr<Stmt> parseSyncForRest(Token& syncTok, bool isThread);  // NEW 共享解析
+    // 反向查找：C++ 类型名 → 注册条目（如 "int32_t" → int，供 semTypeFromCppName 使用）
+    const BuiltinTypeInfo* findByCppType(const std::string& cppType) const {
+        for (auto& [name, ti] : types_)
+            if (ti.cppType == cppType) return &ti;
+        return nullptr;
+    }
 ```
 
-### C2.2 parseSyncStmt() 转发 sync thread for（[StmtParser.cpp:183-206](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L183-L206)）
+### C1.2 SemAnalyzer.h 新增声明
 
-整函数替换为：
+位置：`resolveNamedType` 声明（L54）之后。
 
 ```cpp
-std::unique_ptr<Stmt> Parser::parseSyncStmt() {
-    auto tok = advance(); // sync
-    // 检测 thread 软关键字：sync thread { ... } 或 sync thread(max=N) { ... }
-    // 'thread' 在此位置作为关键字识别，其他位置仍是普通标识符
-    if (check(TokType::Identifier) && peek().lexeme == "thread") {
-        advance();  // consume 'thread'
-        // 新增：sync thread for → 转发共享解析（thread 模式）
-        if (check(TokType::For)) {
-            advance(); // for
-            return parseSyncForRest(tok, true);
+    // 从 Aura 类型名构造 SemType（int→intType；其他注册类型→GenericSemType；None/未知→Error）
+    [[nodiscard]] std::unique_ptr<SemType> semTypeFromAuraName(const std::string& name);
+    // 从 C++ 类型名映射回 Aura SemType（供 resolvedName 元素类型提取）
+    [[nodiscard]] std::unique_ptr<SemType> semTypeFromCppName(const std::string& cppName);
+```
+
+### C1.3 SemAnalyzer.cpp 新增实现
+
+位置：`namespace Aura {` 之后（匿名 namespace）与 `resolveNamedType` 之前。
+
+```cpp
+namespace {
+// 将 Aura 类型名映射为 C++ 类型名（未注册的类型保持原名）
+std::string cppNameOf(const std::string& auraName) {
+    if (auto* ti = BuiltinRegistry::get().findType(auraName))
+        return ti->cppType;
+    return auraName;
+}
+} // namespace
+
+std::unique_ptr<SemType> SemAnalyzer::semTypeFromAuraName(const std::string& name) {
+    // 先查 BuiltinRegistry：基础类型 → Prim；其他内置类型 → GenericSemType 占位
+    if (auto* ti = BuiltinRegistry::get().findType(name)) {
+        switch (ti->primKind) {
+            case BuiltinPrim::Int:    return intType();
+            case BuiltinPrim::Float:  return floatType();
+            case BuiltinPrim::Bool:   return boolType();
+            case BuiltinPrim::String: return stringType();
+            case BuiltinPrim::None_:  return ErrorSemType::make(); // None 不能独立使用
+            case BuiltinPrim::Other: {
+                auto t = std::make_unique<GenericSemType>();
+                t->name = name;
+                return t;
+            }
         }
-        auto stmt = std::make_unique<SyncStmt>();
-        setNodePos(stmt.get(), tok);
-        stmt->isThread = true;
-        // 可选参数：sync thread(max = expr) { ... }
-        if (check(TokType::LParen)) {
-            advance(); // (
-            consume(TokType::Identifier, "expected 'max' after 'sync('");
-            consume(TokType::Assign, "expected '=' after 'max'");
-            stmt->maxExpr = parseExpr();
-            consume(TokType::RParen, "expected ')' after sync max expression");
+    }
+    return ErrorSemType::make();
+}
+
+std::unique_ptr<SemType> SemAnalyzer::semTypeFromCppName(const std::string& cppName) {
+    // 反向映射：C++ 类型名 → Aura 类型名 → SemType（如 "int32_t" → intType）
+    if (auto* ti = BuiltinRegistry::get().findByCppType(cppName)) {
+        auto t = semTypeFromAuraName(ti->name);
+        if (!dynamic_cast<const ErrorSemType*>(t.get()))
+            return t;
+    }
+    // 未注册的 C++ 类型（record 指针 / Array<T>* 等）：作为堆对象占位
+    auto g = std::make_unique<GenericSemType>();
+    g->name = cppName;
+    g->resolvedName = cppName;
+    return g;
+}
+```
+
+### C1.4 resolveNamedType 改造
+
+`resolveNamedType`（L43-59）开头的 BuiltinRegistry 分支替换：
+
+```cpp
+std::unique_ptr<SemType> SemAnalyzer::resolveNamedType(const std::string& name) {
+    // 先查 BuiltinRegistry（int→intType、Io/Path→GenericSemType 占位等）
+    auto builtin = semTypeFromAuraName(name);
+    if (!dynamic_cast<const ErrorSemType*>(builtin.get()))
+        return builtin;
+    // （以下 symtab 查找逻辑不变）
+```
+
+### C1.5 semTypeFromBuiltinReturn Named 分支改造
+
+`semTypeFromBuiltinReturn` Named 分支（L120-129）的硬编码 Prim 判断替换：
+
+```cpp
+        case ReturnTypeInfo::Kind::Named: {
+            // 基础类型 / 内置类型 → 统一映射（int→intType、Io→GenericSemType 等）
+            auto named = semTypeFromAuraName(ret.typeName);
+            if (!dynamic_cast<const ErrorSemType*>(named.get()))
+                return named;
+            // （[T] 列表处理与 Error fallback 不变）
+```
+
+### C1.6 materializeCanonicalName 两处映射替换
+
+两处 `if (auraName == "int") ... else if ...` 链（L418-422、L447-451）各替换为一行：
+
+```cpp
+            fullName += cppNameOf(auraName);
+```
+
+（`cppNameOf` 对 int→"int32_t"、float→"double"、bool→"bool"、string→"aura_rt::GcString*"，未注册类型保持原名，与原 else 分支语义一致）
+
+**阶段 1 验证**：`cmake --build build` + K1-K28 回归。
+
+---
+
+## C2 阶段 2：P0-2 + P0-3 提取 elemTypeOf（修复 sync for 遍历 channel 元素类型）
+
+### C2.1 SemAnalyzer.h 新增声明
+
+位置：`semTypeFromCppName` 声明之后。
+
+```cpp
+    // 从迭代器/列表/泛型通道类型推导元素类型（for / sync for 迭代变量类型）
+    [[nodiscard]] std::unique_ptr<SemType> elemTypeOf(const SemType* iterType);
+```
+
+### C2.2 SemAnalyzer.cpp 实现
+
+位置：`semTypeFromCppName` 实现之后。
+
+```cpp
+std::unique_ptr<SemType> SemAnalyzer::elemTypeOf(const SemType* iterType) {
+    if (!iterType) return ErrorSemType::make();
+    if (auto* listTy = dynamic_cast<const ListSemType*>(iterType))
+        return listTy->elementType ? listTy->elementType->clone() : ErrorSemType::make();
+    if (auto* iterTy = dynamic_cast<const IterSemType*>(iterType))
+        return iterTy->elementType ? iterTy->elementType->clone() : ErrorSemType::make();
+    if (auto* gs = dynamic_cast<const GenericSemType*>(iterType)) {
+        // sync.Channel<int32_t> / channel<int32_t> 等泛型类型：从 resolvedName 提取 <...> 内元素
+        if (!gs->resolvedName.empty()) {
+            auto lt = gs->resolvedName.find('<');
+            auto rt = gs->resolvedName.rfind('>');
+            if (lt != std::string::npos && rt != std::string::npos && rt > lt)
+                return semTypeFromCppName(gs->resolvedName.substr(lt + 1, rt - lt - 1));
         }
-        stmt->body = parseBlock();
-        return stmt;
+    }
+    return ErrorSemType::make();
+}
+```
+
+### C2.3 checkForStmt 替换
+
+StmtChecker.cpp `checkForStmt`（L164-194）整个元素类型提取块替换：
+
+```cpp
+    // 从列表/迭代器/泛型通道类型推导元素类型（elemTypeOf 统一处理）
+    sym.type = elemTypeOf(iterType.get());
+```
+
+### C2.4 checkSyncForStmt 替换（修复 bug）
+
+StmtChecker.cpp `checkSyncForStmt`（L305-312）：
+
+```cpp
+    // 推断迭代器类型 → 获取元素类型作为 spawn 参数类型（含 GenericSemType 通道类型）
+    auto iterType = inferExpr(*stmt.iterable);
+    auto elemType = elemTypeOf(iterType.get());
+```
+
+### C2.5 semTypeFromBuiltinReturn Optional 分支替换
+
+SemAnalyzer.cpp Optional 分支（L147-172）整体替换：
+
+```cpp
+        case ReturnTypeInfo::Kind::Optional: {
+            // Optional<T>: 从 objType 提取元素类型构造 OptionalSemType
+            // sync.Channel<T>.receive() 时 objType 应携带元素类型信息（resolvedName）
+            if (!objType) return ErrorSemType::make();
+            auto elem = elemTypeOf(objType);
+            if (dynamic_cast<const ErrorSemType*>(elem.get()))
+                return OptionalSemType::make(intType());  // fallback: 无 resolvedName 时默认 int（保持原行为）
+            return OptionalSemType::make(std::move(elem));
+        }
+```
+
+**阶段 2 验证**：`cmake --build build` + K23（普通 for channel）回归 + 新增 K29（sync for 数组，见 C9）。
+
+---
+
+## C3 阶段 3：P0-5 调用参数检查统一 + P2-2 泛型冲突报错
+
+### C3.1 SemAnalyzer.h 声明修改
+
+`collectGenericMapping` 签名（L77-80）修改 + 新增 3 个声明：
+
+```cpp
+    // 从一对 (形参类型, 实参类型) 中递归收集泛型→具体映射
+    // conflict: 同一泛型变量被绑定到不兼容类型时置 true（保留第一个绑定，由调用方报错）
+    void collectGenericMapping(
+        const SemType& formal, const SemType& actual,
+        std::map<std::string, std::unique_ptr<SemType>>& map,
+        bool& conflict) const;
+
+    // 调用参数检查：数量 + 逐参数类型 + 泛型映射收集（inferCall/inferMethodCall 4 处复用）
+    void checkCallArgs(
+        const ASTNode& callNode,                         // 错误定位（CallExpr / MethodCallExpr）
+        const std::string& calleeName,
+        const std::string& role,                         // 错误文案："function" / "constructor"
+        const std::vector<const SemType*>& formalTypes,  // 形参类型（nullptr = 无标注，跳过）
+        const std::vector<std::unique_ptr<ASTNode>>& args,
+        std::map<std::string, std::unique_ptr<SemType>>& genericMap);
+
+    // throws 兼容性检查：非 throws 上下文调用 throws 函数（E016）
+    void checkThrowsContext(const ASTNode& callNode, const std::string& calleeName, bool calleeThrows);
+
+    // 将泛型映射代换到返回类型
+    [[nodiscard]] std::unique_ptr<SemType> applyGenericMap(
+        std::unique_ptr<SemType> result,
+        const std::map<std::string, std::unique_ptr<SemType>>& genericMap);
+```
+
+### C3.2 SemAnalyzer.cpp：collectGenericMapping 改造 + 三辅助实现
+
+`collectGenericMapping`（L322-363）整体替换：
+
+```cpp
+void SemAnalyzer::collectGenericMapping(
+    const SemType& formal, const SemType& actual,
+    std::map<std::string, std::unique_ptr<SemType>>& map,
+    bool& conflict) const
+{
+    // case 1: formal 是泛型变量 <T> → actual 就是 T 的具体绑定
+    if (auto* gf = dynamic_cast<const GenericSemType*>(&formal)) {
+        auto it = map.find(gf->name);
+        if (it != map.end()) {
+            // 已绑定 → 检查一致性（同一个泛型变量被推导为不同类型则冲突）
+            if (!isAssignable(*it->second, actual)) {
+                conflict = true;  // 保留第一个绑定，调用方负责报错
+            }
+        } else {
+            map[gf->name] = actual.clone();
+        }
+        return;
+    }
+
+    // case 2: formal 和 actual 都是 List → 递归匹配元素类型
+    //         如 [T] vs [int] → T=int
+    if (auto* lf = dynamic_cast<const ListSemType*>(&formal)) {
+        if (auto* la = dynamic_cast<const ListSemType*>(&actual)) {
+            if (lf->elementType && la->elementType)
+                collectGenericMapping(*lf->elementType, *la->elementType, map, conflict);
+        }
+        return;
+    }
+
+    // case 3: formal 和 actual 都是函数类型 → 递归匹配参数和返回类型
+    //         如 fun(T)→U vs fun(int)→int → T=int, U=int
+    if (auto* ff = dynamic_cast<const FuncSemType*>(&formal)) {
+        if (auto* fa = dynamic_cast<const FuncSemType*>(&actual)) {
+            for (size_t i = 0; i < ff->paramTypes.size() && i < fa->paramTypes.size(); ++i) {
+                if (ff->paramTypes[i] && fa->paramTypes[i])
+                    collectGenericMapping(*ff->paramTypes[i], *fa->paramTypes[i], map, conflict);
+            }
+            if (ff->returnType && fa->returnType)
+                collectGenericMapping(*ff->returnType, *fa->returnType, map, conflict);
+        }
+        return;
+    }
+}
+```
+
+三辅助实现（放在 `substitute` 实现之后）：
+
+```cpp
+void SemAnalyzer::checkThrowsContext(
+    const ASTNode& callNode, const std::string& calleeName, bool calleeThrows) {
+    if (!currentFunctionThrows_ && insideTry_ == 0 && calleeThrows) {
+        error(callNode, DiagCode::E016_ThrowsViolation,
+              "cannot call throwing function '" + calleeName + "' from non-throwing context",
+              "add 'throws' to the function signature or wrap in 'try { ... } catch'");
+    }
+}
+
+void SemAnalyzer::checkCallArgs(
+    const ASTNode& callNode,
+    const std::string& calleeName,
+    const std::string& role,
+    const std::vector<const SemType*>& formalTypes,
+    const std::vector<std::unique_ptr<ASTNode>>& args,
+    std::map<std::string, std::unique_ptr<SemType>>& genericMap) {
+    // 参数数量检查
+    if (args.size() != formalTypes.size()) {
+        error(callNode, role + " '" + calleeName + "' expects " +
+              std::to_string(formalTypes.size()) + " arguments, got " +
+              std::to_string(args.size()));
+    }
+    // 参数类型检查 + 泛型映射收集
+    bool conflict = false;
+    for (size_t i = 0; i < args.size() && i < formalTypes.size(); ++i) {
+        auto argTy = inferExpr(*args[i]);
+        if (formalTypes[i] && !isAssignable(*formalTypes[i], *argTy)) {
+            error(*args[i], "argument type mismatch: expected '" +
+                  formalTypes[i]->toString() + "', got '" + argTy->toString() + "'");
+        }
+        if (formalTypes[i])
+            collectGenericMapping(*formalTypes[i], *argTy, genericMap, conflict);
+    }
+    // P2-2: 泛型绑定冲突从静默忽略改为报错
+    if (conflict) {
+        error(callNode, "conflicting type arguments for generic parameter(s) in call to '" + calleeName + "'");
+    }
+}
+
+std::unique_ptr<SemType> SemAnalyzer::applyGenericMap(
+    std::unique_ptr<SemType> result,
+    const std::map<std::string, std::unique_ptr<SemType>>& genericMap) {
+    for (auto& [name, concrete] : genericMap) {
+        result = substitute(*result, name, *concrete);
+    }
+    return result;
+}
+```
+
+### C3.3 inferCall 改造
+
+ExprInfer.cpp `inferCall`（L174-252）三个分支整体替换：
+
+```cpp
+    // 泛型变量映射表：形参中的泛型名 → 实参的具体类型
+    std::map<std::string, std::unique_ptr<SemType>> genericMap;
+    // 函数、方法、函数类型变量（let 绑定闭包）、函数类型参数
+    if (sym->kind == SymKind::Function || sym->kind == SymKind::Method) {
+        checkThrowsContext(e, callee->name, sym->throws);
+        std::vector<const SemType*> formalTypes;
+        for (auto& p : sym->params) formalTypes.push_back(p.type.get());
+        checkCallArgs(e, callee->name, "function", formalTypes, e.args, genericMap);
+        auto result = sym->type ? sym->type->clone() : ErrorSemType::make();
+        return applyGenericMap(std::move(result), genericMap);
+    }
+    // TypeAlias 有显式构造函数（fun (self T) T(...)）→ 作为构造函数调用
+    if (sym->kind == SymKind::TypeAlias && !sym->ctorParams.empty()) {
+        std::vector<const SemType*> formalTypes;
+        for (auto& p : sym->ctorParams) formalTypes.push_back(p.type.get());
+        checkCallArgs(e, callee->name, "constructor", formalTypes, e.args, genericMap);
+        return sym->type ? sym->type->clone() : ErrorSemType::make();
+    }
+    // Variable / Parameter 但类型是函数类型 → 可作为函数调用
+    if (sym->kind == SymKind::Variable || sym->kind == SymKind::Parameter) {
+        if (auto* fst = dynamic_cast<const FuncSemType*>(sym->type.get())) {
+            checkThrowsContext(e, callee->name, fst->throws);
+            std::vector<const SemType*> formalTypes;
+            for (auto& pt : fst->paramTypes) formalTypes.push_back(pt.get());
+            checkCallArgs(e, callee->name, "function", formalTypes, e.args, genericMap);
+            auto result = fst->returnType ? fst->returnType->clone() : NoneSemType::make();
+            return applyGenericMap(std::move(result), genericMap);
+        }
+    }
+
+    error(*e.callee, "undefined function '" + callee->name + "'");
+    return ErrorSemType::make();
+```
+
+### C3.4 inferMethodCall imported 分支改造
+
+ExprInfer.cpp `inferMethodCall`（L266-284）的"函数调用"部分替换：
+
+```cpp
+                // 函数调用 — 复用 checkCallArgs 检查逻辑
+                checkThrowsContext(e, e.method, imported->throws);
+                std::vector<const SemType*> formalTypes;
+                for (auto& p : imported->params) formalTypes.push_back(p.type.get());
+                std::map<std::string, std::unique_ptr<SemType>> dummyMap;
+                checkCallArgs(e, e.method, "function", formalTypes, e.args, dummyMap);
+                return imported->type ? imported->type->clone() : NoneSemType::make();
+```
+
+**阶段 3 验证**：`cmake --build build` + K1-K28 回归 + 负向（K30 泛型冲突）。
+
+---
+
+## C4 阶段 4：P0-4 TypeExpr 遍历统一（forEachGenericRef）
+
+### C4.1 DeclChecker.cpp 替换 collectGenericRefs
+
+`collectGenericRefs`（L8-41）整体替换为 `forEachGenericRef`：
+
+```cpp
+// ============================================================
+// 辅助：遍历 TypeExpr 树，对每个泛型类型引用回调 fn(name)
+// （统一 collectGenericRefs / registerGenericParams 的 6 分支遍历）
+// ============================================================
+static void forEachGenericRef(const TypeExpr& type,
+                              const std::function<void(const std::string&)>& fn) {
+    if (auto* g = dynamic_cast<const GenericTypeRef*>(&type)) { fn(g->name); return; }
+    if (auto* n = dynamic_cast<const NamedType*>(&type)) {
+        for (auto& arg : n->typeArgs)
+            if (arg) forEachGenericRef(*arg, fn);
+        return;
+    }
+    if (auto* l = dynamic_cast<const ListType*>(&type)) {
+        if (l->elementType) forEachGenericRef(*l->elementType, fn);
+        return;
+    }
+    if (auto* r = dynamic_cast<const RecordType*>(&type)) {
+        for (auto& f : r->fields)
+            if (f.type) forEachGenericRef(*f.type, fn);
+        return;
+    }
+    if (auto* u = dynamic_cast<const UnionType*>(&type)) {
+        for (auto& v : u->types)
+            if (v) forEachGenericRef(*v, fn);
+        return;
+    }
+    if (auto* fnT = dynamic_cast<const FunctionType*>(&type)) {
+        for (auto& p : fnT->paramTypes)
+            if (p) forEachGenericRef(*p, fn);
+        if (fnT->returnType) forEachGenericRef(*fnT->returnType, fn);
+    }
+}
+
+// 注册 TypeExpr 中所有泛型引用为 GenericParam 符号（checkFunBody/checkMethodBody 复用）
+static void registerTypeGenerics(SymbolTable& symtab, const TypeExpr& type) {
+    forEachGenericRef(type, [&](const std::string& g) {
+        Symbol sym;
+        sym.kind = SymKind::GenericParam;
+        sym.name = g;
+        symtab.define(std::move(sym));
+    });
+}
+```
+
+顶部 include 增加 `#include <functional>`。
+
+### C4.2 declareDecl 调用替换
+
+`declareDecl`（L75-76）：
+
+```cpp
+            std::set<std::string> usedGenerics;
+            forEachGenericRef(*t->type, [&](const std::string& g) { usedGenerics.insert(g); });
+```
+
+### C4.3 registerGenericParams 删除 + 调用替换
+
+删除原 `registerGenericParams` 函数（L370-397）及 SemAnalyzer.h 声明（L94）。
+
+checkFunBody（L248-251）：
+
+```cpp
+    // 1. 先注册泛型参数（后续类型解析需要能查到 T）
+    for (auto& p : decl.params) {
+        if (p.type) registerTypeGenerics(symtab_, *p.type);
+    }
+    if (decl.returnType) registerTypeGenerics(symtab_, *decl.returnType);
+```
+
+checkMethodBody（L285-288）：
+
+```cpp
+    // 2. 注册参数泛型 + 返回类型泛型
+    for (auto& p : decl.params) {
+        if (p.type) registerTypeGenerics(symtab_, *p.type);
+    }
+    if (decl.returnType) registerTypeGenerics(symtab_, *decl.returnType);
+```
+
+**阶段 4 验证**：`cmake --build build` + K1-K28 回归。
+
+---
+
+## C5 阶段 5：P1-1 importExports / extractExports 辅助提取
+
+### C5.1 SemAnalyzer.h 新增声明
+
+位置：`importExports` 声明（L38）之后（private 区）。
+
+```cpp
+    // importExports 辅助：将一个导出函数/构造函数导入为 Function 符号
+    void importFuncSymbol(const std::string& name, const FuncExport& f);
+```
+
+### C5.2 SemAnalyzer.cpp importExports 改造
+
+`importExports`（L607-652）整体替换：
+
+```cpp
+// 导入一个导出函数/构造函数为 Function 符号（importExports 辅助）
+void SemAnalyzer::importFuncSymbol(const std::string& name, const FuncExport& f) {
+    Symbol sym;
+    sym.kind = SymKind::Function;
+    sym.name = name;
+    for (auto& p : f.params) {
+        SymParam sp;
+        sp.name = p.name;
+        sp.type = p.type ? p.type->clone() : nullptr;
+        sym.params.push_back(std::move(sp));
+    }
+    sym.type   = f.returnType ? f.returnType->clone() : nullptr;
+    sym.throws = f.throws;
+    symtab_.defineGlobal(std::move(sym));
+}
+
+void SemAnalyzer::importExports(const std::string& alias, const ModuleExports& exports) {
+    for (auto& [name, type] : exports.types) {
+        Symbol sym;
+        sym.kind = SymKind::TypeAlias;
+        sym.name = alias.empty() ? name : (alias + "." + name);
+        sym.type = type->clone();
+        symtab_.defineGlobal(std::move(sym));
+    }
+    auto qualified = [&](const std::string& name) {
+        return alias.empty() ? name : (alias + "." + name);
+    };
+    for (auto& [name, f] : exports.ctors) importFuncSymbol(qualified(name), f);
+    for (auto& [name, f] : exports.funcs) importFuncSymbol(qualified(name), f);
+    // 注册 import 别名本身（供 inferMethodCall 检测命名空间调用）
+    if (!alias.empty()) {
+        Symbol aliasSym;
+        aliasSym.kind = SymKind::Variable;
+        aliasSym.name = alias;
+        aliasSym.belongsToModule = alias;
+        aliasSym.type = ErrorSemType::make();
+        symtab_.defineGlobal(std::move(aliasSym));
+    }
+}
+```
+
+### C5.3 SemAnalyzer.cpp extractExports 改造
+
+`extractExports`（L654-696）整体替换：
+
+```cpp
+// 构建 FuncExport（extractExports 辅助）：params 深拷贝 + 返回类型 + throws
+static FuncExport buildFuncExport(const std::vector<SymParam>& params,
+                                  const SemType* returnType, bool throws) {
+    FuncExport fe;
+    for (auto& p : params) {
+        SymParam sp;
+        sp.name = p.name;
+        sp.type = p.type ? p.type->clone() : nullptr;
+        fe.params.push_back(std::move(sp));
+    }
+    fe.returnType = returnType ? returnType->clone() : ErrorSemType::make();
+    fe.throws     = throws;
+    return fe;
+}
+
+ModuleExports SemAnalyzer::extractExports() const {
+    ModuleExports e;
+    for (auto& scope : symtab_.allScopes()) {
+        if (scope->kind() != ScopeKind::Global) continue;
+        scope->forEach([&](const std::string& name, const Symbol& sym) {
+            if (!sym.isPublic) return;  // Phase B: 跳过私有符号
+            switch (sym.kind) {
+                case SymKind::TypeAlias:
+                    e.types[name] = sym.type ? sym.type->clone() : ErrorSemType::make();
+                    if (!sym.ctorParams.empty()) {
+                        const SemType* ctorRet = sym.ctorReturnType ? sym.ctorReturnType.get()
+                                                 : sym.type.get();
+                        e.ctors[name] = buildFuncExport(sym.ctorParams, ctorRet, sym.throws);
+                    }
+                    break;
+                case SymKind::Function:
+                    e.funcs[name] = buildFuncExport(sym.params, sym.type.get(), sym.throws);
+                    break;
+                default: break;
+            }
+        });
+        break;
+    }
+    return e;
+}
+```
+
+**阶段 5 验证**：`cmake --build build` + K1-K28 回归 + used/ 多文件 import 用例编译。
+
+---
+
+## C6 阶段 6：P1-2 rejectStandaloneNone / checkSyncMax 提取
+
+### C6.1 SemAnalyzer.h 新增声明
+
+位置：`checkExprStmt` 声明（L112）之后。
+
+```cpp
+    // None 不能作为独立类型标注（E017）
+    bool rejectStandaloneNone(const Decl& decl, const TypeExpr* type);
+    // sync 系 max 表达式类型检查（"sync" / "sync thread" / "sync for"）
+    void checkSyncMax(const ASTNode& maxExpr, const std::string& kindName);
+```
+
+### C6.2 StmtChecker.cpp 实现 + 调用替换
+
+新增实现（`checkConstDecl` 之前）：
+
+```cpp
+bool SemAnalyzer::rejectStandaloneNone(const Decl& decl, const TypeExpr* type) {
+    if (type) {
+        if (auto* nt = dynamic_cast<const NamedType*>(type)) {
+            if (nt->name == "None") {
+                error(decl, DiagCode::E017_NoneStandalone,
+                      "None cannot be used as a standalone type; use a union type (e.g. 'int | None')");
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void SemAnalyzer::checkSyncMax(const ASTNode& maxExpr, const std::string& kindName) {
+    auto maxTy = inferExpr(maxExpr);
+    if (!isAssignable(*intType(), *maxTy)) {
+        error(maxExpr, kindName + " max must be int, got '" + maxTy->toString() + "'");
+    }
+}
+```
+
+- checkLetDecl（L18-27）与 checkConstDecl（L63-72）的 None 检查块各替换为：
+
+```cpp
+    // None 不能作为独立变量类型
+    if (rejectStandaloneNone(decl, decl.type.get())) return;
+```
+
+- checkSyncStmt thread 分支 maxExpr（L262-268）替换为：
+
+```cpp
+        // R4: maxExpr 类型检查
+        if (stmt.maxExpr) checkSyncMax(*stmt.maxExpr, "sync thread");
+```
+
+- checkSyncStmt 协程分支 maxExpr（L283-288）替换为：
+
+```cpp
+    if (stmt.maxExpr) checkSyncMax(*stmt.maxExpr, "sync");
+```
+
+- checkSyncForStmt maxExpr（L298-303）替换为：
+
+```cpp
+    // 检查可选的 max 表达式
+    if (stmt.maxExpr) checkSyncMax(*stmt.maxExpr, "sync for");
+```
+
+**阶段 6 验证**：`cmake --build build` + K1-K28 回归 + E017 负向。
+
+---
+
+## C7 阶段 7：P1-3 边界与标志 RAII guard
+
+### C7.1 SemAnalyzer.h 新增嵌套类
+
+位置：`syncBoundaryStack_` 声明（L158）之后。
+
+```cpp
+    // RAII：进入/退出同步块边界（push/pop syncBoundaryStack_）
+    class SyncBoundaryGuard {
+    public:
+        SyncBoundaryGuard(SemAnalyzer& sema, std::string kind)
+            : sema_(sema) {
+            sema_.syncBoundaryStack_.push_back({std::move(kind), sema_.loopDepth_});
+        }
+        ~SyncBoundaryGuard() { sema_.syncBoundaryStack_.pop_back(); }
+        SyncBoundaryGuard(const SyncBoundaryGuard&) = delete;
+        SyncBoundaryGuard& operator=(const SyncBoundaryGuard&) = delete;
+    private:
+        SemAnalyzer& sema_;
+    };
+
+    // RAII：保存并临时设置一个标量成员，析构恢复
+    // （loopDepth_/insideSync_/inSyncThreadBlock_/inLockBlock_）
+    template <typename T>
+    class ScopedValue {
+    public:
+        ScopedValue(T& var, T newVal) : var_(var), old_(var) { var_ = newVal; }
+        ~ScopedValue() { var_ = old_; }
+        ScopedValue(const ScopedValue&) = delete;
+        ScopedValue& operator=(const ScopedValue&) = delete;
+    private:
+        T& var_;
+        T old_;
+    };
+```
+
+### C7.2 StmtChecker.cpp 调用替换
+
+**checkWhileStmt**（L146-154）整体替换：
+
+```cpp
+void SemAnalyzer::checkWhileStmt(const WhileStmt& stmt) {
+    auto condType = inferExpr(*stmt.condition);
+    if (!isAssignable(*boolType(), *condType)) {
+        error(*stmt.condition, "while condition must be bool, got '" + condType->toString() + "'");
+    }
+    ScopedValue<int> guard(loopDepth_, loopDepth_ + 1);
+    if (stmt.body) checkBlock(*stmt.body);
+}
+```
+
+**checkForStmt**（L156-199）整体替换：
+
+```cpp
+void SemAnalyzer::checkForStmt(const ForStmt& stmt) {
+    auto iterType = inferExpr(*stmt.iterable);
+    // 迭代类型默认合法（运行时检查），这里只确保表达式无错误
+    ScopedValue<int> loopGuard(loopDepth_, loopDepth_ + 1);
+    symtab_.enterScope();
+    Symbol sym;
+    sym.kind = SymKind::Variable;
+    sym.name = stmt.itemName;
+    // 从列表/迭代器/泛型通道类型推导元素类型（elemTypeOf 统一处理）
+    sym.type = elemTypeOf(iterType.get());
+    symtab_.define(std::move(sym));
+    if (stmt.body) checkBlock(*stmt.body);
+    symtab_.exitScope();
+}
+```
+
+**checkLoopStmt**（L201-205）整体替换：
+
+```cpp
+void SemAnalyzer::checkLoopStmt(const LoopStmt& stmt) {
+    ScopedValue<int> guard(loopDepth_, loopDepth_ + 1);
+    if (stmt.body) checkBlock(*stmt.body);
+}
+```
+
+**checkSyncStmt**（L254-294）整体替换：
+
+```cpp
+void SemAnalyzer::checkSyncStmt(const SyncStmt& stmt) {
+    // sync thread 分支：多线程模式
+    if (stmt.isThread) {
+        // R1: 禁止嵌套 sync thread
+        if (inSyncThreadBlock_) {
+            error(stmt, "nested sync thread not allowed");
+            return;
+        }
+        // R4: maxExpr 类型检查
+        if (stmt.maxExpr) checkSyncMax(*stmt.maxExpr, "sync thread");
+        // 进入 sync thread 块：设置标志（spawn 将走 R3 检查分支）
+        SyncBoundaryGuard bg(*this, "sync thread");
+        ScopedValue<bool> g1(insideSync_, true);
+        ScopedValue<bool> g2(inSyncThreadBlock_, true);
+        if (stmt.body) checkBlock(*stmt.body);
+        return;
     }
 
     // 原有 sync 协程逻辑
-    auto stmt = std::make_unique<SyncStmt>();
-    setNodePos(stmt.get(), tok);
-    if (check(TokType::LParen)) {
-        advance(); // (
-        consume(TokType::Identifier, "expected 'max' after 'sync('");
-        consume(TokType::Assign, "expected '=' after 'max'");
-        stmt->maxExpr = parseExpr();
-        consume(TokType::RParen, "expected ')' after sync max expression");
-    }
-    stmt->body = parseBlock();
-    return stmt;
-}
-```
-
-### C2.3 parseSyncForStmt() + 新增 parseSyncForRest()（[StmtParser.cpp:208-230](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L208-L230)）
-
-整段替换为：
-
-```cpp
-std::unique_ptr<Stmt> Parser::parseSyncForStmt() {
-    auto syncTok = advance(); // sync
-    advance();                // for
-    return parseSyncForRest(syncTok, false);
-}
-
-// 共享：sync for / sync thread for 公共解析
-// isThread=false 入口：parseSyncForStmt()（消费 sync+for 后调用）
-// isThread=true  入口：parseSyncStmt()（消费 sync+thread+for 后调用）
-std::unique_ptr<Stmt> Parser::parseSyncForRest(Token& syncTok, bool isThread) {
-    auto stmt = std::make_unique<SyncForStmt>();
-    setNodePos(stmt.get(), syncTok);
-    stmt->isThread = isThread;
-
-    // 可选参数：for(max = expr)
-    if (check(TokType::LParen)) {
-        advance(); // (
-        consume(TokType::Identifier, "expected 'max' after 'sync for('");
-        consume(TokType::Assign, "expected '=' after 'max'");
-        stmt->maxExpr = parseExpr();
-        consume(TokType::RParen, "expected ')' after sync for max expression");
-    }
-
-    // 循环变量
-    auto& itemTok = consume(TokType::Identifier, "expected loop variable after 'for'");
-    stmt->itemName = itemTok.lexeme;
-    consume(TokType::Identifier, "expected 'in' after loop variable");
-    stmt->iterable = parseExpr();
-
-    // === 省略花括号（Feature 3）：仅允许函数/方法调用 ===
-    if (check(TokType::LBrace)) {
-        stmt->body = parseBlock();
-    } else {
-        auto expr = parseExpr();
-        if (!expr) return nullptr;
-        if (!dynamic_cast<CallExpr*>(expr.get())
-            && !dynamic_cast<MethodCallExpr*>(expr.get())) {
-            error("expected function call after 'sync for ... in ...' "
-                  "(wrap complex bodies in braces)");
-            return nullptr;
-        }
-        auto block = std::make_unique<BlockStmt>();
-        auto es = std::make_unique<ExprStmt>();   // Stmt.h:71-80，字段 expr
-        es->expr = std::move(expr);
-        block->stmts.push_back(std::move(es));
-        stmt->body = std::move(block);
-    }
-    return stmt;
-}
-```
-
-### C2.4 parseSpawnStmt() 重写（[StmtParser.cpp:232-273](file:///d:/you/Aura/src/Parser/StmtParser.cpp#L232-L273)）
-
-整函数替换为：
-
-```cpp
-std::unique_ptr<Stmt> Parser::parseSpawnStmt() {
-    auto tok = advance(); // spawn
-    auto stmt = std::make_unique<SpawnStmt>();
-    setNodePos(stmt.get(), tok);
-
-    // 分支判定：spawn ( → 闭包形态；spawn 其他 → 调用形态
-    if (check(TokType::LParen)) {
-        // === 闭包形态：spawn (io: Io, n: int) { ... } [可选显式实参] ===
-        advance(); // consume '('
-        if (!check(TokType::RParen))
-            stmt->params = parseParams();
-        consume(TokType::RParen, "expected ')' after spawn parameters");
-        consume(TokType::LBrace, "expected '{' after spawn parameters");
-
-        while (!check(TokType::RBrace) && !atEnd()) {
-            auto s = parseStmt();
-            if (s) {
-                stmt->body.push_back(std::move(s));
-            } else {
-                // 错误恢复：同步到下一个安全恢复点，避免死循环
-                synchronize();
-            }
-        }
-        consume(TokType::RBrace, "expected '}' after spawn body");
-
-        // 可选的显式实参：spawn (x: int) { ... }(arg)
-        if (check(TokType::LParen)) {
-            advance(); // (
-            while (!check(TokType::RParen) && !atEnd()) {
-                auto arg = parseExpr();
-                if (arg) stmt->args.push_back(std::move(arg));
-                if (!check(TokType::RParen))
-                    consume(TokType::Comma, "expected ',' between spawn arguments");
-            }
-            consume(TokType::RParen, "expected ')' after spawn arguments");
-        }
-    } else {
-        // === 调用形态：spawn func(args) / spawn obj.method(args) ===
-        if (check(TokType::LBrace))
-            error("old-style 'spawn { ... }' is removed; "
-                  "use 'spawn func(args)' or 'spawn (params) { ... }'");
-        stmt->callExpr = parseExpr();
-        if (!stmt->callExpr) return nullptr;
-        if (!dynamic_cast<CallExpr*>(stmt->callExpr.get())
-            && !dynamic_cast<MethodCallExpr*>(stmt->callExpr.get())) {
-            error("expected function call after 'spawn', got non-call expression");
-            return nullptr;
-        }
-    }
-    return stmt;
-}
-```
-
-要点：删除旧式 `spawn { }` 路径（显式报错提示新语法）；调用形态校验限 CallExpr / MethodCallExpr。
-
----
-
-## C3 Sema（SemAnalyzer.h / DeclChecker.cpp / StmtChecker.cpp / SemAnalyzer.cpp）
-
-### C3.1 SemAnalyzer.h：loopDepth_ + syncBoundaryStack_（[SemAnalyzer.h:145-149](file:///d:/you/Aura/src/Sema/SemAnalyzer.h#L145-L149)）
-
-替换：
-
-```cpp
-    bool insideLoop_ = false; // break/continue 仅在循环内合法
-    bool insideSync_ = false; // spawn 仅在 sync 块内合法
-```
-
-为：
-
-```cpp
-    int  loopDepth_ = 0;      // 循环嵌套深度（替代 insideLoop_ 的 bool）
-    bool insideSync_ = false; // spawn 仅在 sync 块内合法
-```
-
-在 `int  insideTry_  = 0;` 行后新增（[SemAnalyzer.h:149](file:///d:/you/Aura/src/Sema/SemAnalyzer.h#L149) 之后）：
-
-```cpp
-    // ============ 同步块边界栈 ============
-    // 记录进入 sync/spawn 块时的循环深度，用于拦截 return/break/continue 跨出块
-    // （生成代码会跳过 co_await when_all / _stx waitGroup 析构）
-    struct SyncBoundary {
-        std::string kind;       // "sync" / "sync thread" / "sync for" / "sync thread for" / "spawn"
-        int loopDepthAtEntry;   // 进入块时的 loopDepth_
-    };
-    std::vector<SyncBoundary> syncBoundaryStack_;
-```
-
-### C3.2 DeclChecker.cpp：函数入口重置（[DeclChecker.cpp:242,270](file:///d:/you/Aura/src/Sema/Checker/DeclChecker.cpp#L242-L270)）
-
-`checkFunBody` 与 `checkMethodBody` 开头的 `insideLoop_ = false;` 均替换为：
-
-```cpp
-    loopDepth_ = 0;
-    syncBoundaryStack_.clear();
-```
-
-（防御性：错误路径下保证状态不跨函数残留。）
-
-### C3.3 StmtChecker.cpp：循环深度递增/递减（[StmtChecker.cpp:147-149,155,194,198-200](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L147-L200)）
-
-- checkWhileStmt：
-
-```cpp
-    int prev = loopDepth_; loopDepth_++;
+    if (stmt.maxExpr) checkSyncMax(*stmt.maxExpr, "sync");
+    SyncBoundaryGuard bg(*this, "sync");
+    ScopedValue<bool> g(insideSync_, true);
     if (stmt.body) checkBlock(*stmt.body);
-    loopDepth_ = prev;
+}
 ```
 
-- checkForStmt 同模式（`bool prev = insideLoop_; insideLoop_ = true;` → `int prev = loopDepth_; loopDepth_++;` / 恢复 `loopDepth_ = prev;`）。
-- checkLoopStmt 同模式。
-
-### C3.4 StmtChecker.cpp：checkReturnStmt 边界检查（[StmtChecker.cpp:110-113](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L110-L113)）
-
-L3 lock 检查后追加：
-
-```cpp
-    // sync/spawn 块内禁止 return 跨出（跳过 when_all / waitGroup）
-    if (!syncBoundaryStack_.empty()) {
-        error(stmt, "cannot return out of " + syncBoundaryStack_.back().kind + " block");
-    }
-```
-
-### C3.5 StmtChecker.cpp：checkSyncStmt 边界 push/pop（[StmtChecker.cpp:250-286](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L250-L286)）
-
-- sync thread 分支：`inSyncThreadBlock_ = true;` 后加 `syncBoundaryStack_.push_back({"sync thread", loopDepth_});`，`checkBlock` 后加 `syncBoundaryStack_.pop_back();`
-- 协程 sync 分支：`insideSync_ = true;` 后加 `syncBoundaryStack_.push_back({"sync", loopDepth_});`，`checkBlock` 后加 `syncBoundaryStack_.pop_back();`
-
-### C3.6 StmtChecker.cpp：checkSyncForStmt isThread 分支 + 边界 push/pop（[StmtChecker.cpp:288-319](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L288-L319)）
-
-在 `if (stmt.body) checkBlock(*stmt.body);` 前插入 isThread 分支，整函数变为：
+**checkSyncForStmt**（L296-349）整体替换：
 
 ```cpp
 void SemAnalyzer::checkSyncForStmt(const SyncForStmt& stmt) {
     // 检查可选的 max 表达式
-    if (stmt.maxExpr) {
-        auto maxTy = inferExpr(*stmt.maxExpr);
-        if (!isAssignable(*intType(), *maxTy)) {
-            error(*stmt.maxExpr, "sync for max must be int, got '" + maxTy->toString() + "'");
-        }
-    }
+    if (stmt.maxExpr) checkSyncMax(*stmt.maxExpr, "sync for");
 
-    // 推断迭代器类型 → 获取元素类型作为 spawn 参数类型
+    // 推断迭代器类型 → 获取元素类型作为 spawn 参数类型（含 GenericSemType 通道类型）
     auto iterType = inferExpr(*stmt.iterable);
-    std::unique_ptr<SemType> elemType = ErrorSemType::make();
-    if (auto* listTy = dynamic_cast<ListSemType*>(iterType.get())) {
-        elemType = listTy->elementType ? listTy->elementType->clone() : ErrorSemType::make();
-    } else if (auto* iterTy = dynamic_cast<IterSemType*>(iterType.get())) {
-        elemType = iterTy->elementType ? iterTy->elementType->clone() : ErrorSemType::make();
-    }
+    auto elemType = elemTypeOf(iterType.get());
 
     // 检查 body（spawn 体内 itemName 可用）
-    insideSync_ = true;
     symtab_.enterScope();
     {
         Symbol sym;
@@ -333,634 +789,200 @@ void SemAnalyzer::checkSyncForStmt(const SyncForStmt& stmt) {
         if (inSyncThreadBlock_) {
             error(stmt, "nested sync thread not allowed");
             symtab_.exitScope();
-            insideSync_ = false;
             return;
         }
-        bool oldInSync = insideSync_;
-        bool oldInThread = inSyncThreadBlock_;
-        insideSync_ = true;
-        inSyncThreadBlock_ = true;
-        syncBoundaryStack_.push_back({"sync thread for", loopDepth_});
+        SyncBoundaryGuard bg(*this, "sync thread for");
+        ScopedValue<bool> g1(insideSync_, true);
+        ScopedValue<bool> g2(inSyncThreadBlock_, true);
         if (stmt.body) checkBlock(*stmt.body);
-        syncBoundaryStack_.pop_back();
-        insideSync_ = oldInSync;
-        inSyncThreadBlock_ = oldInThread;
     } else {
-        syncBoundaryStack_.push_back({"sync for", loopDepth_});
+        SyncBoundaryGuard bg(*this, "sync for");
+        ScopedValue<bool> g(insideSync_, true);
         if (stmt.body) checkBlock(*stmt.body);
-        syncBoundaryStack_.pop_back();
     }
     symtab_.exitScope();
-    insideSync_ = false;
 }
 ```
 
-### C3.7 StmtChecker.cpp：checkSpawnStmt 调用形态 + 空参闭包拒绝 + 边界 push/pop（[StmtChecker.cpp:321-365](file:///d:/you/Aura/src/Sema/Checker/StmtChecker.cpp#L321-L365)）
-
-整函数替换为：
+**checkSpawnStmt** 边界部分（L392-401）：
 
 ```cpp
-void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
-    if (!insideSync_) {
-        error(stmt, DiagCode::E018_SpawnOutsideSync,
-          "'spawn' can only be used inside a 'sync' block",
-          "wrap the spawn statement in 'sync { ... }'");
-        return;
-    }
-
-    // L6: lock 块内禁止 spawn（spawn 不应持锁）
-    if (inLockBlock_) {
-        error(stmt, "cannot spawn inside lock block");
-        return;
-    }
-
-    // === 调用形态：spawn func(args) ===
-    // 无 body、无 params 作用域；callee/参数匹配由 checkExpr 保证；
-    // R3 天然满足：args 中标识符显式可见，无隐式捕获
-    if (stmt.callExpr) {
-        checkExpr(*stmt.callExpr);
-        return;
-    }
-
-    // === 空参数闭包拒绝：旧式自动捕获已删除 ===
-    // spawn () { ... } 无显式参数，若放行会落入 CodeGen 空路径（静默丢语句）
-    if (stmt.params.empty()) {
-        error(stmt, "spawn closure must have explicit params"
-                    " (use 'spawn (io: Io, x: int) { ... }' or 'spawn func(args)')");
-        return;
-    }
-
-    // 显式传参：将参数注册到 spawn 作用域（参数只读）
-    symtab_.enterScope();
-    for (auto& p : stmt.params) {
-        Symbol sym;
-        sym.kind = SymKind::Variable;
-        sym.name = p.name;
-        sym.type = p.type ? resolveType(*p.type) : nullptr;
-        sym.isConst = true;  // spawn 参数只读
-        symtab_.define(std::move(sym));
-    }
-
     // 处理 spawn 体
     symtab_.enterScope();
-    syncBoundaryStack_.push_back({"spawn", loopDepth_});
+    SyncBoundaryGuard bg(*this, "spawn");
     for (auto& s : stmt.body) {
         if (s) checkStmt(*s);
     }
-    syncBoundaryStack_.pop_back();
     symtab_.exitScope();
 
     symtab_.exitScope();
-}
 ```
 
-**说明**：原 R3 检查（`inSyncThreadBlock_ && stmt.params.empty()`）被"空参数闭包拒绝"通用检查覆盖（更早拦截，报错信息更通用）；原 `if (!stmt.params.empty())` 条件嵌套可展开为无条件（空参数已提前 return）。
-
-### C3.8 SemAnalyzer.cpp：break/continue 边界检查（[SemAnalyzer.cpp:585-594](file:///d:/you/Aura/src/Sema/SemAnalyzer.cpp#L585-L594)）
-
-替换：
+**checkLockStmt** 标志部分（L504-508）：
 
 ```cpp
-    if (auto* br = dynamic_cast<const BreakStmt*>(&stmt)) {
-        if (loopDepth_ == 0) error(*br, "'break' outside of loop");
-        if (inLockBlock_) error(*br, "cannot break out of lock block");
-        if (!syncBoundaryStack_.empty()
-            && loopDepth_ <= syncBoundaryStack_.back().loopDepthAtEntry)
-            error(*br, "cannot break out of " + syncBoundaryStack_.back().kind + " block");
-        return;
-    }
-    if (auto* co = dynamic_cast<const ContinueStmt*>(&stmt)) {
-        if (loopDepth_ == 0) error(*co, "'continue' outside of loop");
-        if (inLockBlock_) error(*co, "cannot continue out of lock block");
-        if (!syncBoundaryStack_.empty()
-            && loopDepth_ <= syncBoundaryStack_.back().loopDepthAtEntry)
-            error(*co, "cannot continue out of " + syncBoundaryStack_.back().kind + " block");
-        return;
-    }
+    // 进入 lock 块：设置标志，检查 body
+    ScopedValue<bool> guard(inLockBlock_, true);
+    if (stmt.body) checkBlock(*stmt.body);
 ```
 
-**判定原理**：`loopDepth_ <= 最内层边界.loopDepthAtEntry` ⟺ 最内层循环在进入该块**之前**已开启 ⟺ break/continue 将跨出该块。块内新开启循环时 `loopDepth_` 已增长 → 合法放行（如 spawn 体内 `while true { break }`，K18/K21 现有测试合法）。
+**阶段 7 验证**：`cmake --build build` + K1-K28 回归（重点 K18/K21 边界 break）+ 负向（跨块 return/break/continue）。
 
 ---
 
-## C4 CodeGen（CodeGen.h / StmtGen.cpp）
+## C8 阶段 8：P2 清理
 
-### C4.1 CodeGen.h 新增函数声明（[CodeGen.h:314-315](file:///d:/you/Aura/src/CodeGen/CodeGen.h#L314-L315)）
+### C8.1 inferMethodCall 死分支清理
+
+ExprInfer.cpp `inferMethodCall`（L330-338）：
 
 ```cpp
-    void genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt, bool isCoroutine);
-    void genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt);  // sync thread 内的 spawn
-    void genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt);   // NEW 调用形态（协程版）
-    void genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stmt); // NEW 调用形态（线程版）
+        // 内置类型查表失败 → 报错
+        std::string typeName = (typeKey == "[T]") ? "array" : typeKey;
 ```
 
-### C4.2 genSpawnStmt() 重写（[StmtGen.cpp:814-914](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L814-L914)）
+### C8.2 checkReturnStmt 冗余分支清理
 
-替换 `if (inSyncThreadBlock_)` 之后的旧式分支为调用形态分派，保留显式传参分支，删除旧式分支：
+StmtChecker.cpp `checkReturnStmt`（L100-105）：
 
 ```cpp
-void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
-                                  bool /*isCoroutine*/) {
-    // === 调用形态：spawn func(args) / spawn obj.method(args) ===
-    if (stmt.callExpr) {
-        if (inSyncThreadBlock_)
-            genSpawnCallAsThread(cpp, stmt);
-        else
-            genSpawnCallAsCoro(cpp, stmt);
-        return;
-    }
-
-    // sync thread 块内的 spawn：分派到线程版本
-    if (inSyncThreadBlock_) {
-        genSpawnAsThread(cpp, stmt);
-        return;
-    }
-
-    // === 显式传参模式（spawn (io: Io, n: int) { ... }） ===
-    // 检查用户是否已声明 io / _tasks
-    bool hasIo = false;
-    bool hasTasks = false;
-    for (auto& p : stmt.params) {
-        if (p.name == "io") hasIo = true;
-        if (p.name == "_tasks") hasTasks = true;
-    }
-
-    // 生成 lambda 签名为显式参数
-    cpp << indentStr() << "_tasks.push_back([](";
-    for (size_t i = 0; i < stmt.params.size(); ++i) {
-        if (i > 0) cpp << ", ";
-        cpp << (stmt.params[i].type ? mapParamType(*stmt.params[i].type) : "auto")
-            << " " << safeName(stmt.params[i].name);
-    }
-    // 自动追加 io 和 _tasks（如果用户未声明）
-    if (!hasIo) cpp << ", aura_rt::Io& io";
-    if (!hasTasks) cpp << ", std::vector<aura_rt::task<void>>& _tasks";
-    cpp << ") -> aura_rt::task<void> {\n";
-    insideSpawn_ = true;
-
-    for (auto& s : stmt.body)
-        if (s) genStmt(cpp, *s, true);
-
-    insideSpawn_ = false;
-    cpp << indentStr() << "    co_return;\n";
-    cpp << indentStr() << "}(";
-
-    // 实参：同名自动绑定 or 显式传入
-    if (!stmt.args.empty()) {
-        for (size_t i = 0; i < stmt.args.size(); ++i) {
-            if (i > 0) cpp << ", ";
-            cpp << genExpr(*stmt.args[i], true);
-        }
-    } else {
-        for (size_t i = 0; i < stmt.params.size(); ++i) {
-            if (i > 0) cpp << ", ";
-            cpp << safeName(stmt.params[i].name); // 同名自动绑定
-        }
-    }
-    if (!hasIo) cpp << ", io";
-    if (!hasTasks) cpp << ", _tasks";
-    cpp << "));\n";
-}
+        // 标注 return 表达式自身（RecordExpr 也是 ASTNode 子类，统一处理）
+        const_cast<ASTNode*>(stmt.expr.get())->inferredType = typeStore_.back().get();
 ```
 
-删除内容：旧式语法分支（原 870-914 行，IdRefCollector/DeclaredCollector 自由变量收集 + 自动捕获 lambda）——无 params 的 spawn 已被 Sema 拒绝（C3.7）。
+### C8.3 inferFunExpr save/restore RAII 化
 
-### C4.3 genSpawnCallAsCoro（新增，插在 genSpawnStmt 之后）
-
-```cpp
-// 调用形态（协程 sync 块内）：spawn func(args)
-// 生成：_tasks.push_back([](auto fv..., Io& io, taskvec& _tasks)
-//           -> task<void> { 调用; co_return; }(fv..., io, _tasks));
-void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt) {
-    // 1. 自由变量 = 调用表达式中所有 Identifier - 函数/类型名 - 内置
-    std::set<std::string> allRefs;
-    IdRefCollector idCol(allRefs);
-    idCol.collectExpr(*stmt.callExpr);   // 含 callee + args
-    std::set<std::string> builtins = {"io", "_tasks"};
-    std::vector<std::string> freeVars;
-    for (auto& name : allRefs) {
-        if (builtins.count(name)) continue;
-        if (registeredTypes_.count(name)) continue;  // 函数名/类型名不捕获
-        freeVars.push_back(name);
-    }
-
-    // 2. 协程 lambda：[] 空捕获 + 显式参数（复用旧式 spawn 的安全模式）
-    cpp << indentStr() << "_tasks.push_back([](";
-    for (auto& v : freeVars)
-        cpp << "auto " << safeName(v) << ", ";
-    cpp << "aura_rt::Io& io, std::vector<aura_rt::task<void>>& _tasks"
-        << ") -> aura_rt::task<void> {\n";
-    indentLevel_++;
-    insideSpawn_ = true;
-    // isCoroutine=true：若 callee 为协程函数，genExpr 自动加 co_await；返回值丢弃
-    writeLine(cpp, genExpr(*stmt.callExpr, true) + ";");
-    insideSpawn_ = false;
-    writeLine(cpp, "co_return;");
-    indentLevel_--;
-    cpp << indentStr() << "}(";
-    for (auto& v : freeVars)
-        cpp << safeName(v) << ", ";
-    cpp << "io, _tasks));\n";
-}
-```
-
-### C4.4 genSpawnCallAsThread（新增）
+ExprInfer.cpp `inferFunExpr`（L455-463）：
 
 ```cpp
-// 调用形态（sync thread 块内）：spawn func(args)
-// 生成：_stx.submit([fv..., &io]() mutable { 调用; });
-void CodeGenerator::genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
-    bool oldIoSync = ioSync_;
-    bool oldCoroutine = currentFunctionIsCoroutine_;
-    ioSync_ = true;                      // 强制 io 方法 _sync 版本
-    currentFunctionIsCoroutine_ = false; // 普通 lambda，禁止 co_await
-
-    // 1. 自由变量 + io 使用检测
-    std::set<std::string> allRefs;
-    IdRefCollector idCol(allRefs);
-    idCol.collectExpr(*stmt.callExpr);
-    std::set<std::string> builtins = {"io", "_tasks"};
-    std::vector<std::string> freeVars;
-    bool ioUsed = false;
-    for (auto& name : allRefs) {
-        if (name == "io") { ioUsed = true; continue; }
-        if (builtins.count(name)) continue;
-        if (registeredTypes_.count(name)) continue;
-        freeVars.push_back(name);
-    }
-
-    // 2. 捕获列表：freeVars 值捕获 + io 引用捕获
-    cpp << indentStr() << "_stx.submit([";
-    for (size_t i = 0; i < freeVars.size(); ++i) {
-        if (i > 0) cpp << ", ";
-        cpp << safeName(freeVars[i]);
-    }
-    if (ioUsed) {
-        if (!freeVars.empty()) cpp << ", ";
-        cpp << "&io";
-    }
-    cpp << "]() mutable {";
-    indentLevel_++;
-    insideSpawn_ = true;
-    writeLine(cpp, genExpr(*stmt.callExpr, false) + ";");
-    insideSpawn_ = false;
-    indentLevel_--;
-    cpp << "\n" << indentStr() << "});\n";
-
-    ioSync_ = oldIoSync;
-    currentFunctionIsCoroutine_ = oldCoroutine;
-}
-```
-
-### C4.5 genSyncForStmt() 重写：isThread 分支 + 自由变量捕获（[StmtGen.cpp:741-812](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L741-L812)）
-
-**潜在缺陷修复**：现有协程版 lambda 仅接收 `(var, io, _tasks)`，body 引用外部变量（如 `sync for i in range(5) { ch.send(i) }`）会生成 C++ 编译错误 `'ch' was not captured in this lambda`。本次协程版与线程版统一加入 body 自由变量收集（IdRefCollector + DeclaredCollector，机制与旧式 spawn 相同）。
-
-整函数替换为：
-
-```cpp
-void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, bool) {
-    std::string var = safeName(stmt.itemName);
-    bool hasMax = stmt.maxExpr != nullptr;
-
-    // === 线程版：sync thread for ===
-    if (stmt.isThread) {
-        cpp << indentStr() << "{\n";
-        indentLevel_++;
-        std::string maxArg = hasMax ? genExpr(*stmt.maxExpr, false) : "0";
-        writeLine(cpp, "aura_rt::sync_thread_context _stx(" + maxArg + ");");
-        writeLine(cpp, "aura_rt::ThreadPool::instance().ensureStarted();");
-
-        // for 循环头（复用协程版的 range/数组遍历生成逻辑）
-        bool isRangeCall = false;
-        if (auto* call = dynamic_cast<const CallExpr*>(stmt.iterable.get())) {
-            auto* id = dynamic_cast<const Identifier*>(call->callee.get());
-            if (id && id->name == "range") {
-                isRangeCall = true;
-                if (call->args.size() == 1) {
-                    std::string end = genExpr(*call->args[0], false);
-                    cpp << indentStr() << "for (auto " << var
-                        << " : std::views::iota(0, " << end << ")) {\n";
-                } else if (call->args.size() == 2) {
-                    std::string start = genExpr(*call->args[0], false);
-                    std::string end   = genExpr(*call->args[1], false);
-                    cpp << indentStr() << "for (auto " << var
-                        << " : std::views::iota(" << start << ", " << end << ")) {\n";
-                }
+    if (e.body) {
+        // RAII：保存/恢复函数上下文（返回类型 + throws）
+        struct FnCtxGuard {
+            SemAnalyzer& s;
+            std::unique_ptr<SemType> prevRet;
+            bool prevThrows;
+            FnCtxGuard(SemAnalyzer& sema, std::unique_ptr<SemType> newRet, bool newThrows)
+                : s(sema), prevRet(std::move(sema.currentReturnType_)),
+                  prevThrows(sema.currentFunctionThrows_) {
+                s.currentReturnType_ = std::move(newRet);
+                s.currentFunctionThrows_ = newThrows;
             }
-        }
-        if (!isRangeCall) {
-            std::string iter = genExpr(*stmt.iterable, false);
-            cpp << indentStr() << "for (auto " << var
-                << " : *" << iter << ") {\n";
-        }
-        indentLevel_++;
-
-        // body 自由变量收集（修复：引用外部变量必须显式捕获）
-        std::set<std::string> allRefs;
-        IdRefCollector idCol(allRefs);
-        if (stmt.body) idCol.collectStmt(*stmt.body);
-        std::set<std::string> declared;
-        DeclaredCollector declCol(declared);
-        if (stmt.body) declCol.collectStmt(*stmt.body);
-        std::set<std::string> builtins = {"io", "_tasks"};
-        std::vector<std::string> freeVars;
-        bool ioUsed = false;
-        for (auto& name : allRefs) {
-            if (name == stmt.itemName) continue;    // 迭代变量已值捕获
-            if (declared.count(name)) continue;      // body 内局部声明
-            if (name == "io") { ioUsed = true; continue; }
-            if (builtins.count(name)) continue;
-            if (registeredTypes_.count(name)) continue;  // 函数名/类型名
-            freeVars.push_back(name);
-        }
-
-        // spawn body：普通 lambda + _stx.submit（var + freeVars 值捕获 + io 引用捕获）
-        // 注：外部变量在主线程作用域仍存活（如 let ch27 的 GcRootHandle），
-        //     worker 线程执行期间对象不会被回收，与闭包形态线程版语义一致
-        bool oldIoSync = ioSync_;
-        bool oldCoroutine = currentFunctionIsCoroutine_;
-        ioSync_ = true;                       // 强制 io 方法 _sync 版本
-        currentFunctionIsCoroutine_ = false;  // 普通 lambda，禁止 co_await
-        cpp << indentStr() << "_stx.submit([" << var;
-        for (auto& v : freeVars) cpp << ", " << safeName(v);
-        if (ioUsed) cpp << ", &io";
-        cpp << "]() mutable {\n";
-        indentLevel_++;
-        insideSpawn_ = true;
-        if (stmt.body) genBlock(cpp, *stmt.body, false);   // 非协程！
-        insideSpawn_ = false;
-        indentLevel_--;
-        writeLine(cpp, "});");
-        ioSync_ = oldIoSync;
-        currentFunctionIsCoroutine_ = oldCoroutine;
-
-        // 回边 safepoint
-        writeLine(cpp, "aura_rt::gc_safepoint();");
-        indentLevel_--;
-        cpp << indentStr() << "}\n";   // close for
-        // _stx 析构自动 waitGroup
-        indentLevel_--;
-        cpp << indentStr() << "}\n";   // close block
-        return;
-    }
-
-    // === 协程版（现有逻辑 + 自由变量捕获修复） ===
-    // 1. Open sync block
-    if (hasMax) {
-        std::string maxN = genExpr(*stmt.maxExpr, false);
-        cpp << indentStr() << "{\n";
-        indentLevel_++;
-        writeLine(cpp, "aura_rt::bounded_sync _sync(" + maxN + ");");
-        writeLine(cpp, "auto& _tasks = _sync.tasks();");
-    } else {
-        cpp << indentStr() << "{\n";
-        indentLevel_++;
-        writeLine(cpp, "std::vector<aura_rt::task<void>> _tasks;");
-    }
-
-    // 2. Generate for loop over iterable
-    bool isRangeCall = false;
-    if (auto* call = dynamic_cast<const CallExpr*>(stmt.iterable.get())) {
-        auto* id = dynamic_cast<const Identifier*>(call->callee.get());
-        if (id && id->name == "range") {
-            isRangeCall = true;
-            if (call->args.size() == 1) {
-                std::string end = genExpr(*call->args[0], true);
-                cpp << indentStr() << "for (auto " << var
-                    << " : std::views::iota(0, " << end << ")) {\n";
-            } else if (call->args.size() == 2) {
-                std::string start = genExpr(*call->args[0], true);
-                std::string end   = genExpr(*call->args[1], true);
-                cpp << indentStr() << "for (auto " << var
-                    << " : std::views::iota(" << start << ", " << end << ")) {\n";
+            ~FnCtxGuard() {
+                s.currentReturnType_ = std::move(prevRet);
+                s.currentFunctionThrows_ = prevThrows;
             }
+        } guard(*this, returnType->clone(), e.throws);
+        checkBlock(*e.body);
+    }
+```
+
+### C8.4 isAssignable null 防御 + inferBinaryExpr 未知操作符报错
+
+SemAnalyzer.cpp isAssignable 列表分支（L234-239）：
+
+```cpp
+    // 列表类型：元素类型兼容即兼容（元素类型为 null 时仅当双方都为 null 才兼容）
+    if (auto* lt = dynamic_cast<const ListSemType*>(&target)) {
+        if (auto* ls = dynamic_cast<const ListSemType*>(&source)) {
+            if (!lt->elementType || !ls->elementType)
+                return !lt->elementType && !ls->elementType;
+            return isAssignable(*lt->elementType, *ls->elementType);
         }
+        return false;
     }
-    if (!isRangeCall) {
-        std::string iter = genExpr(*stmt.iterable, true);
-        cpp << indentStr() << "for (auto " << var
-            << " : *" << iter << ") {\n";
-    }
-    indentLevel_++;
-
-    // 3. body 自由变量收集（修复：现有版本 body 引用外部变量编译失败）
-    std::set<std::string> allRefs;
-    IdRefCollector idCol(allRefs);
-    if (stmt.body) idCol.collectStmt(*stmt.body);
-    std::set<std::string> declared;
-    DeclaredCollector declCol(declared);
-    if (stmt.body) declCol.collectStmt(*stmt.body);
-    std::set<std::string> builtins = {"io", "_tasks"};
-    std::vector<std::string> freeVars;
-    for (auto& name : allRefs) {
-        if (name == stmt.itemName) continue;   // 迭代变量已有参数
-        if (declared.count(name)) continue;     // body 内局部声明
-        if (builtins.count(name)) continue;
-        if (registeredTypes_.count(name)) continue;  // 函数名/类型名
-        freeVars.push_back(name);
-    }
-
-    // 4. Generate spawn lambda：[] 空捕获 + 显式参数（var + freeVars + io + _tasks）
-    //    安全模式与旧式 spawn 一致：协程帧在创建时拷贝参数，无 this 野指针 UB
-    cpp << indentStr() << "_tasks.push_back([](auto " << var;
-    for (auto& v : freeVars) cpp << ", auto " << safeName(v);
-    cpp << ", aura_rt::Io& io, std::vector<aura_rt::task<void>>& _tasks"
-        << ") -> aura_rt::task<void> {\n";
-    indentLevel_++;
-    insideSpawn_ = true;
-    if (stmt.body) genBlock(cpp, *stmt.body, true);
-    insideSpawn_ = false;
-    writeLine(cpp, "co_return;");
-    indentLevel_--;
-    cpp << indentStr() << "}(" << var;
-    for (auto& v : freeVars) cpp << ", " << safeName(v);
-    cpp << ", io, _tasks));\n";
-
-    // 5. L2 safepoint：sync for 循环回边
-    writeLine(cpp, "aura_rt::gc_safepoint();");
-    indentLevel_--;
-    cpp << indentStr() << "}\n";   // close for
-
-    // 6. Close sync block
-    writeLine(cpp, "aura_rt::gc_safepoint();");
-    if (hasMax) {
-        writeLine(cpp, "co_await _sync.wait_all();");
-    } else {
-        writeLine(cpp, "co_await aura_rt::when_all(std::move(_tasks));");
-    }
-    indentLevel_--;
-    cpp << indentStr() << "}\n";   // close sync block
-}
 ```
 
-**GC 安全性说明**（协程版 freeVars / 线程版值捕获）：
-- 协程版：`auto ch28` 参数推断为外部变量类型（GcRootHandle），`ch28.get()->send(i)` 由 genIdentifier 的 `gcRootVarNames_` 匹配自动生成，与旧式 spawn 捕获机制完全一致。
-- 线程版：值捕获 GcRootHandle，worker 执行期间外部作用域仍持有引用，对象不回收；`ch27->send(i)` 走 GcRootHandle::operator->（[gc.h:146](file:///d:/you/Aura/runtime/gc/gc.h#L146)）。
-
-### C4.6 genSpawnAsThread() 加固（[StmtGen.cpp:1060](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1060)）
-
-函数体顶部追加防御性断言：
+SemAnalyzer.cpp isAssignable 记录分支（L267-272）：
 
 ```cpp
-void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
-    // 仅闭包形态进入（调用形态由 genSpawnCallAsThread 处理）
-    assert(!stmt.callExpr);
-    // ... 现有逻辑不变 ...
-}
+            for (auto& tf : rt->fields) {
+                auto it = std::find_if(rs->fields.begin(), rs->fields.end(),
+                    [&](const RecordFieldSem& sf) { return sf.name == tf.name; });
+                if (it == rs->fields.end()) return false;
+                if (!tf.type || !it->type)
+                    return !tf.type && !it->type;
+                if (!isAssignable(*tf.type, *it->type)) return false;
+            }
 ```
+
+ExprInfer.cpp inferBinaryExpr 末尾兜底（L138-139）：
+
+```cpp
+    // 未知操作符：报错暴露（正常路径已被上面全部分支覆盖）
+    error(e, "unknown binary operator '" + op + "'");
+    return ErrorSemType::make();
+```
+
+### C8.5 doLoadAurai 异步方法白名单集中化
+
+BuiltinRegistry.h 新增常量（class BuiltinRegistry 定义之前）：
+
+```cpp
+// Io 中无异步版本的同步方法白名单（hasAsync 判定用；新增同步 Io 方法需在此登记）
+static const std::set<std::string> kSyncIoMethods = {"file_exists", "cwd"};
+```
+
+BuiltinRegistry.h doLoadAurai（L188-190）：
+
+```cpp
+                bm.returns = extractReturnType(md->returnType.get());
+                // Io 方法根据名称判断 hasAsync（同步白名单集中在 kSyncIoMethods）
+                if (bm.typeName == "Io" && !kSyncIoMethods.count(md->name))
+                    bm.hasAsync = true;
+```
+
+**阶段 8 验证**：`cmake --build build` + K1-K28 回归 + 负向。
 
 ---
 
-## C5 CoroDecide — 无改动
+## C9 测试
 
-`visit(const SyncForStmt&)` 保持返回 `true`，与 `SyncStmt`（含 sync thread）行为一致。理由：协程函数尾有 `co_return` 兜底（[DeclGen.cpp:289-294](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L289-L294)），无 co_await 也能编译；sync thread for 生成代码中无 co_await，函数标记为协程无害。
-
----
-
-## C6 ASTWalker（CodeGen.h / ASTWalker.h）
-
-各 Walker 的 `visit(const SpawnStmt&)` 增加调用形态分支（callExpr 非空时遍历 callExpr）：
-
-| Walker | 位置 | 改动 |
-|--------|------|------|
-| IdRefCollector | [CodeGen.h:138](file:///d:/you/Aura/src/CodeGen/CodeGen.h#L138) | `if (n.callExpr) return self.collectExpr(*n.callExpr);` 否则遍历 body |
-| DeclaredCollector | [CodeGen.h:181](file:///d:/you/Aura/src/CodeGen/CodeGen.h#L181) | `if (n.callExpr) return false;`（调用表达式无声明）否则遍历 body |
-| AssignTargetCollector | [ASTWalker.h:211](file:///d:/you/Aura/src/ASTWalker.h#L211) | `if (n.callExpr) return false;` 否则遍历 body |
-| CallTargetScanner | [ASTWalker.h:261](file:///d:/you/Aura/src/ASTWalker.h#L261) | `if (n.callExpr) return self.scanExpr(*n.callExpr);` 否则遍历 body |
-| CaptureArgScanner | [ASTWalker.h:328](file:///d:/you/Aura/src/ASTWalker.h#L328) | `if (n.callExpr) return self.scanExpr(*n.callExpr);` 否则遍历 body |
-| IoDetector | [ASTWalker.h:175](file:///d:/you/Aura/src/ASTWalker.h#L175) | 保持 `return false;`（无改动） |
-
-具体代码：
-
-```cpp
-// IdRefCollector（CodeGen.h:138）
-bool visit(const SpawnStmt& n, IdRefCollector& self)  { if (n.callExpr) return self.collectExpr(*n.callExpr); for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
-// DeclaredCollector（CodeGen.h:181）
-bool visit(const SpawnStmt& n, DeclaredCollector& self){ if (n.callExpr) return false; for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
-// AssignTargetCollector（ASTWalker.h:211）
-bool visit(const SpawnStmt& n, AssignTargetCollector& self) { if (n.callExpr) return false; for (auto& sb : n.body) if (sb && self.collectStmt(*sb)) return true; return false; }
-// CallTargetScanner（ASTWalker.h:261）
-bool visit(const SpawnStmt& n, CallTargetScanner& self) { if (n.callExpr) return self.scanExpr(*n.callExpr); for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
-// CaptureArgScanner（ASTWalker.h:328）
-bool visit(const SpawnStmt& n, CaptureArgScanner& self) { if (n.callExpr) return self.scanExpr(*n.callExpr); for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
-```
-
-`SyncForStmt.isThread` 不改变各 Walker 行为（都按 body/iterable 遍历，无差别）。
-
----
-
-## C7 ASTPrinter（ASTPrinter.cpp）
-
-### C7.1 SyncForStmt::print（[ASTPrinter.cpp:354-360](file:///d:/you/Aura/src/ASTPrinter.cpp#L354-L360)）
-
-```cpp
-void SyncForStmt::print(std::ostream& os, int indent) const {
-    printIndent(os, indent);
-    os << "SyncForStmt";
-    if (isThread) os << " thread";   // NEW
-    if (maxExpr) os << " (max)";
-    os << " item=" << itemName << '\n';
-    if (body) body->print(os, indent + 1);
-}
-```
-
-### C7.2 SpawnStmt::print（[ASTPrinter.cpp:369-375](file:///d:/you/Aura/src/ASTPrinter.cpp#L369-L375)）
-
-```cpp
-void SpawnStmt::print(std::ostream& os, int indent) const {
-    printIndent(os, indent);
-    os << "SpawnStmt" << '\n';
-    if (callExpr) {                                  // NEW 调用形态
-        printIndent(os, indent + 1);
-        os << "call:\n";
-        callExpr->print(os, indent + 2);
-    }
-    for (auto& s : body) {
-        if (s) s->print(os, indent + 1);
-    }
-}
-```
-
----
-
-## 测试（example/test.aura 追加 K24-K28）
+### C9.1 正向测试追加（test.aura 尾部，`io.println("=== All tests passed ===")` 之前）
 
 ```aura
-// ---------- K24-K28: spawn 调用形态 / sync thread for / 省略花括号 ----------
-
-// 顶部新增全局函数（供 K25 调用形态测试）
-fun spawnWorker(n: int, io: Io) {
-    io.println("spawnWorker: " + n)
-}
-
-// === K24: spawn 调用形态（协程版，方法调用） ===
-io.println("=== K24: spawn call coro ===")
-let ch24: sync.Channel<int> = sync.Channel(10)
-sync {
-    spawn ch24.send(42)          // 方法调用形态
-}
-let v24 = ch24.receive()
-io.println("v24: " + v24.unwrap())  // 42
-
-// === K25: spawn 调用形态（协程版，全局函数 + 参数捕获） ===
-// 自由变量 = ∅（spawnWorker 是函数名被过滤，io 是 builtins）
-io.println("=== K25: spawn call global fun ===")
-sync {
-    spawn spawnWorker(1, io)
-    spawn spawnWorker(2, io)
-}
-io.println("K25 done")
-
-// === K26: sync thread 块内 spawn（闭包形态保留 + 调用形态） ===
-io.println("=== K26: spawn in sync thread ===")
-let ch26: sync.Channel<int> = sync.Channel(10)
-sync thread {
-    spawn (io: Io) { io.println_sync("thread-a") }   // 闭包形态保留
-    spawn ch26.send(100)                             // 调用形态（线程版）
-}
-ch26.close()
-let v26 = 0
-for v in ch26 { v26 = v }
-io.println("v26: " + v26)   // 100
-
-// === K27: sync thread for ===
-io.println("=== K27: sync thread for ===")
-let ch27: sync.Channel<int> = sync.Channel(100)
-sync thread for i in range(10) {
-    ch27.send(i)
-}
-ch27.close()
-let sum27 = 0
-for v in ch27 { sum27 = sum27 + v }
-io.println("sum27: " + sum27)   // 0+...+9 = 45
-
-// === K28: sync for 省略花括号 ===
-io.println("=== K28: sync for no braces ===")
-let ch28: sync.Channel<int> = sync.Channel(50)
-sync for i in range(5) ch28.send(i)
-ch28.close()
-let sum28 = 0
-for v in ch28 { sum28 = sum28 + v }
-io.println("sum28: " + sum28)   // 0+1+2+3+4 = 10
+    // ---------- K29: sync for 遍历数组（元素类型推断：ListSemType 路径） ----------
+    io.println("=== K29: sync for array ===")
+    let arr29: [int] = [10, 20, 30, 40, 50]
+    let sum29 = 0
+    sync for v in arr29 {
+        sum29 = sum29 + v
+    }
+    io.println("sum29: " + sum29)   // 150
 ```
 
-## 负向测试（编译期断言，逐条验证报错信息）
+> 说明：sync for 遍历 channel 的 CodeGen 支持（ThreadChannel 无 begin/end）属独立未实现功能，不在本次范围；
+> 本次仅修复其 Sema 元素类型推断（checkSyncForStmt 与 checkForStmt 共享 elemTypeOf）。
+> GenericSemType 提取路径由 K23（普通 for 遍历 channel，已有）回归验证。
 
-- `spawn { io.println("x") }` → "old-style 'spawn { ... }' is removed"
-- `spawn x`（x 为变量）→ "expected function call after 'spawn'"
-- `spawn () { io.println("x") }` → "spawn closure must have explicit params"
-- `sync for i in range(3) if true { }` → "expected function call ... wrap complex bodies in braces"
-- 外层 `for` + `sync thread { break }` → "cannot break out of sync thread block"
-- `sync { return }` → "cannot return out of sync block"
-- spawn 体内 `break`（指向 spawn 外循环）→ "cannot break out of spawn block"
+### C9.2 负向测试（临时修改 test.aura 断言后还原）
 
-## 验证步骤
+**N1（K30）泛型绑定冲突报错**（P2-2）：
+```aura
+fun pick30(a: <T>, b: <T>) -> int { return 0 }
+let x30 = pick30(1, "x")
+```
+期望编译错误含：`conflicting type arguments for generic parameter(s) in call to 'pick30'`
 
-1. `cmake --build build`（各阶段增量编译）
-2. `compile.cmd`（非 ASAN）编译 `example/test.aura`
-3. 运行 `example/test.exe` 全量回归（K1-K28）
-4. 负向测试逐条验证（临时改 test.aura 断言编译错误信息）
-5. 回归 `used/test_sync_for.aura`（现有 sync for 语法）
+**N2 跨块 return / break / continue**（阶段 7 回归）：
+```aura
+sync {
+    return    // 期望：cannot return out of sync block
+}
+```
 
----
+**N3 E017 None 独立类型**（阶段 6 回归）：
+```aura
+let n: None = None   // 期望：E017 None cannot be used as a standalone type
+```
+
+**N4 E016 throws 违反 + 参数数量不匹配**（阶段 3 回归）：既有负向，确认错误消息仍触发（E016 消息带函数名）。
+
+### C9.3 验证步骤
+
+1. 各阶段 `cmake --build build`（增量编译，无 error）
+2. 阶段 2 后：`compile.cmd`（非 ASAN）编译 test.aura + 运行 test.exe（K1-K29）
+3. 阶段 3 后：N1 负向断言（临时加入 → 编译报错 → 还原）
+4. 阶段 7 后：N2 负向断言
+5. 阶段 6 后：N3 负向断言
+6. 全部完成后：`compile.cmd` + test.exe 全量回归 K1-K29 + `example/used/test_sync_for.aura` 回归 + used/ 多文件 import 编译
+7. 通过后从 TODO.txt 移除该 issue

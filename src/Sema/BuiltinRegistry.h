@@ -24,6 +24,10 @@ namespace Aura {
 
 enum class BuiltinPrim : uint8_t { Int, Float, Bool, String, None_, Other };
 
+// Io 方法白名单：同步方法（不产生 hasAsync），其余 Io 方法默认异步
+// 注：std::set 在 C++23 前非 constexpr 字面类型，故用 inline const 而非 static constexpr
+inline const std::set<std::string_view> kSyncIoMethods = {"file_exists", "cwd"};
+
 struct BuiltinTypeInfo {
     std::string name;           // Aura 类型名
     bool        isHeap;         // 堆指针类型（GcString*, Array<T>*）
@@ -82,6 +86,13 @@ public:
     const BuiltinTypeInfo* findType(const std::string& name) const {
         auto it = types_.find(name);
         return it != types_.end() ? &it->second : nullptr;
+    }
+
+    // 反向查找：C++ 类型名 → 注册条目（如 "int32_t" → int，供 semTypeFromCppName 使用）
+    const BuiltinTypeInfo* findByCppType(const std::string& cppType) const {
+        for (auto& [name, ti] : types_)
+            if (ti.cppType == cppType) return &ti;
+        return nullptr;
     }
 
     bool isHeapType(const std::string& name) const {
@@ -185,8 +196,8 @@ private:
                     bm.params.push_back({p.name, typeExprToName(p.type.get())});
                 }
                 bm.returns = extractReturnType(md->returnType.get());
-                // Io 方法根据名称判断 hasAsync
-                if (bm.typeName == "Io" && md->name != "file_exists" && md->name != "cwd")
+                // Io 方法根据名称判断 hasAsync（白名单方法为同步）
+                if (bm.typeName == "Io" && !kSyncIoMethods.count(md->name))
                     bm.hasAsync = true;
                 methods_.push_back(std::move(bm));
             } else if (auto* fn = dynamic_cast<const FunDecl*>(d.get())) {

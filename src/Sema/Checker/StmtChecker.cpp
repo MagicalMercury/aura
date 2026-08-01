@@ -14,17 +14,31 @@ void SemAnalyzer::checkBlock(const BlockStmt& stmt) {
     symtab_.exitScope();
 }
 
-void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
-    // None 不能作为独立变量类型
-    if (decl.type) {
-        if (auto* nt = dynamic_cast<const NamedType*>(decl.type.get())) {
+// None 不能作为独立类型标注（E017）—— let/const 复用
+bool SemAnalyzer::rejectStandaloneNone(const Decl& decl, const TypeExpr* type) {
+    if (type) {
+        if (auto* nt = dynamic_cast<const NamedType*>(type)) {
             if (nt->name == "None") {
                 error(decl, DiagCode::E017_NoneStandalone,
                       "None cannot be used as a standalone type; use a union type (e.g. 'int | None')");
-                return;
+                return true;
             }
         }
     }
+    return false;
+}
+
+// sync 系 max 表达式类型检查（"sync" / "sync thread" / "sync for" 复用）
+void SemAnalyzer::checkSyncMax(const ASTNode& maxExpr, const std::string& kindName) {
+    auto maxTy = inferExpr(maxExpr);
+    if (!isAssignable(*intType(), *maxTy)) {
+        error(maxExpr, kindName + " max must be int, got '" + maxTy->toString() + "'");
+    }
+}
+
+void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
+    // None 不能作为独立变量类型
+    if (rejectStandaloneNone(decl, decl.type.get())) return;
 
     // 先注册占位符号（若有类型标注则用标注类型，否则暂设 error），
     // 使递归闭包能引用自身（如 let fact: fun(int)->int = fun(n) { return n * fact(n-1) }）
@@ -61,15 +75,7 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
 
 void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
     // None 不能作为独立变量类型
-    if (decl.type) {
-        if (auto* nt = dynamic_cast<const NamedType*>(decl.type.get())) {
-            if (nt->name == "None") {
-                error(decl, DiagCode::E017_NoneStandalone,
-                      "None cannot be used as a standalone type; use a union type (e.g. 'int | None')");
-                return;
-            }
-        }
-    }
+    if (rejectStandaloneNone(decl, decl.type.get())) return;
 
     auto inferredType = decl.initializer ? inferExpr(*decl.initializer) : ErrorSemType::make();
     if (decl.type) {
@@ -148,60 +154,28 @@ void SemAnalyzer::checkWhileStmt(const WhileStmt& stmt) {
     if (!isAssignable(*boolType(), *condType)) {
         error(*stmt.condition, "while condition must be bool, got '" + condType->toString() + "'");
     }
-    int prev = loopDepth_; loopDepth_++;
+    ScopedValue<int> guard(loopDepth_, loopDepth_ + 1);
     if (stmt.body) checkBlock(*stmt.body);
-    loopDepth_ = prev;
 }
 
 void SemAnalyzer::checkForStmt(const ForStmt& stmt) {
     auto iterType = inferExpr(*stmt.iterable);
     // 迭代类型默认合法（运行时检查），这里只确保表达式无错误
-    int prev = loopDepth_; loopDepth_++;
+    ScopedValue<int> loopGuard(loopDepth_, loopDepth_ + 1);
     symtab_.enterScope();
     Symbol sym;
     sym.kind = SymKind::Variable;
     sym.name = stmt.itemName;
-    // 从列表/迭代器类型推导元素类型
-    if (auto* listTy = dynamic_cast<ListSemType*>(iterType.get())) {
-        sym.type = listTy->elementType ? listTy->elementType->clone() : ErrorSemType::make();
-    } else if (auto* iterTy = dynamic_cast<IterSemType*>(iterType.get())) {
-        sym.type = iterTy->elementType ? iterTy->elementType->clone() : ErrorSemType::make();
-    } else if (auto* gs = dynamic_cast<GenericSemType*>(iterType.get())) {
-        // sync.Channel<T> / channel<T> 等泛型通道类型：从 resolvedName 提取元素类型
-        // resolvedName 形如 "sync.Channel<int32_t>" 或 "channel<int32_t>"
-        // 无 resolvedName 时回退到 ErrorSemType（运行时 auto 推断兜底）
-        sym.type = ErrorSemType::make();
-        if (!gs->resolvedName.empty()) {
-            auto lt = gs->resolvedName.find('<');
-            auto rt = gs->resolvedName.rfind('>');
-            if (lt != std::string::npos && rt != std::string::npos && rt > lt) {
-                std::string elemName = gs->resolvedName.substr(lt + 1, rt - lt - 1);
-                // 映射回 Aura 基础 SemType，避免被 isHeapSemType 误判
-                if (elemName == "int32_t")            sym.type = intType();
-                else if (elemName == "double")        sym.type = floatType();
-                else if (elemName == "bool")          sym.type = boolType();
-                else if (elemName == "aura_rt::GcString*") sym.type = stringType();
-                else {
-                    auto elem = std::make_unique<GenericSemType>();
-                    elem->name = elemName;
-                    elem->resolvedName = elemName;
-                    sym.type = std::move(elem);
-                }
-            }
-        }
-    } else {
-        sym.type = ErrorSemType::make();
-    }
+    // 从列表/迭代器/泛型通道类型推导元素类型（elemTypeOf 统一处理）
+    sym.type = elemTypeOf(iterType.get());
     symtab_.define(std::move(sym));
     if (stmt.body) checkBlock(*stmt.body);
     symtab_.exitScope();
-    loopDepth_ = prev;
 }
 
 void SemAnalyzer::checkLoopStmt(const LoopStmt& stmt) {
-    int prev = loopDepth_; loopDepth_++;
+    ScopedValue<int> guard(loopDepth_, loopDepth_ + 1);
     if (stmt.body) checkBlock(*stmt.body);
-    loopDepth_ = prev;
 }
 
 void SemAnalyzer::checkMatchStmt(const MatchStmt& stmt) {
@@ -260,59 +234,31 @@ void SemAnalyzer::checkSyncStmt(const SyncStmt& stmt) {
             return;
         }
         // R4: maxExpr 类型检查
-        if (stmt.maxExpr) {
-            auto maxTy = inferExpr(*stmt.maxExpr);
-            if (!isAssignable(*intType(), *maxTy)) {
-                error(*stmt.maxExpr, "sync thread max must be int, got '" + maxTy->toString() + "'");
-            }
-        }
+        if (stmt.maxExpr) checkSyncMax(*stmt.maxExpr, "sync thread");
         // 进入 sync thread 块：设置标志（spawn 将走 R3 检查分支）
-        bool oldInSync = insideSync_;
-        bool oldInThread = inSyncThreadBlock_;
-        insideSync_ = true;          // spawn 合法
-        inSyncThreadBlock_ = true;   // 多线程模式
-        syncBoundaryStack_.push_back({"sync thread", loopDepth_});
+        SyncBoundaryGuard bg(*this, "sync thread");
+        ScopedValue<bool> g1(insideSync_, true);
+        ScopedValue<bool> g2(inSyncThreadBlock_, true);
         if (stmt.body) checkBlock(*stmt.body);
-        syncBoundaryStack_.pop_back();
-        insideSync_ = oldInSync;
-        inSyncThreadBlock_ = oldInThread;
         return;
     }
 
     // 原有 sync 协程逻辑
-    if (stmt.maxExpr) {
-        auto maxTy = inferExpr(*stmt.maxExpr);
-        if (!isAssignable(*intType(), *maxTy)) {
-            error(*stmt.maxExpr, "sync max must be int, got '" + maxTy->toString() + "'");
-        }
-    }
-    insideSync_ = true;
-    syncBoundaryStack_.push_back({"sync", loopDepth_});
+    if (stmt.maxExpr) checkSyncMax(*stmt.maxExpr, "sync");
+    SyncBoundaryGuard bg(*this, "sync");
+    ScopedValue<bool> g(insideSync_, true);
     if (stmt.body) checkBlock(*stmt.body);
-    syncBoundaryStack_.pop_back();
-    insideSync_ = false;
 }
 
 void SemAnalyzer::checkSyncForStmt(const SyncForStmt& stmt) {
     // 检查可选的 max 表达式
-    if (stmt.maxExpr) {
-        auto maxTy = inferExpr(*stmt.maxExpr);
-        if (!isAssignable(*intType(), *maxTy)) {
-            error(*stmt.maxExpr, "sync for max must be int, got '" + maxTy->toString() + "'");
-        }
-    }
+    if (stmt.maxExpr) checkSyncMax(*stmt.maxExpr, "sync for");
 
-    // 推断迭代器类型 → 获取元素类型作为 spawn 参数类型
+    // 推断迭代器类型 → 获取元素类型作为 spawn 参数类型（含 GenericSemType 通道类型）
     auto iterType = inferExpr(*stmt.iterable);
-    std::unique_ptr<SemType> elemType = ErrorSemType::make();
-    if (auto* listTy = dynamic_cast<ListSemType*>(iterType.get())) {
-        elemType = listTy->elementType ? listTy->elementType->clone() : ErrorSemType::make();
-    } else if (auto* iterTy = dynamic_cast<IterSemType*>(iterType.get())) {
-        elemType = iterTy->elementType ? iterTy->elementType->clone() : ErrorSemType::make();
-    }
+    auto elemType = elemTypeOf(iterType.get());
 
     // 检查 body（spawn 体内 itemName 可用）
-    insideSync_ = true;
     symtab_.enterScope();
     {
         Symbol sym;
@@ -327,25 +273,18 @@ void SemAnalyzer::checkSyncForStmt(const SyncForStmt& stmt) {
         if (inSyncThreadBlock_) {
             error(stmt, "nested sync thread not allowed");
             symtab_.exitScope();
-            insideSync_ = false;
             return;
         }
-        bool oldInSync = insideSync_;
-        bool oldInThread = inSyncThreadBlock_;
-        insideSync_ = true;
-        inSyncThreadBlock_ = true;
-        syncBoundaryStack_.push_back({"sync thread for", loopDepth_});
+        SyncBoundaryGuard bg(*this, "sync thread for");
+        ScopedValue<bool> g1(insideSync_, true);
+        ScopedValue<bool> g2(inSyncThreadBlock_, true);
         if (stmt.body) checkBlock(*stmt.body);
-        syncBoundaryStack_.pop_back();
-        insideSync_ = oldInSync;
-        inSyncThreadBlock_ = oldInThread;
     } else {
-        syncBoundaryStack_.push_back({"sync for", loopDepth_});
+        SyncBoundaryGuard bg(*this, "sync for");
+        ScopedValue<bool> g(insideSync_, true);
         if (stmt.body) checkBlock(*stmt.body);
-        syncBoundaryStack_.pop_back();
     }
     symtab_.exitScope();
-    insideSync_ = false;
 }
 
 void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
@@ -391,11 +330,10 @@ void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
 
     // 处理 spawn 体
     symtab_.enterScope();
-    syncBoundaryStack_.push_back({"spawn", loopDepth_});
+    SyncBoundaryGuard bg(*this, "spawn");
     for (auto& s : stmt.body) {
         if (s) checkStmt(*s);
     }
-    syncBoundaryStack_.pop_back();
     symtab_.exitScope();
 
     symtab_.exitScope();
@@ -502,10 +440,8 @@ void SemAnalyzer::checkLockStmt(const LockStmt& stmt) {
     }
 
     // 进入 lock 块：设置标志，检查 body
-    bool oldInLock = inLockBlock_;
-    inLockBlock_ = true;
+    ScopedValue<bool> g(inLockBlock_, true);
     if (stmt.body) checkBlock(*stmt.body);
-    inLockBlock_ = oldInLock;
 }
 
 } // namespace Aura

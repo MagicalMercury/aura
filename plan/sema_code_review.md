@@ -514,3 +514,59 @@ methods_ 是 `vector`，每次 `findMethod` 是 O(n)。在方法很少（~30 个
 ---
 
 **审查结论**：类型系统完整（10 种 SemType 正交覆盖），符号表正确处理自引用和重载，表达式推断覆盖 20 种表达式类型，语句检查覆盖 15 种语句含 9 条锁/并发规则。主要风险点：CanonicalName 未生成时的 CodeGen 影响、match 穷尽性仅检查 Union（不检查其他枚举）、泛型深层传递不支持。
+
+---
+
+## 十二、硬编码逻辑与逻辑混乱审查（2026-08-01 补充）
+
+> **审查维度**：可提取的硬编码逻辑 + 逻辑混乱 / 难读点
+> **审查范围**：src/Sema/ 全部 11 个文件
+> **结论摘要**：5 处 Aura↔C++ 类型映射重复（未复用 BuiltinRegistry.types_ 权威表）、
+> 3 处 TypeExpr 树遍历平行重复、inferCall 三处参数检查重复（约 70 行）、
+> 9 处逻辑混乱点（含 1 处未完成逻辑、1 处数据不一致）。
+
+### 12.1 硬编码逻辑提取点
+
+**P0 — 建议优先提取**
+
+| # | 问题 | 位置 | 说明 |
+|:--|:--|:--|:--|
+| 1 | Aura↔C++ 类型映射重复 5 处 | SemAnalyzer.cpp:418/447（正向）、SemAnalyzer.cpp:121（Aura→SemType）、StmtChecker.cpp:180（反向 C++→Aura） | `int→int32_t` 正反向映射散落 5 处，未复用 BuiltinRegistry.h:211-233 的权威表 `types_`（含 cppType 字段） |
+| 2 | resolvedName 提取 `<...>` 元素类型重复 2 处 | SemAnalyzer.cpp:152-168、StmtChecker.cpp:174-190 | `find('<')/rfind('>')/substr` + C++名→SemType 逻辑完全相同，可提取 `extractElemTypeFromResolved()` |
+| 3 | `elemTypeOf(iterType)` 重复且不一致 | StmtChecker.cpp:165-194 vs 308-312 | checkForStmt 有 List/Iter/**Generic(channel)** 三分支，checkSyncForStmt 仅两分支——**sync for 遍历 channel 时元素类型推断缺失**，需统一提取 |
+| 4 | TypeExpr 树遍历 3 处平行重复 | DeclChecker.cpp:8-41、168-235、370-397 | `collectGenericRefs` / `resolveType` / `registerGenericParams` 都是 6 分支 dynamic_cast 遍历，可模板化 `TypeExprWalker` |
+| 5 | inferCall 三处参数检查重复 | ExprInfer.cpp:185-197、206-217、230-242 | Function/Method、TypeAlias ctor、Variable(FuncSemType) 各 8 行重复。提取 `checkCallArgs()` 可消除 Function 与 Variable 分支约 70 行重复 |
+
+**P1 — 推荐提取**
+
+| # | 问题 | 位置 |
+|:--|:--|:--|
+| 6 | importExports 中 ctors/funcs 两循环逐行相同 | SemAnalyzer.cpp:615-642 |
+| 7 | extractExports 中 FuncExport 构建两处重复 | SemAnalyzer.cpp:664-688 |
+| 8 | checkLetDecl / checkConstDecl None 检查（E017）完全相同 | StmtChecker.cpp:19-27、63-72 |
+| 9 | checkSyncStmt / checkSyncForStmt isThread 分支结构重复（R1 + old/restore） | StmtChecker.cpp:254-294、325-346 |
+| 10 | maxExpr 类型检查三处重复 | StmtChecker.cpp:263、283、298 |
+| 11 | throws 兼容性检查三处重复 | ExprInfer.cpp:179、224、267 |
+| 12 | 泛型代换循环两处重复 | ExprInfer.cpp:199-201、244-246 |
+
+**P2 — 硬编码白名单**
+
+| # | 问题 | 位置 |
+|:--|:--|:--|
+| 13 | doLoadAurai 用方法名白名单判定 hasAsync（`file_exists`/`cwd` 排除） | BuiltinRegistry.h:189-190 |
+
+### 12.2 逻辑混乱 / 难读点
+
+1. **inferMethodCall 死分支**（ExprInfer.cpp:331-338）：`else if (typeKey == "Io" || typeKey == "Path") typeName = typeKey;` 与 `else typeName = typeKey;` 效果完全相同，误导读者
+2. **collectGenericMapping 空 if 块**（SemAnalyzer.cpp:331-333）：泛型绑定冲突时注释"保留第一个绑定"但无任何处理——未完成逻辑，应记录 error 或删注释
+3. **semTypeFromBuiltinReturn Generic 分支死代码**（L194-197）：`"channel"` 分支直接返回 ErrorSemType，与 Optional 分支能力不对称
+4. **inferFunExpr 用 `std::move(unique_ptr)` 做 save/restore**（ExprInfer.cpp:456-462）：可读性差且恢复后 prevRet 变空，应 RAII 化
+5. **checkSpawnStmt 双层 enterScope**（L382-401）：enter/exit 相距 30 行，易漏配
+6. **checkReturnStmt 冗余分支**（StmtChecker.cpp:101-105）：RecordExpr 分支与 ASTNode 分支效果相同（RecordExpr 也是 ASTNode 子类）
+7. **null 解引用不一致**：isAssignable 对 `*lt->elementType`（L236）、`*tf.type`（L271）无防御，而 checkForStmt 同场景有防御
+8. **inferBinaryExpr 未知操作符静默通过**（ExprInfer.cpp:139）：`return lt->clone()` 兜底不报错，潜在隐藏 bug
+9. **BuiltinRegistry 数据不一致**：`Io`/`Path` 代码实际 isHeap=false（与 §4.1 记载 true 相反）；`channel` cppType 是 `Channel*` 但与模板语义混淆
+
+### 12.3 重构优先级建议
+
+按 P0 子项（12.1 的 1-5）实施可消除约 150+ 行重复，其中第 3 项顺带修复 `sync for` 遍历 channel 的元素类型 bug。已开 issue 记录于 TODO.txt §八（P1）。建议逐子项实施，避免一次性大改。
