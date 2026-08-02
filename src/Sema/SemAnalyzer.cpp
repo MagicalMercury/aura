@@ -47,6 +47,94 @@ std::string cppNameOf(const std::string& auraName) {
         return ti->cppType;
     return auraName;
 }
+
+// 将 SemType 映射为 C++ 类型名（供 canonicalName 模板参数实例化使用）
+std::string semTypeToCppName(const SemType& t) {
+    if (auto* p = dynamic_cast<const PrimSemType*>(&t)) {
+        switch (p->kind) {
+            case PrimSemType::Int:    return "int32_t";
+            case PrimSemType::Float:  return "double";
+            case PrimSemType::Bool:   return "bool";
+            case PrimSemType::String: return "aura_rt::GcString*";
+        }
+    }
+    if (dynamic_cast<const NoneSemType*>(&t)) return "aura_rt::NoneType";
+    if (auto* l = dynamic_cast<const ListSemType*>(&t))
+        return "aura_rt::Array<" + semTypeToCppName(*l->elementType) + ">*";
+    if (auto* r = dynamic_cast<const RecordSemType*>(&t))
+        return r->canonicalName + "*";
+    if (auto* g = dynamic_cast<const GenericSemType*>(&t)) {
+        if (!g->resolvedName.empty()) return g->resolvedName;
+        return cppNameOf(g->name);
+    }
+    return "auto";
+}
+
+// 将 canonicalName（如 "Pair<A, B>"）模板参数列表中名为 name 的形参替换为 cppName
+std::string replaceCanonicalArg(const std::string& canonicalName,
+                                const std::string& name,
+                                const std::string& cppName) {
+    auto lt = canonicalName.find('<');
+    auto rt = canonicalName.rfind('>');
+    if (lt == std::string::npos || rt == std::string::npos || rt < lt)
+        return canonicalName;
+    std::string head = canonicalName.substr(0, lt + 1);  // 含 '<'
+    std::string tail = canonicalName.substr(rt);         // 含 '>'
+    std::string args = canonicalName.substr(lt + 1, rt - lt - 1);
+    // 按逗号（括号深度 0）分割，支持嵌套泛型如 Pair<Stack<int>, B>
+    std::vector<std::string> parts;
+    std::string cur;
+    int depth = 0;
+    for (char c : args) {
+        if (c == '<') ++depth;
+        else if (c == '>') --depth;
+        if (c == ',' && depth == 0) {
+            parts.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    parts.push_back(cur);
+    std::string joined;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) joined += ", ";
+        auto b = parts[i].find_first_not_of(" \t");
+        auto e = parts[i].find_last_not_of(" \t");
+        std::string tok = (b == std::string::npos)
+            ? "" : parts[i].substr(b, e - b + 1);
+        joined += (tok == name) ? cppName : parts[i];
+    }
+    return head + joined + tail;
+}
+
+// 将导出的类型中的所有 RecordSemType canonicalName 加上模块别名前缀
+// （如 "Pair<A, B>" → "math::Pair<A, B>"），使 CodeGen mapSemType 输出完整 C++ 类型名。
+// C++ 侧 CodeGen 会生成 `namespace math = aura_mod_math_utils;` 别名。
+void qualifyRecordTypes(std::unique_ptr<SemType>& t, const std::string& alias) {
+    if (!t || alias.empty()) return;
+    if (auto* rec = dynamic_cast<RecordSemType*>(t.get())) {
+        if (!rec->canonicalName.empty()
+            && rec->canonicalName.find("::") == std::string::npos) {
+            rec->canonicalName = alias + "::" + rec->canonicalName;
+        }
+        for (auto& f : rec->fields)
+            if (f.type) qualifyRecordTypes(f.type, alias);
+    } else if (auto* l = dynamic_cast<ListSemType*>(t.get())) {
+        qualifyRecordTypes(l->elementType, alias);
+    } else if (auto* u = dynamic_cast<UnionSemType*>(t.get())) {
+        for (auto& v : u->variants)
+            qualifyRecordTypes(v, alias);
+    } else if (auto* f = dynamic_cast<FuncSemType*>(t.get())) {
+        for (auto& p : f->paramTypes)
+            qualifyRecordTypes(p, alias);
+        qualifyRecordTypes(f->returnType, alias);
+    } else if (auto* o = dynamic_cast<OptionalSemType*>(t.get())) {
+        qualifyRecordTypes(o->elementType, alias);
+    } else if (auto* it = dynamic_cast<IterSemType*>(t.get())) {
+        qualifyRecordTypes(it->elementType, alias);
+    }
+}
 } // namespace
 
 std::unique_ptr<SemType> SemAnalyzer::semTypeFromAuraName(const std::string& name) {
@@ -88,6 +176,8 @@ std::unique_ptr<SemType> SemAnalyzer::elemTypeOf(const SemType* iterType) {
         return listTy->elementType ? listTy->elementType->clone() : ErrorSemType::make();
     if (auto* iterTy = dynamic_cast<const IterSemType*>(iterType))
         return iterTy->elementType ? iterTy->elementType->clone() : ErrorSemType::make();
+    if (auto* os = dynamic_cast<const OptionalSemType*>(iterType))
+        return os->elementType ? os->elementType->clone() : ErrorSemType::make();
     if (auto* gs = dynamic_cast<const GenericSemType*>(iterType)) {
         // sync.Channel<int32_t> / channel<int32_t> 等泛型类型：从 resolvedName 提取 <...> 内元素
         if (!gs->resolvedName.empty()) {
@@ -187,7 +277,7 @@ std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(
             return ErrorSemType::make();
         }
         case ReturnTypeInfo::Kind::Generator:
-            return IterSemType::make(intType());
+            return IterSemType::make(semTypeFromAuraName(ret.typeName));
         case ReturnTypeInfo::Kind::Optional: {
             // Optional<T>: 从 objType 提取元素类型构造 OptionalSemType
             // sync.Channel<T>.receive() 时 objType 应携带元素类型信息（resolvedName）
@@ -216,11 +306,9 @@ std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(
             if (ret.typeName == "string") {
                 return stringType();
             }
-            // fallback == "channel" → 返回 channel 的元素类型
+            // fallback == "channel" → 返回 channel 的元素类型（D1 修复：原实现直接 return ErrorSemType）
             if (ret.typeName == "channel") {
-                // channel<T> 的元素类型：从 objType 提取
-                // GenericSemType("channel") 无元素类型信息，回退到 error
-                return ErrorSemType::make();
+                return elemTypeOf(objType);
             }
             return ErrorSemType::make();
         }
@@ -324,7 +412,9 @@ std::unique_ptr<SemType> SemAnalyzer::substitute(
     }
     if (auto* r = dynamic_cast<const RecordSemType*>(&type)) {
         auto n = std::make_unique<RecordSemType>();
-        n->canonicalName = r->canonicalName;
+        // 泛型 record 的 canonicalName（如 "Pair<A, B>"）同步实例化：
+        // 将形参名替换为绑定的具体 C++ 类型名（"Pair<int32_t, aura_rt::GcString*>"）
+        n->canonicalName = replaceCanonicalArg(r->canonicalName, genericName, semTypeToCppName(concrete));
         for (auto& fld : r->fields) {
             n->fields.push_back({fld.name, fld.type ? substitute(*fld.type, genericName, concrete) : nullptr});
         }
@@ -679,7 +769,8 @@ void SemAnalyzer::checkStmt(const Stmt& stmt) {
 // ============================================================
 
 // 导入一个导出函数/构造函数为 Function 符号（importExports 辅助）
-void SemAnalyzer::importFuncSymbol(const std::string& name, const FuncExport& f) {
+void SemAnalyzer::importFuncSymbol(const std::string& name, const FuncExport& f,
+                                    const std::string& alias) {
     Symbol sym;
     sym.kind = SymKind::Function;
     sym.name = name;
@@ -687,9 +778,11 @@ void SemAnalyzer::importFuncSymbol(const std::string& name, const FuncExport& f)
         SymParam sp;
         sp.name = p.name;
         sp.type = p.type ? p.type->clone() : nullptr;
+        if (sp.type) qualifyRecordTypes(sp.type, alias);
         sym.params.push_back(std::move(sp));
     }
     sym.type   = f.returnType ? f.returnType->clone() : nullptr;
+    if (sym.type) qualifyRecordTypes(sym.type, alias);
     sym.throws = f.throws;
     symtab_.defineGlobal(std::move(sym));
 }
@@ -700,13 +793,14 @@ void SemAnalyzer::importExports(const std::string& alias, const ModuleExports& e
         sym.kind = SymKind::TypeAlias;
         sym.name = alias.empty() ? name : (alias + "." + name);
         sym.type = type->clone();
+        if (sym.type) qualifyRecordTypes(sym.type, alias);
         symtab_.defineGlobal(std::move(sym));
     }
     auto qualified = [&](const std::string& name) {
         return alias.empty() ? name : (alias + "." + name);
     };
-    for (auto& [name, f] : exports.ctors) importFuncSymbol(qualified(name), f);
-    for (auto& [name, f] : exports.funcs) importFuncSymbol(qualified(name), f);
+    for (auto& [name, f] : exports.ctors) importFuncSymbol(qualified(name), f, alias);
+    for (auto& [name, f] : exports.funcs) importFuncSymbol(qualified(name), f, alias);
     // 注册 import 别名本身（供 inferMethodCall 检测命名空间调用）
     if (!alias.empty()) {
         Symbol aliasSym;
@@ -738,7 +832,8 @@ ModuleExports SemAnalyzer::extractExports() const {
     for (auto& scope : symtab_.allScopes()) {
         if (scope->kind() != ScopeKind::Global) continue;
         scope->forEach([&](const std::string& name, const Symbol& sym) {
-            if (!sym.isPublic) return;  // Phase B: 跳过私有符号
+            if (sym.isImported) return;               // import 不透传（C6-1）
+            if (hasAnyPub_ && !sym.isPublic) return;  // 模块级策略：有 pub 仅导出带 pub 的（C6-2）
             switch (sym.kind) {
                 case SymKind::TypeAlias:
                     e.types[name] = sym.type ? sym.type->clone() : ErrorSemType::make();

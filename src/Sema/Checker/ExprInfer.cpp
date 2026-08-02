@@ -218,13 +218,14 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
                 if (imported->kind == SymKind::TypeAlias) {
                     return imported->type ? imported->type->clone() : ErrorSemType::make();
                 }
-                // 函数调用 — 复用 checkCallArgs 检查逻辑
+                // 函数调用 — 复用 checkCallArgs 检查逻辑（泛型绑定：实参→形参映射用于实例化返回类型）
                 checkThrowsContext(e, e.method, imported->throws);
                 std::vector<const SemType*> formalTypes;
                 for (auto& p : imported->params) formalTypes.push_back(p.type.get());
-                std::map<std::string, std::unique_ptr<SemType>> dummyMap;
-                checkCallArgs(e, e.method, "function", formalTypes, e.args, dummyMap);
-                return imported->type ? imported->type->clone() : NoneSemType::make();
+                std::map<std::string, std::unique_ptr<SemType>> genericMap;
+                checkCallArgs(e, e.method, "function", formalTypes, e.args, genericMap);
+                auto result = imported->type ? imported->type->clone() : NoneSemType::make();
+                return applyGenericMap(std::move(result), genericMap);
             }
             error(e, "module '" + id->name + "' has no exported symbol '" + e.method + "'");
             return ErrorSemType::make();
@@ -268,6 +269,18 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
         }
         if (auto* entry = BuiltinRegistry::get().findMethod(typeKey, e.method, (int)e.args.size())) {
             auto& ret = entry->returns;
+            // 返回形状依赖元素类型的调用（Optional<T> / Generic("channel")）：
+            // 元素类型不可知 → 报错引导显式类型标注（不改返回 fallback，仅诊断）
+            bool needsElem = (ret.kind == ReturnTypeInfo::Kind::Optional)
+                || (ret.kind == ReturnTypeInfo::Kind::Generic
+                    && ret.typeName != "[T]" && ret.typeName != "string");
+            if (needsElem) {
+                auto elem = elemTypeOf(objType.get());
+                if (dynamic_cast<const ErrorSemType*>(elem.get())) {
+                    error(e, "cannot infer element type of '" + typeKey
+                           + "'; add explicit type annotation (e.g. " + typeKey + "<int>)");
+                }
+            }
             return semTypeFromBuiltinReturn(ret, objType.get());
         }
         // 内置类型查表失败 → 报错（"[T]" 显示为 array，其余保持原名）

@@ -83,6 +83,7 @@ struct Diagnostic {
     std::string  message;
     std::string  fixHint;         // 可选的修复建议
     std::vector<Diagnostic> notes; // 附注（暂未使用，预留）
+    std::string  file = {};       // 所属文件（report 时快照 fileName_；多模块并行诊断归属）
 };
 
 } // namespace Aura

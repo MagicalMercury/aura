@@ -550,6 +550,16 @@ inline void gc_write_barrier(GcObject* parent, void* fieldAddr, GcObject* newVal
     GcHeap::instance().writeBarrier(parent, fieldAddr, newVal);
 }
 
+// 泛型模板上下文写屏障：字段类型依赖模板参数（如 Pair<A,B>::Pair_ctor 中的 self->first = a），
+// 编译期无法静态判断 A 是否为 GC 指针。实例化后仅在可转换为 GcObject* 时记录写屏障，
+// 标量类型（如 int）跳过 —— static_cast<GcObject*>(int) 非法。
+template <typename T>
+inline void gc_write_barrier_generic(GcObject* parent, void* fieldAddr, const T& value) {
+    if constexpr (std::is_convertible_v<T, GcObject*>) {
+        gc_write_barrier(parent, fieldAddr, static_cast<GcObject*>(value));
+    }
+}
+
 // 安全点
 inline void gc_safepoint() {
     GcHeap::instance().safepoint();

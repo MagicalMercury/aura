@@ -38,3 +38,28 @@ io.read_file("config.txt")!      // string 字面量 → Path
 io.write_file(path.join(path.new("dir"), "file.txt"), content)!
                                   // Path + string 混合 → Path
 ```
+
+## 12.4 可见性（pub）
+
+可见性按**模块级策略**控制导出：
+
+- **文件中没有任何 `pub` 关键字** → 全部顶层声明默认导出。
+- **文件中存在 `pub` 关键字** → 仅带 `pub` 的声明导出，其余为模块私有。
+
+```aura
+// utils.aura —— 存在 pub，半开放模式
+pub type Pair<A, B> = { first: A, second: B }
+pub fun zip(a: <A>, b: <B>) -> Pair<A, B> { return Pair(a, b) }
+fun helper() { ... }              // 私有：仅 utils.aura 内可用
+
+// helpers.aura —— 无 pub，全导出模式
+fun helper1() { ... }             // 自动公开
+fun helper2() { ... }             // 自动公开
+```
+
+**规则：**
+
+1. 导出对象：顶层 `type`、`fun`、方法、构造函数。
+2. 被导出的 `type` 的方法与字段随类型一并公开（Go 风格，无字段/方法级 `pub`）。
+3. **import 不透传**：模块 B `import "a.aura"` 后，B 自身不导出 A 的符号；模块 C `import "b.aura"` 无法间接访问 A 的符号。C 若需要 A 的符号，直接 `import "a.aura"` 即可（import 按路径直达，无层级传递）。
+4. `pub` 仅可修饰声明（`type` / `fun` / 方法 / 构造函数）；`pub import` 为错误。

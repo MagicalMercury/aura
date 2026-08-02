@@ -2,6 +2,16 @@
 
 namespace Aura {
 
+// 列表元素类型链递归检测 ErrorSemType（空列表 [] / 嵌套 [[]] → 元素类型不可知）
+// 仅检查 List 链，不检查整体 Error / Optional（避免误伤 record 方法调用等放行路径）
+static bool listContainsError(const SemType* t) {
+    auto* l = dynamic_cast<const ListSemType*>(t);
+    if (!l) return false;
+    if (!l->elementType) return true;
+    return dynamic_cast<const ErrorSemType*>(l->elementType.get())
+        || listContainsError(l->elementType.get());
+}
+
 // ============================================================
 // 块 & 语句检查
 // ============================================================
@@ -84,6 +94,8 @@ void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
             error(decl, "type mismatch in const: expected '" + declaredType->toString() + "', got '" + inferredType->toString() + "'");
         }
         inferredType = std::move(declaredType);
+    } else if (listContainsError(inferredType.get())) {
+        error(decl, "cannot infer element type from initializer; add explicit type annotation (e.g. let x: [int] = [])");
     }
     Symbol sym;
     sym.kind = SymKind::Variable;

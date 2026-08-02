@@ -92,6 +92,16 @@ sync {
 | 迭代 | `for val in ch { ... }` | 通道关闭且缓冲为空时退出 |
 | 关闭 | `ch.close()` | 标记不再发送，允许接收方完成 |
 
+> **元素类型必须显式标注**：`channel<T>` / `sync.Channel<T>` 的元素类型无法从构造表达式
+> `channel(cap)` 推断，编译器不会猜测（v1 不做从 `send()` 反推）。
+> 未标注时，`receive()` / `for val in ch` 会在编译期报错：
+
+```aura
+let ch: channel<int> = channel(10)   // 必须标注元素类型
+let v = ch.receive()                 // 合法：从标注推断 v: Optional<int>
+// let ch = channel(10)              // 编译错误：无法推断元素类型
+```
+
 ## 11.3 协程透明性
 
 程序员无需关心函数是否为协程，编译器自动判定。调用 I/O 或可能挂起的操作时，当前函数即成为协程，所有异步细节在生成的代码中处理。
@@ -499,6 +509,10 @@ sync thread(max = 2) {
 | 关闭 | `ch.close()` | 标记不再发送；唤醒所有阻塞的 send/receive |
 | 查询 | `ch.is_done() -> bool` | 已关闭且缓冲区空 |
 | 迭代 | `for val in ch { ... }` | `sync thread` 块内自动展开为 `while + receive + is_none` |
+
+> 与 §11.2 的 `channel<T>` 相同：`sync.Channel<T>` 的元素类型**必须显式标注**
+> （`let ch: sync.Channel<int> = sync.Channel(10)`），否则 `receive()` / `for val in ch`
+> 编译期报错（编译器不做从 `send()` 反推）。
 
 ### 11.7.3 `Optional<T>` — receive 的返回类型
 

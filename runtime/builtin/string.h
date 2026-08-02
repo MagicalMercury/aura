@@ -47,6 +47,8 @@ struct GcString : GcObject {
     static GcString* from(int64_t val);
     static GcString* from(double val);
     static GcString* from(bool val);
+    // 字符串本身作为参数：直接返回（避免 GcString* 隐式匹配 from(bool) 输出 "true"）
+    static GcString* from(GcString* s) { return s; }
     static GcString* empty();
 
     GcString* concat(const GcString& other) const;  // 三层防护 自动切换 Flat/Rope

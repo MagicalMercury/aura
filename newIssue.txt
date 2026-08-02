@@ -6,3 +6,4 @@
 4、一种union，可以用来打包多个返回
 5、typeof函数内置
 6、sync.Channel登记注册乱了
+7、sema架构改变支持反推

@@ -39,7 +39,8 @@ public:
     [[nodiscard]] ModuleExports extractExports() const;
 
     // importExports 辅助：将一个导出函数/构造函数导入为 Function 符号
-    void importFuncSymbol(const std::string& name, const FuncExport& f);
+    void importFuncSymbol(const std::string& name, const FuncExport& f,
+                          const std::string& alias = "");
 
     // 错误列表
     const std::vector<std::string>& errors() const { return diag_.errorMessages(); }
@@ -262,6 +263,7 @@ private:
 
     // ============ #config 配置 ============
     bool ioSync_ = false;       // #io.sync = true → 同步模式
+    bool hasAnyPub_ = false;    // 模块级 pub 策略：文件中出现任一 pub 声明 → 仅导出带 pub 的
 
     // ============ 表达式类型存储 ============
     // 持有 inferExpr 返回的临时 SemType（供 ASTNode::inferredType 指向）

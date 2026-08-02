@@ -49,7 +49,8 @@ struct Symbol {
 
     // ——— 导入符号 ———
     std::string belongsToModule;  // 非空 = 来自此模块的导入
-    bool isPublic = true;  // Phase B: 默认公开（向后兼容：无 pub 时暂不破坏现有行为）
+    bool isImported = false;      // 来自 import 注入（永远不透传 re-export）
+    bool isPublic = true;  // 实际由 DeclChecker 显式赋值；Global 自有符号默认公开，模块级策略在 extractExports 判定
 };
 
 } // namespace Aura

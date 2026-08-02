@@ -58,6 +58,13 @@ void SemAnalyzer::declareTopLevel(const Program& program) {
 }
 
 void SemAnalyzer::declareDecl(const Decl& decl) {
+    // 模块级 pub 策略：pub 仅可修饰声明（type/fun/方法/构造函数）
+    // pub import 为错误（C6-3）；config 语法待定，不参与策略（C6-4）
+    if (decl.isPublic && dynamic_cast<const ImportDecl*>(&decl)) {
+        error(decl, "pub cannot be applied to import declarations");
+    } else if (decl.isPublic && !dynamic_cast<const ConfigDecl*>(&decl)) {
+        hasAnyPub_ = true;
+    }
     if (auto* t = dynamic_cast<const TypeDecl*>(&decl)) {
         // 注册类型泛型参数（如 type Stack<T> 中的 T）
         for (auto& tp : t->typeParams) {
@@ -194,6 +201,12 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
         if (!n->typeArgs.empty()) {
             auto* sym = symtab_.lookup(fullName);
             if (sym && sym->kind == SymKind::TypeAlias && !sym->typeParams.empty()) {
+                // 泛型实参数必须与声明一致（缺省/多余均报错，D4）
+                if (n->typeArgs.size() != sym->typeParams.size()) {
+                    error(*n, "type '" + n->name + "' expects "
+                          + std::to_string(sym->typeParams.size())
+                          + " type argument(s), got " + std::to_string(n->typeArgs.size()));
+                }
                 // 用户自定义泛型：applyTypeArgs 替换形参为实参 + materializeCanonicalName
                 result = applyTypeArgs(std::move(result), *sym, n->typeArgs);
                 materializeCanonicalName(result, *n);

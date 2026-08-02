@@ -919,6 +919,16 @@ std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) 
     // 记录 old→young 跨代引用到记忆集
     if (isGcFieldAssignment(target) && isHeapSemType(e.value->inferredType)) {
         auto [parentObj, fieldAddr] = decomposeFieldAccess(target);
+        // 泛型上下文：值类型是未实例化的模板参数（GenericSemType）时，
+        // 编译期无法判断实例化后是标量还是 GC 指针，改用模板辅助函数
+        // （实例化为标量时跳过写屏障，static_cast<GcObject*>(int) 非法）
+        if (auto* gs = dynamic_cast<const GenericSemType*>(e.value->inferredType)) {
+            if (gs->resolvedName.empty()) {
+                return target + " = " + value + ";\n" + indentStr()
+                     + "aura_rt::gc_write_barrier_generic(" + parentObj
+                     + ", " + fieldAddr + ", " + value + ")";
+            }
+        }
         return target + " = " + value + ";\n" + indentStr()
              + "aura_rt::gc_write_barrier(" + parentObj
              + ", " + fieldAddr

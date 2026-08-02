@@ -29,10 +29,14 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <future>     // std::async / std::future
 #include <iostream>
+#include <map>        // moduleSemas / moduleDiags / cgResults
+#include <memory>     // std::unique_ptr
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>     // hardware_concurrency
 #include <vector>
 
 // ============================================================
@@ -47,6 +51,7 @@ struct CliOptions {
     bool        stopAfterCpp = false; // -S：只生成 cpp 不编译
     int         gLevel       = 0;     // -G0（默认 debug）或 -G1（release）
     bool        sizeOptimize = false; // -s：-Os 体积优化
+    int         jobs         = 0;     // -j N：并行任务数（0 = 自动）
 };
 
 CliOptions parseArgs(const std::vector<std::string_view>& args) {
@@ -67,6 +72,8 @@ CliOptions parseArgs(const std::vector<std::string_view>& args) {
             opts.gLevel = 1;
         } else if (arg == "-s") {
             opts.sizeOptimize = true;
+        } else if (arg == "-j" && i + 1 < args.size()) {
+            opts.jobs = std::atoi(args[++i].data());
         } else if (!arg.empty() && arg[0] != '-') {
             opts.inputPath = arg;
         }
@@ -81,6 +88,17 @@ std::string gccFlags(const CliOptions& opts) {
     if (opts.sizeOptimize) return "-Os";
     if (opts.gLevel == 0)  return "-g -O0";
     return "-O2";
+}
+
+// ============================================================
+// 并行度计算：-j 指定 / 硬件并发，与任务数取 min；任务数 <2 → 1（串行）
+// ============================================================
+static int parallelJobs(const CliOptions& opts, size_t taskCount) {
+    int n = opts.jobs > 0 ? opts.jobs
+            : (int)std::thread::hardware_concurrency();
+    if (n < 1) n = 1;
+    if ((size_t)n > taskCount) n = (int)taskCount;
+    return n;
 }
 
 // ============================================================
@@ -211,6 +229,12 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
     diag.reset();
     Aura::ModuleManager mgr(diag);
 
+    // 每模块独立的 SemAnalyzer / DiagnosticEngine（P0 生命周期修复）：
+    // moduleSemas 持有各模块 SemAnalyzer 直至本函数结束，保证模块 AST 节点
+    // inferredType 引用的 typeStore_ 对象存活到 CodeGen 阶段（原循环局部对象导致悬垂崩溃）
+    std::map<std::string, std::unique_ptr<Aura::DiagnosticEngine>> moduleDiags;  // key = mod->sourcePath
+    std::map<std::string, std::unique_ptr<Aura::SemAnalyzer>>     moduleSemas;
+
     // 0. 加载内置 .aurai 接口声明（始终加载 io.aurai）
     mgr.loadBuiltinAurai();
 
@@ -237,32 +261,62 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
         return 1;
     }
 
-    // 5. 语义分析各模块（按拓扑层，逐模块注入依赖导出表）
+    // 5. 语义分析各模块（按拓扑层；同层并行，层间串行）
+    //    - 每模块独立 SemAnalyzer + 独立 DiagnosticEngine（任务线程零共享写，无锁）
+    //    - 主线程按层内顺序 merge 诊断（错误输出顺序确定）
+    //    - runSemaModule 返回 unique_ptr：moduleSemas 的 map 写入只在主线程进行（修复并行 data race）
+    auto runSemaModule = [&](Aura::ModuleInfo* mod, Aura::DiagnosticEngine& modDiag)
+        -> std::unique_ptr<Aura::SemAnalyzer> {
+        auto sema = std::make_unique<Aura::SemAnalyzer>(modDiag);
+        // 注入依赖模块的导出表（Phase A；exports 来自前序层，层间 join 保证可见）
+        for (auto& depPath : mod->deps) {
+            auto depIt = mgr.modules().find(depPath);
+            if (depIt == mgr.modules().end()) continue;
+            // 找到 dep 对应的 import alias
+            std::string alias;
+            for (auto& imp : mod->imports) {
+                if (imp.path == depPath) { alias = imp.alias; break; }
+            }
+            sema->importExports(alias, depIt->second.exports);
+        }
+        (void)sema->analyze(*mod->ast);
+        // 提取本模块导出表，供后续层依赖使用
+        mod->exports = sema->extractExports();
+        return sema;   // 交回主线程统一存入 moduleSemas
+    };
+
     for (auto& layer : layers) {
+        // 收集本层任务（非 builtin 且 AST 非空）；每模块独立 diag 并绑定源码视图
+        std::vector<Aura::ModuleInfo*> tasks;
         for (auto* mod : layer) {
             if (mod->isBuiltin) continue;
             if (!mod->ast) continue;
-
-            Aura::SemAnalyzer sema(diag);
-
-            // Phase A: 注入依赖模块的导出表
-            for (auto& depPath : mod->deps) {
-                auto depIt = mgr.modules().find(depPath);
-                if (depIt == mgr.modules().end()) continue;
-                auto& depInfo = depIt->second;
-                // 找到 dep 对应的 import alias
-                std::string alias;
-                for (auto& imp : mod->imports) {
-                    if (imp.path == depPath) { alias = imp.alias; break; }
-                }
-                sema.importExports(alias, depInfo.exports);
-            }
-
-            (void)sema.analyze(*mod->ast);
-
-            // Phase A: 提取本模块导出表，供后续层依赖使用
-            mod->exports = sema.extractExports();
+            tasks.push_back(mod);
+            auto modDiag = std::make_unique<Aura::DiagnosticEngine>();
+            modDiag->setSourceView(Aura::readFile(mod->sourcePath));
+            modDiag->setFileName(mod->sourcePath);
+            moduleDiags[mod->sourcePath] = std::move(modDiag);
         }
+
+        int n = parallelJobs(opts, tasks.size());
+        if (n < 2) {
+            // 串行路径（等价于原逻辑）；moduleSemas 写入在主线程
+            for (auto* mod : tasks)
+                moduleSemas[mod->sourcePath] = runSemaModule(mod, *moduleDiags[mod->sourcePath]);
+        } else {
+            std::vector<std::future<std::unique_ptr<Aura::SemAnalyzer>>> futs;
+            for (auto* mod : tasks) {
+                // 主线程先绑定 diag 引用，任务体内不再触碰 moduleDiags（map 只读也避免）
+                Aura::DiagnosticEngine& modDiag = *moduleDiags[mod->sourcePath];
+                futs.push_back(std::async(std::launch::async,
+                    [&, mod] { return runSemaModule(mod, modDiag); }));
+            }
+            // 主线程按任务序取结果写入 moduleSemas（map 写仅发生在主线程，无 data race）
+            for (size_t i = 0; i < futs.size(); ++i)
+                moduleSemas[tasks[i]->sourcePath] = futs[i].get();   // 异常在此重抛（由 main 捕获）
+        }
+        // 主线程按层内顺序合并诊断（总数守恒，不截断）
+        for (auto* mod : tasks) diag.mergeFrom(*moduleDiags[mod->sourcePath]);
     }
     if (diag.hasErrors()) {
         std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
@@ -281,65 +335,96 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
     // 7. 收集所有生成的 .cpp 文件路径
     std::vector<std::string> allCppPaths;
 
-    // 7. 按层编译各模块
+    // 7. 并行生成各模块 C++（无层间依赖；CodeGen 只读自身 AST + 依赖命名空间信息）
+    struct CgResult {
+        std::string cppPath;
+        std::unique_ptr<Aura::DiagnosticEngine> diag;
+    };
+
+    // 单个模块的 CodeGen 任务（含写 .h/.cpp；路径互异，无写竞争）
+    auto runCgModule = [&](Aura::ModuleInfo* mod) -> CgResult {
+        CgResult res;
+        auto modDiag = std::make_unique<Aura::DiagnosticEngine>();
+        modDiag->setSourceView(Aura::readFile(mod->sourcePath));
+        modDiag->setFileName(mod->sourcePath);
+
+        // 构建 import 信息列表（只读 mgr.modules()，并发读安全）
+        std::vector<Aura::CodeGenImport> cgImports;
+        for (auto& imp : mod->imports) {
+            Aura::CodeGenImport ci;
+            ci.path      = imp.path;
+            ci.alias     = imp.alias;
+            ci.isBuiltin = imp.isBuiltin;
+            if (!imp.isBuiltin) {
+                auto it = mgr.modules().find(imp.path);
+                if (it != mgr.modules().end()) {
+                    ci.nsName   = it->second.nsName;
+                    ci.modName  = it->second.moduleName;
+                }
+            } else {
+                ci.modName = imp.path; // 内置模块名即命名空间键
+            }
+            cgImports.push_back(ci);
+        }
+
+        // 代码生成
+        Aura::CodeGenerator cg(*modDiag);
+        auto unit = cg.generate(*mod->ast, mod->moduleName, cgImports, mod->nsName);
+
+        // 写出头文件
+        std::string hdrPath = outDir + "/" + mod->moduleName + ".aura.h";
+        {
+            std::ostringstream hdr;
+            hdr << unit.header;
+            Aura::writeFile(hdrPath, hdr.str());
+        }
+        // 写出实现文件
+        std::string cppPath = outDir + "/" + mod->moduleName + ".aura.cpp";
+        {
+            std::ostringstream implCpp;
+            implCpp << "#include \"" << mod->moduleName << ".aura.h\"\n";
+            implCpp << unit.impl;
+            if (!unit.footer.empty()) implCpp << "\n" << unit.footer;
+            Aura::writeFile(cppPath, implCpp.str());
+        }
+        res.cppPath = cppPath;
+        res.diag = std::move(modDiag);
+        return res;
+    };
+
+    // 收集所有非内置模块任务
+    std::vector<Aura::ModuleInfo*> cgTasks;
+    for (auto& layer : layers)
+        for (auto* mod : layer)
+            if (!mod->isBuiltin) cgTasks.push_back(mod);
+
+    std::map<std::string, CgResult> cgResults;  // key = mod->sourcePath
+    int cgN = parallelJobs(opts, cgTasks.size());
+    if (cgN < 2) {
+        for (auto* mod : cgTasks) cgResults[mod->sourcePath] = runCgModule(mod);
+    } else {
+        std::vector<std::future<CgResult>> futs;
+        for (auto* mod : cgTasks)
+            futs.push_back(std::async(std::launch::async,
+                [&, mod] { return runCgModule(mod); }));
+        for (size_t i = 0; i < futs.size(); ++i)
+            cgResults[cgTasks[i]->sourcePath] = futs[i].get();
+    }
+
+    // 主线程按"层序 + 层内序"收集 cppPath + 汇总诊断 + 打印（顺序确定）
     for (auto& layer : layers) {
         for (auto* mod : layer) {
             if (mod->isBuiltin) continue;
-
-            // 构建 import 信息列表
-            std::vector<Aura::CodeGenImport> cgImports;
-            for (auto& imp : mod->imports) {
-                Aura::CodeGenImport ci;
-                ci.path      = imp.path;
-                ci.alias     = imp.alias;
-                ci.isBuiltin = imp.isBuiltin;
-                if (!imp.isBuiltin) {
-                    auto it = mgr.modules().find(imp.path);
-                    if (it != mgr.modules().end()) {
-                        ci.nsName   = it->second.nsName;
-                        ci.modName  = it->second.moduleName;
-                    }
-                } else {
-                    ci.modName = imp.path; // 内置模块名即命名空间键
-                }
-                cgImports.push_back(ci);
-            }
-
-            // 代码生成
-            Aura::CodeGenerator cg(diag);
-            auto unit = cg.generate(*mod->ast, mod->moduleName, cgImports, mod->nsName);
-
-            if (diag.hasErrors()) {
-                std::cerr << "CodeGen errors in " << mod->sourcePath << ":\n";
-                diag.print(std::cerr);
-                return 1;
-            }
-
-            // 写出头文件
-            std::string hdrPath = outDir + "/" + mod->moduleName + ".aura.h";
-            {
-                std::ostringstream hdr;
-                hdr << unit.header;
-                if (!unit.footer.empty()) {
-                    // footer 属于 .cpp，不属于 .h
-                }
-                Aura::writeFile(hdrPath, hdr.str());
-            }
-
-            // 写出实现文件
-            std::string cppPath = outDir + "/" + mod->moduleName + ".aura.cpp";
-            {
-                std::ostringstream implCpp;
-                implCpp << "#include \"" << mod->moduleName << ".aura.h\"\n";
-                implCpp << unit.impl;
-                if (!unit.footer.empty()) implCpp << "\n" << unit.footer;
-                Aura::writeFile(cppPath, implCpp.str());
-            }
-
-            allCppPaths.push_back(cppPath);
-
+            auto& res = cgResults[mod->sourcePath];
+            diag.mergeFrom(*res.diag);
+            if (!res.cppPath.empty()) allCppPaths.push_back(res.cppPath);
             std::cerr << "  compiled: " << mod->moduleName << ".aura\n";
         }
+    }
+    if (diag.hasErrors()) {
+        std::cerr << "CodeGen errors:\n";
+        diag.print(std::cerr);
+        return 1;
     }
 
     // 入口模块总是在最后一层或接近最后一层
