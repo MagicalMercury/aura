@@ -200,11 +200,23 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
 
     // 跟踪字符串变量（用于后续 string + T 拼接检测 / s = s + x → append 优化）
     // 匹配 make_string / concat / intern_string 三种 string 生成路径
-    if (!init.empty() &&
+    // Bug 修复：IIFE 包裹的复杂 init（如 let i = float("Infinity")! 生成的
+    //   [&]() -> auto { ...intern_string("Infinity")... }()）内部含 intern_string
+    //   子串但结果不是 string → 排除 IIFE 顶层 substring 匹配
+    //   （IIFE 结果类型由下方 Sema inferredType 判定，string 场景仍会被标记）
+    if (!init.empty() && !(init.size() > 4 && init.compare(0, 4, "[&](") == 0) &&
         (init.find("aura_rt::make_string") != std::string::npos ||
          init.find("aura_rt::concat") != std::string::npos ||
-         init.find("aura_rt::intern_string") != std::string::npos)) {
+         init.find("aura_rt::intern_string") != std::string::npos ||
+         init.find("aura_rt::string_of") != std::string::npos)) {
         stringVarNames_.insert(varName);
+    }
+    // Sema 推断类型为 string → 标记（覆盖 IIFE / 复杂表达式返回 string 的场景）
+    if (decl.inferredType) {
+        if (auto* p = dynamic_cast<const PrimSemType*>(decl.inferredType)) {
+            if (p->kind == PrimSemType::String)
+                stringVarNames_.insert(varName);
+        }
     }
 
     // 跟踪值类型变量（如 Path，用 . 而非 ->）

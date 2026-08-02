@@ -1,0 +1,19 @@
+// ============================================================
+// builtins/builtin.aurai — 基础内置全局函数（始终加载）
+//
+// int/float/str 语义对齐 Python 3；解析失败抛 ValueError（throws）
+//   - int(s, base=10)：十进制解析，0x/0o/0b 前缀自动检测；base 0 或 2~36
+//   - float(s)：支持 inf/infinity/nan（大小写不敏感）
+//   - str(x)：int/float/bool → 字符串（string 原样返回）
+// range/channel/sync.* 保留硬编码注册（BuiltinRegistry.h）
+// ============================================================
+
+fun gc_force() -> None
+fun gc_stats() -> string
+
+fun int(s: string, base: int = 10) throws -> int
+fun float(s: string) throws -> float
+fun str(x: int) -> string
+fun str(x: float) -> string
+fun str(x: bool) -> string
+fun str(x: string) -> string

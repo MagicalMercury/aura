@@ -100,7 +100,12 @@ private:
         const std::string& role,                         // 错误文案："function" / "constructor"
         const std::vector<const SemType*>& formalTypes,  // 形参类型（nullptr = 无标注，跳过）
         const std::vector<std::unique_ptr<ASTNode>>& args,
-        std::map<std::string, std::unique_ptr<SemType>>& genericMap);
+        std::map<std::string, std::unique_ptr<SemType>>& genericMap,
+        size_t defaultCount = 0);                        // 尾部默认参数个数（C3.1 保证连续）
+
+    // 默认参数声明规则：尾部连续、类型可赋值、泛型参数拒绝（C3.1）
+    void checkDefaultArgRules(const ASTNode& declNode,
+                              const std::vector<Param>& params);
 
     // throws 兼容性检查：非 throws 上下文调用 throws 函数（E016）
     void checkThrowsContext(const ASTNode& callNode, const std::string& calleeName, bool calleeThrows);

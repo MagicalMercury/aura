@@ -212,6 +212,10 @@ Param Parser::parseParam() {
 
     if (match(TokType::Colon)) {
         p.type = parseType();
+        // 默认参数：name: type = expr
+        if (match(TokType::Assign)) {
+            p.defaultExpr = parseExpr();
+        }
     }
     return p;
 }

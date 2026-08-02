@@ -6,7 +6,12 @@
 // ============================================================
 
 #include "string.h"
+#include "error.h"   // make_value_error（错误转换工厂）
 #include "../gc.h"
+#include <cctype>
+#include <cerrno>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -767,6 +772,98 @@ GcString* intern_string(const char* s) {
 // ============================================================
 void clear_intern_cache() {
     tl_internCache.count = 0;
+}
+
+// ============================================================
+// string_to_int — Python 风格 int(s, base=10)
+// 解析失败抛 ValueError；base 仅 0 或 2~36（0 = 自动前缀检测）
+// GC 安全：s 为 GC 堆裸指针，本函数内 make_string/make_value_error 会分配
+// 并可能触发 GC/compact（移动 s）。措施：
+//   1) GcRootHandle 保活 s（GC 后指针自动更新）；
+//   2) 立即值拷贝内容到 C++ 栈（std::string），使 string_view 不再引用 GC 内存。
+// ============================================================
+int32_t string_to_int(GcString* s, int32_t base) {
+    if (!s) throw make_value_error("invalid literal for int(): <None>");
+    aura_rt::GcRootHandle<GcString*> root(s);  // 绑定栈上指针变量，compact 时自动更新
+    std::string input(s->view());
+    std::string_view v = input;
+    // 错误消息统一构造（make_value_error 仅接受 const char* / GcString*，std::string 需 .c_str()）
+    auto err = [base, &v](const std::string& msg) -> void {
+        throw make_value_error(msg.c_str());
+    };
+    if (v.empty()) err("invalid literal for int() with base " + std::to_string(base) + ": ''");
+    if (base != 0 && (base < 2 || base > 36))
+        err("int() base must be >= 2 and <= 36, or 0");
+
+    size_t start = 0;
+    bool neg = false;
+    if (v[0] == '+' || v[0] == '-') { neg = (v[0] == '-'); start = 1; }
+    std::string_view body = v.substr(start);
+    if (body.empty())
+        err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
+
+    // 前缀自动检测（Python 3.11 行为：base=10 也认前缀；显式 base 与前缀冲突 → ValueError）
+    int32_t effBase = base;
+    size_t bodyStart = 0;
+    if (body.size() >= 2 && body[0] == '0') {
+        char c = static_cast<char>(std::tolower(static_cast<unsigned char>(body[1])));
+        int32_t want = 0;
+        if (c == 'x') want = 16; else if (c == 'o') want = 8; else if (c == 'b') want = 2;
+        if (want != 0) {
+            if (effBase != 0 && effBase != want)
+                err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
+            effBase = want;
+            bodyStart = 2;
+        }
+    }
+
+    std::string cstr(body.substr(bodyStart));
+    if (cstr.empty())
+        err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
+    errno = 0;
+    char* end = nullptr;
+    long long val = std::strtoll(cstr.c_str(), &end, effBase);
+    bool consumed = (end == cstr.c_str() + cstr.size()) && end != cstr.c_str();
+    if (!consumed || errno == ERANGE)
+        err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
+    long long result = neg ? -val : val;
+    if (result > INT32_MAX || result < INT32_MIN)
+        err("int() overflow: '" + std::string(v) + "'");
+    return static_cast<int32_t>(result);
+}
+
+// ============================================================
+// string_to_float — Python 风格 float(s)
+// 支持 inf/infinity/nan（大小写不敏感）；ERANGE 溢出返回 ±inf（不报错）
+// GC 安全策略同 string_to_int（GcRootHandle + 值拷贝）
+// ============================================================
+double string_to_float(GcString* s) {
+    if (!s) throw make_value_error("could not convert string to float: <None>");
+    aura_rt::GcRootHandle<GcString*> root(s);  // 绑定栈上指针变量，compact 时自动更新
+    std::string input(s->view());
+    std::string_view v = input;
+    auto err = [&v](const std::string& msg) -> void {
+        throw make_value_error(msg.c_str());
+    };
+    if (v.empty()) err("could not convert string to float: ''");
+
+    size_t start = 0;
+    bool neg = false;
+    if (v[0] == '+' || v[0] == '-') { neg = (v[0] == '-'); start = 1; }
+    // 特殊 token：inf / infinity / nan（大小写不敏感，可带符号）
+    std::string lower(v.substr(start));
+    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower == "inf" || lower == "infinity") return neg ? -INFINITY : INFINITY;
+    if (lower == "nan") return NAN;
+
+    std::string cstr(v);
+    errno = 0;
+    char* end = nullptr;
+    double val = std::strtod(cstr.c_str(), &end);
+    bool consumed = (end == cstr.c_str() + cstr.size()) && end != cstr.c_str();
+    if (!consumed)
+        err("could not convert string to float: '" + std::string(v) + "'");
+    return val;   // ERANGE 溢出 → ±inf（Python 行为，不报错）
 }
 
 } // namespace aura_rt

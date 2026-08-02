@@ -1,5 +1,7 @@
 # AGENTS.md
 
+- **本使用者是中国人！请全程使用中文进行思考和输出！**
+
 ## 构建命令
 - 编译编译器：`cmake --build build`
 - 编译 Runtime 库：`cmake --build runtime/build`

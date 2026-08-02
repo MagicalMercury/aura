@@ -367,9 +367,28 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
             cgImports.push_back(ci);
         }
 
+        // C5.4: 收集跨模块函数默认参数（导出表携带默认值表达式 AST，常驻内存只读）
+        // 键 = 导入命名空间在 Aura 源码中的访问名（alias 优先，与 CodeGen importNsNames_ 一致）
+        Aura::CodeGenerator::CrossModuleDefaults crossDefaults;
+        for (auto& imp : mod->imports) {
+            if (imp.isBuiltin) continue;
+            auto it = mgr.modules().find(imp.path);
+            if (it == mgr.modules().end()) continue;
+            std::string nsKey = imp.alias.empty() ? it->second.moduleName : imp.alias;
+            auto& modDefaults = crossDefaults[nsKey];
+            for (auto& [fnName, f] : it->second.exports.funcs) {
+                std::vector<const Aura::ASTNode*> defaults(f.params.size(), nullptr);
+                bool any = false;
+                for (size_t i = 0; i < f.params.size(); ++i)
+                    if (f.params[i].defaultExpr) { defaults[i] = f.params[i].defaultExpr.get(); any = true; }
+                if (any) modDefaults[fnName] = std::move(defaults);
+            }
+        }
+
         // 代码生成
         Aura::CodeGenerator cg(*modDiag);
-        auto unit = cg.generate(*mod->ast, mod->moduleName, cgImports, mod->nsName);
+        auto unit = cg.generate(*mod->ast, mod->moduleName, cgImports, mod->nsName,
+                                Aura::CodeGenConfig(), crossDefaults);
 
         // 写出头文件
         std::string hdrPath = outDir + "/" + mod->moduleName + ".aura.h";

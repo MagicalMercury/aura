@@ -168,6 +168,9 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
     if (!sym) {
         // 不在符号表中 → 查 BuiltinRegistry 全局函数
         if (auto* fn = BuiltinRegistry::get().findFunction(callee->name, (int)e.args.size())) {
+            checkThrowsContext(e, callee->name, fn->throws);
+            // 与 inferMethodCall 对齐：推断参数类型（CodeGen GcRootHandle 依赖 inferredType）
+            for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
             return semTypeFromBuiltinReturn(fn->returns);
         }
         error(*e.callee, "undefined identifier '" + callee->name + "'");
@@ -180,7 +183,9 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
         checkThrowsContext(e, callee->name, sym->throws);
         std::vector<const SemType*> formalTypes;
         for (auto& p : sym->params) formalTypes.push_back(p.type.get());
-        checkCallArgs(e, callee->name, "function", formalTypes, e.args, genericMap);
+        size_t dc = 0;
+        for (auto it = sym->params.rbegin(); it != sym->params.rend() && it->hasDefault; ++it) ++dc;
+        checkCallArgs(e, callee->name, "function", formalTypes, e.args, genericMap, dc);
         auto result = sym->type ? sym->type->clone() : ErrorSemType::make();
         return applyGenericMap(std::move(result), genericMap);
     }
@@ -188,7 +193,9 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
     if (sym->kind == SymKind::TypeAlias && !sym->ctorParams.empty()) {
         std::vector<const SemType*> formalTypes;
         for (auto& p : sym->ctorParams) formalTypes.push_back(p.type.get());
-        checkCallArgs(e, callee->name, "constructor", formalTypes, e.args, genericMap);
+        size_t dc = 0;
+        for (auto it = sym->ctorParams.rbegin(); it != sym->ctorParams.rend() && it->hasDefault; ++it) ++dc;
+        checkCallArgs(e, callee->name, "constructor", formalTypes, e.args, genericMap, dc);
         return sym->type ? sym->type->clone() : ErrorSemType::make();
     }
     // Variable / Parameter 但类型是函数类型 → 可作为函数调用
@@ -223,7 +230,9 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
                 std::vector<const SemType*> formalTypes;
                 for (auto& p : imported->params) formalTypes.push_back(p.type.get());
                 std::map<std::string, std::unique_ptr<SemType>> genericMap;
-                checkCallArgs(e, e.method, "function", formalTypes, e.args, genericMap);
+                size_t dc = 0;
+                for (auto it = imported->params.rbegin(); it != imported->params.rend() && it->hasDefault; ++it) ++dc;
+                checkCallArgs(e, e.method, "function", formalTypes, e.args, genericMap, dc);
                 auto result = imported->type ? imported->type->clone() : NoneSemType::make();
                 return applyGenericMap(std::move(result), genericMap);
             }
@@ -237,6 +246,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
         std::string fqName = id->name + "." + e.method;
         if (auto* fn = BuiltinRegistry::get().findFunction(fqName, (int)e.args.size())) {
+            checkThrowsContext(e, e.method, fn->throws);
             // 对参数进行类型推断，设置 args 的 inferredType
             // （CodeGen 依赖此信息判断是否需要 GcRootHandle 包装）
             for (auto& arg : e.args) {
@@ -268,6 +278,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
             if (arg) (void)inferExpr(*arg);
         }
         if (auto* entry = BuiltinRegistry::get().findMethod(typeKey, e.method, (int)e.args.size())) {
+            checkThrowsContext(e, e.method, entry->throws);
             auto& ret = entry->returns;
             // 返回形状依赖元素类型的调用（Optional<T> / Generic("channel")）：
             // 元素类型不可知 → 报错引导显式类型标注（不改返回 fallback，仅诊断）

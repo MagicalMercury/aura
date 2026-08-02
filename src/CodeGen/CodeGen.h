@@ -95,15 +95,22 @@ struct TypeMapEntry {
 // ============================================================
 class CodeGenerator {
 public:
+    // 跨模块函数默认参数：模块命名空间名 → (函数名 → 默认值表达式数组)（C5.4）
+    // AST 指针来自依赖模块 ModuleInfo.exports（常驻内存，多文件 CodeGen 并行只读）
+    using CrossModuleDefaults = std::map<std::string,
+        std::map<std::string, std::vector<const ASTNode*>>>;
+
     CodeGenerator(DiagnosticEngine& diag);
 
     // -- 主入口 --
     // 生成一个编译单元（.aura → .cpp/.h）
+    // crossDefaults: 跨模块函数默认参数表（C5.4，多文件模式由 main.cpp 构造）
     [[nodiscard]] CompileUnit generate(const Program& program,
                                         const std::string& moduleName = "main",
                                         const std::vector<CodeGenImport>& imports = {},
                                         const std::string& nsName = "",
-                                        const CodeGenConfig& config = {});
+                                        const CodeGenConfig& config = {},
+                                        const CrossModuleDefaults& crossDefaults = {});
 
     // -- 协程判定入口 --
     [[nodiscard]] CoroDecision decideCoro(const FunDecl& decl);
@@ -468,6 +475,15 @@ private:
 
     // 函数名 → 其 FunctionType 参数的位置（用于 genCallExpr 中包装裸 lambda 为 std::function）
     std::map<std::string, std::vector<std::pair<size_t, std::string>>> fnCallbackParams_;
+
+    // 函数名 → 默认值表达式指针数组（长度 = 形参总数；nullptr = 无默认值）
+    // 同模块函数调用点补默认实参（C5.1）；AST 指针来自本模块 Program，生命周期安全
+    std::map<std::string, std::vector<const ASTNode*>> fnDefaultArgs_;
+
+    // 方法键 "ReceiverType.methodName" / ctor 键 "ReceiverType" → 默认值表达式数组（C5.3）
+    std::map<std::string, std::vector<const ASTNode*>> methodDefaultArgs_;
+
+    CrossModuleDefaults crossDefaults_;
 
     // let/const 声明中类型标注的显式模板参数（如 math.Pair<float, bool> → {"float", "bool"}）
     // genLetStmt 设置，genMethodCall 的 ns-ctor 路径消费后清空

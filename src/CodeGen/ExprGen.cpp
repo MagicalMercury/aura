@@ -398,7 +398,8 @@ bool CodeGenerator::isStringExprInChain(const std::string& s) const {
         || s.find(".to_string") != std::string::npos
         || s.find("aura_rt::concat") != std::string::npos
         || s.find("aura_rt::string_concat") != std::string::npos
-        || s.find("aura_rt::concat_multi") != std::string::npos) {
+        || s.find("aura_rt::concat_multi") != std::string::npos
+        || s.find("aura_rt::string_of") != std::string::npos) {
         return true;
     }
     auto stripGet = [](const std::string& in) -> std::string {
@@ -426,13 +427,15 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
                        || left.find("->to_string") != std::string::npos
                        || left.find(".to_string") != std::string::npos
                        || left.find("aura_rt::concat") != std::string::npos
-                       || left.find("aura_rt::string_concat") != std::string::npos;
+                       || left.find("aura_rt::string_concat") != std::string::npos
+                       || left.find("aura_rt::string_of") != std::string::npos;
         bool rightIsStr = right.find("aura_rt::make_string") != std::string::npos
                        || right.find("aura_rt::intern_string") != std::string::npos
                        || right.find("->to_string") != std::string::npos
                        || right.find(".to_string") != std::string::npos
                        || right.find("aura_rt::concat") != std::string::npos
-                       || right.find("aura_rt::string_concat") != std::string::npos;
+                       || right.find("aura_rt::string_concat") != std::string::npos
+                       || right.find("aura_rt::string_of") != std::string::npos;
 
         // 也检测已知字符串类型变量（含 GcRootHandle 包装后的 name.get()）
         auto stripGet = [](const std::string& s) -> std::string {
@@ -498,11 +501,13 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
         bool leftIsStr  = left.find("aura_rt::make_string") != std::string::npos
                        || left.find("aura_rt::intern_string") != std::string::npos
                        || left.find("aura_rt::concat") != std::string::npos
-                       || left.find("aura_rt::string_concat") != std::string::npos;
+                       || left.find("aura_rt::string_concat") != std::string::npos
+                       || left.find("aura_rt::string_of") != std::string::npos;
         bool rightIsStr = right.find("aura_rt::make_string") != std::string::npos
                        || right.find("aura_rt::intern_string") != std::string::npos
                        || right.find("aura_rt::concat") != std::string::npos
-                       || right.find("aura_rt::string_concat") != std::string::npos;
+                       || right.find("aura_rt::string_concat") != std::string::npos
+                       || right.find("aura_rt::string_of") != std::string::npos;
         if (leftIsStr || rightIsStr) {
             std::vector<std::pair<std::string, const SemType*>> gcArgs;
             gcArgs.emplace_back(left, e.left->inferredType);
@@ -551,6 +556,31 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
         return "aura_rt::gc_stats_string()";
     }
 
+    // C5.2: 全局内置函数映射（int/float/str 是 C++ 关键字，必须在 safeName 前拦截）
+    static const std::map<std::string, std::string> kGlobalFnMap = {
+        {"int",   "aura_rt::string_to_int"},
+        {"float", "aura_rt::string_to_float"},
+        {"str",   "aura_rt::string_of"},
+    };
+    if (auto gmap = kGlobalFnMap.find(calleeName); gmap != kGlobalFnMap.end()) {
+        std::vector<std::string> argExprs;
+        for (size_t i = 0; i < e.args.size(); ++i)
+            argExprs.push_back(genExpr(*e.args[i], isCoroutine));
+        // 内置默认参数补齐：int 的 base=10（defaultCount 驱动，v1 生成字面量）
+        if (auto* fn = BuiltinRegistry::get().findFunction(calleeName, (int)e.args.size())) {
+            for (size_t i = argExprs.size(); i < fn->params.size(); ++i)
+                argExprs.push_back("10");
+        }
+        std::string callExpr = gmap->second + "(";
+        for (size_t i = 0; i < argExprs.size(); ++i) { if (i > 0) callExpr += ", "; callExpr += "{" + std::to_string(i) + "}"; }
+        callExpr += ")";
+        // 统一走 genGcRootedArgs 保护（string 参数为堆类型）
+        std::vector<std::pair<std::string, const SemType*>> gcArgs;
+        for (size_t i = 0; i < argExprs.size(); ++i)
+            gcArgs.emplace_back(argExprs[i], i < e.args.size() ? e.args[i]->inferredType : nullptr);
+        return genGcRootedArgs(gcArgs, callExpr, isCoroutine);
+    }
+
     bool isCtor = false;
     bool hasUserCtor = false;
 
@@ -592,6 +622,7 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
     auto ipIt = fnInterfaceParams_.find(calleeName);
     auto cbIt = fnCallbackParams_.find(calleeName);
     std::vector<std::string> argExprs;
+    // 先收集实参（保持参数顺序：前面的实参 + 尾部的默认参数）
     for (size_t i = 0; i < e.args.size(); ++i) {
         std::string arg = genExpr(*e.args[i], isCoroutine);
         if (ipIt != fnInterfaceParams_.end()) {
@@ -615,6 +646,15 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
         }
         argExprs.push_back(arg);
     }
+    // C5.1/C5.3: 同模块函数 / ctor 默认参数补齐（调用点补实参，支持任意表达式）
+    if (isCtor) {
+        if (auto ctIt = methodDefaultArgs_.find(calleeName); ctIt != methodDefaultArgs_.end())
+            for (size_t k = e.args.size(); k < ctIt->second.size(); ++k)
+                if (ctIt->second[k]) argExprs.push_back(genExpr(*ctIt->second[k], isCoroutine));
+    } else if (auto fit = fnDefaultArgs_.find(calleeName); fit != fnDefaultArgs_.end()) {
+        for (size_t k = e.args.size(); k < fit->second.size(); ++k)
+            if (fit->second[k]) argExprs.push_back(genExpr(*fit->second[k], isCoroutine));
+    }
 
     std::string prefix = needAwait ? "co_await " : "";
     std::ostringstream oss;
@@ -626,11 +666,24 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
     oss << ")";
     std::string callExpr = oss.str();
 
-    // 有堆类型参数 → GcRootHandle 保护（含构造函数调用）
-    if (!e.args.empty()) {
+    // 有堆类型参数 → GcRootHandle 保护（含构造函数调用、补齐的默认实参）
+    if (!argExprs.empty()) {
         std::vector<std::pair<std::string, const SemType*>> gcArgs;
-        for (size_t i = 0; i < e.args.size(); ++i)
-            gcArgs.emplace_back(argExprs[i], e.args[i]->inferredType);
+        for (size_t i = 0; i < argExprs.size(); ++i) {
+            const SemType* ty = nullptr;
+            if (i < e.args.size()) {
+                ty = e.args[i]->inferredType;
+            } else if (isCtor) {
+                auto ctIt = methodDefaultArgs_.find(calleeName);
+                if (ctIt != methodDefaultArgs_.end() && ctIt->second[i])
+                    ty = ctIt->second[i]->inferredType;
+            } else {
+                auto fit = fnDefaultArgs_.find(calleeName);
+                if (fit != fnDefaultArgs_.end() && fit->second[i])
+                    ty = fit->second[i]->inferredType;
+            }
+            gcArgs.emplace_back(argExprs[i], ty);
+        }
         return genGcRootedArgs(gcArgs, callExpr, isCoroutine);
     }
 
@@ -780,10 +833,61 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         }
         oss << prefix << obj << access << safeName(e.method) << "(";
     }
-    // 先收集参数表达式
+    // C5.3: 方法默认参数补齐（键 = ReceiverType.methodName）
+    // recvTypeKey 从 receiver 的 inferredType 推导：
+    //   string → "string"、Array<T> → "[T]"、泛型 T → g->name、自定义类型 → canonicalName
+    std::string recvTypeKey;
+    if (e.object->inferredType) {
+        if (auto* p = dynamic_cast<const PrimSemType*>(e.object->inferredType)) {
+            if (p->kind == PrimSemType::String) recvTypeKey = "string";
+        } else if (dynamic_cast<const ListSemType*>(e.object->inferredType)) {
+            recvTypeKey = "[T]";
+        } else if (auto* g = dynamic_cast<const GenericSemType*>(e.object->inferredType)) {
+            recvTypeKey = g->name;
+        } else if (auto* r = dynamic_cast<const RecordSemType*>(e.object->inferredType)) {
+            if (!r->canonicalName.empty()) recvTypeKey = r->canonicalName;
+        }
+    }
+    // 先收集参数表达式（保持参数顺序：前面的实参 + 尾部的默认参数）
     std::vector<std::string> mArgExprs;
     for (size_t i = 0; i < e.args.size(); ++i)
         mArgExprs.push_back(genExpr(*e.args[i], isCoroutine));
+    // C5.3: 方法默认参数补齐（跨模块 ctor（isNsCtor）默认参数 v1 不支持）
+    if (!isNs && !isNsCtor) {
+        if (auto mmIt = methodDefaultArgs_.find(recvTypeKey + "." + e.method); mmIt != methodDefaultArgs_.end())
+            for (size_t k = e.args.size(); k < mmIt->second.size(); ++k)
+                if (mmIt->second[k]) mArgExprs.push_back(genExpr(*mmIt->second[k], isCoroutine));
+    }
+    // C5.4: 跨模块函数默认参数补齐（math.foo(...) 缺参时）
+    if (isNs) {
+        if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+            auto cmIt = crossDefaults_.find(id->name);
+            if (cmIt != crossDefaults_.end()) {
+                auto fnIt = cmIt->second.find(e.method);
+                if (fnIt != cmIt->second.end())
+                    for (size_t k = e.args.size(); k < fnIt->second.size(); ++k)
+                        if (fnIt->second[k]) mArgExprs.push_back(genExpr(*fnIt->second[k], isCoroutine));
+            }
+        }
+    }
+    // 第 i 个参数的 inferredType（实参 → 方法默认 → 跨模块默认），供 GC 保护判断
+    auto mArgType = [&](size_t i) -> const SemType* {
+        if (i < e.args.size()) return e.args[i]->inferredType;
+        if (auto mmIt = methodDefaultArgs_.find(recvTypeKey + "." + e.method);
+            mmIt != methodDefaultArgs_.end() && i < mmIt->second.size() && mmIt->second[i])
+            return mmIt->second[i]->inferredType;
+        if (isNs) {
+            if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+                auto cmIt = crossDefaults_.find(id->name);
+                if (cmIt != crossDefaults_.end()) {
+                    auto fnIt = cmIt->second.find(e.method);
+                    if (fnIt != cmIt->second.end() && i < fnIt->second.size() && fnIt->second[i])
+                        return fnIt->second[i]->inferredType;
+                }
+            }
+        }
+        return nullptr;
+    };
     for (size_t i = 0; i < mArgExprs.size(); ++i) {
         if (i > 0) oss << ", ";
         oss << "{" << (i + 1) << "}";  // {0} = obj, {1..} = args
@@ -808,23 +912,23 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         // isNs：path.new(...) / math.abs(...) 等，receiver 是 namespace 别名，
         // 不能作为表达式求值（不能 `const auto& x = (path);`），必须直接用 obj 名字生成 obj::method(...)
         std::vector<std::pair<std::string, const SemType*>> ioArgs;
-        for (size_t i = 0; i < e.args.size(); ++i)
-            ioArgs.push_back({mArgExprs[i], e.args[i]->inferredType});
+        for (size_t i = 0; i < mArgExprs.size(); ++i)
+            ioArgs.push_back({mArgExprs[i], mArgType(i)});
         return genGcRootedArgs(ioArgs, buildRawCall(), isCoroutine);
     }
     if (e.object.get() && e.object->inferredType
         && !isHeapSemType(e.object->inferredType)) {
         std::vector<std::pair<std::string, const SemType*>> valArgs;
-        for (size_t i = 0; i < e.args.size(); ++i)
-            valArgs.push_back({mArgExprs[i], e.args[i]->inferredType});
+        for (size_t i = 0; i < mArgExprs.size(); ++i)
+            valArgs.push_back({mArgExprs[i], mArgType(i)});
         return genGcRootedArgs(valArgs, buildRawCall(), isCoroutine);
     }
 
     // 堆类型对象或参数 → GcRootHandle 保护
     std::vector<std::pair<std::string, const SemType*>> gcArgs;
     gcArgs.emplace_back(obj, e.object->inferredType);  // {0} = obj
-    for (size_t i = 0; i < e.args.size(); ++i)
-        gcArgs.emplace_back(mArgExprs[i], e.args[i]->inferredType);  // {i+1}
+    for (size_t i = 0; i < mArgExprs.size(); ++i)
+        gcArgs.emplace_back(mArgExprs[i], mArgType(i));  // {i+1}
     // 构建带占位符的 callExpr
     std::ostringstream gcCall;
     gcCall << prefix << "{0}" << access << safeName(e.method) << "(";
@@ -909,10 +1013,21 @@ std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) 
         }
     }
     // 如果值包含 concat/make_string/intern_string，标记目标为字符串变量
-    if (value.find("aura_rt::concat") != std::string::npos ||
-        value.find("aura_rt::make_string") != std::string::npos ||
-        value.find("aura_rt::intern_string") != std::string::npos) {
+    // Bug 修复（同 StmtGen genLetStmt）：排除 IIFE 顶层——如 `x = float("1")!`
+    // 生成的 [&]() -> auto { ...intern_string... }() 内部含 intern_string 但结果是 float；
+    // 结果类型由下方 Sema inferredType 判定覆盖
+    if (!value.empty() && !(value.size() > 4 && value.compare(0, 4, "[&](") == 0) &&
+        (value.find("aura_rt::concat") != std::string::npos ||
+         value.find("aura_rt::make_string") != std::string::npos ||
+         value.find("aura_rt::intern_string") != std::string::npos ||
+         value.find("aura_rt::string_of") != std::string::npos)) {
         stringVarNames_.insert(targetBase);
+    }
+    if (e.value->inferredType) {
+        if (auto* p = dynamic_cast<const PrimSemType*>(e.value->inferredType)) {
+            if (p->kind == PrimSemType::String)
+                stringVarNames_.insert(targetBase);
+        }
     }
 
     // 写屏障：GC 对象字段赋值（如 obj.field = newVal）时，

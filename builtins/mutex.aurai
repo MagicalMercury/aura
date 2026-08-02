@@ -1,0 +1,17 @@
+// ============================================================
+// builtins/mutex.aurai — 锁原语（文档性质，不加载）
+// 权威注册见 BuiltinRegistry.h types_/functions_
+// ============================================================
+
+type Mutex
+type RWMutex
+type Once
+type RWMutexReadView
+type RWMutexWriteView
+
+fun sync.Mutex() -> Mutex
+fun sync.RWMutex() -> RWMutex
+fun sync.Once() -> Once
+
+fun (self RWMutex) r() -> RWMutexReadView
+fun (self RWMutex) w() -> RWMutexWriteView

@@ -7,20 +7,44 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-07-31（新增 spawn/sync for 语法糖三个 issue）
+# 最近更新：2026-08-02（新增 int()/float()/str() 转换函数 issue）
 
 ================================================================
 [ 一 ] 内置 API 与模块（plan/plan11.md）
 ================================================================
 
-[ ] P0  string_to_int(s: string) throws -> int
-      - plan/plan11.md:41 明确规划
-      - 缺：BuiltinRegistry 注册 + runtime 实现
-      - 文件：src/Sema/BuiltinRegistry.h:249-254 (functions_ 表仅 range)
-
-[ ] P0  string_to_float(s: string) throws -> float
-      - plan/plan11.md:42 明确规划
-      - 缺：同上
+[ ] P0  int() / float() / str() 字符串转换函数  [2026-08-02 提出]
+      - 来源：原 string_to_int / string_to_float 两条（plan11.md:41-42）
+        强化为 Python int()/float()/str() 风格（用户确认方向）
+      - 语言层暴露名（Python 风格）：
+          * int(s: string, base: int = 10) throws -> int
+            — ± 符号 + 前后空白 + 十进制；带 base 时 2-36（超界报错），
+            base=0 按前缀自动判定（strtol base=0 语义，支持 0x/0o/0b）
+          * float(s: string) throws -> float
+            — ± + 小数 + e/E 指数 + inf/Infinity/nan（大小写不敏感）
+          * str(x: int/float/bool/string) -> string
+            — 复用 GcString::from；string 原样返回（from(GcString*) 重载已有）
+      - 默认参数支持（用户要求纳入 plan）：
+          * 现状：Parser 不支持 `name: type = value`（TypeParser.cpp:208-217
+            parseParam 只解析 name + 可选 : type），AST Param 无 default 字段，
+            README 未声明 → 当前完全不支持
+          * 目标：int 用单签名 `int(s, base = 10)`，避免双重载；
+            作为通用语言特性实现（Parser/AST/Sema/CodeGen 全链路），
+            函数/方法/构造函数/闭包参数统一生效
+          * 关注点：默认值表达式可能非常量（C++ 默认参数仅限常量表达式），
+            CodeGen 倾向调用点补实参而非 C++ 默认参数语法
+      - 错误：一律 Error{kind="parse_error", message=...}
+      - runtime：strtol/strtod + endptr 完整消费检查（不用 std::stoi/stod——
+        "12abc" 半解析不报错 + 抛的是 C++ 异常需转换）
+        C++ 函数名避让关键字：aura_rt::string_to_int / string_to_float / string_of
+      - 注册：BuiltinRegistry functions_（int×2 / float / str×4，含 throws 标记）
+      - Sema 补缺口：inferCall BuiltinRegistry 全局函数分支缺 checkThrowsContext
+        （当前 throws 全局函数调用无 try/! 包裹不报错，必须一并修）
+      - CodeGen：genCallExpr 新增全局函数映射表（Aura 名 → aura_rt:: 函数），
+        str 参数走 GcRootHandle 保护
+      - 文件：runtime/builtin/string.h/.cpp、src/Sema/BuiltinRegistry.h、
+        src/Sema/Checker/ExprInfer.cpp、src/CodeGen/ExprGen.cpp
+      - 状态：待起草 plan
 
 [ ] P1  math 内置模块
       - plan/plan11.md:54 规划 math.abs / math.sqrt / math.floor 等 8 个函数

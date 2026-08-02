@@ -16,12 +16,14 @@ namespace Aura {
 struct Param {
     std::string name;
     std::unique_ptr<TypeExpr> type;
+    std::unique_ptr<ASTNode> defaultExpr;  // 默认值表达式（nullptr = 无默认值）
 };
 
 inline Param cloneParam(const Param& p) {
     Param r;
     r.name = p.name;
     if (p.type) r.type.reset(static_cast<TypeExpr*>(p.type->clone().release()));
+    if (p.defaultExpr) r.defaultExpr = p.defaultExpr->clone();
     return r;
 }
 

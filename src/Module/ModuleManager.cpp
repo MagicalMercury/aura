@@ -225,6 +225,7 @@ void ModuleManager::loadAuraiFile(const std::string& baseName) {
 
 void ModuleManager::loadBuiltinAurai() {
     loadAuraiFile("io.aurai");
+    loadAuraiFile("builtin.aurai");  // 基础内置全局函数（int/float/str/gc_*）
     // path.aurai 不在此加载——由 import path 时按需加载
 }
 

@@ -483,10 +483,10 @@ void GcHeap::ensureOomError() {
     if (oomInit_.load()) return;  // 递归防护（同线程递归调用被挡掉）
 
     oomInit_.store(true);
-    // make_string → alloc → tryAlloc → ensureOomError 递归调用
-    // 被上面的 oomInit_.load() 挡掉，不会重复初始化
-    oomError_.kind    = make_string("OutOfMemoryError");
-    oomError_.message = make_string("memory exhausted after GC");
+    // 预 intern：OOM 路径零分配（L1 缓存命中）、字符串入全局根永不回收
+    // 避免 make_string 在 OOM 时分配再次失败/触发递归
+    oomError_.kind    = intern_string("OutOfMemoryError");
+    oomError_.message = intern_string("memory exhausted after GC");
     oomInit_.store(false);
 }
 

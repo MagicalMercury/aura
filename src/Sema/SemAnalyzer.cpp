@@ -453,12 +453,16 @@ void SemAnalyzer::checkCallArgs(
     const std::string& role,
     const std::vector<const SemType*>& formalTypes,
     const std::vector<std::unique_ptr<ASTNode>>& args,
-    std::map<std::string, std::unique_ptr<SemType>>& genericMap) {
-    // 参数数量检查
-    if (args.size() != formalTypes.size()) {
-        error(callNode, role + " '" + calleeName + "' expects " +
-              std::to_string(formalTypes.size()) + " arguments, got " +
-              std::to_string(args.size()));
+    std::map<std::string, std::unique_ptr<SemType>>& genericMap,
+    size_t defaultCount) {
+    // 参数数量检查（支持默认参数：实参数量在 [min, total] 内合法）
+    size_t total = formalTypes.size();
+    size_t min   = total - defaultCount;
+    if (args.size() < min || args.size() > total) {
+        std::string expected = (min == total) ? std::to_string(total)
+                                              : (std::to_string(min) + "~" + std::to_string(total));
+        error(callNode, role + " '" + calleeName + "' expects " + expected +
+              " arguments, got " + std::to_string(args.size()));
     }
     // 参数类型检查 + 泛型映射收集
     bool conflict = false;
@@ -779,6 +783,7 @@ void SemAnalyzer::importFuncSymbol(const std::string& name, const FuncExport& f,
         sp.name = p.name;
         sp.type = p.type ? p.type->clone() : nullptr;
         if (sp.type) qualifyRecordTypes(sp.type, alias);
+        if (p.defaultExpr) { sp.defaultExpr = p.defaultExpr->clone(); sp.hasDefault = true; }
         sym.params.push_back(std::move(sp));
     }
     sym.type   = f.returnType ? f.returnType->clone() : nullptr;
@@ -820,6 +825,7 @@ static FuncExport buildFuncExport(const std::vector<SymParam>& params,
         SymParam sp;
         sp.name = p.name;
         sp.type = p.type ? p.type->clone() : nullptr;
+        if (p.defaultExpr) { sp.defaultExpr = p.defaultExpr->clone(); sp.hasDefault = true; }
         fe.params.push_back(std::move(sp));
     }
     fe.returnType = returnType ? returnType->clone() : ErrorSemType::make();

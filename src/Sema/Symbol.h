@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SemType.h"
+#include "../AST/ASTNode.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -24,6 +25,8 @@ enum class SymKind {
 struct SymParam {
     std::string name;
     std::unique_ptr<SemType> type;
+    std::unique_ptr<ASTNode> defaultExpr;  // 默认值表达式（跨模块导出 + Sema 调用检查）
+    bool hasDefault = false;
 };
 
 struct Symbol {

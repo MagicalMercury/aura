@@ -60,6 +60,7 @@ struct BuiltinGlobalFn {
     std::vector<ParamInfo> params;   // 按参数数量区分重载
     ReturnTypeInfo  returns;
     bool throws = false;
+    int  defaultCount = 0;   // 尾部默认参数个数（C3.1 保证连续）
 };
 
 struct BuiltinMethod {
@@ -69,6 +70,7 @@ struct BuiltinMethod {
     ReturnTypeInfo  returns;
     bool throws  = false;       // 是否标记 throws
     bool hasAsync = false;      // 是否有异步版本（用于协程判定，Io 方法特有）
+    int  defaultCount = 0;      // 尾部默认参数个数
 };
 
 // ============================================================
@@ -106,7 +108,8 @@ public:
                                      int argCount) const {
         for (auto& m : methods_) {
             if (m.typeName == typeName && m.methodName == methodName
-                && (int)m.params.size() == argCount)
+                && (int)m.params.size() - m.defaultCount <= argCount
+                && argCount <= (int)m.params.size())
                 return &m;
         }
         return nullptr;
@@ -150,7 +153,9 @@ public:
     // ----- 全局函数查询 -----
     const BuiltinGlobalFn* findFunction(const std::string& name, int argCount) const {
         for (auto& f : functions_) {
-            if (f.name == name && (int)f.params.size() == argCount)
+            if (f.name == name
+                && (int)f.params.size() - f.defaultCount <= argCount
+                && argCount <= (int)f.params.size())
                 return &f;
         }
         return nullptr;
@@ -207,6 +212,9 @@ private:
                 for (auto& p : fn->params) {
                     gf.params.push_back({p.name, typeExprToName(p.type.get())});
                 }
+                // 默认参数计数（尾部连续，aurai 声明侧同样遵守 C3.1）
+                for (auto it = fn->params.rbegin(); it != fn->params.rend() && it->defaultExpr; ++it)
+                    ++gf.defaultCount;
                 gf.returns = extractReturnType(fn->returnType.get());
                 functions_.push_back(std::move(gf));
             }
@@ -314,9 +322,8 @@ private:
             {"sync.Channel", {{"cap", "int"}}, ReturnTypeInfo::Named("sync.Channel")},
             // sync.Channel 无参构造（cap=0，视为 cap=1，近似无缓冲）
             {"sync.Channel", {},                ReturnTypeInfo::Named("sync.Channel")},
-            // GC 内建函数
-            {"gc_force", {}, ReturnTypeInfo::None()},
-            {"gc_stats", {}, ReturnTypeInfo::Named("string")},
+            // GC 内建函数已迁移至 builtin.aurai（gc_force/gc_stats）
+            // int/float/str 转换函数亦在 builtin.aurai（CodeGen 映射 C++ 关键字）
         };
     }
 

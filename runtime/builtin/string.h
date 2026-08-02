@@ -194,4 +194,19 @@ inline bool string_eq(GcString* a, GcString* b) {
 // 多串拼接：一次分配 + 一次 memcpy，避免链式 concat 的中间对象
 GcString* concat_multi(std::initializer_list<const GcString*> parts);
 
+// ============================================================
+// 字符串 ↔ 数值转换（Python 风格 int()/float()/str()）
+// ============================================================
+// int(s, base=10)：解析失败抛 ValueError；base 仅 0 或 2~36（0 = 自动前缀检测）
+[[nodiscard]] int32_t string_to_int(GcString* s, int32_t base = 10);
+// float(s)：支持 inf/infinity/nan（大小写不敏感）；溢出返回 ±inf（不报错）
+[[nodiscard]] double string_to_float(GcString* s);
+
+// str(x)：直接转发 GcString::from（string 原样返回）
+inline GcString* string_of(int32_t v) { return GcString::from(v); }
+inline GcString* string_of(int64_t v) { return GcString::from(v); }
+inline GcString* string_of(double v)  { return GcString::from(v); }
+inline GcString* string_of(bool v)    { return GcString::from(v); }
+inline GcString* string_of(GcString* s) { return s; }
+
 } // namespace aura_rt

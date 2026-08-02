@@ -1,5 +1,6 @@
 // ============================================================
 // builtins/channel.aurai — 协程间通信 Channel<T>
+// 本文件仅为文档性质
 //
 // Channel<T> 是有缓冲的协程通道，用于协程间传递数据。
 //   - channel(cap: int) 创建容量为 cap 的通道
@@ -16,3 +17,15 @@ type channel<T>
 fun (self channel<T>) send(value: T)
 fun (self channel<T>) receive() -> T
 fun (self channel<T>) close()
+
+// ──────────────────────────────────────────────────────────
+// sync.Channel<T>：sync thread 跨线程通信通道
+// 本段为文档性质（不加载），权威注册见 BuiltinRegistry.h
+// ──────────────────────────────────────────────────────────
+type sync.Channel<T>
+fun sync.Channel(cap: int) -> sync.Channel<T>
+fun sync.Channel() -> sync.Channel<T>
+fun (self sync.Channel<T>) send(value: T)
+fun (self sync.Channel<T>) receive() -> Optional<T>
+fun (self sync.Channel<T>) close()
+fun (self sync.Channel<T>) is_done() -> bool

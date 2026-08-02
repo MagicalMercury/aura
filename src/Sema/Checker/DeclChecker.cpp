@@ -152,7 +152,11 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         if (f->returnType) registerTypeGenerics(symtab_, *f->returnType);
 
         for (auto& p : f->params) {
-            sym.params.push_back({p.name, p.type ? resolveType(*p.type) : ErrorSemType::make()});
+            SymParam sp;
+            sp.name = p.name;
+            sp.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
+            if (p.defaultExpr) { sp.defaultExpr = p.defaultExpr->clone(); sp.hasDefault = true; }
+            sym.params.push_back(std::move(sp));
         }
         sym.type = f->returnType ? resolveType(*f->returnType) : nullptr;
         symtab_.exitScope();
@@ -167,7 +171,11 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         sym.throws = m->throws;
         sym.isPublic = m->isPublic;  // Phase B
         for (auto& p : m->params) {
-            sym.params.push_back({p.name, p.type ? resolveType(*p.type) : ErrorSemType::make()});
+            SymParam sp;
+            sp.name = p.name;
+            sp.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
+            if (p.defaultExpr) { sp.defaultExpr = p.defaultExpr->clone(); sp.hasDefault = true; }
+            sym.params.push_back(std::move(sp));
         }
         sym.type = m->returnType ? resolveType(*m->returnType) : nullptr;
         symtab_.defineGlobal(std::move(sym));
@@ -258,6 +266,92 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
 // 函数体/方法体检查入口
 // ============================================================
 
+// 默认参数声明规则：尾部连续、类型可赋值、泛型参数拒绝（C3.1）
+void SemAnalyzer::checkDefaultArgRules(const ASTNode& declNode,
+                                       const std::vector<Param>& params) {
+    bool seenDefault = false;
+    for (auto& p : params) {
+        if (!p.defaultExpr) {
+            if (seenDefault)
+                error(declNode, "parameter '" + p.name
+                      + "': default argument must be trailing");
+            continue;
+        }
+        seenDefault = true;
+        // v1 限制：泛型参数不支持默认值（isAssignable 对未绑定 T 语义未定义）
+        if (p.type && dynamic_cast<const GenericTypeRef*>(p.type.get())) {
+            error(declNode, "parameter '" + p.name
+                  + "': default argument not supported on generic parameter");
+        }
+        // 默认值表达式声明处求值检查（inferExpr 写入 defaultExpr->inferredType，C5 复用）
+        auto dt = inferExpr(*p.defaultExpr);
+        if (dynamic_cast<const ErrorSemType*>(dt.get())) {
+            error(*p.defaultExpr, "invalid default argument for parameter '" + p.name + "'");
+            continue;
+        }
+        if (p.type) {
+            auto pt = resolveType(*p.type);
+            if (!isAssignable(*pt, *dt))
+                error(*p.defaultExpr, "default argument type mismatch for parameter '"
+                      + p.name + "': expected '" + pt->toString() + "', got '"
+                      + dt->toString() + "'");
+        }
+    }
+}
+
+// ============================================================
+// 辅助：漏 return 检查（非 None 返回类型函数必须所有路径显式 return）
+// 递归判断语句是否在所有路径上以 return/throw 终结（终结后语句不可达）
+// ============================================================
+static bool stmtAllPathsReturn(const Stmt& stmt);
+
+static bool blockAllPathsReturn(const BlockStmt& block) {
+    for (auto& s : block.stmts) {
+        if (!s) continue;
+        // 一旦遇到终结语句（return/throw），其后的语句不可达
+        if (stmtAllPathsReturn(*s)) return true;
+    }
+    return false;
+}
+
+static bool stmtAllPathsReturn(const Stmt& stmt) {
+    // return / throw 均为终结语句
+    if (dynamic_cast<const ReturnStmt*>(&stmt)) return true;
+    if (dynamic_cast<const ThrowStmt*>(&stmt)) return true;
+    if (auto* blk = dynamic_cast<const BlockStmt*>(&stmt))
+        return blockAllPathsReturn(*blk);
+    if (auto* iff = dynamic_cast<const IfStmt*>(&stmt)) {
+        if (!iff->elseBranch) return false;   // 无 else：条件为假时落入函数尾
+        if (!blockAllPathsReturn(*iff->thenBranch)) return false;
+        for (auto& ei : iff->elseIfs) {
+            if (!blockAllPathsReturn(*ei.body)) return false;
+        }
+        return blockAllPathsReturn(*iff->elseBranch);
+    }
+    if (auto* tc = dynamic_cast<const TryCatchStmt*>(&stmt)) {
+        // try 全路径 return → 安全；否则 try 落入函数尾的路径必须被 catch 兜住
+        return tc->tryBody && tc->catchBody
+            && blockAllPathsReturn(*tc->tryBody)
+            && blockAllPathsReturn(*tc->catchBody);
+    }
+    if (auto* m = dynamic_cast<const MatchStmt*>(&stmt)) {
+        if (m->cases.empty()) return false;
+        for (auto& c : m->cases) {
+            if (!c.body) return false;
+            // case body 可为 BlockStmt 或表达式
+            if (auto* blk = dynamic_cast<const BlockStmt*>(c.body.get())) {
+                if (!blockAllPathsReturn(*blk)) return false;
+            } else {
+                return false;  // 表达式体不可能含 return
+            }
+        }
+        return true;
+    }
+    // 循环（while/loop/for/sync for）可能执行 0 次 → 视为可落入函数尾
+    // lock/sync/spawn/表达式/声明等 → 保守不返回
+    return false;
+}
+
 void SemAnalyzer::checkFunBody(const FunDecl& decl) {
     loopDepth_ = 0;
     syncBoundaryStack_.clear();
@@ -281,10 +375,23 @@ void SemAnalyzer::checkFunBody(const FunDecl& decl) {
 
     // 3. 解析返回类型（泛型已注册，T 可正确解析为 GenericSemType）
     //    用 FnCtxGuard 保存/恢复外层上下文（支持闭包体嵌套检查）
-    FnCtxGuard fc(*this, decl.returnType ? resolveType(*decl.returnType) : nullptr,
-                  decl.throws);
+    auto retType = decl.returnType ? resolveType(*decl.returnType) : nullptr;
+    FnCtxGuard fc(*this, retType ? retType->clone() : nullptr, decl.throws);
 
-    if (decl.body) checkBlock(*decl.body);
+    // 默认参数声明规则检查（尾部连续、类型可赋值、泛型参数拒绝）
+    checkDefaultArgRules(decl, decl.params);
+
+    if (decl.body) {
+        checkBlock(*decl.body);
+        // 漏 return 检查：非 None 返回类型必须所有路径显式 return
+        // 避免 CodeGen 生成缺 return 的 C++ 函数导致 g++ 编译错误
+        if (retType && !dynamic_cast<const NoneSemType*>(retType.get())
+            && !dynamic_cast<const ErrorSemType*>(retType.get())
+            && !blockAllPathsReturn(*decl.body)) {
+            error(decl, "function '" + decl.name
+                  + "' must return a value on all paths (missing explicit return)");
+        }
+    }
     symtab_.exitScope();
 }
 
@@ -327,10 +434,22 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
     }
 
     // 5. 解析返回类型（用 FnCtxGuard 保存/恢复外层上下文）
-    FnCtxGuard fc(*this, decl.returnType ? resolveType(*decl.returnType) : nullptr,
-                  decl.throws);
+    auto retType = decl.returnType ? resolveType(*decl.returnType) : nullptr;
+    FnCtxGuard fc(*this, retType ? retType->clone() : nullptr, decl.throws);
 
-    if (decl.body) checkBlock(*decl.body);
+    // 默认参数声明规则检查（尾部连续、类型可赋值、泛型参数拒绝）
+    checkDefaultArgRules(decl, decl.params);
+
+    if (decl.body) {
+        checkBlock(*decl.body);
+        // 漏 return 检查：非 None 返回类型方法必须所有路径显式 return
+        if (retType && !dynamic_cast<const NoneSemType*>(retType.get())
+            && !dynamic_cast<const ErrorSemType*>(retType.get())
+            && !blockAllPathsReturn(*decl.body)) {
+            error(decl, "method '" + decl.name
+                  + "' must return a value on all paths (missing explicit return)");
+        }
+    }
     symtab_.exitScope();
 
     // impl 接口一致性验证

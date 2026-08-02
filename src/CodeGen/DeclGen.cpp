@@ -212,6 +212,16 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
         }
     }
 
+    // C5.1: 收集函数默认参数表（调用点补实参用；长度 = 形参总数，无默认值为 nullptr）
+    // 必须在 declarationsOnly（A 遍）收集：调用点函数可能先于定义生成（如 main 在前）
+    {
+        std::vector<const ASTNode*> defaults(decl.params.size(), nullptr);
+        bool any = false;
+        for (size_t i = 0; i < decl.params.size(); ++i)
+            if (decl.params[i].defaultExpr) { defaults[i] = decl.params[i].defaultExpr.get(); any = true; }
+        if (any) fnDefaultArgs_[decl.name] = std::move(defaults);
+    }
+
     // declarationsOnly 模式：仅输出前向声明
     if (declarationsOnly) {
         h << tprefix << sig << ";\n";
@@ -361,9 +371,34 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
 void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
                                    const MethodDecl& decl,
                                    bool declarationsOnly) {
+    // C5.3: 收集方法默认参数表（调用点补实参用；键 = ReceiverType 或 ReceiverType.methodName）
+    // 必须在 declarationsOnly（A 遍）收集：调用点函数可能先于方法定义生成（如 main 在前）
+    {
+        std::vector<const ASTNode*> defaults(decl.params.size(), nullptr);
+        bool any = false;
+        for (size_t i = 0; i < decl.params.size(); ++i)
+            if (decl.params[i].defaultExpr) { defaults[i] = decl.params[i].defaultExpr.get(); any = true; }
+        if (any) methodDefaultArgs_[decl.isConstructor
+            ? decl.receiverType                                   // ctor 键 = "ReceiverType"
+            : decl.receiverType + "." + decl.name] = std::move(defaults);
+    }
     if (decl.isConstructor) {
-        if (!declarationsOnly)  // 构造函数体只在定义阶段生成
-            genConstructor(cpp, decl);
+        if (declarationsOnly) {
+            // A 遍：生成 ctor 前向声明（调用点可能先于定义生成，如 main 在前调用 Counter()）
+            std::vector<std::string> tparams = collectMethodTParams(decl);
+            std::string tprefix;
+            if (!tparams.empty()) {
+                tprefix = "template<";
+                for (size_t i = 0; i < tparams.size(); ++i) {
+                    if (i > 0) tprefix += ", ";
+                    tprefix += "typename " + tparams[i];
+                }
+                tprefix += ">\n";
+            }
+            h << tprefix << constructorSignature(decl, tparams) << ";\n";
+        } else {
+            genConstructor(cpp, decl);  // 构造函数体只在定义阶段生成
+        }
         return;
     }
     if (declarationsOnly) return;  // 方法声明已在 struct 内部，无需重复
@@ -486,6 +521,7 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
 // ============================================================
 
 void CodeGenerator::genConstructor(std::ostream& cpp, const MethodDecl& decl) {
+    // 默认参数表已在 genMethodDecl A 遍收集（methodDefaultArgs_[receiverType]）
     // 提取泛型类型参数（统一用 collectMethodTParams）
     std::vector<std::string> tparams = collectMethodTParams(decl);
     currentTParams_ = tparams;
