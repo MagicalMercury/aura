@@ -15,6 +15,7 @@ void DiagnosticEngine::report(const Diagnostic& diag) {
         warningCount_++;
     }
     diags_.push_back(diag);
+    diags_.back().file = fileName_;   // 快照所属文件（并行任务 merge 后能定位模块）
 
     // 维护兼容旧 API 的纯文本消息列表
     std::ostringstream oss;
@@ -66,10 +67,10 @@ std::string DiagnosticEngine::getSourceLine(int line) const {
         if (current == line) {
             start = i;
             while (i < source_.size() && source_[i] != '\n') ++i;
-            auto s = source_.substr(start, i - start);
+            auto sv = std::string_view(source_).substr(start, i - start);
             // 去尾 \r
-            if (!s.empty() && s.back() == '\r') s.remove_suffix(1);
-            return std::string(s);
+            if (!sv.empty() && sv.back() == '\r') sv.remove_suffix(1);
+            return std::string(sv);
         }
         if (source_[i] == '\n') ++current;
     }
@@ -87,8 +88,9 @@ void DiagnosticEngine::print(std::ostream& os) const {
         os << ": " << diag.message << "\n";
 
         // --- 文件位置 ---
-        if (!fileName_.empty())
-            os << "  --> " << fileName_ << ":" << diag.range.line << ":" << diag.range.colStart << "\n";
+        const std::string& f = !diag.file.empty() ? diag.file : fileName_;
+        if (!f.empty())
+            os << "  --> " << f << ":" << diag.range.line << ":" << diag.range.colStart << "\n";
         else
             os << "  --> line " << diag.range.line << ":" << diag.range.colStart << "\n";
 
@@ -115,6 +117,18 @@ void DiagnosticEngine::print(std::ostream& os) const {
 
         os << "\n";
     }
+}
+
+// ============================================================
+// mergeFrom — 合并另一引擎的诊断（多线程任务结果汇总）
+// 不检查 maxErrors_：每模块 diag 上限仅防单模块级联刷屏，汇总时全部保留
+// ============================================================
+void DiagnosticEngine::mergeFrom(const DiagnosticEngine& other) {
+    diags_.insert(diags_.end(), other.diags_.begin(), other.diags_.end());
+    errorMessages_.insert(errorMessages_.end(),
+                          other.errorMessages_.begin(), other.errorMessages_.end());
+    errorCount_   += other.errorCount_;
+    warningCount_ += other.warningCount_;
 }
 
 // ============================================================

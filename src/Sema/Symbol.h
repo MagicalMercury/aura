@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SemType.h"
+#include "../AST/ASTNode.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -24,6 +25,8 @@ enum class SymKind {
 struct SymParam {
     std::string name;
     std::unique_ptr<SemType> type;
+    std::unique_ptr<ASTNode> defaultExpr;  // 默认值表达式（跨模块导出 + Sema 调用检查）
+    bool hasDefault = false;
 };
 
 struct Symbol {
@@ -49,7 +52,8 @@ struct Symbol {
 
     // ——— 导入符号 ———
     std::string belongsToModule;  // 非空 = 来自此模块的导入
-    bool isPublic = true;  // Phase B: 默认公开（向后兼容：无 pub 时暂不破坏现有行为）
+    bool isImported = false;      // 来自 import 注入（永远不透传 re-export）
+    bool isPublic = true;  // 实际由 DeclChecker 显式赋值；Global 自有符号默认公开，模块级策略在 extractExports 判定
 };
 
 } // namespace Aura

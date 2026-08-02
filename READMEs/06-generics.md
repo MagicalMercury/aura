@@ -25,6 +25,14 @@ let maybe: Maybe<float> = None                     // ✅ 正确：Maybe<float>
 // let bad2: Maybe = None                           // ❌ 错误：Maybe 缺少类型参数
 ```
 
+**泛型类型实参数必须与声明一致**（缺省或多余均报错）：
+
+```aura
+type Pair<A, B> = { first: A, second: B }
+let p: Pair<int, string> = ...   // 合法
+// let p: Pair<int> = ...        // 编译错误：expects 2 type argument(s), got 1
+```
+
 ## 6.2 泛型函数
 
 **规则一：泛型必须通过参数类型引入。**

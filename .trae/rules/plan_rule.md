@@ -1,6 +1,6 @@
 ---
 alwaysApply: false
-description: 
+description: 当被要求生成plan时启用。
 ---
 # Strict Planning Protocol (Agent Rule)
 

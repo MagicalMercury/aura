@@ -136,7 +136,9 @@ std::unique_ptr<SemType> SemAnalyzer::inferBinaryExpr(const BinaryExpr& e) {
         if (!isAssignable(*boolType(), *rt)) error(*e.right, "'" + op + "' requires bool, got " + rt->toString());
         return boolType();
     }
-    return lt->clone();
+    // 未知操作符：显式报错（替代静默返回左操作数类型）
+    error(e, "unknown binary operator '" + op + "'");
+    return ErrorSemType::make();
 }
 
 std::unique_ptr<SemType> SemAnalyzer::inferUnaryExpr(const UnaryExpr& e) {
@@ -166,15 +168,10 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
     if (!sym) {
         // 不在符号表中 → 查 BuiltinRegistry 全局函数
         if (auto* fn = BuiltinRegistry::get().findFunction(callee->name, (int)e.args.size())) {
-            auto& ret = fn->returns;
-            switch (ret.kind) {
-                case ReturnTypeInfo::Kind::None:
-                    return NoneSemType::make();
-                case ReturnTypeInfo::Kind::Named:
-                case ReturnTypeInfo::Kind::Generator:
-                case ReturnTypeInfo::Kind::Generic:
-                    return semTypeFromBuiltinReturn(ret);
-            }
+            checkThrowsContext(e, callee->name, fn->throws);
+            // 与 inferMethodCall 对齐：推断参数类型（CodeGen GcRootHandle 依赖 inferredType）
+            for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
+            return semTypeFromBuiltinReturn(fn->returns);
         }
         error(*e.callee, "undefined identifier '" + callee->name + "'");
         return ErrorSemType::make();
@@ -183,76 +180,33 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
     std::map<std::string, std::unique_ptr<SemType>> genericMap;
     // 函数、方法、函数类型变量（let 绑定闭包）、函数类型参数
     if (sym->kind == SymKind::Function || sym->kind == SymKind::Method) {
-        // throws 兼容性检查
-        if (!currentFunctionThrows_ && insideTry_ == 0 && sym->throws) {
-            error(e, DiagCode::E016_ThrowsViolation,
-                  "cannot call throwing function '" + callee->name + "' from non-throwing context",
-                  "add 'throws' to the function signature or wrap in 'try { ... } catch'");
-        }
-        // 参数数量检查
-        if (e.args.size() != sym->params.size()) {
-            error(e, "function '" + callee->name + "' expects " + std::to_string(sym->params.size()) + " arguments, got " + std::to_string(e.args.size()));
-        }
-        // 参数类型检查
-        for (size_t i = 0; i < e.args.size() && i < sym->params.size(); ++i) {
-            auto argTy = inferExpr(*e.args[i]);
-            if (sym->params[i].type && !isAssignable(*sym->params[i].type, *argTy)) {
-                error(*e.args[i], "argument type mismatch: expected '" + sym->params[i].type->toString() + "', got '" + argTy->toString() + "'");
-            }
-            // 泛型替换：从实参推断泛型变量
-            if (sym->params[i].type)
-                collectGenericMapping(*sym->params[i].type, *argTy, genericMap);
-        }
+        checkThrowsContext(e, callee->name, sym->throws);
+        std::vector<const SemType*> formalTypes;
+        for (auto& p : sym->params) formalTypes.push_back(p.type.get());
+        size_t dc = 0;
+        for (auto it = sym->params.rbegin(); it != sym->params.rend() && it->hasDefault; ++it) ++dc;
+        checkCallArgs(e, callee->name, "function", formalTypes, e.args, genericMap, dc);
         auto result = sym->type ? sym->type->clone() : ErrorSemType::make();
-        for (auto& [name, concrete] : genericMap) {
-            result = substitute(*result, name, *concrete);
-        }
-        return result;
+        return applyGenericMap(std::move(result), genericMap);
     }
     // TypeAlias 有显式构造函数（fun (self T) T(...)）→ 作为构造函数调用
     if (sym->kind == SymKind::TypeAlias && !sym->ctorParams.empty()) {
-        if (e.args.size() != sym->ctorParams.size()) {
-            error(e, "constructor '" + callee->name + "' expects " +
-                  std::to_string(sym->ctorParams.size()) + " arguments, got " +
-                  std::to_string(e.args.size()));
-        }
-        for (size_t i = 0; i < e.args.size() && i < sym->ctorParams.size(); ++i) {
-            auto argTy = inferExpr(*e.args[i]);
-            if (sym->ctorParams[i].type && !isAssignable(*sym->ctorParams[i].type, *argTy)) {
-                error(*e.args[i], "argument type mismatch: expected '" +
-                      sym->ctorParams[i].type->toString() + "', got '" + argTy->toString() + "'");
-            }
-        }
+        std::vector<const SemType*> formalTypes;
+        for (auto& p : sym->ctorParams) formalTypes.push_back(p.type.get());
+        size_t dc = 0;
+        for (auto it = sym->ctorParams.rbegin(); it != sym->ctorParams.rend() && it->hasDefault; ++it) ++dc;
+        checkCallArgs(e, callee->name, "constructor", formalTypes, e.args, genericMap, dc);
         return sym->type ? sym->type->clone() : ErrorSemType::make();
     }
     // Variable / Parameter 但类型是函数类型 → 可作为函数调用
     if (sym->kind == SymKind::Variable || sym->kind == SymKind::Parameter) {
         if (auto* fst = dynamic_cast<const FuncSemType*>(sym->type.get())) {
-            // throws 兼容性检查
-            if (!currentFunctionThrows_ && insideTry_ == 0 && fst->throws) {
-                error(e, DiagCode::E016_ThrowsViolation,
-                      "cannot call throwing function from non-throwing context",
-                      "add 'throws' to the function signature or wrap in 'try { ... } catch'");
-            }
-            // 参数数量检查（从 FuncSemType 提取）
-            if (e.args.size() != fst->paramTypes.size()) {
-                error(e, "function expects " + std::to_string(fst->paramTypes.size()) + " arguments, got " + std::to_string(e.args.size()));
-            }
-            // 参数类型检查
-            for (size_t i = 0; i < e.args.size() && i < fst->paramTypes.size(); ++i) {
-                auto argTy = inferExpr(*e.args[i]);
-                if (fst->paramTypes[i] && !isAssignable(*fst->paramTypes[i], *argTy)) {
-                    error(*e.args[i], "argument type mismatch: expected '" + fst->paramTypes[i]->toString() + "', got '" + argTy->toString() + "'");
-                }
-                // 泛型替换：从实参推断泛型变量
-                if (fst->paramTypes[i])
-                    collectGenericMapping(*fst->paramTypes[i], *argTy, genericMap);
-            }
+            checkThrowsContext(e, callee->name, fst->throws);
+            std::vector<const SemType*> formalTypes;
+            for (auto& pt : fst->paramTypes) formalTypes.push_back(pt.get());
+            checkCallArgs(e, callee->name, "function", formalTypes, e.args, genericMap);
             auto result = fst->returnType ? fst->returnType->clone() : NoneSemType::make();
-            for (auto& [name, concrete] : genericMap) {
-                result = substitute(*result, name, *concrete);
-            }
-            return result;
+            return applyGenericMap(std::move(result), genericMap);
         }
     }
 
@@ -271,25 +225,16 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
                 if (imported->kind == SymKind::TypeAlias) {
                     return imported->type ? imported->type->clone() : ErrorSemType::make();
                 }
-                // 函数调用 — 复用 inferCall 检查逻辑
-                if (!currentFunctionThrows_ && insideTry_ == 0 && imported->throws) {
-                    error(e, DiagCode::E016_ThrowsViolation,
-                          "cannot call throwing function '" + e.method + "' from non-throwing context",
-                          "add 'throws' to the function signature or wrap in 'try { ... } catch'");
-                }
-                if (e.args.size() != imported->params.size()) {
-                    error(e, "function '" + e.method + "' expects "
-                          + std::to_string(imported->params.size()) + " arguments, got "
-                          + std::to_string(e.args.size()));
-                }
-                for (size_t i = 0; i < e.args.size() && i < imported->params.size(); ++i) {
-                    auto argTy = inferExpr(*e.args[i]);
-                    if (imported->params[i].type && !isAssignable(*imported->params[i].type, *argTy)) {
-                        error(*e.args[i], "argument type mismatch: expected '"
-                              + imported->params[i].type->toString() + "', got '" + argTy->toString() + "'");
-                    }
-                }
-                return imported->type ? imported->type->clone() : NoneSemType::make();
+                // 函数调用 — 复用 checkCallArgs 检查逻辑（泛型绑定：实参→形参映射用于实例化返回类型）
+                checkThrowsContext(e, e.method, imported->throws);
+                std::vector<const SemType*> formalTypes;
+                for (auto& p : imported->params) formalTypes.push_back(p.type.get());
+                std::map<std::string, std::unique_ptr<SemType>> genericMap;
+                size_t dc = 0;
+                for (auto it = imported->params.rbegin(); it != imported->params.rend() && it->hasDefault; ++it) ++dc;
+                checkCallArgs(e, e.method, "function", formalTypes, e.args, genericMap, dc);
+                auto result = imported->type ? imported->type->clone() : NoneSemType::make();
+                return applyGenericMap(std::move(result), genericMap);
             }
             error(e, "module '" + id->name + "' has no exported symbol '" + e.method + "'");
             return ErrorSemType::make();
@@ -301,20 +246,13 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
         std::string fqName = id->name + "." + e.method;
         if (auto* fn = BuiltinRegistry::get().findFunction(fqName, (int)e.args.size())) {
+            checkThrowsContext(e, e.method, fn->throws);
             // 对参数进行类型推断，设置 args 的 inferredType
             // （CodeGen 依赖此信息判断是否需要 GcRootHandle 包装）
             for (auto& arg : e.args) {
                 if (arg) (void)inferExpr(*arg);
             }
-            auto& ret = fn->returns;
-            switch (ret.kind) {
-                case ReturnTypeInfo::Kind::None:
-                    return NoneSemType::make();
-                case ReturnTypeInfo::Kind::Named:
-                case ReturnTypeInfo::Kind::Generator:
-                case ReturnTypeInfo::Kind::Generic:
-                    return semTypeFromBuiltinReturn(ret);
-            }
+            return semTypeFromBuiltinReturn(fn->returns);
         }
     }
 
@@ -340,25 +278,24 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
             if (arg) (void)inferExpr(*arg);
         }
         if (auto* entry = BuiltinRegistry::get().findMethod(typeKey, e.method, (int)e.args.size())) {
+            checkThrowsContext(e, e.method, entry->throws);
             auto& ret = entry->returns;
-            switch (ret.kind) {
-                case ReturnTypeInfo::Kind::None:
-                    return NoneSemType::make();
-                case ReturnTypeInfo::Kind::Named:
-                case ReturnTypeInfo::Kind::Generator:
-                case ReturnTypeInfo::Kind::Generic:
-                    return semTypeFromBuiltinReturn(ret);
+            // 返回形状依赖元素类型的调用（Optional<T> / Generic("channel")）：
+            // 元素类型不可知 → 报错引导显式类型标注（不改返回 fallback，仅诊断）
+            bool needsElem = (ret.kind == ReturnTypeInfo::Kind::Optional)
+                || (ret.kind == ReturnTypeInfo::Kind::Generic
+                    && ret.typeName != "[T]" && ret.typeName != "string");
+            if (needsElem) {
+                auto elem = elemTypeOf(objType.get());
+                if (dynamic_cast<const ErrorSemType*>(elem.get())) {
+                    error(e, "cannot infer element type of '" + typeKey
+                           + "'; add explicit type annotation (e.g. " + typeKey + "<int>)");
+                }
             }
+            return semTypeFromBuiltinReturn(ret, objType.get());
         }
-        // 内置类型查表失败 → 报错
-        std::string typeName;
-        if (typeKey == "[T]") {
-            typeName = "array";
-        } else if (typeKey == "Io" || typeKey == "Path") {
-            typeName = typeKey;  // 保持原始名称
-        } else {
-            typeName = typeKey;  // "string" 等
-        }
+        // 内置类型查表失败 → 报错（"[T]" 显示为 array，其余保持原名）
+        std::string typeName = (typeKey == "[T]") ? "array" : typeKey;
         // 检查方法名是否存在（不考虑参数数量），给出更有用的错误提示
         std::string hint;
         if (BuiltinRegistry::get().hasMethodName(typeKey, e.method)) {
@@ -423,6 +360,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
     if (!isAssignable(*targetTy, *valueTy)) {
         error(e, "assignment type mismatch: cannot assign '" + valueTy->toString() + "' to '" + targetTy->toString() + "'");
     }
+
     return valueTy->clone();
 }
 
@@ -475,13 +413,9 @@ std::unique_ptr<SemType> SemAnalyzer::inferFunExpr(const FunExpr& e) {
         symtab_.define(std::move(sym));
     }
     if (e.body) {
-        auto prevRet = std::move(currentReturnType_);
-        auto prevThrows = currentFunctionThrows_;
-        currentReturnType_ = returnType->clone();
-        currentFunctionThrows_ = e.throws;
+        // 用 FnCtxGuard 保存/恢复外层上下文（闭包体内 return 检查使用闭包自身返回类型）
+        FnCtxGuard fc(*this, returnType->clone(), e.throws);
         checkBlock(*e.body);
-        currentReturnType_ = std::move(prevRet);
-        currentFunctionThrows_ = prevThrows;
     }
     symtab_.exitScope();
 

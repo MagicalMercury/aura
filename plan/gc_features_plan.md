@@ -4,6 +4,14 @@
 > 当前实现：[runtime/gc.h](file:///d:/you/Aura/runtime/gc.h) + [runtime/gc.cpp](file:///d:/you/Aura/runtime/gc.cpp)
 > 状态：草案（待审核）
 > 日期：2026-07-18
+> 关联：
+> - [compacting_gc_plan.md](file:///d:/you/Aura/plan/compacting_gc_plan.md)：§十三 compact GC 的独立细化方案
+> - [generational_paged_gc.md](file:///d:/you/Aura/plan/generational_paged_gc.md)：分代分页 GC + LOS（§十三 compact GC 的演进方案，阶段 1 已实施）
+> - [sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md)：§八 多线程 GC 暂停的前置 plan
+> - [done/io_coroutine_plan.md](file:///d:/you/Aura/plan/done/io_coroutine_plan.md)：§八 多线程 GC 暂停的前置 plan
+> - [gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md)：§二 CodeGen 生成 GcRootHandle（间接依赖）
+> - [done/gc_promotion_issues.md](file:///d:/you/Aura/plan/done/gc_promotion_issues.md)：GC 晋升机制缺陷报告（§九/§十一/§十三相关）
+> - [done/gc_refactor_split.md](file:///d:/you/Aura/plan/done/gc_refactor_split.md)：GC 模块拆分 plan（已实施，gc.h/cpp 拆分为 gc/ 子目录）
 
 ---
 
@@ -44,12 +52,12 @@
 | P1 | forceGc 暴露给 Aura 语言 + 多线程安全 | §十八 | ✅ 已完成 |
 | P2 | 精确栈扫描（替代保守扫描） | §九 | [-] 暂不实施 |
 | P2 | compactAndReclaim 性能优化 | §十 | 待实施 |
-| P2 | TLAB（Thread-Local Allocation Buffer） | §十一 | [~] 延后 |
+| P2 | TLAB（Thread-Local Allocation Buffer） | §十一 | ✅ 已完成 |
 | P2 | GC 触发策略调优 | §十二 | [-] 暂不实施 |
-| P2 | 对象可移动性（compacting GC） | §十三 | [~] 延后 |
+| P2 | 对象可移动性（compacting GC） | §十三 | ✅ 已完成 |
 | P3 | 分代年龄记录 | §十四 | ✅ 已完成 |
 | P3 | 并发 GC（concurrent marking） | §十五 | 远期 |
-| P3 | Large Object Space（大对象区） | §十六 | 远期 |
+| P3 | Large Object Space（大对象区） | §十六 | ✅ 已完成 |
 | P3 | GC 日志与统计 | §十七 | ⚠️ 部分完成（`gc_stats_string` 已有，`verbose_` 开关 + `logGcEvent` 未实施） |
 
 ### 1.4 状态说明（2026-07-19 更新）
@@ -388,7 +396,7 @@ void GcHeap::sweepPhaseAll() {
 
 ### 8.1 用途
 
-[sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md) 和 [io_coroutine_plan.md](file:///d:/you/Aura/plan/io_coroutine_plan.md) 的共同前置。
+[sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md) 和 [io_coroutine_plan.md](file:///d:/you/Aura/plan/done/io_coroutine_plan.md) 的共同前置。
 
 ### 8.2 设计
 
@@ -1149,7 +1157,7 @@ fun main(io: Io) {
 | plan | 依赖的 GC 功能 |
 |:---|:---|
 | [sync_thread_plan.md](file:///d:/you/Aura/plan/sync_thread_plan.md) | §八 多线程 GC 暂停 |
-| [io_coroutine_plan.md](file:///d:/you/Aura/plan/io_coroutine_plan.md) | §八 多线程 GC 暂停 |
+| [io_coroutine_plan.md](file:///d:/you/Aura/plan/done/io_coroutine_plan.md) | §八 多线程 GC 暂停 |
 | [gcstring_optimization.md](file:///d:/you/Aura/plan/gcstring_optimization.md) | §二 CodeGen 生成 GcRootHandle（间接） |
 
 **关键路径**：

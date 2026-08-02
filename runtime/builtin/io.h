@@ -50,10 +50,10 @@ public:
     GcString* read_file_sync(const Path& path);
 
     // write_file(path: Path, content: string) throws — 写入文件（覆盖）
-    task<void> write_file(const Path& path, const std::string& content);
+    task<void> write_file(const Path& path, GcString* content);
 
     // write_file_sync(path: Path, content: string) throws — 同步版本
-    void write_file_sync(const Path& path, const std::string& content);
+    void write_file_sync(const Path& path, GcString* content);
 
     // file_exists(path: Path) -> bool — 检查文件或目录是否存在
     bool file_exists(const Path& path) const;

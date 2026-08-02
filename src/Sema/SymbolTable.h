@@ -36,7 +36,8 @@ public:
     Symbol* lookup(const std::string& name) const;
 
     // 遍历本层所有符号
-    void forEach(auto&& fn) const {
+    template<typename Fn>
+    void forEach(Fn&& fn) const {
         for (auto& [name, sym] : symbols_) {
             fn(name, sym);
         }

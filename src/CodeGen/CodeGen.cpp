@@ -1,5 +1,4 @@
 #include "CodeGen.h"
-#include "../Sema/BuiltinRegistry.h"
 #include "../Sema/SemAnalyzer.h"
 #include <filesystem>
 #include <sstream>
@@ -26,8 +25,10 @@ CompileUnit CodeGenerator::generate(const Program& program,
                                      const std::string& moduleName,
                                      const std::vector<CodeGenImport>& imports,
                                      const std::string& nsName,
-                                     const CodeGenConfig& config) {
+                                     const CodeGenConfig& config,
+                                     const CrossModuleDefaults& crossDefaults) {
     ioSync_ = config.ioSync;
+    crossDefaults_ = crossDefaults;   // C5.4: 跨模块函数默认参数表
     CompileUnit unit;
     unit.moduleName = moduleName;
     unit.nsName     = nsName;

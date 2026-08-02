@@ -34,12 +34,14 @@ public:
     void setFileName(const std::string& name) { fileName_ = name; }
 
     void print(std::ostream& os) const;
+    // 将 other 的诊断并入本引擎（多线程任务结果汇总；不截断，保留全部已记录错误）
+    void mergeFrom(const DiagnosticEngine& other);
     void reset();
 
 private:
     std::vector<Diagnostic> diags_;
     std::vector<std::string> errorMessages_;
-    std::string_view source_;
+    std::string source_;    // 按值持有源码（setSourceView 任意入参生命周期均安全，避免悬垂 string_view）
     std::string fileName_;
     int maxErrors_   = 20;
     int errorCount_  = 0;

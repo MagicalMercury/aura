@@ -16,12 +16,14 @@ namespace Aura {
 struct Param {
     std::string name;
     std::unique_ptr<TypeExpr> type;
+    std::unique_ptr<ASTNode> defaultExpr;  // 默认值表达式（nullptr = 无默认值）
 };
 
 inline Param cloneParam(const Param& p) {
     Param r;
     r.name = p.name;
     if (p.type) r.type.reset(static_cast<TypeExpr*>(p.type->clone().release()));
+    if (p.defaultExpr) r.defaultExpr = p.defaultExpr->clone();
     return r;
 }
 
@@ -218,20 +220,39 @@ struct TryCatchStmt : Stmt {
 struct SyncStmt : Stmt {
     std::unique_ptr<BlockStmt> body;
     std::unique_ptr<ASTNode> maxExpr;  // 可选：sync(max=N) 中的 N 表达式
+    bool isThread = false;             // true 表示 sync thread（多线程），false 表示 sync（协程）
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<SyncStmt>();
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
         if (maxExpr) n->maxExpr = maxExpr->clone();
+        n->isThread = isThread;
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
+// lock (e1, e2, ...) { body } — 锁块语句
+// v1.0: 单锁 Mutex；v1.1: RWMutex/Once；v1.2: 多锁列表
+// lockExprs 至少 1 个；多锁时由 CodeGen 运行时排序后加锁，避免锁序反转死锁
+struct LockStmt : Stmt {
+    std::vector<std::unique_ptr<ASTNode>> lockExprs;  // v1.2：单锁→多锁列表
+    std::unique_ptr<BlockStmt> body;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<LockStmt>();
+        for (auto& e : lockExprs) n->lockExprs.push_back(e ? e->clone() : nullptr);
+        if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
         n->line = line; n->col = col;
         return n;
     }
 };
 
 struct SpawnStmt : Stmt {
-    std::vector<Param> params;                     // spawn 参数列表（显式传参）
-    std::vector<std::unique_ptr<ASTNode>> args;    // 可选的显式实参（异名时使用）
-    std::vector<std::unique_ptr<Stmt>> body;
+    std::vector<Param> params;                     // 闭包形态：spawn 参数列表（显式传参）
+    std::vector<std::unique_ptr<ASTNode>> args;    // 闭包形态：可选的显式实参（异名时使用）
+    std::vector<std::unique_ptr<Stmt>> body;       // 闭包形态：语句体
+    std::unique_ptr<ASTNode> callExpr;             // 调用形态：spawn func(args) / spawn obj.method(args)
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<SpawnStmt>();
@@ -247,6 +268,7 @@ struct SpawnStmt : Stmt {
             if (s) n->body.emplace_back(static_cast<Stmt*>(s->clone().release()));
             else n->body.push_back(nullptr);
         }
+        if (callExpr) n->callExpr = callExpr->clone();
         n->line = line; n->col = col;
         return n;
     }
@@ -258,6 +280,7 @@ struct SyncForStmt : Stmt {
     std::string itemName;
     std::unique_ptr<ASTNode> iterable;
     std::unique_ptr<BlockStmt> body;
+    bool isThread = false;             // true 表示 sync thread for（多线程），false 表示 sync for（协程）
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<SyncForStmt>();
@@ -265,6 +288,7 @@ struct SyncForStmt : Stmt {
         n->itemName = itemName;
         n->iterable = iterable ? iterable->clone() : nullptr;
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
+        n->isThread = isThread;
         n->line = line; n->col = col;
         return n;
     }

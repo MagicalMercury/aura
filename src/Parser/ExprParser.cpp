@@ -306,6 +306,17 @@ std::unique_ptr<ASTNode> Parser::parsePrimary() {
         return n;
     }
 
+    // sync 关键字在表达式位置作为伪模块名处理（如 sync.Mutex()）
+    // 语法上 sync 是关键字（用于 sync 块），但在表达式上下文 +
+    // 后续 .Method() 时应作为命名空间标识符
+    if (check(TokType::Sync)) {
+        auto& tok = advance();
+        auto n = std::make_unique<Identifier>();
+        setNodePos(n.get(), tok);
+        n->name = "sync";
+        return n;
+    }
+
     if (match(TokType::LParen)) {
         auto expr = parseExpr();
         consume(TokType::RParen, "expected ')' after expression");

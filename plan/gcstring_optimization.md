@@ -3,6 +3,10 @@
 > 日期：2026-07-20（v7 精简版）
 > 状态：主体完成，本文档仅保留剩余项
 > 历史实施：第一/二/三阶段 + 第四阶段 D1/D2 已全部完成（详见 [TODO.txt §六](file:///d:/you/Aura/TODO.txt)）
+> 关联：
+> - [done/plan13.md](file:///d:/you/Aura/plan/done/plan13.md)：GcString 重构原始 plan
+> - [gc_features_plan.md](file:///d:/you/Aura/plan/gc_features_plan.md)：GC 功能完整 plan（§二 CodeGen 生成 GcRootHandle，GcString 间接依赖）
+> - [generational_paged_gc.md](file:///d:/you/Aura/plan/generational_paged_gc.md)：分代分页 GC + LOS（GcString 拼接/append 等所有 alloc 路径需 GcRootHandle 保护，已在阶段 1 修复）
 
 ---
 

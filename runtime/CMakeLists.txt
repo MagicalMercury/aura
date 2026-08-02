@@ -8,6 +8,10 @@ if(ENABLE_ASAN)
     # 深度调试：CLANG64 的 clang 带 ASAN 运行时，UCRT64 的 GCC 不支持 ASAN
     set(CMAKE_C_COMPILER "C:/msys64/clang64/bin/clang.exe")
     set(CMAKE_CXX_COMPILER "C:/msys64/clang64/bin/clang++.exe")
+else()
+    # 常规模式：使用环境变量配置的 g++（UCRT64 GCC）
+    set(CMAKE_C_COMPILER "C:/msys64/ucrt64/bin/gcc.exe")
+    set(CMAKE_CXX_COMPILER "C:/msys64/ucrt64/bin/g++.exe")
 endif()
 
 project(aura_rt LANGUAGES CXX)
@@ -41,10 +45,20 @@ endif()
 
 add_library(aura_rt STATIC
     types.cpp
-    gc.cpp
+    gc/gc.cpp
+    gc/alloc.cpp
+    gc/tlab.cpp
+    gc/roots.cpp
+    gc/safepoint.cpp
+    gc/mark_sweep.cpp
+    gc/compact.cpp
+    gc/los.cpp
     task.cpp
+    thread_pool.cpp
     builtin/io.cpp
     builtin/string.cpp
+    builtin/mutex.cpp
+    win_iocp.cpp
 )
 
 target_include_directories(aura_rt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

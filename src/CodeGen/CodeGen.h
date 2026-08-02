@@ -95,15 +95,22 @@ struct TypeMapEntry {
 // ============================================================
 class CodeGenerator {
 public:
+    // 跨模块函数默认参数：模块命名空间名 → (函数名 → 默认值表达式数组)（C5.4）
+    // AST 指针来自依赖模块 ModuleInfo.exports（常驻内存，多文件 CodeGen 并行只读）
+    using CrossModuleDefaults = std::map<std::string,
+        std::map<std::string, std::vector<const ASTNode*>>>;
+
     CodeGenerator(DiagnosticEngine& diag);
 
     // -- 主入口 --
     // 生成一个编译单元（.aura → .cpp/.h）
+    // crossDefaults: 跨模块函数默认参数表（C5.4，多文件模式由 main.cpp 构造）
     [[nodiscard]] CompileUnit generate(const Program& program,
                                         const std::string& moduleName = "main",
                                         const std::vector<CodeGenImport>& imports = {},
                                         const std::string& nsName = "",
-                                        const CodeGenConfig& config = {});
+                                        const CodeGenConfig& config = {},
+                                        const CrossModuleDefaults& crossDefaults = {});
 
     // -- 协程判定入口 --
     [[nodiscard]] CoroDecision decideCoro(const FunDecl& decl);
@@ -135,7 +142,7 @@ public:
         bool visit(const TryCatchStmt& n, IdRefCollector& self) { if (n.tryBody) self.collectStmt(*n.tryBody); if (n.catchBody) self.collectStmt(*n.catchBody); return false; }
         bool visit(const SyncStmt& n, IdRefCollector& self)   { if (n.body) self.collectStmt(*n.body); return false; }
         bool visit(const SyncForStmt& n, IdRefCollector& self) { if (n.iterable) self.collectExpr(*n.iterable); if (n.body) self.collectStmt(*n.body); return false; }
-        bool visit(const SpawnStmt& n, IdRefCollector& self)  { for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
+        bool visit(const SpawnStmt& n, IdRefCollector& self)  { if (n.callExpr) return self.collectExpr(*n.callExpr); for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
         bool visit(const MatchStmt& n, IdRefCollector& self) { if (n.expr) self.collectExpr(*n.expr); for (auto& c : n.cases) { if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) self.collectStmt(*cb); else self.collectExpr(*c.body); } } return false; }
         bool visit(const ExprStmt& n, IdRefCollector& self)   { if (n.expr) self.collectExpr(*n.expr); return false; }
         bool visit(const LetDecl& n, IdRefCollector& self)    { if (n.initializer) self.collectExpr(*n.initializer); return false; }
@@ -178,7 +185,7 @@ public:
         bool visit(const BlockStmt& n, DeclaredCollector& self){ for (auto& s : n.stmts) if (s) self.collectStmt(*s); return false; }
         bool visit(const SyncStmt& n, DeclaredCollector& self) { if (n.body) for (auto& sb : n.body->stmts) if (sb) self.collectStmt(*sb); return false; }
         bool visit(const SyncForStmt& n, DeclaredCollector& self){ out_.insert(n.itemName); if (n.body) for (auto& sb : n.body->stmts) if (sb) self.collectStmt(*sb); return false; }
-        bool visit(const SpawnStmt& n, DeclaredCollector& self){ for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
+        bool visit(const SpawnStmt& n, DeclaredCollector& self){ if (n.callExpr) return false; for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
         bool visit(const ReturnStmt&,  DeclaredCollector&) { return false; }
         bool visit(const ThrowStmt&,   DeclaredCollector&) { return false; }
         bool visit(const IfStmt&,      DeclaredCollector&) { return false; }
@@ -304,11 +311,18 @@ private:
     void genContinueStmt(std::ostream& cpp);
     void genTryCatchStmt(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
     void genSyncStmt(std::ostream& cpp, const SyncStmt& stmt, bool isCoroutine);
+    void genSyncThreadStmt(std::ostream& cpp, const SyncStmt& stmt);  // sync thread 多线程
     void genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, bool isCoroutine);
 
     // 原始 try/catch（非协程模式回退，被 genTryCatchStmt 复用）
     void genTryCatchRaw(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
+    // v1.2：协程模式下无 setupLet 的 try/catch 用 IIFE + variant<monostate, Error>
+    void genTryCatchNoSetupIIFE(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
     void genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt, bool isCoroutine);
+    void genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt);  // sync thread 内的 spawn
+    void genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt);   // 调用形态（协程版）：spawn func(args)
+    void genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stmt); // 调用形态（线程版）：spawn func(args)
+    void genLockStmt(std::ostream& cpp, const LockStmt& stmt, bool isCoroutine);  // lock (m) { }
     void genMatchStmt(std::ostream& cpp, const MatchStmt& stmt, bool isCoroutine);
     void genExprStmt(std::ostream& cpp, const ExprStmt& stmt, bool isCoroutine);
 
@@ -416,6 +430,9 @@ private:
     // 当前是否在 spawn 块内生成代码（避免嵌套协程 co_await）
     bool insideSpawn_ = false;
 
+    // 当前是否在 sync thread 块内（控制 spawn 生成分派到 genSpawnAsThread）
+    bool inSyncThreadBlock_ = false;
+
     // 列表表达式计数器 — 生成唯一的临时变量名
     int listCounter_ = 0;
     int recordAllocCounter_ = 0;
@@ -458,6 +475,15 @@ private:
 
     // 函数名 → 其 FunctionType 参数的位置（用于 genCallExpr 中包装裸 lambda 为 std::function）
     std::map<std::string, std::vector<std::pair<size_t, std::string>>> fnCallbackParams_;
+
+    // 函数名 → 默认值表达式指针数组（长度 = 形参总数；nullptr = 无默认值）
+    // 同模块函数调用点补默认实参（C5.1）；AST 指针来自本模块 Program，生命周期安全
+    std::map<std::string, std::vector<const ASTNode*>> fnDefaultArgs_;
+
+    // 方法键 "ReceiverType.methodName" / ctor 键 "ReceiverType" → 默认值表达式数组（C5.3）
+    std::map<std::string, std::vector<const ASTNode*>> methodDefaultArgs_;
+
+    CrossModuleDefaults crossDefaults_;
 
     // let/const 声明中类型标注的显式模板参数（如 math.Pair<float, bool> → {"float", "bool"}）
     // genLetStmt 设置，genMethodCall 的 ns-ctor 路径消费后清空

@@ -44,8 +44,11 @@ struct GcString : GcObject {
     static GcString* from(const char* s, size_t len);
     static GcString* from(const std::string& s);
     static GcString* from(int32_t val);
+    static GcString* from(int64_t val);
     static GcString* from(double val);
     static GcString* from(bool val);
+    // 字符串本身作为参数：直接返回（避免 GcString* 隐式匹配 from(bool) 输出 "true"）
+    static GcString* from(GcString* s) { return s; }
     static GcString* empty();
 
     GcString* concat(const GcString& other) const;  // 三层防护 自动切换 Flat/Rope
@@ -103,6 +106,8 @@ private:
 // 字面量 intern：相同内容返回同一指针（注册为 GC 全局根，永不回收）
 GcString* intern_string(const char* s);
 GcString* intern_string(const char* s, size_t len);
+// 清空本线程的 intern L1 缓存（GC compaction 前调用，防止缓存指针悬垂）
+void clear_intern_cache();
 
 // ============================================================
 // ToString — Aura 内置接口
@@ -152,6 +157,8 @@ inline GcString* concat(GcString* a, GcString* b) {
 // 需用 GcRootHandle 保护 a（防 compact 移动）和 GcString::from(b) 返回的临时对象
 GcString* concat(GcString* a, int32_t b);
 GcString* concat(int32_t a,    GcString* b);
+GcString* concat(GcString* a, int64_t b);
+GcString* concat(int64_t a,    GcString* b);
 GcString* concat(GcString* a, double b);
 GcString* concat(double a,     GcString* b);
 GcString* concat(GcString* a, bool b);
@@ -186,5 +193,20 @@ inline bool string_eq(GcString* a, GcString* b) {
 
 // 多串拼接：一次分配 + 一次 memcpy，避免链式 concat 的中间对象
 GcString* concat_multi(std::initializer_list<const GcString*> parts);
+
+// ============================================================
+// 字符串 ↔ 数值转换（Python 风格 int()/float()/str()）
+// ============================================================
+// int(s, base=10)：解析失败抛 ValueError；base 仅 0 或 2~36（0 = 自动前缀检测）
+[[nodiscard]] int32_t string_to_int(GcString* s, int32_t base = 10);
+// float(s)：支持 inf/infinity/nan（大小写不敏感）；溢出返回 ±inf（不报错）
+[[nodiscard]] double string_to_float(GcString* s);
+
+// str(x)：直接转发 GcString::from（string 原样返回）
+inline GcString* string_of(int32_t v) { return GcString::from(v); }
+inline GcString* string_of(int64_t v) { return GcString::from(v); }
+inline GcString* string_of(double v)  { return GcString::from(v); }
+inline GcString* string_of(bool v)    { return GcString::from(v); }
+inline GcString* string_of(GcString* s) { return s; }
 
 } // namespace aura_rt

@@ -209,7 +209,7 @@ public:
     bool visit(const LoopStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
     bool visit(const TryCatchStmt& n, AssignTargetCollector& self) { if (n.tryBody && self.collectStmt(*n.tryBody)) return true; return n.catchBody && self.collectStmt(*n.catchBody); }
     bool visit(const SyncStmt& n, AssignTargetCollector& self) { return n.body && self.collectStmt(*n.body); }
-    bool visit(const SpawnStmt& n, AssignTargetCollector& self) { for (auto& sb : n.body) if (sb && self.collectStmt(*sb)) return true; return false; }
+    bool visit(const SpawnStmt& n, AssignTargetCollector& self) { if (n.callExpr) return false; for (auto& sb : n.body) if (sb && self.collectStmt(*sb)) return true; return false; }
     bool visit(const MatchStmt& n, AssignTargetCollector& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.collectStmt(*cb)) return true; } else { if (auto* ae = dynamic_cast<const AssignExpr*>(c.body.get())) return self.visit(*ae, self); } } return false; }
     bool visit(const ExprStmt& n, AssignTargetCollector& self) { if (auto* ae = dynamic_cast<const AssignExpr*>(n.expr.get())) return self.visit(*ae, self); return false; }
     bool visit(const ReturnStmt&, AssignTargetCollector&) { return false; }
@@ -258,7 +258,7 @@ public:
     bool visit(const TryCatchStmt& n, CallTargetScanner& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
     bool visit(const SyncStmt& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
     bool visit(const SyncForStmt& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const SpawnStmt& n, CallTargetScanner& self) { for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
+    bool visit(const SpawnStmt& n, CallTargetScanner& self) { if (n.callExpr) return self.scanExpr(*n.callExpr); for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
     bool visit(const MatchStmt& n, CallTargetScanner& self) { if (n.expr && self.scanExpr(*n.expr)) return true; for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } else if (self.scanExpr(*c.body)) return true; } return false; }
     bool visit(const ExprStmt& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
     bool visit(const ReturnStmt& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
@@ -325,7 +325,7 @@ public:
     bool visit(const TryCatchStmt& n, CaptureArgScanner& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
     bool visit(const SyncStmt& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
     bool visit(const SyncForStmt& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const SpawnStmt& n, CaptureArgScanner& self) { for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
+    bool visit(const SpawnStmt& n, CaptureArgScanner& self) { if (n.callExpr) return self.scanExpr(*n.callExpr); for (auto& sb : n.body) if (sb && self.scanStmt(*sb)) return true; return false; }
     bool visit(const MatchStmt& n, CaptureArgScanner& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } else if (self.scanExpr(*c.body)) return true; } return false; }
     bool visit(const LetDecl& n, CaptureArgScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }
     bool visit(const ConstDecl& n, CaptureArgScanner& self) { return n.initializer && self.scanExpr(*n.initializer); }

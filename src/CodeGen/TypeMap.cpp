@@ -44,6 +44,29 @@ bool CodeGenerator::isGcPointerType(const std::string& cppType) const {
 
 std::string CodeGenerator::mapType(const TypeExpr& type) {
     if (auto* n = dynamic_cast<const NamedType*>(&type)) {
+        // 有命名空间前缀时，先查全限定名（如 "sync.Channel"）是否在 BuiltinRegistry
+        // 命中则直接取 cppType 并注入模板参数，避免后续 mapNamedType 只解析短名 "Channel"
+        if (!n->namespacePrefix.empty()) {
+            std::string fullName;
+            for (auto& ns : n->namespacePrefix) fullName += ns + ".";
+            fullName += n->name;
+            if (auto* ti = BuiltinRegistry::get().findType(fullName)) {
+                std::string cpp = ti->cppType;  // e.g. "aura_rt::ThreadChannel*"
+                if (!n->typeArgs.empty()) {
+                    bool hasStar = !cpp.empty() && cpp.back() == '*';
+                    if (hasStar) cpp.pop_back();
+                    cpp += "<";
+                    for (size_t i = 0; i < n->typeArgs.size(); ++i) {
+                        if (i > 0) cpp += ", ";
+                        cpp += n->typeArgs[i] ? mapType(*n->typeArgs[i]) : "???";
+                    }
+                    cpp += ">";
+                    if (hasStar) cpp += "*";
+                }
+                return cpp;
+            }
+        }
+
         std::string base = mapNamedType(n->name);
         if (!n->typeArgs.empty()) {
             bool hadStar = base.size() > 1 && base.back() == '*';
@@ -57,17 +80,25 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
             if (hadStar) base += "*";
         }
         // 命名空间前缀：math.Pair → math::Pair
+        // 注意：sync 是伪模块名（sync.Mutex/RWMutex/Once），
+        // BuiltinRegistry 已注册为 aura_rt::Mutex* 等，无需加 sync:: 前缀
         if (!n->namespacePrefix.empty()) {
-            std::string prefix;
-            for (auto& ns : n->namespacePrefix)
-                prefix += ns + "::";
-            // 跨模块类型都是堆指针，若 base 不是以 * 结尾则追加
-            if (!base.empty() && base.back() != '*')
-                base += "*";
-            if (base.find("aura_rt::") == 0) {
-                base.insert(std::string("aura_rt::").size(), prefix);
-            } else {
-                base = prefix + base;
+            // sync 伪命名空间：跳过，不加前缀
+            bool isSyncBuiltin = (n->namespacePrefix.size() == 1
+                                  && n->namespacePrefix[0] == "sync"
+                                  && base.find("aura_rt::") == 0);
+            if (!isSyncBuiltin) {
+                std::string prefix;
+                for (auto& ns : n->namespacePrefix)
+                    prefix += ns + "::";
+                // 跨模块类型都是堆指针，若 base 不是以 * 结尾则追加
+                if (!base.empty() && base.back() != '*')
+                    base += "*";
+                if (base.find("aura_rt::") == 0) {
+                    base.insert(std::string("aura_rt::").size(), prefix);
+                } else {
+                    base = prefix + base;
+                }
             }
         }
         return base;
@@ -175,6 +206,11 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
     if (auto* l = dynamic_cast<const ListSemType*>(&semType)) {
         return "aura_rt::Array<" + mapSemType(*l->elementType) + ">*";
     }
+    if (auto* o = dynamic_cast<const OptionalSemType*>(&semType)) {
+        // Optional<T> → aura_rt::Optional<T>*（堆对象指针）
+        std::string elem = o->elementType ? mapSemType(*o->elementType) : "void";
+        return "aura_rt::Optional<" + elem + ">*";
+    }
     if (auto* r = dynamic_cast<const RecordSemType*>(&semType)) {
         if (!r->canonicalName.empty()) {
             return r->canonicalName + "*";
@@ -194,6 +230,9 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
     }
     if (auto* gs = dynamic_cast<const GenericSemType*>(&semType)) {
         if (!gs->resolvedName.empty()) return gs->resolvedName + "*";
+        // 未实例化的泛型：查 BuiltinRegistry 回退（如 sync.Channel → aura_rt::ThreadChannel*）
+        if (auto* ti = BuiltinRegistry::get().findType(gs->name))
+            return ti->cppType;
         return "auto";
     }
     return "/* unknown_semtype */";

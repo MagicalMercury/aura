@@ -15,10 +15,17 @@
 // ============================================================
 
 #include <coroutine>
+#include <cstddef>
 #include <exception>
 #include <vector>
 
 namespace aura_rt {
+
+// 前向声明：由 gc.cpp 提供，task<T>::promise_type::operator new/delete 调用
+// 用途：记录协程帧实际大小，供 GC 保守扫描时使用实际帧大小
+//      避免固定 4096 字节范围越过帧边界（ASAN heap-buffer-overflow）
+// 不在 task.h 中 include gc.h，避免循环依赖
+void noteCoroutineFrameImpl(void* framePtr, std::size_t size);
 
 // ============================================================
 // task<T> ─ C++20 协程包装
@@ -55,6 +62,19 @@ struct task_promise_base {
 template <>
 struct task<void> {
     struct promise_type : detail::task_promise_base {
+        // 自定义 operator new：记录协程帧大小，供 GC 保守扫描使用
+        // 避免 GC 读取固定 4096 字节范围越过实际帧边界（ASAN heap-buffer-overflow）
+        static void* operator new(std::size_t n) {
+            void* p = ::operator new(n);
+            noteCoroutineFrameImpl(p, n);
+            return p;
+        }
+        static void operator delete(void* p, std::size_t /*n*/) {
+            // 注：n 由 operator new 已记录，此处仅注销帧指针
+            noteCoroutineFrameImpl(p, 0);
+            ::operator delete(p);
+        }
+
         task<void> get_return_object() {
             return task<void>{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
@@ -104,6 +124,17 @@ template <typename T>
 struct task {
     struct promise_type : detail::task_promise_base {
         T value_;
+
+        // 自定义 operator new：记录协程帧大小（同 task<void>）
+        static void* operator new(std::size_t n) {
+            void* p = ::operator new(n);
+            noteCoroutineFrameImpl(p, n);
+            return p;
+        }
+        static void operator delete(void* p, std::size_t /*n*/) {
+            noteCoroutineFrameImpl(p, 0);
+            ::operator delete(p);
+        }
 
         task<T> get_return_object() {
             return task<T>{std::coroutine_handle<promise_type>::from_promise(*this)};

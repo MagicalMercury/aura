@@ -15,6 +15,7 @@ namespace aura_rt {
 // ============================================================
 // 前向声明
 // ============================================================
+class GcHeap;            // GC 堆主类（完整定义在 gc.h）
 struct TypeDescriptor;
 struct GcObject;
 struct GcString;

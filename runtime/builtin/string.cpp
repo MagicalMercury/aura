@@ -6,11 +6,16 @@
 // ============================================================
 
 #include "string.h"
+#include "error.h"   // make_value_error（错误转换工厂）
 #include "../gc.h"
+#include <cctype>
+#include <cerrno>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
-#include <shared_mutex>
+#include <mutex>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -75,6 +80,17 @@ GcString* GcString::from(int32_t val) {
     return make(buf, static_cast<size_t>(len));
 }
 
+GcString* GcString::from(int64_t val) {
+    // int64 不缓存（容量等数值通常较大，缓存命中率低）
+    // 小范围值走 int32_t 缓存路径，避免重复格式化
+    if (val >= INT32_MIN && val <= INT32_MAX) {
+        return from(static_cast<int32_t>(val));
+    }
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(val));
+    return make(buf, static_cast<size_t>(len));
+}
+
 GcString* GcString::from(double val) {
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "%.6g", val);
@@ -101,6 +117,18 @@ GcString* concat(GcString* a, int32_t b) {
     return a_guard.get()->concat(*tmp_guard.get());
 }
 GcString* concat(int32_t a, GcString* b) {
+    GcString* tmp = GcString::from(a);
+    GcRootHandle<GcString*> tmp_guard(tmp);
+    GcRootHandle<GcString*> b_guard(b);
+    return tmp_guard.get()->concat(*b_guard.get());
+}
+GcString* concat(GcString* a, int64_t b) {
+    GcRootHandle<GcString*> a_guard(a);
+    GcString* tmp = GcString::from(b);
+    GcRootHandle<GcString*> tmp_guard(tmp);
+    return a_guard.get()->concat(*tmp_guard.get());
+}
+GcString* concat(int64_t a, GcString* b) {
     GcString* tmp = GcString::from(a);
     GcRootHandle<GcString*> tmp_guard(tmp);
     GcRootHandle<GcString*> b_guard(b);
@@ -148,9 +176,19 @@ static constexpr int32_t kFlatFallbackThreshold = 64;
 
 static GcString* concat_flat(const GcString* a, const GcString* b) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 a/b 及其 data() 内部指针
+    // 额外用 GcRootHandle 保护 a/b，防止 alloc 触发 GC 时对象被回收
+    GcObject* _aptr = const_cast<GcObject*>(static_cast<const GcObject*>(a));
+    GcObject* _bptr = const_cast<GcObject*>(static_cast<const GcObject*>(b));
+    GcRootHandle<GcObject*> _ra(_aptr);
+    GcRootHandle<GcObject*> _rb(_bptr);
     int32_t total = a->length + b->length;
     size_t objSize = sizeof(GcString) + total + 1;
     auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
+    // 关键：r 也必须 root 保护！alloc 后到 return 前，r 尚未被任何外部 root 引用，
+    // 若 alloc 内部触发 GC（虽然本次 alloc 已完成，但 a->data() 调用可能触发 flatten
+    // 进而 alloc），sweep 会回收 r，导致 r->raw_data() 访问已释放内存
+    GcObject* _rPtr = static_cast<GcObject*>(r);
+    GcRootHandle<GcObject*> _rr(_rPtr);
     r->length = total;
     r->u.capacity = total;
     r->parent = nullptr;
@@ -163,10 +201,20 @@ static GcString* concat_flat(const GcString* a, const GcString* b) {
 static GcString* concat_multi_flat_range(const std::vector<const GcString*>& parts,
                                           size_t start, size_t end) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 parts 及其 data()
+    // 额外用 GcRootHandle 保护 parts 中的对象，防止 alloc 触发 GC 时对象被回收
+    std::vector<GcObject*> _objs;
+    std::vector<GcRootHandle<GcObject*>> _guards;
+    for (size_t i = start; i < end; ++i) {
+        _objs.push_back(const_cast<GcObject*>(static_cast<const GcObject*>(parts[i])));
+        _guards.emplace_back(_objs.back());
+    }
     int32_t total = 0;
     for (size_t i = start; i < end; ++i) total += parts[i]->length;
     size_t objSize = sizeof(GcString) + total + 1;
     auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
+    // r 也必须 root 保护，防止后续 parts[i]->data() 触发 GC 时 sweep 回收 r
+    GcObject* _rPtr = static_cast<GcObject*>(r);
+    GcRootHandle<GcObject*> _rr(_rPtr);
     r->length = total;
     r->u.capacity = total;
     r->parent = nullptr;
@@ -182,6 +230,13 @@ static GcString* concat_multi_flat_range(const std::vector<const GcString*>& par
 static GcString* build_balanced_rope(const std::vector<const GcString*>& parts,
                                       size_t start, size_t end) {
     GcCompactSuspendGuard _compactGuard;  // 递归 alloc，保护 parts
+    // 额外用 GcRootHandle 保护 parts 中的对象，防止递归 alloc 触发 GC 时 sweep 回收
+    std::vector<GcObject*> _objs;
+    std::vector<GcRootHandle<GcObject*>> _guards;
+    for (size_t i = start; i < end; ++i) {
+        _objs.push_back(const_cast<GcObject*>(static_cast<const GcObject*>(parts[i])));
+        _guards.emplace_back(_objs.back());
+    }
     if (end - start == 1) return const_cast<GcString*>(parts[start]);
     if (end - start == 0) return GcString::empty();
     int32_t subtreeTotal = 0;
@@ -190,7 +245,12 @@ static GcString* build_balanced_rope(const std::vector<const GcString*>& parts,
         return concat_multi_flat_range(parts, start, end);
     size_t mid = start + (end - start) / 2;
     GcString* left  = build_balanced_rope(parts, start, mid);
+    // 关键：left 必须在 right 递归 alloc 期间 root 保护，防止 sweep 回收 left
+    GcObject* _leftPtr = static_cast<GcObject*>(left);
+    GcRootHandle<GcObject*> _rleft(_leftPtr);
     GcString* right = build_balanced_rope(parts, mid, end);
+    GcObject* _rightPtr = static_cast<GcObject*>(right);
+    GcRootHandle<GcObject*> _rright(_rightPtr);
     int leftDepth  = left->ropeDepth();
     int rightDepth = right->ropeDepth();
     int newDepth   = std::max(leftDepth, rightDepth) + 1;
@@ -230,6 +290,15 @@ GcString* GcString::concat(const GcString& other) const {
 // ============================================================
 GcString* concat_multi(std::initializer_list<const GcString*> parts) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 parts 中的裸指针值拷贝
+    // 额外用 GcRootHandle 保护 parts 中的对象，防止 alloc 触发 GC 时对象被回收
+    std::vector<GcObject*> _objs;
+    std::vector<GcRootHandle<GcObject*>> _guards;
+    for (auto* p : parts) {
+        if (p) {
+            _objs.push_back(const_cast<GcObject*>(static_cast<const GcObject*>(p)));
+            _guards.emplace_back(_objs.back());
+        }
+    }
     int32_t total = 0;
     for (auto* p : parts) {
         if (p) total += p->length;
@@ -238,6 +307,9 @@ GcString* concat_multi(std::initializer_list<const GcString*> parts) {
     if (total < kConcatByCopySize) {
         size_t objSize = sizeof(GcString) + total + 1;
         auto* r = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &GcString::_desc));
+        // r 也必须 root 保护，防止后续 s->data() 触发 GC 时 sweep 回收 r
+        GcObject* _rPtr = static_cast<GcObject*>(r);
+        GcRootHandle<GcObject*> _rr(_rPtr);
         r->length = total;
         r->u.capacity = total;
         r->parent = nullptr;
@@ -266,6 +338,9 @@ GcString* GcString::make_with_capacity(size_t len, size_t cap) {
     if (cap < len) cap = len;
     size_t objSize = sizeof(GcString) + cap + 1;
     auto* str = static_cast<GcString*>(GcHeap::instance().alloc(objSize, &_desc));
+    // str 也必须 root 保护，防止 alloc 触发 GC 时 sweep 回收 str
+    GcObject* _strPtr = static_cast<GcObject*>(str);
+    GcRootHandle<GcObject*> _rstr(_strPtr);
     str->length = static_cast<int32_t>(len);
     str->parent = nullptr;
     str->u.capacity = static_cast<int32_t>(cap);
@@ -280,17 +355,30 @@ GcString* GcString::make_with_capacity(size_t len, size_t cap) {
 GcString* GcString::append(const GcString* other) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 this/other 及 alloc 新对象
     if (!other || other->length == 0) return this;
+    // 额外用 GcRootHandle 保护 this/other，防止 alloc 触发 GC 时对象被回收
+    GcObject* _thisPtr = static_cast<GcObject*>(this);
+    GcObject* _otherPtr = const_cast<GcObject*>(static_cast<const GcObject*>(other));
+    GcRootHandle<GcObject*> _rthis(_thisPtr);
+    GcRootHandle<GcObject*> _rother(_otherPtr);
 
     size_t needed = static_cast<size_t>(length) + static_cast<size_t>(other->length);
 
-    // Rope 模式：降级到 Flat
-    if (isRope()) {
-        GcString* flat_self = ensure_flat();
-        if (flat_self != this) return flat_self->append(other);
+    // Bug 4 修复：快速路径 — Flat 模式且容量足够时直接就地追加（零分配，O(1)）
+    // 原 Bug：入口处无条件 ensure_flat() 导致每次 append 都拷贝整个字符串，O(n²)
+    if (!isRope() && needed <= static_cast<size_t>(capacity())) {
+        std::memcpy(raw_data() + length, other->data(), other->length);
+        length += other->length;
+        raw_data()[length] = '\0';
+        return this;
     }
 
-    // 结果 < 128B：走原 Flat 扩容
+    // 结果 < 128B：走 Flat 扩容（仅小结果时才 flatten）
     if (needed < static_cast<size_t>(kConcatByCopySize)) {
+        // Bug 4 修复：延迟 flatten — 仅此处才 flatten，非入口处无条件 flatten
+        if (isRope()) {
+            GcString* flat_self = ensure_flat();
+            if (flat_self != this) return flat_self->append(other);
+        }
         size_t curCap = static_cast<size_t>(capacity());
         if (needed <= curCap) {
             std::memcpy(raw_data() + length, other->data(), other->length);
@@ -302,6 +390,9 @@ GcString* GcString::append(const GcString* other) {
         if (newCap < 16) newCap = 16;
         auto* newStr = static_cast<GcString*>(
             GcHeap::instance().alloc(sizeof(GcString) + newCap + 1, &_desc));
+        // newStr 也必须 root 保护，防止后续 data()/other->data() 触发 GC 时 sweep 回收 newStr
+        GcObject* _newPtr = static_cast<GcObject*>(newStr);
+        GcRootHandle<GcObject*> _rnew(_newPtr);
         newStr->length = static_cast<int32_t>(needed);
         newStr->u.capacity = static_cast<int32_t>(newCap);
         newStr->parent = nullptr;
@@ -316,10 +407,16 @@ GcString* GcString::append(const GcString* other) {
     if (newDepth >= kMaxRopeDepth ||
         (newDepth < (int)kMinLengthByDepthSize && (int32_t)needed < kMinLengthByDepth[newDepth])) {
         // 走 Flat 扩容
-        size_t newCap = std::max(needed, static_cast<size_t>(capacity()) * 2);
+        // Bug 4 修复：rope 节点的 capacity() 返回 0，用 length*2 作为扩容基准
+        // 原代码用 capacity()*2，rope 节点扩容失效，每次精确分配 needed 大小，无倍增效果
+        size_t baseCap = isRope() ? static_cast<size_t>(length) : static_cast<size_t>(capacity());
+        size_t newCap = std::max(needed, baseCap * 2);
         if (newCap < 16) newCap = 16;
         auto* newStr = static_cast<GcString*>(
             GcHeap::instance().alloc(sizeof(GcString) + newCap + 1, &_desc));
+        // newStr 也必须 root 保护
+        GcObject* _newPtr = static_cast<GcObject*>(newStr);
+        GcRootHandle<GcObject*> _rnew(_newPtr);
         newStr->length = static_cast<int32_t>(needed);
         newStr->u.capacity = static_cast<int32_t>(newCap);
         newStr->parent = nullptr;
@@ -339,6 +436,14 @@ GcString* GcString::append(const char* s) {
 GcString* GcString::append(const char* s, size_t len) {
     if (len == 0) return this;
 
+    // Bug 2 修复：alloc 可能触发 GC（safepoint → minor/major/compact），
+    // 必须禁 compact 并用 GcRootHandle 保护 this，防止：
+    //   1. compaction 移动 this → 后续 data()/length 访问悬垂内存
+    //   2. mark-sweep 回收 this → this 未被 root 保护
+    GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 this 不被移动
+    GcObject* _thisPtr = static_cast<GcObject*>(this);
+    GcRootHandle<GcObject*> _rthis(_thisPtr);  // 保护 this，防 mark-sweep 回收
+
     size_t curCap = static_cast<size_t>(capacity());
     size_t needed = static_cast<size_t>(length) + len;
 
@@ -349,18 +454,21 @@ GcString* GcString::append(const char* s, size_t len) {
         auto* newStr = static_cast<GcString*>(
             GcHeap::instance().alloc(sizeof(GcString) + newCap + 1, &_desc)
         );
+        // newStr 也必须 root 保护，防止后续 data() 触发 GC 时 sweep 回收 newStr
+        GcObject* _newPtr = static_cast<GcObject*>(newStr);
+        GcRootHandle<GcObject*> _rnew(_newPtr);
         newStr->length = static_cast<int32_t>(needed);
         newStr->parent = nullptr;
         newStr->u.capacity = static_cast<int32_t>(newCap);
-        std::memcpy(newStr->data(), data(), length);
-        std::memcpy(newStr->data() + length, s, len);
-        newStr->data()[newStr->length] = '\0';
+        std::memcpy(newStr->raw_data(), data(), length);
+        std::memcpy(newStr->raw_data() + length, s, len);
+        newStr->raw_data()[newStr->length] = '\0';
         return newStr;
     }
     // 容量足够：就地修改，零分配
-    std::memcpy(data() + length, s, len);
+    std::memcpy(raw_data() + length, s, len);
     length += static_cast<int32_t>(len);
-    data()[length] = '\0';
+    raw_data()[length] = '\0';
     return this;
 }
 
@@ -389,11 +497,18 @@ GcString* GcString::slice(int32_t start, int32_t len) const {
                      start, len, length);
         std::abort();
     }
+    // Bug 3 修复：alloc 可能触发 compaction 移动 this，
+    // 此时 s->parent = this 会指向旧地址（已释放）。
+    // 禁 compact 确保 this 在整个函数体内地址稳定。
+    GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 this 不被移动
     auto* s = static_cast<GcString*>(
         GcHeap::instance().alloc(sizeof(GcString), &_desc)
     );
+    // s 也必须 root 保护，防止 alloc 触发 GC 时 sweep 回收 s
+    GcObject* _sPtr = static_cast<GcObject*>(s);
+    GcRootHandle<GcObject*> _rs(_sPtr);
     s->length = len;
-    s->parent = const_cast<GcString*>(this);
+    s->parent = const_cast<GcString*>(this);  // this 地址稳定，赋值安全
     s->u.offset = start;
     return s;
 }
@@ -454,9 +569,17 @@ const TypeDescriptor GcRopeNode::_desc = {
 // ============================================================
 GcRopeNode* GcRopeNode::make(GcString* l, GcString* r) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 l/r
+    // 额外用 GcRootHandle 保护 l/r，防止 alloc 触发 GC 时对象被回收
+    GcObject* _lPtr = static_cast<GcObject*>(l);
+    GcObject* _rPtr = static_cast<GcObject*>(r);
+    GcRootHandle<GcObject*> _rl(_lPtr);
+    GcRootHandle<GcObject*> _rr(_rPtr);
     auto* node = static_cast<GcRopeNode*>(
         GcHeap::instance().alloc(sizeof(GcRopeNode), &_desc)
     );
+    // node 也必须 root 保护，防止后续 l->ropeDepth()/r->ropeDepth() 触发 GC 时 sweep 回收 node
+    GcObject* _nodePtr = static_cast<GcObject*>(node);
+    GcRootHandle<GcObject*> _rnode(_nodePtr);
     node->length = l->length + r->length;
     node->u.capacity = 0;
     node->parent = nullptr;
@@ -476,6 +599,9 @@ GcString* GcRopeNode::flatten() const {
     auto* flat = static_cast<GcString*>(
         GcHeap::instance().alloc(sizeof(GcString) + length + 1, &GcString::_desc)
     );
+    // flat 也必须 root 保护，防止 flatten_recursive 内部 alloc 触发 GC 时 sweep 回收 flat
+    GcObject* _flatPtr = static_cast<GcObject*>(flat);
+    GcRootHandle<GcObject*> _rflat(_flatPtr);
     flat->length = length;
     flat->u.capacity = length;
     flat->parent = nullptr;
@@ -483,6 +609,13 @@ GcString* GcRopeNode::flatten() const {
     int32_t pos = 0;
     flatten_recursive(dst, pos, 16);
     flat->raw_data()[length] = '\0';
+    // Bug 4 修复：设置 flat_cache_ 前调用写屏障。
+    // 若 rope node 已晋升到老年代，而 flat 是新生代对象，
+    // 这个 old→young 引用若不被 rememberedSet_ 追踪，
+    // 后续 minor GC 的 markPhase 仅扫记忆集中的 old 对象，漏标 flat → sweep 回收 flat → 悬垂指针。
+    gc_write_barrier(const_cast<GcObject*>(static_cast<const GcObject*>(this)),
+                     &flat_cache_,
+                     static_cast<GcObject*>(flat));
     flat_cache_ = flat;
     return flat;
 }
@@ -526,30 +659,211 @@ void GcRopeNode::flatten_recursive(char* dst, int32_t& pos, int32_t maxDepth) co
 // ============================================================
 namespace {
     [[gnu::init_priority(105)]] std::unordered_map<std::string, std::unique_ptr<GcGlobalRoot<GcString>>> g_internPool;
-    [[gnu::init_priority(105)]] std::shared_mutex g_internMutex;
+    // 注意：不用 std::shared_mutex，MinGW 下有 bug
+    //   https://github.com/msys2/MINGW-packages/issues/25193
+    //   现象：lock_shared() 抛 "__ret == 0" 断言。读路径改用独占锁，
+    //   find() 本身耗时极小，对并发性能影响可忽略。
+    [[gnu::init_priority(105)]] std::mutex g_internMutex;
+
+    // ============================================================
+    // intern_string L1 线程局部缓存（64 槽 LRU）
+    //
+    // 热点字符串字面量无锁命中，消除 1000 万次循环的锁竞争
+    // key 指向 Aura 源码字符串字面量（编译期常量，永久存活），不会失效
+    // 线程间缓存不一致不影响正确性：L1 未命中走全局锁 double-check
+    // ============================================================
+    struct InternCacheEntry { const char* key; size_t keyLen; GcString* val; };
+    static thread_local struct {
+        InternCacheEntry entries[64];
+        size_t count;
+    } tl_internCache;
+
+    // L1 缓存插入（LRU 淘汰：新条目放头部，满则淘汰末尾）
+    static void internCacheInsert(const char* s, size_t len, GcString* val) {
+        auto& cache = tl_internCache;
+        // 先查重：若已存在则提前到头部（提升命中率）
+        for (size_t i = 0; i < cache.count; ++i) {
+            if (cache.entries[i].keyLen == len &&
+                std::memcmp(cache.entries[i].key, s, len) == 0) {
+                // 已存在：移到头部
+                if (i != 0) {
+                    InternCacheEntry tmp = cache.entries[i];
+                    std::memmove(&cache.entries[1], &cache.entries[0], i * sizeof(InternCacheEntry));
+                    cache.entries[0] = tmp;
+                }
+                return;
+            }
+        }
+        // 不存在：插入头部
+        if (cache.count < 64) {
+            if (cache.count > 0) {
+                std::memmove(&cache.entries[1], &cache.entries[0],
+                             cache.count * sizeof(InternCacheEntry));
+            }
+            cache.entries[0] = {s, len, val};
+            ++cache.count;
+        } else {
+            // 满：淘汰末尾，新条目放头部
+            std::memmove(&cache.entries[1], &cache.entries[0],
+                         63 * sizeof(InternCacheEntry));
+            cache.entries[0] = {s, len, val};
+        }
+    }
 }
 
 GcString* intern_string(const char* s, size_t len) {
-    std::string_view keyView(s, len);
+    // 0. L1 线程局部缓存查找（无锁，热点字面量快速命中）
     {
-        std::shared_lock lk(g_internMutex);
-        auto it = g_internPool.find(std::string(keyView));
-        if (it != g_internPool.end()) return it->second->get();
+        auto& cache = tl_internCache;
+        for (size_t i = 0; i < cache.count; ++i) {
+            auto& e = cache.entries[i];
+            if (e.keyLen == len && std::memcmp(e.key, s, len) == 0) {
+                return e.val;  // 命中
+            }
+        }
     }
+
+    std::string key(s, len);
+    // 1. 独占锁查找（替代 shared_lock，规避 MinGW shared_mutex bug）
+    GcString* found = nullptr;
     {
-        std::unique_lock lk(g_internMutex);
-        std::string key(keyView);
+        std::lock_guard lk(g_internMutex);
         auto it = g_internPool.find(key);
-        if (it != g_internPool.end()) return it->second->get();
-        auto root = std::make_unique<GcGlobalRoot<GcString>>(GcString::make(s, len));
-        GcString* result = root->get();
-        g_internPool.emplace(std::move(key), std::move(root));
-        return result;
+        if (it != g_internPool.end()) {
+            found = it->second->get();
+        }
     }
+    if (found) {
+        internCacheInsert(s, len, found);  // 插入 L1 缓存
+        return found;
+    }
+    // 2. 不持锁 alloc：make → alloc → 可能触发 safepoint/GC
+    //    关键：不能持 g_internMutex 时 alloc，否则 STW 时其他线程
+    //    阻塞在 lock_guard 无法到达 safepoint → 死锁
+    GcString* newly = GcString::make(s, len);
+    // 3. 写锁 double-check insert
+    GcString* result;
+    {
+        std::lock_guard lk(g_internMutex);
+        auto it = g_internPool.find(key);
+        if (it != g_internPool.end()) {
+            // 别人已插入，丢弃 newly（等 GC 回收）
+            result = it->second->get();
+        } else {
+            auto root = std::make_unique<GcGlobalRoot<GcString>>(newly);
+            result = root->get();
+            g_internPool.emplace(std::move(key), std::move(root));
+        }
+    }
+    internCacheInsert(s, len, result);  // 插入 L1 缓存
+    return result;
 }
 
 GcString* intern_string(const char* s) {
     return intern_string(s, std::strlen(s));
+}
+
+// ============================================================
+// clear_intern_cache — 清空本线程的 intern L1 缓存
+//
+// GC compaction 会搬运对象到新地址，updateAllReferences 更新 globalRoots_
+// 但无法更新线程局部缓存中的裸指针。GC 入口前调用此函数清空缓存，
+// 下次 intern_string 未命中后从全局池获取正确指针并重新填充。
+// ============================================================
+void clear_intern_cache() {
+    tl_internCache.count = 0;
+}
+
+// ============================================================
+// string_to_int — Python 风格 int(s, base=10)
+// 解析失败抛 ValueError；base 仅 0 或 2~36（0 = 自动前缀检测）
+// GC 安全：s 为 GC 堆裸指针，本函数内 make_string/make_value_error 会分配
+// 并可能触发 GC/compact（移动 s）。措施：
+//   1) GcRootHandle 保活 s（GC 后指针自动更新）；
+//   2) 立即值拷贝内容到 C++ 栈（std::string），使 string_view 不再引用 GC 内存。
+// ============================================================
+int32_t string_to_int(GcString* s, int32_t base) {
+    if (!s) throw make_value_error("invalid literal for int(): <None>");
+    aura_rt::GcRootHandle<GcString*> root(s);  // 绑定栈上指针变量，compact 时自动更新
+    std::string input(s->view());
+    std::string_view v = input;
+    // 错误消息统一构造（make_value_error 仅接受 const char* / GcString*，std::string 需 .c_str()）
+    auto err = [base, &v](const std::string& msg) -> void {
+        throw make_value_error(msg.c_str());
+    };
+    if (v.empty()) err("invalid literal for int() with base " + std::to_string(base) + ": ''");
+    if (base != 0 && (base < 2 || base > 36))
+        err("int() base must be >= 2 and <= 36, or 0");
+
+    size_t start = 0;
+    bool neg = false;
+    if (v[0] == '+' || v[0] == '-') { neg = (v[0] == '-'); start = 1; }
+    std::string_view body = v.substr(start);
+    if (body.empty())
+        err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
+
+    // 前缀自动检测（Python 3.11 行为：base=10 也认前缀；显式 base 与前缀冲突 → ValueError）
+    int32_t effBase = base;
+    size_t bodyStart = 0;
+    if (body.size() >= 2 && body[0] == '0') {
+        char c = static_cast<char>(std::tolower(static_cast<unsigned char>(body[1])));
+        int32_t want = 0;
+        if (c == 'x') want = 16; else if (c == 'o') want = 8; else if (c == 'b') want = 2;
+        if (want != 0) {
+            if (effBase != 0 && effBase != want)
+                err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
+            effBase = want;
+            bodyStart = 2;
+        }
+    }
+
+    std::string cstr(body.substr(bodyStart));
+    if (cstr.empty())
+        err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
+    errno = 0;
+    char* end = nullptr;
+    long long val = std::strtoll(cstr.c_str(), &end, effBase);
+    bool consumed = (end == cstr.c_str() + cstr.size()) && end != cstr.c_str();
+    if (!consumed || errno == ERANGE)
+        err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
+    long long result = neg ? -val : val;
+    if (result > INT32_MAX || result < INT32_MIN)
+        err("int() overflow: '" + std::string(v) + "'");
+    return static_cast<int32_t>(result);
+}
+
+// ============================================================
+// string_to_float — Python 风格 float(s)
+// 支持 inf/infinity/nan（大小写不敏感）；ERANGE 溢出返回 ±inf（不报错）
+// GC 安全策略同 string_to_int（GcRootHandle + 值拷贝）
+// ============================================================
+double string_to_float(GcString* s) {
+    if (!s) throw make_value_error("could not convert string to float: <None>");
+    aura_rt::GcRootHandle<GcString*> root(s);  // 绑定栈上指针变量，compact 时自动更新
+    std::string input(s->view());
+    std::string_view v = input;
+    auto err = [&v](const std::string& msg) -> void {
+        throw make_value_error(msg.c_str());
+    };
+    if (v.empty()) err("could not convert string to float: ''");
+
+    size_t start = 0;
+    bool neg = false;
+    if (v[0] == '+' || v[0] == '-') { neg = (v[0] == '-'); start = 1; }
+    // 特殊 token：inf / infinity / nan（大小写不敏感，可带符号）
+    std::string lower(v.substr(start));
+    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower == "inf" || lower == "infinity") return neg ? -INFINITY : INFINITY;
+    if (lower == "nan") return NAN;
+
+    std::string cstr(v);
+    errno = 0;
+    char* end = nullptr;
+    double val = std::strtod(cstr.c_str(), &end);
+    bool consumed = (end == cstr.c_str() + cstr.size()) && end != cstr.c_str();
+    if (!consumed)
+        err("could not convert string to float: '" + std::string(v) + "'");
+    return val;   // ERANGE 溢出 → ±inf（Python 行为，不报错）
 }
 
 } // namespace aura_rt
