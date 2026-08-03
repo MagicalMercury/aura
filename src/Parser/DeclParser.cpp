@@ -113,6 +113,15 @@ std::unique_ptr<InterfaceDecl> Parser::parseInterfaceDecl() {
     auto& nameTok = consume(TokType::Identifier, "expected interface name");
     decl->name = nameTok.lexeme;
 
+    // 泛型参数：interface Iterator<T> / interface Comparable<T>
+    if (match(TokType::Less)) {
+        do {
+            auto& tp = consume(TokType::Identifier, "expected type parameter in interface");
+            decl->typeParams.push_back(tp.lexeme);
+        } while (match(TokType::Comma));
+        consume(TokType::Greater, "expected '>' after interface type parameters");
+    }
+
     consume(TokType::LBrace, "expected '{' after interface name");
 
     while (!check(TokType::RBrace) && !atEnd()) {
@@ -137,15 +146,24 @@ std::unique_ptr<MethodDecl> Parser::parseMethodDecl() {
     // 泛型接收者类型参数：fun (self Stack<T>) 中的 <T>
     if (match(TokType::Less)) {
         do {
-            auto& tp = consume(TokType::Identifier, "expected type parameter in receiver");
+            auto& tp = consume(TokType::Identifier, "expected type parameter name");
             decl->receiverTypeArgs.push_back(tp.lexeme);
         } while (match(TokType::Comma));
-        consume(TokType::Greater, "expected '>' after receiver type arguments");
+        consume(TokType::Greater, "expected '>' after type parameters");
     }
 
+    // 接口实现声明：fun (self User impl Greetable) greet() -> string
+    // impl 位于接收者类型之后、')' 之前；泛型接口可带类型实参：
+    // fun (self Point impl Comparable<Point>) cmp(other: Point) -> int
     if (match(TokType::Impl)) {
         auto& implTok = consume(TokType::Identifier, "expected interface name after 'impl'");
         decl->implInterface = implTok.lexeme;
+        if (match(TokType::Less)) {
+            do {
+                decl->implTypeArgs.push_back(parseType());
+            } while (match(TokType::Comma));
+            consume(TokType::Greater, "expected '>' after interface type arguments");
+        }
     }
 
     consume(TokType::RParen, "expected ')' after receiver");

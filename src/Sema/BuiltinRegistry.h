@@ -178,6 +178,11 @@ public:
     // 列出已加载的 .aurai 文件（用于调试）
     const std::set<std::string>& loadedAurai() const { return loadedAurai_; }
 
+    // 内置接口声明（interfaces.aurai），SemAnalyzer::declareTopLevel 注册符号用
+    const std::vector<std::unique_ptr<InterfaceDecl>>& auraiInterfaces() const {
+        return auraiInterfaces_;
+    }
+
 private:
     void doLoadAurai(const Program& ast) {
         for (auto& d : ast.decls) {
@@ -217,6 +222,12 @@ private:
                     ++gf.defaultCount;
                 gf.returns = extractReturnType(fn->returnType.get());
                 functions_.push_back(std::move(gf));
+            } else if (auto* i = dynamic_cast<const InterfaceDecl*>(d.get())) {
+                // 内置接口（interfaces.aurai：Stringer/Comparable/Iterator）：
+                // 保存 AST 拷贝，由 SemAnalyzer::declareTopLevel 注册为 Interface 符号
+                auraiInterfaces_.push_back(
+                    std::unique_ptr<InterfaceDecl>(
+                        static_cast<InterfaceDecl*>(i->clone().release())));
             }
         }
     }
@@ -331,6 +342,8 @@ private:
     std::vector<BuiltinMethod>                       methods_;
     std::vector<BuiltinGlobalFn>                     functions_;
     std::set<std::string>                            loadedAurai_;  // 已加载的 .aurai 文件名
+    // 内置接口声明（interfaces.aurai），由 SemAnalyzer 注册为符号表 Interface 条目
+    std::vector<std::unique_ptr<InterfaceDecl>>      auraiInterfaces_;
 
     // ============================================================
     // AuraiLoader 辅助

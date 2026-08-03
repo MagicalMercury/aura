@@ -418,6 +418,36 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
     std::string left  = genExpr(*e.left, isCoroutine);
     std::string right = genExpr(*e.right, isCoroutine);
 
+    // C5b: 比较符号 → Comparable 接口分发
+    // 判定"record 实现 Comparable"查组合收集 interfaceImplementations_（含 "Comparable"），
+    // 不用 inferredType 标记（比较推断为 boolType，无法携带）
+    // 生成 <recName>Comparable({0}).less(<recName>Comparable({1}))（虚调用，尊重 override）
+    if (e.op == "<" || e.op == "<=" || e.op == ">" || e.op == ">="
+        || e.op == "==" || e.op == "!=") {
+        auto* lt = dynamic_cast<const RecordSemType*>(e.left->inferredType);
+        auto* rt = dynamic_cast<const RecordSemType*>(e.right->inferredType);
+        if (lt && rt && !lt->canonicalName.empty()
+            && lt->canonicalName == rt->canonicalName) {
+            auto recIt = interfaceImplementations_.find(lt->canonicalName);
+            if (recIt != interfaceImplementations_.end()
+                && recIt->second.count("Comparable") > 0) {
+                static const std::map<std::string, std::string> kOpToMethod = {
+                    {"<",  "less"}, {"<=", "le"}, {">", "greater"}, {">=", "ge"},
+                    {"==", "equal"}, {"!=", "ne"},
+                };
+                std::string adapter = safeName(lt->canonicalName) + "Comparable";
+                std::string method = kOpToMethod.at(e.op);
+                std::vector<std::pair<std::string, const SemType*>> cmpArgs;
+                cmpArgs.emplace_back(left, e.left->inferredType);
+                cmpArgs.emplace_back(right, e.right->inferredType);
+                // 基类实例化 Comparable<Point*>：方法参数已是 Point*（record 指针），
+                // 只需第一个操作数包适配器，第二个直接传 record 指针
+                std::string callExpr = adapter + "({0})." + method + "({1})";
+                return genGcRootedArgs(cmpArgs, callExpr, isCoroutine);
+            }
+        }
+    }
+
     // 字符串拼接：检测左操作数是否为 GcString*/make_string
     // 使用 aura_rt::concat 代替 string_concat，利用 C++ 重载决议自动处理
     // string + int / int + string / float + string 等组合
@@ -566,6 +596,20 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
         std::vector<std::string> argExprs;
         for (size_t i = 0; i < e.args.size(); ++i)
             argExprs.push_back(genExpr(*e.args[i], isCoroutine));
+        // C5.6: str(obj) 衔接 Stringer：实参 record 实现 Stringer → obj->to_string()
+        // 判定用组合收集集合 interfaceImplementations_（与 C3.2 同一数据源）
+        if (calleeName == "str" && e.args.size() == 1 && e.args[0]->inferredType) {
+            if (auto* rt = dynamic_cast<const RecordSemType*>(e.args[0]->inferredType)) {
+                std::string recName = rt->canonicalName;
+                auto recIt = interfaceImplementations_.find(recName);
+                if (recIt != interfaceImplementations_.end()
+                    && recIt->second.count("Stringer") > 0) {
+                    std::vector<std::pair<std::string, const SemType*>> stArgs;
+                    stArgs.emplace_back(argExprs[0], e.args[0]->inferredType);
+                    return genGcRootedArgs(stArgs, "{0}->to_string()", isCoroutine);
+                }
+            }
+        }
         // 内置默认参数补齐：int 的 base=10（defaultCount 驱动，v1 生成字面量）
         if (auto* fn = BuiltinRegistry::get().findFunction(calleeName, (int)e.args.size())) {
             for (size_t i = argExprs.size(); i < fn->params.size(); ++i)
@@ -618,7 +662,9 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
                  || coroClosureNames_.count(calleeExpr) > 0;
     }
 
-    // 接口参数自动包装
+    // 接口参数自动包装（双源：具体 record → 适配器；闭包 → IfaceFunc；接口变量 → 透传）
+    // 透传判定完全基于 inferredType（InterfaceSemType），不用 arg 字符串 find 判断
+    // ——record 名含接口名子串（如 GreetableUser）或 inferredType 缺失时都会误判
     auto ipIt = fnInterfaceParams_.find(calleeName);
     auto cbIt = fnCallbackParams_.find(calleeName);
     std::vector<std::string> argExprs;
@@ -628,7 +674,15 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
         if (ipIt != fnInterfaceParams_.end()) {
             for (auto& [idx, ifaceName] : ipIt->second) {
                 if (idx == i) {
-                    if (arg.find(ifaceName) == std::string::npos) {
+                    const SemType* argTy = e.args[i]->inferredType;
+                    if (argTy && dynamic_cast<const InterfaceSemType*>(argTy)) {
+                        // 接口变量透传（已在传参处构造适配器）：不包装
+                    } else if (auto* rt = dynamic_cast<const RecordSemType*>(argTy)) {
+                        // 具体 record → 适配器构造（v1 仅非泛型 record）
+                        std::string recName = rt->canonicalName;
+                        arg = safeName(recName) + ifaceName + "(" + arg + ")";
+                    } else {
+                        // 闭包/其他路径：直接包装为 IfaceFunc
                         arg = ifaceName + "Func(" + arg + ")";
                     }
                     break;
@@ -1218,10 +1272,11 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
         if (!currentLetName_.empty() && captures[i] == currentLetName_) {
             oss << "&" << cn;
         } else if (gcRootVarNames_.count(captures[i])) {
-            // GC 根变量 → init-capture 创建 GcSharedRoot 副本
-            // 如 [greeting = aura_rt::GcSharedRoot<GcString*>(greeting.get())]
+            // GC 根变量 → init-capture 创建 GcRootHandle 值持有副本（全局根，闭包跨线程安全）
+            // 如 [greeting = aura_rt::GcRootHandle<GcString*>(greeting.get(), aura_rt::GcRootScope::Global)]
             std::string type = gcRootTypes_[captures[i]];
-            oss << cn << " = aura_rt::GcSharedRoot<" << type << ">(" << cn << ".get())";
+            oss << cn << " = aura_rt::GcRootHandle<" << type << ">(" << cn << ".get(), "
+                << "aura_rt::GcRootScope::Global)";
         } else {
             oss << cn;
         }

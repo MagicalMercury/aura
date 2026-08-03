@@ -118,6 +118,8 @@ private:
     // ============ 声明注册（第 1 遍） ============
     void declareTopLevel(const Program& program);
     void declareDecl(const Decl& decl);
+    // 接口符号注册（用户接口与内置 .aurai 接口共用）
+    void declareInterface(const InterfaceDecl& i);
 
     // ============ 体检查（第 2 遍） ============
     void checkProgram(const Program& program);
@@ -277,6 +279,20 @@ private:
     // ============ 成员表 ============
     SymbolTable symtab_;
     DiagnosticEngine& diag_;
+
+    // ============ 接口显式 impl（Interface 改造）============
+    // receiverType 规范名 → 该 record 类型拥有的方法签名（buildTypeMethods 构建）
+    std::map<std::string, std::vector<InterfaceSemType::MethodSig>> typeMethods_;
+    // 第 1 遍末尾统一构建（resolveType 安全时刻）
+    void buildTypeMethods(const Program& program);
+    // receiverType 规范名（查符号表 RecordSemType.canonicalName）
+    [[nodiscard]] std::string recordTypeKey(const std::string& receiverType) const;
+    // receiverType 规范名 → 显式 impl 的接口名集合（declareDecl 收集；结构匹配已移除，
+    // 接口实现必须显式声明 impl。isAssignable / Comparable 校验据此判定）
+    std::map<std::string, std::set<std::string>> recordImplIfaces_;
+    // 显式 impl 完整性验证：record 声明 impl 接口 → 接口所有非默认方法必须已实现
+    // （第 1 遍末尾调用；报错定位用带 impl 的方法声明节点）
+    void verifyImplCompleteness(const Program& program);
 };
 
 } // namespace Aura

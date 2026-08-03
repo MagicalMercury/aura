@@ -13,7 +13,7 @@
 [ 一 ] 内置 API 与模块（plan/plan11.md）
 ================================================================
 
-[ ] P0  int() / float() / str() 字符串转换函数  [2026-08-02 提出]
+[x] P0  int() / float() / str() 字符串转换函数  [2026-08-02 提出]
       - 来源：原 string_to_int / string_to_float 两条（plan11.md:41-42）
         强化为 Python int()/float()/str() 风格（用户确认方向）
       - 语言层暴露名（Python 风格）：
@@ -59,6 +59,14 @@
 ================================================================
 [ 二 ] 高级类型 / 迭代器扩展（实验性，plan/range_implementation.md）
 ================================================================
+
+[ ] P1  Interface 改造：C++ 虚函数层限制 + 内置常见接口  [2026-08-02 提出]
+      - 要做的事（详细现状见 plan/interface_rework_issue.md）：
+          * 接口在 C++ 层真正以虚函数生效：实现接口的 record 生成时继承抽象基类并 override
+          * 补齐 Sema"具体类型→接口"结构匹配（当前 isAssignable 对具体类型直接
+            return false，与 README"结构类型自动实现"承诺矛盾）
+          * 内置接口：Stringer（Printable 更名，对象可 to_string()）、Comparable、Iterator
+            （Iterator 与下方 Iterator<T> 高级类型条目整合）
 
 [ ] P2  Iterator<T> 高级类型（与当前 IterSemType 整合）
       - 现状：IterSemType 仅 range 使用，无 .map / .filter / .collect 链式
@@ -267,30 +275,6 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
 
 ----------------------------------------------------------------
 
-[~] P2  Array<T> 优化 issue  [2026-07-27 提出，等待起草 plan]
-      - 背景：基于 array.h 代码审查识别的优化空间，分 P0/P1/P2/P3 子项
-      - issue 草案：见本轮对话分析报告（优点/代价缺陷/优先级已分类）
-
-      --- P2 中等优先 ---
-      [-] P2  list 字面量构造低效（ExprGen.cpp:292-312）  [2026-07-31 跳过]
-            - 问题：N 次 append + N 次 GcRootHandle 包装
-            - 跳过理由：GcCompactSuspendGuard 构造为 atomic<int> ++（纳秒级）；
-              genListExpr 的 make(N) 已预分配容量，append 不触发 createChunk；
-              GcRootHandle 无默认构造，不支持数组收集
-
-      --- P3 远期 / 代码质量 ---
-      [-] P3  shrink_to_fit API 新增  [2026-07-31 用户明确不计划]
-      [ ] P3  .iter() 方法（Iterator<T> 链式 .map/.filter/.collect）
-            - 已在 TODO §二（高级类型）规划，此处仅作关联引用
-
-      - 优点（保留）：
-          * 块链表在 GC 环境下优秀：扩容无大块拷贝，与 GcObject/TypeDescriptor 无缝集成
-          * append 写屏障正确实现（std::is_pointer_v<T> 条件触发）
-          * 迭代器用 GcRootHandle 保护 chunk 指针，防 compact 移动悬垂
-          * InlineArrayField 精确描述内联数据区，GC 精确扫描
-          * API 完整度高（13 方法），错误处理统一（Error{IndexError}）
-      - 下一步：按工作场景 2 起草 plan（建议先 P0 两个 bug 修复，再 P1 性能优化）
-
 ================================================================
 [ 七 ] 诊断 / 编译流程（plan/fix_plan.md）
 ================================================================
@@ -310,24 +294,6 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
       - 现状：可读性高，建议保留
       - 文件：src/Parser/ExprParser.cpp:47-158
 
-[x] P1  Sema 硬编码提取与逻辑混乱重构  [2026-08-01 提出] [2026-08-01 完成]
-      - 来源：plan/sema_code_review.md §十二（2026-08-01 补充审查）
-      - 背景：Sema 区域存在 5 处 Aura↔C++ 类型名映射重复（未复用
-        BuiltinRegistry.types_ 权威表）、3 处 TypeExpr 树遍历平行重复、
-        inferCall 三处参数检查重复（约 70 行）等硬编码；另有 9 处逻辑混乱点
-      - 实施：plan/sema_refactor_issue.md（详细方案）+ change.md（实现清单）
-      - 实现摘要：P0-1 semTypeFromAuraName/semTypeFromCppName/cppNameOf 统一 5 处
-        映射 + findByCppType 反向查找；P0-2/3 elemTypeOf 提取（顺带修复 sync for
-        遍历 channel 元素类型缺失）；P0-4 forEachGenericRef 统一 TypeExpr 遍历；
-        P0-5 checkCallArgs/checkThrowsContext/applyGenericMap；P1-1 importFuncSymbol/
-        buildFuncExport；P1-2 rejectStandaloneNone/checkSyncMax；P1-3 SyncBoundaryGuard/
-        ScopedValue/FnCtxGuard RAII；P2-1 死分支清理；P2-2 泛型冲突报错；P2-4 null
-        防御 + 未知操作符报错；P2-5 kSyncIoMethods 白名单
-      - 测试：K1-K29 全量回归通过 + N1-N4 负向断言（泛型冲突/跨块 return/E017/E016+
-        参数数量）+ example/used/test_sync_for.aura 回归
-      - 文件：src/Sema/SemAnalyzer.cpp, Checker/StmtChecker.cpp, Checker/ExprInfer.cpp,
-        Checker/DeclChecker.cpp, BuiltinRegistry.h
-
 ================================================================
 [ 九 ] 文档与示例
 ================================================================
@@ -338,55 +304,6 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
 ================================================================
 [ 十 ] 并发与多线程（plan/sync_thread_plan.md）
 ================================================================
-
-[x] P1  spawn 语法激进简化  [2026-07-31 提出] [2026-08-01 完成]
-      - 目标：`spawn func(args)` 直接调用函数/方法（类 Go 语言 go 关键字）
-      - 删除：旧式 `spawn { }`（自动捕获自由变量，IdRefCollector 分支）
-      - 保留：`spawn (params) { body }` 作为闭包形态（多语句场景 fallback）
-      - Parser：`parseSpawnStmt()` 改为解析 CallExpr（函数/方法调用）
-      - Sema：校验 spawn 表达式必须是 CallExpr；参数中的标识符显式可见，天然满足 R3
-      - CodeGen：遍历 CallExpr 参数收集自由变量（而非 stmt.body），复用现有 lambda 生成模式
-      - 协程模式：`_tasks.push_back([captures](...) -> task<void> { callee(args); co_return; })`
-      - 线程模式：`_stx.submit([captures]() mutable { callee(args); })`
-      - 歧义处理：`spawn (` 恒走闭包形态（现有语法），`spawn func` 恒走调用形态（无歧义）
-      - 涉及文件：Parser/StmtParser.cpp, Sema/Checker/StmtChecker.cpp, CodeGen/StmtGen.cpp,
-        CodeGen/CodeGen.h, CodeGen/CoroDecide.cpp, AST/Stmt.h
-      - 实现摘要：SpawnStmt 新增 callExpr 字段；parseSpawnStmt 重写（`spawn { }` 报错 removed、
-        空参数闭包 Sema 拒绝）；genSpawnStmt 调用形态分派 genSpawnCallAsCoro/Thread；
-        syncBoundaryStack_ 边界检查（return/break/continue 跨出报错）；
-        测试 K24/K25（协程调用形态：方法调用 + 全局函数）、K26（sync thread 内混合形态）
-
-[x] P1  sync thread for 语句  [2026-07-31 提出] [2026-08-01 完成]
-      - 目标：`sync thread for x in arr { body }` 多线程并行迭代语法糖
-      - AST：SyncForStmt 新增 `bool isThread = false` 字段
-      - Parser：`parseSyncStmt()` 消费 `thread` 后检测当前 token 为 `for` → 转向新函数解析
-      - Sema：`checkSyncForStmt()` 新增 isThread 分支，设置 `inSyncThreadBlock_ = true`
-      - CodeGen：`genSyncForStmt()` 新增 isThread 分支，生成线程池展开代码：
-        ```
-        { sync_thread_context _stx; ThreadPool::ensureStarted();
-          for (auto x : *iter) {
-            _stx.submit([x, freeVars..., &io]() mutable { body });
-            gc_safepoint();
-          }
-        }
-        ```
-      - body 内禁止嵌套 spawn（已在隐式 spawn 内）
-      - body 是非协程上下文，io 方法强制 _sync 版本（现有 ioSync_ 机制覆盖）
-      - 涉及文件：AST/Stmt.h, Parser/StmtParser.cpp, Parser/Parser.h,
-        Sema/Checker/StmtChecker.cpp, CodeGen/StmtGen.cpp, CodeGen/CodeGen.h
-      - 实现摘要：parseSyncForRest 共享解析（协程/线程两入口）；线程版 submit 捕获自由变量
-        （IdRefCollector+DeclaredCollector 修复 body 引用外部变量编译失败）；R1 嵌套检查；
-        测试 K27（sum=45 验证 10 线程并发累加）
-
-[x] P2  sync for / sync thread for 省略花括号  [2026-07-31 提出] [2026-08-01 完成]
-      - 目标：`sync for i in range(10) process(i)` / `sync thread for x in arr process(x)`
-      - Parser：解析完 `itemName in iterable` 后检测下一个 token：
-        → `{` = 块体（现有），否则 = 解析 CallExpr，包装为单语句 BlockStmt
-      - 限制：仅允许 CallExpr（函数调用），拒绝 if/match/loop 等复杂控制流
-      - AST/Sema/CodeGen 零改动（body 仍是 BlockStmt，Sema/CodeGen 透明）
-      - 涉及文件：仅 Parser/StmtParser.cpp
-      - 实现摘要：parseSyncForRest 省略花括号分支（CallExpr/MethodCallExpr 包装 ExprStmt）；
-        非调用表达式报错；测试 K28（sum=10 验证协程并行 send 5 个元素）
 
 [ ] P3  sync.WaitGroup 重新设计  [2026-07-27 推迟，待场景验证]
       - 现状：v1.1 实施过程中发现 sync_thread_context 析构已自动 waitGroup

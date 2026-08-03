@@ -271,6 +271,9 @@ private:
 
     // --- 接口声明 (§4.5) ---
     void genInterfaceDecl(std::ostream& h, const InterfaceDecl& decl);
+    // 生成"类型 × 接口"适配器（方案 B：record 保持不动，适配器持值持有根）
+    void genIfaceAdapter(std::ostream& h, const std::string& recordName,
+                         const InterfaceDecl& iface);
 
     // --- 函数/方法声明 + 实现 ---
     void genFunDecl(std::ostream& h, std::ostream& cpp,
@@ -411,6 +414,15 @@ private:
 
     // 已声明的接口名（用于方法签名映射）
     std::set<std::string> interfaceNames_;
+
+    // === 接口适配器（Interface 改造）===
+    // receiverType → 其 impl 的接口名 → 接口类型实参的 C++ 类型名列表（空 = 非泛型接口）
+    // 组合收集；键 = AST 接收者名，非泛型下与 C++ 类型名一致
+    std::map<std::string, std::map<std::string, std::vector<std::string>>> interfaceImplementations_;
+    // 已生成适配器组合名缓存（record 名 + 接口名）
+    std::set<std::string> ifaceAdapterCache_;
+    // receiverType → 非构造方法名集合（结构匹配组合收集 + 适配器默认方法转发判定）
+    std::map<std::string, std::set<std::string>> recordMethods_;
 
     // 当前编译单元中已知的需要协程的函数名
     std::set<std::string> coroutineFunctions_;

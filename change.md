@@ -1,922 +1,655 @@
-# change.md — int()/float()/str() 字符串转换函数 + 通用默认参数支持
+# change.md — Interface 改造 + 根引用统一 + 内置接口（实现代码）
 
-来源：[plan/int_float_str_conversion.md](plan/int_float_str_conversion.md)（详细实施方案，2026-08-02）
-阶段划分：阶段 1 默认参数基础设施 → 阶段 2 int/float/str + throws + builtin.aurai → 阶段 3 aurai 文档文件 → 阶段 4 方法/ctor/闭包/跨模块 + README
-
-## 1. 修改文件清单
-
-| 文件 | 变更 |
-|---|---|
-| src/AST/Stmt.h | Param 加 defaultExpr；cloneParam 深拷贝（C1） |
-| src/Parser/TypeParser.cpp | parseParam 解析 `= expr`（C2） |
-| src/Sema/Symbol.h | SymParam 加 defaultExpr/hasDefault；include ASTNode.h（C3.2） |
-| src/Sema/SemAnalyzer.h | checkCallArgs 加 defaultCount；checkDefaultArgRules 声明（C3） |
-| src/Sema/SemAnalyzer.cpp | buildFuncExport 深拷贝 defaultExpr（C3.2） |
-| src/Sema/Checker/DeclChecker.cpp | declareDecl 拷贝 defaultExpr；checkDefaultArgRules 实现 + checkFunBody/checkMethodBody 调用（C3.1） |
-| src/Sema/Checker/ExprInfer.cpp | checkCallArgs 传 defaultCount；三处 throws 检查；内置分支补 inferExpr（C3.3/C3.4） |
-| src/Sema/BuiltinRegistry.h | BuiltinGlobalFn/BuiltinMethod 加 defaultCount；findFunction/findMethod 放宽；doLoadAurai 计算；移除 gc_force/gc_stats（C4/C7.1） |
-| src/CodeGen/CodeGen.h | fnDefaultArgs_/methodDefaultArgs_/CrossModuleDefaults 成员；generate 新参数（C5） |
-| src/CodeGen/CodeGen.cpp | generate 赋值 crossDefaults_（C5.4） |
-| src/CodeGen/ExprGen.cpp | genCallExpr 映射表 + 补齐 + genGcRootedArgs 分支修正；genMethodCall 方法/跨模块补齐（C5.1/C5.2/C5.3/C5.4） |
-| src/CodeGen/DeclGen.cpp | genFunDecl/genMethodDecl/genConstructor 收集默认参数（C5.1/C5.3） |
-| src/Module/ModuleManager.cpp | loadBuiltinAurai 追加 builtin.aurai（C7.1） |
-| src/main.cpp | runCgModule 构造 crossDefaults + generate 新参（C5.4） |
-| runtime/builtin/string.h | string_to_int/string_to_float/string_of 声明（C6） |
-| runtime/builtin/string.cpp | string_to_int/string_to_float 实现（参数 GcRootHandle + 值拷贝）（C6） |
-| runtime/builtin/error.h | 全部 kind 改 intern_string 预 intern（C6.4） |
-| runtime/gc/alloc.cpp | ensureOomError kind/message 预 intern（C6.4） |
-| builtins/builtin.aurai | 新建（始终加载，C7.1） |
-| builtins/channel.aurai | 追加 sync.Channel 文档声明（C7.3） |
-| builtins/mutex.aurai | 新建文档性文件（C7.3） |
-| READMEs/16-builtins.md、READMEs/05-functions.md、README.md | 文档（C7.2，阶段 4） |
+> 来源 plan：`plan/interface_rework_plan.md`（已审查）
+> 分 7 个变更块：C0 根引用统一 → C1 typeMethods_ 映射 → C2 isAssignable 结构匹配 → C3 适配器 CodeGen → C4 接口默认方法 → C5 内置接口+泛型接口 → C5b Comparable 运算符重载
+> 实施顺序：C0 → C1 → C2 → C3 → C4 → C5 → C5b（每步可独立编译验证）
 
 ---
 
-## 2. 详细实现代码
+## C0. runtime 根引用统一（GcRootHandle 三模式）
 
-### C1 — AST：Param 支持默认值表达式（src/AST/Stmt.h:15-25）
+### C0.1 修改 `runtime/gc/gc.h`
 
-修改 `struct Param` 与 `cloneParam`：
+**新增枚举**（`GcRootHandleBase` 之前）：
 
 ```cpp
-struct Param {
-    std::string name;
-    std::unique_ptr<TypeExpr> type;
-    std::unique_ptr<ASTNode> defaultExpr;  // 默认值表达式（nullptr = 无默认值）
-};
-
-inline Param cloneParam(const Param& p) {
-    Param r;
-    r.name = p.name;
-    if (p.type) r.type.reset(static_cast<TypeExpr*>(p.type->clone().release()));
-    if (p.defaultExpr) r.defaultExpr = p.defaultExpr->clone();
-    return r;
-}
+// 根持有模式：引用外部变量（栈变量）/ 值持有（适配器）/ 值持有+全局（闭包捕获）
+enum class GcRootMode : uint8_t { Ref, ValueThreadLocal, ValueGlobal };
+// 值持有模式的根作用域（编译期静态决定，非运行时判断）
+enum class GcRootScope { ThreadLocal, Global };
 ```
 
-说明：Stmt.h 已 include ASTNode.h（Stmt.h:3），`ASTNode::clone()` 返回 `std::unique_ptr<ASTNode>`，直接赋值即可。FunDecl/FunExpr/MethodDecl 复用 `std::vector<Param>`，一处修改全链路生效。
-
-### C2 — Parser：解析 `name: type = expr`（src/Parser/TypeParser.cpp:208-217）
+**修改 GcRootHandle 类定义**（替换 L73-100）：
 
 ```cpp
-Param Parser::parseParam() {
-    Param p;
-    auto& nameTok = consume(TokType::Identifier, "expected parameter name");
-    p.name = nameTok.lexeme;
+template <typename T>
+class GcRootHandle : public GcRootHandleBase {
+public:
+    // 模式 A：引用外部变量（线程局部）← 现有 CodeGen 栈变量，语义零变化
+    GcRootHandle(T& ref);
+    // 模式 B/C：值持有。scope 必须显式（无默认值），避免与 T& 重载歧义
+    //   ThreadLocal ← 接口适配器；Global ← 闭包捕获/全局缓存
+    GcRootHandle(T val, GcRootScope scope);
+    ~GcRootHandle();
 
-    if (match(TokType::Colon)) {
-        p.type = parseType();
-        // 默认参数：name: type = expr（TokType::Assign 已存在）
-        if (match(TokType::Assign)) {
-            p.defaultExpr = parseExpr();
-        }
+    // 拷贝：按 other.mode_ 分支（Ref→引用同一变量；Value→深拷贝值+独立注册）
+    GcRootHandle(const GcRootHandle& other);
+    GcRootHandle& operator=(const GcRootHandle&) = delete;
+
+    // 更新被包装的引用目标（仅 Ref 模式）
+    void rebind(T& ref) {
+        ptr_ = &ref;
+        ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
     }
-    return p;
-}
-```
 
-说明：`parseExpr()` 是表达式统一入口（ExprParser.cpp:9 `Parser::parseExpr`），parseParams（TypeParser.cpp:219-225）与 parseAurai（Parser.cpp:127-138）均复用 parseParam，aurai 声明默认参数自动支持。
+    T& operator*()  const { return *ptr_; }
+    T* operator->() const { return ptr_; }
+    T& get()              { return *ptr_; }  // 非 const：返回引用，可作赋值左侧
+    T  get()        const { return *ptr_; }  // const：返回值
 
-### C3 — Sema
+    void set(T v);                            // Ref 写外部变量；Value 写内部 val_
 
-#### C3.1 声明规则检查
-
-**src/Sema/SemAnalyzer.h**（private 区，checkCallArgs 附近）新增声明：
-
-```cpp
-    // 默认参数声明规则：尾部连续、类型可赋值、泛型参数拒绝（C3.1）
-    void checkDefaultArgRules(const ASTNode& declNode,
-                              const std::vector<Param>& params);
-```
-
-**src/Sema/Checker/DeclChecker.cpp**：在 `checkFunBody`（L261）前新增实现，并在 checkFunBody/checkMethodBody 内调用。
-
-实现（新增）：
-
-```cpp
-void SemAnalyzer::checkDefaultArgRules(const ASTNode& declNode,
-                                       const std::vector<Param>& params) {
-    bool seenDefault = false;
-    for (auto& p : params) {
-        if (!p.defaultExpr) {
-            if (seenDefault)
-                error(declNode, "parameter '" + p.name
-                      + "': default argument must be trailing");
-            continue;
-        }
-        seenDefault = true;
-        // v1 限制：泛型参数不支持默认值（isAssignable 对未绑定 T 语义未定义）
-        if (p.type && dynamic_cast<const GenericTypeRef*>(p.type.get())) {
-            error(declNode, "parameter '" + p.name
-                  + "': default argument not supported on generic parameter");
-        }
-        // 默认值表达式声明处求值检查（inferExpr 写入 defaultExpr->inferredType，C5 复用）
-        auto dt = inferExpr(*p.defaultExpr);
-        if (dynamic_cast<const ErrorSemType*>(dt.get())) {
-            error(*p.defaultExpr, "invalid default argument for parameter '" + p.name + "'");
-            continue;
-        }
-        if (p.type) {
-            auto pt = resolveType(*p.type);
-            if (!isAssignable(*pt, *dt))
-                error(*p.defaultExpr, "default argument type mismatch for parameter '"
-                      + p.name + "': expected '" + pt->toString() + "', got '"
-                      + dt->toString() + "'");
-        }
-    }
-}
-```
-
-调用点（checkFunBody，DeclChecker.cpp:287 `checkBlock` 之前）：
-
-```cpp
-    // 默认参数声明规则检查（尾部连续、类型可赋值、泛型参数拒绝）
-    checkDefaultArgRules(decl, decl.params);
-```
-
-调用点（checkMethodBody，self 注册后、checkBlock 前，DeclChecker.cpp:318 之后对应位置）：
-
-```cpp
-    checkDefaultArgRules(decl, decl.params);
-```
-
-#### C3.2 SymParam 传递
-
-**src/Sema/Symbol.h**（L24-27 + include）：
-
-```cpp
-#include "../AST/ASTNode.h"
-```
-
-```cpp
-struct SymParam {
-    std::string name;
-    std::unique_ptr<SemType> type;
-    std::unique_ptr<ASTNode> defaultExpr;  // 默认值表达式（跨模块导出 + Sema 调用检查）
-    bool hasDefault = false;
+private:
+    union { T* ptr_; T val_; };   // Ref 用 ptr_（&外部变量）；Value 用 val_（内部持值）——共享 8B 槽
+    GcRootMode mode_;             // 1B：拷贝构造与析构据此分支（Ref/ValueTL/ValueGlobal）
+    friend class GcHeap;
 };
 ```
 
-**src/Sema/Checker/DeclChecker.cpp** declareDecl FunDecl 分支（L154-156）改为：
+**删除** L137-150 `GcGlobalRoot<T>` 类定义。
+
+### C0.2 修改 `runtime/gc/handles.h`
+
+**替换 GcRootHandle 模板实现**（L20-40）：
 
 ```cpp
-        for (auto& p : f->params) {
-            SymParam sp;
-            sp.name = p.name;
-            sp.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
-            if (p.defaultExpr) { sp.defaultExpr = p.defaultExpr->clone(); sp.hasDefault = true; }
-            sym.params.push_back(std::move(sp));
-        }
-```
+template <typename T>
+GcRootHandle<T>::GcRootHandle(T& ref)
+    : GcRootHandleBase(), ptr_(&ref), mode_(GcRootMode::Ref) {
+    ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
+    GcHeap::instance().registerRootThreadLocal(this);
+}
 
-MethodDecl 分支（L169-171）同理：
+template <typename T>
+GcRootHandle<T>::GcRootHandle(T val, GcRootScope scope)
+    : GcRootHandleBase(), val_(val), ptr_(&val_), mode_(scope == GcRootScope::Global
+        ? GcRootMode::ValueGlobal : GcRootMode::ValueThreadLocal) {
+    ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
+    if (mode_ == GcRootMode::ValueGlobal)
+        GcHeap::instance().registerGlobalRoot(ptr_ref_);   // 全局根容器
+    else
+        GcHeap::instance().registerRootThreadLocal(this);  // 线程局部链表
+}
 
-```cpp
-        for (auto& p : m->params) {
-            SymParam sp;
-            sp.name = p.name;
-            sp.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
-            if (p.defaultExpr) { sp.defaultExpr = p.defaultExpr->clone(); sp.hasDefault = true; }
-            sym.params.push_back(std::move(sp));
-        }
-```
+template <typename T>
+GcRootHandle<T>::~GcRootHandle() {
+    if (!ptr_) return;
+    if (mode_ == GcRootMode::ValueGlobal)
+        GcHeap::instance().unregisterGlobalRoot(ptr_ref_);
+    else
+        GcHeap::instance().unregisterRootThreadLocal(this);
+}
 
-**src/Sema/SemAnalyzer.cpp** importFuncSymbol（L777-783）补拷贝：
-
-```cpp
-    for (auto& p : f.params) {
-        SymParam sp;
-        sp.name = p.name;
-        sp.type = p.type ? p.type->clone() : nullptr;
-        if (sp.type) qualifyRecordTypes(sp.type, alias);
-        if (p.defaultExpr) { sp.defaultExpr = p.defaultExpr->clone(); sp.hasDefault = true; }
-        sym.params.push_back(std::move(sp));
+// 拷贝：Ref → 引用同一外部变量（注册独立线程局部根，指针相同，现语义）；
+//       Value → 深拷贝值 + 独立注册（闭包捕获语义，各副本独立持有根）
+template <typename T>
+GcRootHandle<T>::GcRootHandle(const GcRootHandle& other)
+    : GcRootHandleBase(), mode_(other.mode_) {
+    if (other.mode_ == GcRootMode::Ref) {
+        ptr_ = other.ptr_;                       // 引用同一外部变量
+        ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
+        GcHeap::instance().registerRootThreadLocal(this);
+    } else {
+        val_ = other.get();                      // 深拷贝值
+        ptr_ = &val_;
+        ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
+        if (other.mode_ == GcRootMode::ValueGlobal)
+            GcHeap::instance().registerGlobalRoot(ptr_ref_);
+        else
+            GcHeap::instance().registerRootThreadLocal(this);
     }
-```
+}
 
-buildFuncExport（L819-823）补拷贝：
-
-```cpp
-    for (auto& p : params) {
-        SymParam sp;
-        sp.name = p.name;
-        sp.type = p.type ? p.type->clone() : nullptr;
-        if (p.defaultExpr) { sp.defaultExpr = p.defaultExpr->clone(); sp.hasDefault = true; }
-        fe.params.push_back(std::move(sp));
+template <typename T>
+void GcRootHandle<T>::set(T v) {
+    if (mode_ == GcRootMode::Ref) {
+        *ptr_ = v;                               // 写外部变量
+        GcHeap::instance().writeBarrier(nullptr, ptr_, static_cast<GcObject*>(v));
+    } else {
+        val_ = v;                                // 写内部 val_
     }
+}
 ```
 
-#### C3.3 checkCallArgs 数量放宽
+**删除 GcGlobalRoot 模板实现**（L50-61）。
 
-**src/Sema/SemAnalyzer.h**（L97 附近）签名加默认参数：
+**删除 GcSharedRoot<T> 类**（L63-131）——闭包捕获迁移到 `GcRootHandle<T>(val, GcRootScope::Global)`。
+
+### C0.3 迁移调用点
+
+**`runtime/builtin/string.cpp`**（7 处 `GcGlobalRoot<GcString>`）：逐处替换为值持有模式，如：
 
 ```cpp
-    void checkCallArgs(
-        const ASTNode& callNode,
-        const std::string& calleeName,
-        const std::string& role,
-        const std::vector<const SemType*>& formalTypes,
-        const std::vector<std::unique_ptr<ASTNode>>& args,
-        std::map<std::string, std::unique_ptr<SemType>>& genericMap,
-        size_t defaultCount = 0);   // 尾部默认参数个数（C3.1 保证连续）
+// 修改前（示例 1 处）
+static GcGlobalRoot<GcString> emptyRoot(GcString::from(""));
+// 修改后
+static GcRootHandle<GcString*> emptyRoot(nullptr, aura_rt::GcRootScope::Global);
+// 使用处 emptyRoot.get() 接口不变
 ```
 
-**src/Sema/SemAnalyzer.cpp**（L457-462）数量检查替换：
+（其余 6 处同式替换；`GcString::empty()/from(bool)/from(int)` 等全局单例缓存。）
+
+**`src/CodeGen/ExprGen.cpp`** 闭包捕获（约 L1224，生成 `[name = aura_rt::GcSharedRoot<T>(name.get())]`）：
 
 ```cpp
-    // 参数数量检查（支持默认参数：实参数量在 [min, total] 内合法）
-    size_t total = formalTypes.size();
-    size_t min   = total - defaultCount;
-    if (args.size() < min || args.size() > total) {
-        std::string expected = (min == total) ? std::to_string(total)
-                                              : (std::to_string(min) + "~" + std::to_string(total));
-        error(callNode, role + " '" + calleeName + "' expects " + expected +
-              " arguments, got " + std::to_string(args.size()));
+// 修改前
+h << "[name = aura_rt::GcSharedRoot<T>(" << name << ".get())]";
+// 修改后
+h << "[name = aura_rt::GcRootHandle<T>(" << name << ".get(), "
+  << "aura_rt::GcRootScope::Global)]";
+```
+
+### C0.4 验证
+
+- 编译 runtime + aurac；回归 intern 字符串、闭包捕获、栈变量包装（example/used + test.aura 全量）
+- `GcRootHandle` 内存 40B（基类 24 + union 8 + mode_ 1 + padding），assert 或注释核对
+
+---
+
+## C1. Sema "类型→方法"映射（typeMethods_）
+
+### C1.1 修改 `src/Sema/SemAnalyzer.h`
+
+private 区新增（`symtab_` 附近）：
+
+```cpp
+// ============ 接口结构匹配（Interface 改造）============
+// receiverType 规范名 → 该 record 类型拥有的方法签名（buildTypeMethods 构建）
+std::map<std::string, std::vector<InterfaceSemType::MethodSig>> typeMethods_;
+// 第 1 遍末尾统一构建（resolveType 安全时刻）
+void buildTypeMethods(const Program& program);
+// receiverType 规范名（查符号表 RecordSemType.canonicalName）
+[[nodiscard]] std::string recordTypeKey(const std::string& receiverType) const;
+```
+
+### C1.2 实现（`src/Sema/Checker/DeclChecker.cpp` 或 SemAnalyzer.cpp）
+
+**注意：`MethodDecl.receiverType` 是 `std::string`（非 TypeExpr）**，recordTypeKey 直接查符号表：
+
+```cpp
+std::string SemAnalyzer::recordTypeKey(const std::string& receiverType) const {
+    auto* sym = symtab_.lookup(receiverType);
+    if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
+        if (auto* rec = dynamic_cast<const RecordSemType*>(sym->type.get()))
+            return rec->canonicalName.empty() ? rec->name : rec->canonicalName;
     }
-```
+    return "";   // 非 record 接收者（v1 接口仅支持 record 实现）
+}
 
-类型检查循环（L465）保持 `i < args.size() && i < formalTypes.size()` 不变（缺失默认参数不参与泛型映射）。
-
-**src/Sema/Checker/ExprInfer.cpp** 各调用点：
-
-符号表函数分支（L179-186）：
-
-```cpp
-    if (sym->kind == SymKind::Function || sym->kind == SymKind::Method) {
-        checkThrowsContext(e, callee->name, sym->throws);
-        std::vector<const SemType*> formalTypes;
-        for (auto& p : sym->params) formalTypes.push_back(p.type.get());
-        size_t dc = 0;
-        for (auto it = sym->params.rbegin(); it != sym->params.rend() && it->hasDefault; ++it) ++dc;
-        checkCallArgs(e, callee->name, "function", formalTypes, e.args, genericMap, dc);
-        auto result = sym->type ? sym->type->clone() : ErrorSemType::make();
-        return applyGenericMap(std::move(result), genericMap);
-    }
-```
-
-import 命名空间函数分支（L222-228）：
-
-```cpp
-                // 函数调用 — 复用 checkCallArgs 检查逻辑（泛型绑定：实参→形参映射用于实例化返回类型）
-                checkThrowsContext(e, e.method, imported->throws);
-                std::vector<const SemType*> formalTypes;
-                for (auto& p : imported->params) formalTypes.push_back(p.type.get());
-                std::map<std::string, std::unique_ptr<SemType>> genericMap;
-                size_t dc = 0;
-                for (auto it = imported->params.rbegin(); it != imported->params.rend() && it->hasDefault; ++it) ++dc;
-                checkCallArgs(e, e.method, "function", formalTypes, e.args, genericMap, dc);
-                auto result = imported->type ? imported->type->clone() : NoneSemType::make();
-                return applyGenericMap(std::move(result), genericMap);
-```
-
-ctor 分支（L191）与函数类型变量分支（L200）不改（v1 闭包/ctor 默认参数由 C5.3 覆盖 CodeGen，Sema 侧传默认 0）。
-
-#### C3.4 throws 检查补缺口 + inferExpr
-
-**src/Sema/Checker/ExprInfer.cpp** L168-175 内置全局函数分支替换：
-
-```cpp
-    if (!sym) {
-        // 不在符号表中 → 查 BuiltinRegistry 全局函数
-        if (auto* fn = BuiltinRegistry::get().findFunction(callee->name, (int)e.args.size())) {
-            checkThrowsContext(e, callee->name, fn->throws);   // C3.4 补缺口
-            // 与 inferMethodCall 对齐：推断参数类型（CodeGen GcRootHandle 依赖 inferredType）
-            for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
-            return semTypeFromBuiltinReturn(fn->returns);
-        }
-        error(*e.callee, "undefined identifier '" + callee->name + "'");
-        return ErrorSemType::make();
-    }
-```
-
-内置模块函数分支（L237-247）：
-
-```cpp
-    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
-        std::string fqName = id->name + "." + e.method;
-        if (auto* fn = BuiltinRegistry::get().findFunction(fqName, (int)e.args.size())) {
-            checkThrowsContext(e, e.method, fn->throws);   // C3.4 补缺口
-            for (auto& arg : e.args) {
-                if (arg) (void)inferExpr(*arg);
+void SemAnalyzer::buildTypeMethods(const Program& program) {
+    typeMethods_.clear();
+    for (auto& d : program.decls) {
+        if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
+            if (m->isConstructor || m->receiverType.empty()) continue;
+            std::string key = recordTypeKey(m->receiverType);
+            if (key.empty()) continue;
+            InterfaceSemType::MethodSig sig;
+            sig.name = m->name;
+            // 签名直接 resolveType 解析（第 1 遍末尾所有类型已声明，resolveType 安全）
+            // 注：不从符号表 lookup(m->name) 取——不同 record 的同名方法会取错符号
+            for (auto& p : m->params) {
+                if (p.type) sig.paramTypes.push_back(resolveType(*p.type));
+                else        sig.paramTypes.push_back(ErrorSemType::make());
             }
-            return semTypeFromBuiltinReturn(fn->returns);
+            if (m->returnType) sig.returnType = resolveType(*m->returnType);
+            sig.throws = m->throws;
+            typeMethods_[key].push_back(std::move(sig));
         }
     }
+}
 ```
 
-内置类型方法分支（L270 `findMethod` 命中后）补 throws 检查：
+### C1.3 调用时机（`src/Sema/Checker/DeclChecker.cpp` declareTopLevel 末尾）
 
 ```cpp
-        if (auto* entry = BuiltinRegistry::get().findMethod(typeKey, e.method, (int)e.args.size())) {
-            checkThrowsContext(e, e.method, entry->throws);   // C3.4 补缺口
-            auto& ret = entry->returns;
-            ...
+void SemAnalyzer::declareTopLevel(const Program& program) {
+    for (auto& d : program.decls) {
+        if (d) declareDecl(*d);
+    }
+    // 第 1 遍末尾统一构建：此时所有 record/interface/方法符号已注册，resolveType 安全
+    buildTypeMethods(program);
+}
+```
+
+> 说明：`implInterface` 一致性验证仍走第 2 遍 checkMethodBody（现有 L455-503），结构匹配不依赖 impl 声明。
+
+---
+
+## C2. Sema isAssignable 结构匹配（record → 接口）
+
+修改 `src/Sema/SemAnalyzer.cpp` L366-377 接口分支：
+
+```cpp
+    // 接口类型：单方法接口可由闭包满足；具体 record 结构匹配（方法名+签名全满足）
+    if (auto* iface = dynamic_cast<const InterfaceSemType*>(&target)) {
+        // 1. 闭包 → 单方法接口（现有路径保留）
+        if (auto* func = dynamic_cast<const FuncSemType*>(&source)) {
+            if (iface->methods.size() == 1) {
+                auto& m = iface->methods[0];
+                return matchFuncSig(m.paramTypes, m.returnType.get(), m.throws,
+                                   func->paramTypes, func->returnType.get(), func->throws);
+            }
+            return false;
         }
-```
-
-### C4 — BuiltinRegistry：defaultCount 与匹配放宽（src/Sema/BuiltinRegistry.h）
-
-**L58-63 / L65-72** 两结构体加字段：
-
-```cpp
-struct BuiltinGlobalFn {
-    std::string name;
-    std::vector<ParamInfo> params;   // 按参数数量区分重载
-    ReturnTypeInfo  returns;
-    bool throws = false;
-    int  defaultCount = 0;   // 尾部默认参数个数（C3.1 保证连续）
-};
-
-struct BuiltinMethod {
-    std::string typeName;       // "string", "[T]", "Io", "Path"
-    std::string methodName;
-    std::vector<ParamInfo> params;
-    ReturnTypeInfo  returns;
-    bool throws  = false;       // 是否标记 throws
-    bool hasAsync = false;      // 是否有异步版本（用于协程判定，Io 方法特有）
-    int  defaultCount = 0;      // 尾部默认参数个数
-};
-```
-
-**findMethod**（L104-113）匹配放宽：
-
-```cpp
-        for (auto& m : methods_) {
-            if (m.typeName == typeName && m.methodName == methodName
-                && (int)m.params.size() - m.defaultCount <= argCount
-                && argCount <= (int)m.params.size())
-                return &m;
-        }
-```
-
-**findFunction**（L151-157）匹配放宽：
-
-```cpp
-        for (auto& f : functions_) {
-            if (f.name == name
-                && (int)f.params.size() - f.defaultCount <= argCount
-                && argCount <= (int)f.params.size())
-                return &f;
-        }
-```
-
-**doLoadAurai** FunDecl 分支（L203-211）计算 defaultCount：
-
-```cpp
-            } else if (auto* fn = dynamic_cast<const FunDecl*>(d.get())) {
-                BuiltinGlobalFn gf;
-                gf.name   = fn->name;
-                gf.throws = fn->throws;
-                for (auto& p : fn->params) {
-                    gf.params.push_back({p.name, typeExprToName(p.type.get())});
+        // 2. 具体 record → 结构匹配（README"结构类型自动实现"）
+        if (auto* rec = dynamic_cast<const RecordSemType*>(&source)) {
+            std::string key = rec->canonicalName.empty() ? rec->name : rec->canonicalName;
+            auto it = typeMethods_.find(key);
+            if (it == typeMethods_.end()) return false;   // 无方法 → 不满足
+            for (auto& im : iface->methods) {
+                // 接口每个方法必须在 record 方法集中存在同名同签名
+                bool found = false;
+                for (auto& rm : it->second) {
+                    if (rm.name != im.name) continue;
+                    found = matchFuncSig(im.paramTypes, im.returnType.get(), im.throws,
+                                         rm.paramTypes, rm.returnType.get(), rm.throws);
+                    break;
                 }
-                // 默认参数计数（尾部连续，aurai 声明侧同样遵守 C3.1）
-                for (auto it = fn->params.rbegin(); it != fn->params.rend() && it->defaultExpr; ++it)
-                    ++gf.defaultCount;
-                gf.returns = extractReturnType(fn->returnType.get());
-                functions_.push_back(std::move(gf));
+                if (!found) return false;
             }
-```
-
-### C5 — CodeGen
-
-#### C5.1/C5.3 成员与 generate 签名（src/CodeGen/CodeGen.h）
-
-**generate 声明**（L102-106）加参数：
-
-```cpp
-    // -- 主入口 --
-    // 生成一个编译单元（.aura → .cpp/.h）
-    // crossDefaults: 跨模块函数默认参数表（C5.4，多文件模式由 main.cpp 构造）
-    [[nodiscard]] CompileUnit generate(const Program& program,
-                                        const std::string& moduleName = "main",
-                                        const std::vector<CodeGenImport>& imports = {},
-                                        const std::string& nsName = "",
-                                        const CodeGenConfig& config = {},
-                                        const CrossModuleDefaults& crossDefaults = {});
-```
-
-**私有成员**（L470 `fnCallbackParams_` 之后、L474 `expectedTemplateArgs_` 前）新增：
-
-```cpp
-    // 函数名 → 默认值表达式指针数组（长度 = 形参总数；nullptr = 无默认值）
-    // 同模块函数调用点补默认实参（C5.1）；AST 指针来自本模块 Program，生命周期安全
-    std::map<std::string, std::vector<const ASTNode*>> fnDefaultArgs_;
-
-    // 方法键 "ReceiverType.methodName" / ctor 键 "ReceiverType" → 默认值表达式数组（C5.3）
-    std::map<std::string, std::vector<const ASTNode*>> methodDefaultArgs_;
-
-    // 跨模块函数默认参数：模块名 → (函数名 → 默认值表达式数组)（C5.4）
-    // AST 指针来自依赖模块 ModuleInfo.exports（常驻内存，多文件 CodeGen 并行只读）
-    using CrossModuleDefaults = std::map<std::string,
-        std::map<std::string, std::vector<const ASTNode*>>>;
-    CrossModuleDefaults crossDefaults_;
-```
-
-#### src/CodeGen/CodeGen.cpp generate 实现（L27 附近）赋值
-
-```cpp
-    crossDefaults_ = crossDefaults;
-```
-
-#### 收集点（src/CodeGen/DeclGen.cpp）
-
-**genFunDecl**（L176）：在 L219 `declarationsOnly` 提前返回之后、L221 `valueTypeVarNames_.clear()` 前插入：
-
-```cpp
-    // C5.1: 收集函数默认参数表（调用点补实参用；长度 = 形参总数，无默认值为 nullptr）
-    {
-        std::vector<const ASTNode*> defaults(decl.params.size(), nullptr);
-        bool any = false;
-        for (size_t i = 0; i < decl.params.size(); ++i)
-            if (decl.params[i].defaultExpr) { defaults[i] = decl.params[i].defaultExpr.get(); any = true; }
-        if (any) fnDefaultArgs_[decl.name] = std::move(defaults);
-    }
-```
-
-**genMethodDecl**（L361）：在 L368 `if (declarationsOnly) return;` 之后插入（非 ctor 方法）：
-
-```cpp
-    // C5.3: 收集方法默认参数表
-    {
-        std::vector<const ASTNode*> defaults(decl.params.size(), nullptr);
-        bool any = false;
-        for (size_t i = 0; i < decl.params.size(); ++i)
-            if (decl.params[i].defaultExpr) { defaults[i] = decl.params[i].defaultExpr.get(); any = true; }
-        if (any) methodDefaultArgs_[decl.receiverType + "." + decl.name] = std::move(defaults);
-    }
-```
-
-**genConstructor**（L488）：函数开头插入：
-
-```cpp
-    // C5.3: 收集构造函数默认参数表（键 = 类型名，genCallExpr isCtor 分支消费）
-    {
-        std::vector<const ASTNode*> defaults(decl.params.size(), nullptr);
-        bool any = false;
-        for (size_t i = 0; i < decl.params.size(); ++i)
-            if (decl.params[i].defaultExpr) { defaults[i] = decl.params[i].defaultExpr.get(); any = true; }
-        if (any) methodDefaultArgs_[decl.receiverType] = std::move(defaults);
-    }
-```
-
-#### C5.2 全局函数映射表（src/CodeGen/ExprGen.cpp genCallExpr）
-
-在 L553（`bool isCtor = false;`）之前插入：
-
-```cpp
-    // C5.2: 全局内置函数映射（int/float/str 是 C++ 关键字，必须在 safeName 前拦截）
-    static const std::map<std::string, std::string> kGlobalFnMap = {
-        {"int",   "aura_rt::string_to_int"},
-        {"float", "aura_rt::string_to_float"},
-        {"str",   "aura_rt::string_of"},
-    };
-    if (auto gmap = kGlobalFnMap.find(calleeName); gmap != kGlobalFnMap.end()) {
-        std::vector<std::string> argExprs;
-        for (size_t i = 0; i < e.args.size(); ++i)
-            argExprs.push_back(genExpr(*e.args[i], isCoroutine));
-        // 内置默认参数补齐：int 的 base=10（defaultCount 驱动，v1 生成字面量）
-        if (auto* fn = BuiltinRegistry::get().findFunction(calleeName, (int)e.args.size())) {
-            for (size_t i = argExprs.size(); i < fn->params.size(); ++i)
-                argExprs.push_back("10");
+            return true;
         }
-        std::string callExpr = gmap->second + "(";
-        for (size_t i = 0; i < argExprs.size(); ++i) { if (i > 0) callExpr += ", "; callExpr += "{" + std::to_string(i) + "}"; }
-        callExpr += ")";
-        // 统一走 genGcRootedArgs 保护（string 参数为堆类型）
-        std::vector<std::pair<std::string, const SemType*>> gcArgs;
-        for (size_t i = 0; i < argExprs.size(); ++i)
-            gcArgs.emplace_back(argExprs[i], i < e.args.size() ? e.args[i]->inferredType.get() : nullptr);
-        return genGcRootedArgs(gcArgs, callExpr, isCoroutine);
+        return false; // 其他类型不能满足接口
     }
 ```
 
-#### C5.1/C5.3 调用点补齐（genCallExpr）
+**缺方法报错**（调用点可给出更友好提示）：在 checkCallArgs / inferCall 中，实参类型是 RecordSemType 而形参是 InterfaceSemType 且不满足时，现有报错已是"expected 'Iface', got 'Record'"。本阶段补充：当 record 差一个方法时提示方法名（可选增强，v1 用现有通用报错）。
 
-L594 后插入：
+验证：`welcome(u: User)` 编译通过；缺 `greet` 方法时编译失败。
+
+---
+
+## C3. CodeGen 接口适配器（方案 B）
+
+### C3.1 修改 `src/CodeGen/CodeGen.h`
+
+public 区新增（`genInterfaceDecl` 附近）：
 
 ```cpp
-    std::vector<std::string> argExprs;
-    // C5.1/C5.3: 同模块函数 / ctor 默认参数补齐（调用点补实参，支持任意表达式）
-    if (isCtor) {
-        if (auto ctIt = methodDefaultArgs_.find(calleeName); ctIt != methodDefaultArgs_.end())
-            for (size_t k = e.args.size(); k < ctIt->second.size(); ++k)
-                if (ctIt->second[k]) argExprs.push_back(genExpr(*ctIt->second[k], isCoroutine));
-    } else if (auto fit = fnDefaultArgs_.find(calleeName); fit != fnDefaultArgs_.end()) {
-        for (size_t k = e.args.size(); k < fit->second.size(); ++k)
-            if (fit->second[k]) argExprs.push_back(genExpr(*fit->second[k], isCoroutine));
-    }
+    // 生成"类型 × 接口"适配器（方案 B：record 保持不动，适配器持值持有根）
+    void genIfaceAdapter(std::ostream& h, const std::string& recordName,
+                         const InterfaceDecl& iface);
+    // 已生成适配器组合名缓存（record 名 + 接口名）
+    std::set<std::string> ifaceAdapterCache_;
 ```
 
-#### genGcRootedArgs 分支修正（L630-635）
+### C3.2 组合收集 + 生成入口（`src/CodeGen/CodeGen.cpp`）
 
-原 `if (!e.args.empty())` 改为基于 argExprs（补齐参数也要走 GC 保护）：
+在 generate 的第一遍扫描（interfaceNames_ 收集处 L90-91 附近）同步收集组合：
 
 ```cpp
-    // 有堆类型参数 → GcRootHandle 保护（含构造函数调用、补齐的默认实参）
-    if (!argExprs.empty()) {
-        std::vector<std::pair<std::string, const SemType*>> gcArgs;
-        for (size_t i = 0; i < argExprs.size(); ++i) {
-            const SemType* ty = nullptr;
-            if (i < e.args.size()) {
-                ty = e.args[i]->inferredType.get();
-            } else if (isCtor) {
-                auto ctIt = methodDefaultArgs_.find(calleeName);
-                if (ctIt != methodDefaultArgs_.end() && ctIt->second[i])
-                    ty = ctIt->second[i]->inferredType.get();
-            } else {
-                auto fit = fnDefaultArgs_.find(calleeName);
-                if (fit != fnDefaultArgs_.end() && fit->second[i])
-                    ty = fit->second[i]->inferredType.get();
-            }
-            gcArgs.emplace_back(argExprs[i], ty);
+        if (auto* i = dynamic_cast<const InterfaceDecl*>(d.get()))
+            interfaceNames_.insert(i->name);
+        // 接口适配器组合收集：record 方法声明 → (receiverType, 该接口名)
+        // ⚠️ Bug 1 修复：只收集非泛型 record（receiverTypeArgs 为空）——
+        //   泛型 record 的 C++ 类型名是 "Stack<T>"（DeclGen.cpp:541-549 拼接模板参数），
+        //   receiverType 仅 "Stack"，适配器类型名无法对应。v1 泛型 record 接接口 → Sema 报错。
+        if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
+            if (!m->implInterface.empty() && m->receiverTypeArgs.empty())
+                interfaceImplementations_[m->receiverType].insert(m->implInterface);
         }
-        return genGcRootedArgs(gcArgs, callExpr, isCoroutine);
-    }
 ```
 
-说明：补齐参数的 inferredType 由 C3.1 `inferExpr` 写入 defaultExpr 节点；string 字面量默认值（intern_string 返回 GcString*）经此正确获得 GcRootHandle 保护。无堆参数分支（L637-645）遍历 argExprs 无需改动。
-
-#### C5.3 方法补齐（genMethodCall，ExprGen.cpp:648）
-
-在 L784（mArgExprs 构造）前插入：
+CodeGen.h 增加成员：
 
 ```cpp
-    // C5.3: 方法默认参数补齐（阶段 4；键 = ReceiverType.methodName）
-    std::string recvTypeKey;
-    if (e.object->inferredType) {
-        if (auto* p = dynamic_cast<const PrimSemType*>(e.object->inferredType.get())) {
-            if (p->kind == PrimSemType::String) recvTypeKey = "string";
-        } else if (dynamic_cast<const ListSemType*>(e.object->inferredType.get())) {
-            recvTypeKey = "[T]";
-        } else if (auto* g = dynamic_cast<const GenericSemType*>(e.object->inferredType.get())) {
-            recvTypeKey = g->name;
-        }
-    }
-    // 先收集参数表达式（含默认参数补齐）
-    std::vector<std::string> mArgExprs;
-    if (auto mmIt = methodDefaultArgs_.find(recvTypeKey + "." + e.method); mmIt != methodDefaultArgs_.end()) {
-        for (size_t k = e.args.size(); k < mmIt->second.size(); ++k)
-            if (mmIt->second[k]) mArgExprs.push_back(genExpr(*mmIt->second[k], isCoroutine));
-    }
+    // receiverType → 其 impl 的接口名集合（组合收集；键 = AST 接收者名，非泛型下与 C++ 类型名一致）
+    std::map<std::string, std::set<std::string>> interfaceImplementations_;
 ```
 
-（原 L784-786 的收集循环保留在其后，遍历 e.args。）
+> **泛型 record 实现接口 → Sema 报错**（checkMethodBody 的 impl 验证处追加）：
+> ```cpp
+> if (!decl.receiverTypeArgs.empty()) {
+>     error(decl, "generic type '" + decl.receiverType
+>           + "' cannot implement interface in v1 (adapter generation unsupported)");
+> }
+> ```
 
-#### C5.4 跨模块函数默认参数
-
-**src/main.cpp** runCgModule（L351-367 cgImports 构建后、L370 CodeGen 前）插入：
+在 `genInterfaceDecl` 生成入口（CodeGen.cpp L185-189，declarationsOnly 分支）之后，为每个实现组合生成适配器：
 
 ```cpp
-        // C5.4: 收集跨模块函数默认参数（导出表携带默认值表达式 AST，常驻内存只读）
-        Aura::CodeGenerator::CrossModuleDefaults crossDefaults;
-        for (auto& imp : mod->imports) {
-            if (imp.isBuiltin) continue;
-            auto it = mgr.modules().find(imp.path);
-            if (it == mgr.modules().end()) continue;
-            auto& modDefaults = crossDefaults[it->second.moduleName];
-            for (auto& [fnName, f] : it->second.exports.funcs) {
-                std::vector<const ASTNode*> defaults(f.params.size(), nullptr);
-                bool any = false;
-                for (size_t i = 0; i < f.params.size(); ++i)
-                    if (f.params[i].defaultExpr) { defaults[i] = f.params[i].defaultExpr.get(); any = true; }
-                if (any) modDefaults[fnName] = std::move(defaults);
+    if (auto* i = dynamic_cast<const InterfaceDecl*>(&decl)) {
+        if (declarationsOnly) {
+            genInterfaceDecl(h, *i);
+            // 为所有实现该接口的 record 生成适配器（在接口基类之后、record 之前）
+            for (auto& [rec, ifaces] : interfaceImplementations_) {
+                if (ifaces.count(i->name) == 0) continue;
+                std::string key = rec + i->name;
+                if (ifaceAdapterCache_.count(key)) continue;
+                ifaceAdapterCache_.insert(key);
+                genIfaceAdapter(h, rec, *i);
             }
         }
+        return;
+    }
 ```
 
-（代码需 `#include "../AST/ASTNode.h"`，main.cpp 已含相关头；`ASTNode` 来自 f.params[i].defaultExpr 的 `get()`。）
-
-generate 调用（L371）改为：
+### C3.3 适配器生成（`src/CodeGen/DeclGen.cpp` 新增）
 
 ```cpp
-        auto unit = cg.generate(*mod->ast, mod->moduleName, cgImports, mod->nsName, Aura::CodeGenConfig(), crossDefaults);
+// record × 接口适配器：持值持有根，转发到 record 具体方法
+void CodeGenerator::genIfaceAdapter(std::ostream& h,
+                                    const std::string& recordName,
+                                    const InterfaceDecl& iface) {
+    std::string adapterName = safeName(recordName) + iface.name;
+    h << "struct " << adapterName << " final : " << iface.name << " {\n";
+    h << "  aura_rt::GcRootHandle<" << recordName << "*> obj;\n";   // 模式 B：值持有+线程局部根
+    h << "  explicit " << adapterName << "(" << recordName << "* o)\n";
+    h << "      : obj(o, aura_rt::GcRootScope::ThreadLocal) {}\n";  // 显式 scope（避免匹配模式 A）
+    for (auto& m : iface.methods) {
+        std::string retType = m.returnType ? mapType(*m.returnType) : "void";
+        h << "  " << retType << " " << m.name << "(";
+        for (size_t i = 0; i < m.params.size(); ++i) {
+            if (i > 0) h << ", ";
+            h << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
+              << " " << safeName(m.params[i].name);
+        }
+        h << ") const override {\n";
+        h << "    return obj.get()->" << m.name << "(";
+        for (size_t i = 0; i < m.params.size(); ++i) {
+            if (i > 0) h << ", ";
+            h << safeName(m.params[i].name);
+        }
+        h << ");\n";
+        h << "  }\n";
+    }
+    h << "};\n\n";
+}
 ```
 
-**genMethodCall** isNs 分支补齐（ExprGen.cpp:784 mArgExprs 收集处，与 C5.3 合并）：
+> 注意：`obj.get()->greet()` 要求 record 的具体方法为 C++ 成员函数（PendingMethod 机制已嵌入 struct），直接虚调用。
+
+### C3.4 调用点双源包装（`src/CodeGen/ExprGen.cpp` L621-648）
 
 ```cpp
-    // C5.4: 跨模块函数默认参数补齐（math.foo(...) 缺参时）
-    if (isNs) {
-        if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
-            auto cmIt = crossDefaults_.find(id->name);
-            if (cmIt != crossDefaults_.end()) {
-                auto fnIt = cmIt->second.find(e.method);
-                if (fnIt != cmIt->second.end())
-                    for (size_t k = e.args.size(); k < fnIt->second.size(); ++k)
-                        if (fnIt->second[k]) mArgExprs.push_back(genExpr(*fnIt->second[k], isCoroutine));
+    // 接口参数自动包装（双源：闭包 → IfaceFunc；具体 record → 适配器；接口变量 → 透传）
+    // ⚠️ Bug 4 修复：透传判定完全基于 inferredType（InterfaceSemType），
+    //    删除现有 arg.find(ifaceName) 字符串判断——record 名含接口名子串（如 GreetableUser）
+    //    或 inferredType 缺失时都会误判
+    auto ipIt = fnInterfaceParams_.find(calleeName);
+    ...
+    for (size_t i = 0; i < e.args.size(); ++i) {
+        std::string arg = genExpr(*e.args[i], isCoroutine);
+        if (ipIt != fnInterfaceParams_.end()) {
+            for (auto& [idx, ifaceName] : ipIt->second) {
+                if (idx == i) {
+                    const SemType* argTy = e.args[i]->inferredType;
+                    if (argTy && dynamic_cast<const InterfaceSemType*>(argTy)) {
+                        // 接口参数透传（已在传参处构造适配器）：不包装
+                    } else if (auto* rt = dynamic_cast<const RecordSemType*>(argTy)) {
+                        // 具体 record → 适配器构造（v1 仅非泛型 record，见 C3.2）
+                        std::string recName = rt->canonicalName.empty() ? rt->name : rt->canonicalName;
+                        arg = safeName(recName) + ifaceName + "(" + arg + ")";
+                    } else {
+                        // 闭包/其他路径：直接包装为 IfaceFunc（不再用 find 判断）
+                        arg = ifaceName + "Func(" + arg + ")";
+                    }
+                    break;
+                }
             }
         }
+        ...
     }
 ```
 
-（注意：isNsCtor 分支 L757-767 构造调用不补齐——跨模块 ctor 默认参数 v1 不支持，记录 TODO。）
+验证：`g.greet()` 运行时正确；welcome 内 io.println 触发 GC 后仍正确（ASAN 辅助）；多接口各适配器独立。
 
-单文件模式 main.cpp:165 `cg.generate(*program, moduleName, cgImports, "", cfg)` 走默认参数，零改动。
+---
 
-### C6 — runtime（src/../../runtime/builtin/string.h、string.cpp）
+## C4. 接口默认方法（模式 1）
 
-**string.h**（GcString::from 声明后）新增：
+### C4.1 修改 `src/AST/Stmt.h` InterfaceMethodSig（L397-402）
 
 ```cpp
-    // ── 字符串 ↔ 数值转换（Python 风格 int()/float()/str()）──
-    // int(s, base=10)：解析失败抛 ValueError；base 仅 0 或 2~36
-    [[nodiscard]] int32_t string_to_int(GcString* s, int32_t base = 10);
-    // float(s)：支持 inf/infinity/nan（大小写不敏感）；溢出返回 ±inf（不报错）
-    [[nodiscard]] double string_to_float(GcString* s);
-
-    // str(x)：直接转发 GcString::from（string 原样返回）
-    inline GcString* string_of(int32_t v) { return GcString::from(v); }
-    inline GcString* string_of(int64_t v) { return GcString::from(v); }
-    inline GcString* string_of(double v)  { return GcString::from(v); }
-    inline GcString* string_of(bool v)    { return GcString::from(v); }
-    inline GcString* string_of(GcString* s) { return s; }
+struct InterfaceMethodSig {
+    std::string name;
+    std::vector<Param> params;
+    bool throws = false;
+    std::unique_ptr<TypeExpr> returnType;
+    std::unique_ptr<BlockStmt> defaultBody;   // 默认实现（nullptr = 必须实现）
+    // clone() 同步复制 defaultBody（与 InterfaceDecl::clone 同改）
+};
 ```
 
-**string.cpp** 追加实现（文件末尾；补充 `#include <cerrno> <cctype> <climits> <cmath>`）：
+InterfaceDecl::clone（L408-422）中同步：
 
 ```cpp
-// ============================================================
-// string_to_int — Python 风格 int(s, base=10)
-// 解析失败抛 ValueError；base 仅 0 或 2~36（0 = 自动前缀检测）
-// GC 安全：s 为 GC 堆裸指针，本函数内 make_string/make_value_error 会分配
-// 并可能触发 GC/compact（移动 s）。措施：
-//   1) GcRootHandle 保活 s（GC 后指针自动更新）；
-//   2) 立即值拷贝内容到 C++ 栈（std::string），使 string_view 不再引用 GC 内存。
-// ============================================================
-int32_t string_to_int(GcString* s, int32_t base) {
-    if (!s) throw make_value_error("invalid literal for int(): <None>");
-    aura_rt::GcRootHandle<GcString> root(s);
-    std::string input(s->view());
-    std::string_view v = input;
-    // 错误消息统一构造（make_value_error 仅接受 const char* / GcString*，std::string 需 .c_str()）
-    auto err = [base, &v](const std::string& msg) -> void {
-        throw make_value_error(msg.c_str());
-    };
-    if (v.empty()) err("invalid literal for int() with base " + std::to_string(base) + ": ''");
-    if (base != 0 && (base < 2 || base > 36))
-        err("int() base must be >= 2 and <= 36, or 0");
+            sig.throws = m.throws;
+            if (m.returnType) sig.returnType.reset(...);
+            if (m.defaultBody) sig.defaultBody.reset(
+                static_cast<BlockStmt*>(m.defaultBody->clone().release()));
+```
 
-    size_t start = 0;
-    bool neg = false;
-    if (v[0] == '+' || v[0] == '-') { neg = (v[0] == '-'); start = 1; }
-    std::string_view body = v.substr(start);
-    if (body.empty())
-        err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
+### C4.2 修改 `src/Parser/TypeParser.cpp` parseInterfaceMethodSig（L231-249）
 
-    // 前缀自动检测（Python 3.11 行为：base=10 也认前缀；显式 base 与前缀冲突 → ValueError）
-    int32_t effBase = base;
-    size_t bodyStart = 0;
-    if (body.size() >= 2 && body[0] == '0') {
-        char c = static_cast<char>(std::tolower(static_cast<unsigned char>(body[1])));
-        int32_t want = 0;
-        if (c == 'x') want = 16; else if (c == 'o') want = 8; else if (c == 'b') want = 2;
-        if (want != 0) {
-            if (effBase != 0 && effBase != want)
-                err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
-            effBase = want;
-            bodyStart = 2;
+```cpp
+    // 接口方法签名后可选函数体（默认实现）：签名后直接 `{`
+    if (check(TokType::LBrace)) {
+        sig->defaultBody = parseBlock();
+    }
+```
+
+（与闭包语法区分：接口方法签名后直接 `{` 即默认实现体。）
+
+### C4.3 修改 `src/CodeGen/DeclGen.cpp` genInterfaceDecl（L131-141）
+
+```cpp
+    for (auto& m : decl.methods) {
+        std::string retType = m.returnType ? mapType(*m.returnType) : "void";
+        if (m.defaultBody) {
+            // 有默认实现 → 非纯虚；体内 self 映射 this
+            h << "  virtual " << retType << " " << m.name << "(";
+            ... 参数列表同现有 ...
+            h << ") const {\n";
+            // 生成默认方法体（复用 genBlock，StmtGen.cpp:11 签名 genBlock(ostream&, const BlockStmt&, bool)）
+            currentReceiverName_ = "self";
+            genBlock(h, *m.defaultBody, /*isCoroutine=*/false);
+            currentReceiverName_.clear();
+            h << "  }\n";
+        } else {
+            h << "  virtual " << retType << " " << m.name << "(" ... << ") const = 0;\n";
         }
     }
-
-    std::string cstr(body.substr(bodyStart));
-    if (cstr.empty())
-        err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
-    errno = 0;
-    char* end = nullptr;
-    long long val = std::strtoll(cstr.c_str(), &end, effBase);
-    bool consumed = (end == cstr.c_str() + cstr.size()) && end != cstr.c_str();
-    if (!consumed || errno == ERANGE)
-        err("invalid literal for int() with base " + std::to_string(base) + ": '" + std::string(v) + "'");
-    long long result = neg ? -val : val;
-    if (result > INT32_MAX || result < INT32_MIN)
-        err("int() overflow: '" + std::string(v) + "'");
-    return static_cast<int32_t>(result);
-}
-
-// ============================================================
-// string_to_float — Python 风格 float(s)
-// 支持 inf/infinity/nan（大小写不敏感）；ERANGE 溢出返回 ±inf（不报错）
-// GC 安全策略同 string_to_int（GcRootHandle + 值拷贝）
-// ============================================================
-double string_to_float(GcString* s) {
-    if (!s) throw make_value_error("could not convert string to float: <None>");
-    aura_rt::GcRootHandle<GcString> root(s);
-    std::string input(s->view());
-    std::string_view v = input;
-    auto err = [&v](const std::string& msg) -> void {
-        throw make_value_error(msg.c_str());
-    };
-    if (v.empty()) err("could not convert string to float: ''");
-
-    size_t start = 0;
-    bool neg = false;
-    if (v[0] == '+' || v[0] == '-') { neg = (v[0] == '-'); start = 1; }
-    // 特殊 token：inf / infinity / nan（大小写不敏感，可带符号）
-    std::string lower(v.substr(start));
-    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (lower == "inf" || lower == "infinity") return neg ? -INFINITY : INFINITY;
-    if (lower == "nan") return NAN;
-
-    std::string cstr(v);
-    errno = 0;
-    char* end = nullptr;
-    double val = std::strtod(cstr.c_str(), &end);
-    bool consumed = (end == cstr.c_str() + cstr.size()) && end != cstr.c_str();
-    if (!consumed)
-        err("could not convert string to float: '" + std::string(v) + "'");
-    return val;   // ERANGE 溢出 → ±inf（Python 行为，不报错）
-}
 ```
 
-注意：`make_value_error`（error.h:29-34）仅接受 `const char*` 或 `GcString*`，`std::string` 无到 `const char*` 的隐式转换——上述实现通过局部 lambda `err` 统一 `.c_str()` 转换。string.cpp 需补充 `#include <cerrno> <cctype> <climits> <cmath>`；GcRootHandle 已在 `#include "../gc.h"`（string.cpp:9）中定义。
+> 实现细节：genInterfaceDecl 内直接内联生成体，或抽取 `genInterfaceDefaultBody`；self 复用 `currentReceiverName_` 映射 this 机制。v1 限制：默认方法返回接口类型 → Sema 报错。
 
-#### C6.4 Error kind/message 的 RootHandle 保护（error.h + alloc.cpp）
+### C4.4 Sema 校验（checkMethodBody 附近）
 
-**CodeGen 层 GcRootHandle 保护已存在**（审查确认，与预 intern 叠加构成双保险）：
+接口声明后校验默认方法体（inferExpr 检查返回类型与声明一致）；"必须实现集合" = 无 defaultBody 的方法。
 
-| 路径 | 位置 | 保护 |
-|---|---|---|
-| throw `{ kind, message }` | StmtGen.cpp:351-357 | `_hk`/`_hm` GcRootHandle + `.get()` |
-| throw Error 表达式 | StmtGen.cpp:360-364 | `_he` GcRootHandle + `Error(_he.get())` |
-| catch（`let x = e!` variant 分支） | StmtGen.cpp:617-619 | `_eh_kind/_eh_msg/_eh_extra`（字段地址入根） |
-| catch（genTryCatchNoSetupIIFE） | StmtGen.cpp:678-680 | 同上 |
-| catch（genTryCatchRaw） | StmtGen.cpp:702-704 | 同上 |
-| `!` 传播 | ExprGen.cpp:966-971 | 不持有 Error（异常自然传播，靠上层 catch） |
+验证：默认方法继承、override、返回基础类型。
 
-GcRootHandle 构造时注册 `&cv.kind`（字段地址），compact 时 `updateAllReferences` 解引用更新字段本身——**Error.kind/message/extra 在 catch 块存续期间由根自动转发到新地址**。因此预 intern 的 kind 即使被 compact 移动，catch 端也会在构造 `_eh_kind` 时重新固定。
+---
 
-**预 intern（error.h）**：`make_*_error` 系列 9 个工厂 × 2 重载的 kind 从 `make_string` 改 `intern_string`——kind 入 g_internPool 全局根（永不回收）、L1 线程缓存命中（错误路径零重复分配）。替代代码（以 ValueError 为例，其余 8 个 kind 同理）：
+## C5. 内置接口 + 泛型接口支持
+
+### C5.1 `src/AST/Stmt.h` InterfaceDecl 加 typeParams + clone 同步（Bug 6）
 
 ```cpp
-inline Error make_value_error(const char* msg) {
-    return Error{intern_string("ValueError"), make_string(msg)};
-}
-inline Error make_value_error(GcString* msg) {
-    return Error{intern_string("ValueError"), msg};
-}
+struct InterfaceDecl : Decl {
+    std::string name;
+    std::vector<std::string> typeParams;          // 泛型参数（如 Iterator<T> 的 T）
+    std::vector<InterfaceMethodSig> methods;
+    // clone() 中：n->typeParams = typeParams;
+};
 ```
 
-**oomError_ 预 intern（runtime/gc/alloc.cpp:481-491）**：OOM 路径是 GcHeap 成员持 Error 的唯一持有点（栈上，不参与 GC 扫描），且 OOM 时 `make_string` 分配可能再次失败/触发递归。改用 `intern_string`（GC 启动时池已就绪，L1 缓存命中零分配）：
+### C5.2 `src/Parser/DeclParser.cpp` parseInterfaceDecl 解析泛型参数（L108-124）
 
 ```cpp
-void GcHeap::ensureOomError() {
-    if (oomError_.kind) return;  // 已初始化（fast path）
-    if (oomInit_.load()) return;  // 递归防护（同线程递归调用被挡掉）
+    decl->name = nameTok.lexeme;
+    // 泛型参数：interface Iterator<T>
+    if (match(TokType::Less)) {
+        do {
+            auto& tp = consume(TokType::Identifier, "expected type parameter in interface");
+            decl->typeParams.push_back(tp.lexeme);
+        } while (match(TokType::Comma));
+        consume(TokType::Greater, "expected '>' after interface type parameters");
+    }
+    consume(TokType::LBrace, "expected '{' after interface name");
+```
 
-    oomInit_.store(true);
-    // 预 intern：OOM 路径零分配（L1 缓存命中）、字符串入全局根永不回收
-    oomError_.kind    = intern_string("OutOfMemoryError");
-    oomError_.message = intern_string("memory exhausted after GC");
-    oomInit_.store(false);
+### C5.3 MethodDecl impl 复合结构（Bug 8）
+
+**`src/AST/Stmt.h`** L461：
+
+```cpp
+    std::string implInterface;                              // 接口名（如 "Comparable"）
+    std::vector<std::unique_ptr<TypeExpr>> implTypeArgs;    // 类型实参（如 <Point>），可空
+    // clone() 同步复制 implTypeArgs
+```
+
+**`src/Parser/DeclParser.cpp`** L146-149：
+
+```cpp
+    if (match(TokType::Impl)) {
+        auto& implTok = consume(TokType::Identifier, "expected interface name after 'impl'");
+        decl->implInterface = implTok.lexeme;
+        // 泛型接口实参：impl Comparable<Point>
+        if (match(TokType::Less)) {
+            do { decl->implTypeArgs.push_back(parseType()); } while (match(TokType::Comma));
+            consume(TokType::Greater, "expected '>' after interface type arguments");
+        }
+    }
+```
+
+**`src/Sema/Checker/DeclChecker.cpp`** checkMethodBody 的接口验证（L456-503）适配：
+
+```cpp
+        if (!ifaceSym || ifaceSym->kind != SymKind::Interface) { ...现有报错... }
+        else {
+            // 泛型接口：类型实参 substitute（implTypeArgs ↔ typeParams 数量校验）
+            if (!decl.implTypeArgs.empty() && ifaceSym->interfaceMethods.empty())
+                ; // 无方法接口不参与签名验证
+            // 比对时：若接口有泛型参数，将 m.paramTypes/returnType 中的 GenericSemType
+            // 按 substitute 替换为 implTypeArgs 后，再与实现方法签名 isAssignable 比对
+            for (auto& m : ifaceSym->interfaceMethods) {
+                if (m.name == decl.name) { ...现有数量/参数/返回/throws 比对，签名用替换后类型... }
+            }
+        }
+```
+
+### C5.4 新建 `builtins/interfaces.aurai`
+
+```aura
+// 内置常见接口（builtin 模块自动加载）
+interface Stringer {
+    to_string() -> string
+}
+
+interface Comparable<T> {
+    cmp(other: T) -> int                // 三路比较核心（<0/=0/>0）：实现它 → 全部符号自动
+    equal(other: T) -> bool { return cmp(other) == 0 }   // ==
+    ne(other: T) -> bool { return !equal(other) }        // !=
+    less(other: T) -> bool { return cmp(other) < 0 }     // <
+    greater(other: T) -> bool { return cmp(other) > 0 }  // >
+    le(other: T) -> bool { return !greater(other) }      // <=
+    ge(other: T) -> bool { return !less(other) }         // >=
+}
+
+interface Iterator<T> {
+    next() -> Optional<T>
+    collect() -> [T] { ... }   // 默认方法示范（返回基础类型，v1 允许）
 }
 ```
 
-边界说明：kind/message 的 GcRootHandle 保护已完备（throw 端 + catch 端 + 预 intern 三重），无遗留缺口；`Error` 作为值拷贝被用户持久存储（如存入数组）不在本 plan 范围（Aura 类型系统无 Error 类型，catch 变量仅访问 `.kind`/`.message`/`.extra` 字段，均受 GcRootHandle 保护）。
-
-### C7 — 注册与文档
-
-#### C7.1 builtins/builtin.aurai（新建）
-
-```
-// 基础内置全局函数（始终加载）
-// int/float/str 语义对齐 Python 3；解析失败抛 ValueError（throws）
-// range/channel/sync.* 保留硬编码注册（BuiltinRegistry.h:301-320）
-fun gc_force() -> None
-fun gc_stats() -> string
-fun int(s: string, base: int = 10) throws -> int
-fun float(s: string) throws -> float
-fun str(x: int) -> string
-fun str(x: float) -> string
-fun str(x: bool) -> string
-fun str(x: string) -> string
-```
-
-**src/Module/ModuleManager.cpp** loadBuiltinAurai（L226-229）：
+### C5.5 `src/Module/ModuleManager.cpp` loadBuiltinAurai 追加（L226-230）
 
 ```cpp
 void ModuleManager::loadBuiltinAurai() {
     loadAuraiFile("io.aurai");
-    loadAuraiFile("builtin.aurai");  // 基础内置全局函数（int/float/str/gc_*）
+    loadAuraiFile("builtin.aurai");      // 基础内置全局函数（int/float/str/gc_*）
+    loadAuraiFile("interfaces.aurai");   // 内置接口（Stringer/Comparable/Iterator）
     // path.aurai 不在此加载——由 import path 时按需加载
 }
 ```
 
-**src/Sema/BuiltinRegistry.h** init() functions_（L318-319）删除：
+### C5.6 str() 衔接
+
+`str(obj)` 若实参静态类型实现 Stringer → 直接方法调用 `obj->to_string()`（v1 绕过接口）。ExprGen.cpp C5.2 全局映射分支中：当实参 inferredType 是 RecordSemType 且该 record 方法集含 to_string 时，将 `{0}` 替换为 `arg.to_string()`（生成 `.to_string()` 成员调用）。
+
+验证：`Iterator<int>` 用户实现 next() + collect() 默认方法；`str(user)` 走 Stringer。
+
+---
+
+## C5b. Comparable 运算符重载（最后实现）
+
+### C5b.1 Sema（`src/Sema/Checker/ExprInfer.cpp` inferBinaryExpr）
+
+比较符号 `<` `<=` `>` `>=` `==` `!=` 处理：左右 inferredType 均为相同 RecordSemType 时，查该 record 是否实现 `Comparable<T>`（通过符号表查接口符号 + recordTypeKey + typeMethods_ 中同名方法）：
 
 ```cpp
-            // GC 内建函数
-            {"gc_force", {}, ReturnTypeInfo::None()},
-            {"gc_stats", {}, ReturnTypeInfo::Named("string")},
+// 伪码：inferBinaryExpr 的 op 是 Ls/Le/Gt/Ge/Eq/Ne 分支前
+if (isComparisonOp(e.op)) {
+    auto* lt = dynamic_cast<const RecordSemType*>(e.lhs->inferredType.get());
+    auto* rt = dynamic_cast<const RecordSemType*>(e.rhs->inferredType.get());
+    if (lt && rt && lt->canonicalName == rt->canonicalName) {
+        std::string key = ...canonicalName...;
+        // 校验实现了 Comparable<T>（cmp 或对应符号存在），否则报错：
+        //   "type 'X' does not implement Comparable, cannot use operator '<'"
+        // 缺符号推导源时：
+        //   "missing '<' implementation: implement cmp() or less() for ordered comparison"
+        return boolType();   // 比较结果恒 bool（inferredType 仅表达类型，不携带标记）
+    }
+    // 否则维持现有行为
+}
 ```
 
-（改为注释说明已迁移 builtin.aurai；range×3/channel/sync.* 保留不动。）
+### C5b.2 CodeGen（`src/CodeGen/ExprGen.cpp` genBinaryExpr）
 
-#### C7.3 aurai 文档文件
+比较符号分发：**判定"record 实现 Comparable"不依赖 inferredType 标记**（Bug 3 修复：inferredType 是 `const SemType*` 且比较符号推断为 `boolType()`，无法携带标记）——改为查询 C3.2 的组合收集集合 `interfaceImplementations_`（键 = record 名，含 "Comparable" 即视为实现）：
 
-**builtins/channel.aurai** 末尾追加：
-
-```
-// ──────────────────────────────────────────────────────────
-// sync.Channel<T>：sync thread 跨线程通信通道
-// 本段为文档性质（不加载），权威注册见 BuiltinRegistry.h
-// ──────────────────────────────────────────────────────────
-type sync.Channel<T>
-fun sync.Channel(cap: int) -> sync.Channel<T>
-fun sync.Channel() -> sync.Channel<T>
-fun (self sync.Channel<T>) send(value: T)
-fun (self sync.Channel<T>) receive() -> Optional<T>
-fun (self sync.Channel<T>) close()
-fun (self sync.Channel<T>) is_done() -> bool
-```
-
-**builtins/mutex.aurai**（新建）：
-
-```
-// 锁原语（文档性质，不加载；权威注册见 BuiltinRegistry.h types_/functions_）
-type Mutex
-type RWMutex
-type Once
-type RWMutexReadView
-type RWMutexWriteView
-fun sync.Mutex() -> Mutex
-fun sync.RWMutex() -> RWMutex
-fun sync.Once() -> Once
-fun (self RWMutex) r() -> RWMutexReadView
-fun (self RWMutex) w() -> RWMutexWriteView
-```
-
----
-
-## 3. 测试计划（example/test.aura，compile.cmd 非 ASAN + test.exe）
-
-```aura
-# 阶段 2 用例（K 组）
-fun main(io: Io) -> None {
-    # int 基础
-    let a = int("42")!                    # 42
-    let b = int("  -17")!                 # -17
-    let c = int("0xff")!                  # 255
-    let d = int("ff", 16)!                # 255
-    let e = int("0b101", 0)!              # 5
-    let f = int("12", 5)!                 # 7
-    # float
-    let g = float("3.14")!                # 3.14
-    let h = float("1e3")!                 # 1000
-    let i = float("Infinity")!            # inf
-    let j = float("1e999")!               # inf
-    # str
-    let k = str(42)                       # "42"
-    let l = str(3.14)                     # "3.14"
-    let m = str(true)                     # "true"
-    let n = str("abc")                    # "abc"
-    # 默认参数
-    let p = add(1)                        # 11
-    let q = add(1, 2)                     # 3
-    let r = greet()                       # "hello world"
-    # throws 检查
-    try {
-        let _ = int("abc")!
-        io.println("FAIL: should throw")
-    } catch e {
-        io.println(e)
+```cpp
+// 判定：lhs 的静态类型是 RecordSemType，且其名在 interfaceImplementations_ 中关联 Comparable
+auto* lt = dynamic_cast<const RecordSemType*>(e.lhs->inferredType);
+if (lt) {
+    std::string recName = lt->canonicalName.empty() ? lt->name : lt->canonicalName;
+    auto it = interfaceImplementations_.find(recName);
+    // 兜底：适配器名按 receiverType 生成（C3.3），此处用同一 recName 匹配
+    if (it != interfaceImplementations_.end() && it->second.count("Comparable") > 0) {
+        // 生成：<recName>Comparable(a.get()).less(<recName>Comparable(b.get()))
+        // a、b 是 GcRootHandle 变量 → genExpr 生成 "a.get()"（已是 User*），直接传适配器
+        std::string lhs = genExpr(*e.lhs, isCoroutine);   // 如 "p1.get()"
+        std::string rhs = genExpr(*e.rhs, isCoroutine);
+        // op → 接口方法名映射：< → less, <= → le, > → greater, >= → ge, == → equal, != → ne
+        return adapterName + "(" + lhs + ")." + methodName
+             + "(" + adapterName + "(" + rhs + "))";
     }
 }
-
-fun add(a: int, b: int = 10) -> int {
-    a + b
-}
-
-fun greet(n: string = "world") -> string {
-    "hello " + n
-}
+// 否则维持现有比较代码生成（string→string_eq、基础类型内置等）
 ```
 
-负向用例（Sema 编译期报错，单独文件验证）：
-- `fun bad(a: int = 1, b: int)` → "default argument must be trailing"
-- `fun bad2(a: int = "x")` → "default argument type mismatch"
-- `fun bad3<T>(x: T = 5)` → "default argument not supported on generic parameter"
-- `let x = int("42")`（裸调用，非 throws 上下文）→ E016_ThrowsViolation
+> 注意：C5b.1 Sema 校验与 C5b.2 CodeGen 判定共用同一数据源（Sema 用 typeMethods_、CodeGen 用 interfaceImplementations_，两者同源于 receiverType 名，非泛型下一致），避免两套逻辑漂移。
+
+验证：Point 实现 `impl Comparable<Point>` 的 cmp → `p1 < p2`、`p1 == p2`、`p1 <= p2` 直接可用；override 某符号生效；只实现 equal+less 也能用全部；缺实现报错；`Point < Rect` 类型不匹配报错。
 
 ---
 
-## 4. 验证步骤（分阶段）
+## 删除项汇总
 
-1. `cmake --build build`（C1-C5 编译通过）
-2. `cmake --build runtime/build`（C6 runtime 重编，注意 AGENTS.md 中 runtime 构建独立）
-3. 阶段 1 单测：K-def1/K-def2/K-def3
-4. 阶段 2 单测：K-int/float/str/throws 全组 + `for i in range(5)` 回归 + `gc_force()` 回归
-5. used/ 系列回归 + 多文件并行三档（-j1/-j2/默认）产物逐字节一致
-6. 阶段 4：方法/ctor 默认参数用例、跨模块默认参数用例（used/ 下双文件）
-7. 全部通过后：移除 TODO.txt 对应条目
+| 文件 | 删除内容 |
+|---|---|
+| runtime/gc/gc.h | `GcGlobalRoot<T>` 类定义 |
+| runtime/gc/handles.h | `GcGlobalRoot` 实现、`GcSharedRoot<T>` 整个类 |
+| runtime/builtin/string.cpp | 7 处 `GcGlobalRoot` 使用（改为 GcRootHandle 值持有+Global） |
 
-## 5. 风险备注
+## 测试计划（写入 example/test.aura 分阶段验证）
 
-- str×4 重载 findFunction 首个命中 `str(x:int)`：返回类型均为 string，无类型影响（plan 风险 2）
-- `int`/`float`/`str` 作为变量名：Sema lookup 优先变量（遮蔽生效），CodeGen safeName 转义 int→int_，行为一致
-- C5.2 映射表必须在 safeName 前（genCallExpr L553 前），否则 int 被转义为 int_
-- 跨模块 ctor 默认参数、闭包默认参数 v1 不支持（TODO 记录）
-- **GC 安全修正（审查项）**：
-  - string_to_int/string_to_float 入口 GcRootHandle 保活 s + 值拷贝（string_view 不再引用 GC 内存），消除错误路径 make_string 触发 compact 移动 s 导致的悬垂（C6）
-  - Error kind/message 保护已完备：CodeGen throw 端（StmtGen.cpp:351-357/360-364）+ catch 端（617-619/678-680/702-704）均生成 GcRootHandle 持有字段地址；error.h 全部 kind + alloc.cpp oomError_ 改 intern_string（全局根常驻、L1 缓存零分配）（C6.4）
-  - **回归关注**：error.h 变更影响全部既有错误构造路径（array.tcc / io / mutex 等），需全量回归验证 Error.kind 取值不变
+1. C0：回归（intern/闭包捕获/栈变量）
+2. C1+C2：`welcome(u: User)` 编译通过；缺方法报错
+3. C3：`g.greet()` 正确；GC 压力（welcome 内 io.println 循环触发 GC）；多接口
+4. C4：默认方法继承；override；默认方法返回基础类型
+5. C5：`Iterator<int>` next+collect；`str(user)` 走 Stringer
+6. C5b：六符号直接比较；override；equal+less 组合；缺实现/混类型报错
+7. 回归：example/used 全量

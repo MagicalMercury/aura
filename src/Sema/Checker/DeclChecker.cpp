@@ -51,9 +51,107 @@ static void registerTypeGenerics(SymbolTable& symtab, const TypeExpr& type) {
 // 第 1 遍：声明顶层符号
 // ============================================================
 
+// receiverType 规范名：查符号表 RecordSemType.canonicalName（与 isAssignable 查询一致）
+std::string SemAnalyzer::recordTypeKey(const std::string& receiverType) const {
+    auto* sym = symtab_.lookup(receiverType);
+    if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
+        if (auto* rec = dynamic_cast<const RecordSemType*>(sym->type.get()))
+            return rec->canonicalName;   // 空 = 匿名 record（无法实现接口）
+    }
+    return "";   // 非 record 接收者（v1 接口仅支持 record 实现）
+}
+
+// 构建 receiverType → 方法签名映射（接口结构匹配数据源）
+void SemAnalyzer::buildTypeMethods(const Program& program) {
+    typeMethods_.clear();
+    for (auto& d : program.decls) {
+        if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
+            if (m->isConstructor || m->receiverType.empty()) continue;
+            std::string key = recordTypeKey(m->receiverType);
+            if (key.empty()) continue;
+            InterfaceSemType::MethodSig sig;
+            sig.name = m->name;
+            // 签名直接 resolveType 解析（第 1 遍末尾所有类型已声明，resolveType 安全）
+            // 注：不从符号表 lookup(m->name) 取——不同 record 的同名方法会取错符号
+            for (auto& p : m->params) {
+                if (p.type) sig.paramTypes.push_back(resolveType(*p.type));
+                else        sig.paramTypes.push_back(ErrorSemType::make());
+            }
+            if (m->returnType) sig.returnType = resolveType(*m->returnType);
+            sig.throws = m->throws;
+            typeMethods_[key].push_back(std::move(sig));
+        }
+    }
+}
+
 void SemAnalyzer::declareTopLevel(const Program& program) {
+    // 内置接口先注册（interfaces.aurai：Stringer/Comparable/Iterator），
+    // 用户 decls 可引用内置接口（如 impl Comparable<Point>）
+    for (auto& i : BuiltinRegistry::get().auraiInterfaces())
+        declareInterface(*i);
     for (auto& d : program.decls) {
         if (d) declareDecl(*d);
+    }
+    // 第 1 遍末尾统一构建 typeMethods_：此时所有 record/interface/方法符号已注册，
+    // recordTypeKey 的 resolveType 安全（declareDecl 阶段前向/自引用类型可能未注册）
+    buildTypeMethods(program);
+    // 显式 impl 收集（第 1 遍末尾，record 类型已全部注册，recordTypeKey 安全）
+    recordImplIfaces_.clear();
+    for (auto& d : program.decls) {
+        if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
+            if (m->implInterface.empty() || m->receiverType.empty()) continue;
+            std::string key = recordTypeKey(m->receiverType);
+            if (!key.empty())
+                recordImplIfaces_[key].insert(m->implInterface);
+        }
+    }
+    // 显式 impl 完整性验证：record 声明 impl 接口 → 接口所有非默认方法必须已实现
+    verifyImplCompleteness(program);
+}
+
+// ============================================================
+// 显式 impl 完整性验证（第 1 遍末尾）
+// ============================================================
+void SemAnalyzer::verifyImplCompleteness(const Program& program) {
+    for (auto& [recKey, ifaces] : recordImplIfaces_) {
+        for (auto& ifaceName : ifaces) {
+            auto* sym = symtab_.lookup(ifaceName);
+            if (!sym || sym->kind != SymKind::Interface) continue;  // 未找到接口 → 已报错
+            auto tmIt = typeMethods_.find(recKey);
+            for (auto& m : sym->interfaceMethods) {
+                if (m.hasDefault) continue;  // 默认方法豁免
+                bool found = false;
+                if (tmIt != typeMethods_.end()) {
+                    for (auto& rm : tmIt->second) {
+                        if (rm.name != m.name) continue;
+                        found = matchFuncSig(m.paramTypes, m.returnType.get(), m.throws,
+                                             rm.paramTypes, rm.returnType.get(), rm.throws);
+                        break;
+                    }
+                }
+                if (!found) {
+                    // 定位报错节点：该 record 任意一个带 impl 的方法声明
+                    const MethodDecl* anchor = nullptr;
+                    for (auto& d : program.decls) {
+                        if (auto* md = dynamic_cast<const MethodDecl*>(d.get())) {
+                            if (md->implInterface == ifaceName && !md->receiverType.empty()
+                                && recordTypeKey(md->receiverType) == recKey) {
+                                anchor = md;
+                                break;
+                            }
+                        }
+                    }
+                    if (anchor) {
+                        error(*anchor,
+                              "type '" + recKey + "' implements interface '" + ifaceName +
+                              "' but does not implement required method '" + m.name + "'");
+                    } else {
+                        error(0, 0, "type '" + recKey + "' implements interface '" + ifaceName +
+                              "' but does not implement required method '" + m.name + "'");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -120,20 +218,7 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         return;
     }
     if (auto* i = dynamic_cast<const InterfaceDecl*>(&decl)) {
-        Symbol sym;
-        sym.kind = SymKind::Interface;
-        sym.name = i->name;
-        sym.isPublic = i->isPublic;  // Phase B
-        for (auto& m : i->methods) {
-            InterfaceSemType::MethodSig sig;
-            sig.name   = m.name;
-            for (auto& p : m.params)
-                sig.paramTypes.push_back(p.type ? resolveType(*p.type) : ErrorSemType::make());
-            sig.returnType = m.returnType ? resolveType(*m.returnType) : nullptr;
-            sig.throws = m.throws;
-            sym.interfaceMethods.push_back(std::move(sig));
-        }
-        symtab_.defineGlobal(std::move(sym));
+        declareInterface(*i);
         return;
     }
     if (auto* f = dynamic_cast<const FunDecl*>(&decl)) {
@@ -260,6 +345,37 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
         return t;
     }
     return ErrorSemType::make();
+}
+
+// ============================================================
+// 接口符号注册（用户接口 + 内置 .aurai 接口共用）
+// ============================================================
+void SemAnalyzer::declareInterface(const InterfaceDecl& i) {
+    Symbol sym;
+    sym.kind = SymKind::Interface;
+    sym.name = i.name;
+    sym.isPublic = i.isPublic;  // Phase B
+    sym.typeParams = i.typeParams;  // 泛型参数名（checkMethodBody substitute 用）
+    // 泛型参数先注册（方法签名可能引用 T，如 cmp(other: T)）
+    symtab_.enterScope(ScopeKind::Function);
+    for (auto& tp : i.typeParams) {
+        Symbol tpSym;
+        tpSym.kind = SymKind::GenericParam;
+        tpSym.name = tp;
+        symtab_.define(std::move(tpSym));
+    }
+    for (auto& m : i.methods) {
+        InterfaceSemType::MethodSig sig;
+        sig.name   = m.name;
+        for (auto& p : m.params)
+            sig.paramTypes.push_back(p.type ? resolveType(*p.type) : ErrorSemType::make());
+        sig.returnType = m.returnType ? resolveType(*m.returnType) : nullptr;
+        sig.throws = m.throws;
+        sig.hasDefault = m.defaultBody != nullptr;   // 默认方法豁免结构匹配
+        sym.interfaceMethods.push_back(std::move(sig));
+    }
+    symtab_.exitScope();
+    symtab_.defineGlobal(std::move(sym));
 }
 
 // ============================================================
@@ -454,10 +570,34 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
 
     // impl 接口一致性验证
     if (!decl.implInterface.empty()) {
+        // 泛型 record 实现接口 → v1 报错（适配器类型名无法对应，见 C3.2）
+        if (!decl.receiverTypeArgs.empty()) {
+            error(decl, "generic type '" + decl.receiverType
+                  + "' cannot implement interface in v1 (adapter generation unsupported)");
+        }
         auto* ifaceSym = symtab_.lookup(decl.implInterface);
         if (!ifaceSym || ifaceSym->kind != SymKind::Interface) {
             error(decl, "interface '" + decl.implInterface + "' not found");
         } else {
+            // 泛型接口：implTypeArgs ↔ typeParams 数量校验（substitute 前置条件）
+            if (!ifaceSym->typeParams.empty() && decl.implTypeArgs.size() != ifaceSym->typeParams.size()) {
+                error(decl, "interface '" + decl.implInterface + "' expects " +
+                      std::to_string(ifaceSym->typeParams.size()) + " type argument(s), got " +
+                      std::to_string(decl.implTypeArgs.size()));
+            } else if (ifaceSym->typeParams.empty() && !decl.implTypeArgs.empty()) {
+                error(decl, "interface '" + decl.implInterface + "' is not generic");
+            }
+            // 接口签名代换：将接口方法签名中的泛型形参（T/U...）替换为 impl 类型实参
+            // （如 Comparable<T> 的 cmp(other: T) 在 impl Comparable<Point> 下为 cmp(other: Point)）
+            auto substIface = [&](const SemType& t) -> std::unique_ptr<SemType> {
+                std::unique_ptr<SemType> cur = t.clone();
+                for (size_t k = 0; k < ifaceSym->typeParams.size()
+                                  && k < decl.implTypeArgs.size(); ++k) {
+                    auto concrete = resolveType(*decl.implTypeArgs[k]);
+                    cur = substitute(*cur, ifaceSym->typeParams[k], *concrete);
+                }
+                return cur;
+            };
             bool found = false;
             for (auto& m : ifaceSym->interfaceMethods) {
                 if (m.name == decl.name) {
@@ -469,22 +609,24 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
                     }
                     for (size_t i = 0; i < decl.params.size() && i < m.paramTypes.size(); ++i) {
                         if (decl.params[i].type && m.paramTypes[i]) {
+                            auto ifaceParamTy = substIface(*m.paramTypes[i]);
                             auto implParamTy = resolveType(*decl.params[i].type);
-                            if (!isAssignable(*m.paramTypes[i], *implParamTy)) {
+                            if (!isAssignable(*ifaceParamTy, *implParamTy)) {
                                 error(*decl.params[i].type,
                                       "impl method '" + decl.name + "' parameter " +
                                       std::to_string(i + 1) + " type mismatch: expected '" +
-                                      m.paramTypes[i]->toString() + "', got '" +
+                                      ifaceParamTy->toString() + "', got '" +
                                       implParamTy->toString() + "'");
                             }
                         }
                     }
                     if (decl.returnType && m.returnType) {
+                        auto ifaceRetTy = substIface(*m.returnType);
                         auto implRetTy = resolveType(*decl.returnType);
-                        if (!isAssignable(*m.returnType, *implRetTy)) {
+                        if (!isAssignable(*ifaceRetTy, *implRetTy)) {
                             error(*decl.returnType,
                                   "impl method '" + decl.name + "' return type mismatch: expected '" +
-                                  m.returnType->toString() + "', got '" +
+                                  ifaceRetTy->toString() + "', got '" +
                                   implRetTy->toString() + "'");
                         }
                     }

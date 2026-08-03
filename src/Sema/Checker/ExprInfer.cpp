@@ -122,6 +122,28 @@ std::unique_ptr<SemType> SemAnalyzer::inferBinaryExpr(const BinaryExpr& e) {
         }
         return lt->clone();
     }
+    // C5b: 比较符号 → Comparable 校验（左右均为 record 时）
+    // 同类型 record：要求显式 impl Comparable（recordImplIfaces_ 判定）
+    // 不同类型 record：显式报错（避免 C++ 指针比较静默通过）
+    if (op == "<" || op == "<=" || op == ">" || op == ">=" || op == "==" || op == "!=") {
+        auto* ltRec = dynamic_cast<const RecordSemType*>(lt.get());
+        auto* rtRec = dynamic_cast<const RecordSemType*>(rt.get());
+        if (ltRec && rtRec) {
+            if (ltRec->canonicalName == rtRec->canonicalName) {
+                auto it = recordImplIfaces_.find(ltRec->canonicalName);
+                bool hasCmp = it != recordImplIfaces_.end()
+                           && it->second.count("Comparable") > 0;
+                if (!hasCmp) {
+                    error(e, "type '" + ltRec->canonicalName + "' does not implement Comparable, "
+                          "cannot use operator '" + op + "' (declare impl Comparable<" + ltRec->canonicalName + "> and implement cmp())");
+                }
+            } else {
+                error(e, "cannot compare '" + ltRec->canonicalName + "' and '"
+                      + rtRec->canonicalName + "' (different types)");
+            }
+            return boolType();
+        }
+    }
     // 比较：返回 bool
     if (op == "<" || op == "<=" || op == ">" || op == ">=") {
         return boolType();
@@ -257,6 +279,21 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     }
 
     auto objType = inferExpr(*e.object);
+
+    // 接口类型 receiver（接口默认方法体内 self.method(...) 调用）：
+    // 在接口方法集中查找，返回声明返回类型（参数逐个校验 v1 简化，由接口定义保证）
+    if (auto* iface = dynamic_cast<const InterfaceSemType*>(objType.get())) {
+        for (auto& m : iface->methods) {
+            if (m.name == e.method) {
+                checkThrowsContext(e, e.method, m.throws);
+                for (auto& arg : e.args)
+                    if (arg) (void)inferExpr(*arg);
+                return m.returnType ? m.returnType->clone() : NoneSemType::make();
+            }
+        }
+        error(e, "interface '" + iface->name + "' has no method '" + e.method + "'");
+        return ErrorSemType::make();
+    }
 
     // 查 BuiltinRegistry：若对象类型匹配已知内置类型，
     // 返回注册的返回类型。

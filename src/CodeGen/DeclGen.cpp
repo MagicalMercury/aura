@@ -125,23 +125,56 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
                                       const InterfaceDecl& decl) {
     std::string name = decl.name;
 
+    // 泛型接口 → 模板抽象基类（template<typename T> struct Comparable { ... }）
+    // 方法签名中的泛型引用（GenericTypeRef → "T"）在模板作用域内有效
+    std::string tprefix;
+    if (!decl.typeParams.empty()) {
+        tprefix = "template<";
+        for (size_t i = 0; i < decl.typeParams.size(); ++i) {
+            if (i > 0) tprefix += ", ";
+            tprefix += "typename " + decl.typeParams[i];
+        }
+        tprefix += ">\n";
+    }
+
     // 1. 抽象基类
-    h << "struct " << name << " {\n";
+    h << tprefix << "struct " << name << " {\n";
     h << "  virtual ~" << name << "() = default;\n";
     for (auto& m : decl.methods) {
         std::string retType = m.returnType ? mapType(*m.returnType) : "void";
-        h << "  virtual " << retType << " " << m.name << "(";
-        for (size_t i = 0; i < m.params.size(); ++i) {
-            if (i > 0) h << ", ";
-            h << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
-              << " " << safeName(m.params[i].name);
+        if (m.defaultBody) {
+            // 有默认实现 → 非纯虚；体内 self 映射 this（虚调用，尊重派生 override）
+            h << "  virtual " << retType << " " << m.name << "(";
+            for (size_t i = 0; i < m.params.size(); ++i) {
+                if (i > 0) h << ", ";
+                h << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
+                  << " " << safeName(m.params[i].name);
+            }
+            h << ") const {\n";
+            currentReceiverName_ = "self";
+            genBlock(h, *m.defaultBody, /*isCoroutine=*/false);
+            currentReceiverName_.clear();
+            // 清理方法体生成残留的变量跟踪状态（与 genMethodDecl 末尾一致）
+            valueTypeVarNames_.clear();
+            stringVarNames_.clear();
+            gcRootVarNames_.clear();
+            gcRootTypes_.clear();
+            h << "  }\n";
+        } else {
+            h << "  virtual " << retType << " " << m.name << "(";
+            for (size_t i = 0; i < m.params.size(); ++i) {
+                if (i > 0) h << ", ";
+                h << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
+                  << " " << safeName(m.params[i].name);
+            }
+            h << ") const = 0;\n";
         }
-        h << ") const = 0;\n";
     }
     h << "};\n\n";
 
-    // 2. std::function 包装器（闭包适配器）
-    if (decl.methods.size() == 1) {
+    // 2. std::function 包装器（闭包适配器）——仅非泛型单方法接口
+    // 泛型接口的闭包适配器 v1 不支持（闭包无类型参数可绑定）
+    if (decl.typeParams.empty() && decl.methods.size() == 1) {
         auto& m = decl.methods[0];
         std::string retType = m.returnType ? mapType(*m.returnType) : "void";
         std::string params;
@@ -167,6 +200,82 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
         h << "); }\n";
         h << "};\n\n";
     }
+}
+
+// ============================================================
+// "类型 × 接口"适配器（方案 B：record 保持不动，适配器持值持有根）
+// ============================================================
+
+void CodeGenerator::genIfaceAdapter(std::ostream& h,
+                                    const std::string& recordName,
+                                    const InterfaceDecl& iface) {
+    std::string adapterName = safeName(recordName) + iface.name;
+    // 适配器可能生成于 record 定义之前（接口 decl 先于 type decl）：
+    // 前向声明 record（重复声明无害），保证 GcRootHandle<record*> 成员合法
+    h << "struct " << safeName(recordName) << ";\n";
+    // 泛型接口：基类实例化为 Comparable<Point>（类型实参来自 interfaceImplementations_ 收集）
+    // 同时构建"泛型形参名 → 具体 C++ 类型"映射（T → Point*），
+    // 适配器无模板上下文，方法签名中的泛型引用必须替换为具体类型
+    std::map<std::string, std::string> tmap;
+    std::string baseType = iface.name;
+    if (!iface.typeParams.empty()) {
+        auto recIt = interfaceImplementations_.find(recordName);
+        if (recIt != interfaceImplementations_.end()) {
+            auto ifIt = recIt->second.find(iface.name);
+            if (ifIt != recIt->second.end() && !ifIt->second.empty()) {
+                baseType += "<";
+                for (size_t i = 0; i < ifIt->second.size(); ++i) {
+                    if (i > 0) baseType += ", ";
+                    baseType += ifIt->second[i];
+                    if (i < iface.typeParams.size())
+                        tmap[iface.typeParams[i]] = ifIt->second[i];
+                }
+                baseType += ">";
+            }
+        }
+    }
+    // 接口方法签名类型映射：泛型引用（T）→ 具体实参类型；其余走 mapType
+    // 注：接口参数/返回类型中的裸泛型名（如 cmp(other: T) 的 T）由 TypeParser 解析为
+    // NamedType 而非 GenericTypeRef，两者都需要查 tmap
+    auto mapIfaceType = [&](const TypeExpr* t) -> std::string {
+        if (auto* g = dynamic_cast<const GenericTypeRef*>(t)) {
+            auto it = tmap.find(g->name);
+            if (it != tmap.end()) return it->second;
+        }
+        if (auto* n = dynamic_cast<const NamedType*>(t)) {
+            auto it = tmap.find(n->name);
+            if (it != tmap.end()) return it->second;
+        }
+        return t ? mapType(*t) : "auto";
+    };
+    h << "struct " << adapterName << " final : " << baseType << " {\n";
+    h << "  aura_rt::GcRootHandle<" << recordName << "*> obj;\n";   // 模式 B：值持有 + 线程局部根
+    h << "  explicit " << adapterName << "(" << recordName << "* o)\n";
+    h << "      : obj(o, aura_rt::GcRootScope::ThreadLocal) {}\n";  // 显式 scope（避免匹配模式 A 构造）
+    for (auto& m : iface.methods) {
+        // 默认方法且 record 未实现 → 不转发（继承基类默认实现，内部虚调用分发）
+        bool recordHas = false;
+        auto recIt = recordMethods_.find(recordName);
+        if (recIt != recordMethods_.end())
+            recordHas = recIt->second.count(m.name) > 0;
+        if (m.defaultBody && !recordHas) continue;
+        std::string retType = m.returnType ? mapIfaceType(m.returnType.get()) : "void";
+        h << "  " << retType << " " << m.name << "(";
+        for (size_t i = 0; i < m.params.size(); ++i) {
+            if (i > 0) h << ", ";
+            h << mapIfaceType(m.params[i].type.get())
+              << " " << safeName(m.params[i].name);
+        }
+        h << ") const override {\n";
+        h << "    return obj.get()->" << m.name << "(";
+        for (size_t i = 0; i < m.params.size(); ++i) {
+            if (i > 0) h << ", ";
+            h << safeName(m.params[i].name);
+        }
+        h << ");\n";
+        h << "  }\n";
+    }
+    h << "};\n\n";
 }
 
 // ============================================================

@@ -220,6 +220,7 @@ std::unique_ptr<SemType> SemAnalyzer::resolveNamedType(const std::string& name) 
                 ms.paramTypes.push_back(pt ? pt->clone() : nullptr);
             ms.returnType = m.returnType ? m.returnType->clone() : nullptr;
             ms.throws = m.throws;
+            ms.hasDefault = m.hasDefault;
             t->methods.push_back(std::move(ms));
         }
         return t;
@@ -363,8 +364,9 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
         return false;
     }
 
-    // 接口类型：单方法接口可由函数类型（闭包）满足（结构类型系统的自动适配）
+    // 接口类型：单方法接口可由函数类型（闭包）满足；具体 record 结构匹配（结构类型系统）
     if (auto* iface = dynamic_cast<const InterfaceSemType*>(&target)) {
+        // 1. 闭包 → 单方法接口（现有路径保留）
         if (auto* func = dynamic_cast<const FuncSemType*>(&source)) {
             if (iface->methods.size() == 1) {
                 auto& m = iface->methods[0];
@@ -373,7 +375,14 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
             }
             return false;
         }
-        return false; // 非函数类型不能满足接口
+        // 2. 具体 record → 必须显式 impl 该接口（无结构匹配）
+        //    （impl 方法签名一致性由 checkMethodBody 验证；完整性由 verifyImplCompleteness 验证）
+        if (auto* rec = dynamic_cast<const RecordSemType*>(&source)) {
+            auto it = recordImplIfaces_.find(rec->canonicalName);   // 空 = 匿名 record
+            if (it == recordImplIfaces_.end()) return false;
+            return it->second.count(iface->name) > 0;
+        }
+        return false; // 其他类型不能满足接口
     }
 
     // 记录类型：结构匹配，用 isAssignable 而非 equals（支持 ErrorSemType / GenericSemType 容错）
@@ -729,8 +738,42 @@ void SemAnalyzer::checkDecl(const Decl& decl) {
         checkFunBody(*f);
     } else if (auto* m = dynamic_cast<const MethodDecl*>(&decl)) {
         checkMethodBody(*m);
+    } else if (auto* i = dynamic_cast<const InterfaceDecl*>(&decl)) {
+        // 接口默认方法体检查（v1）：self 类型 = 接口自身（InterfaceSemType），
+        // 方法签名由接口方法集提供；返回类型与声明一致
+        for (auto& m : i->methods) {
+            if (!m.defaultBody) continue;
+            loopDepth_ = 0;
+            symtab_.enterScope(ScopeKind::Function);
+            // 泛型参数注册（方法签名可能引用 T，如 cmp(other: T)）
+            for (auto& tp : i->typeParams) {
+                Symbol tpSym;
+                tpSym.kind = SymKind::GenericParam;
+                tpSym.name = tp;
+                symtab_.define(std::move(tpSym));
+            }
+            {
+                Symbol sym;
+                sym.kind = SymKind::Parameter;
+                sym.name = "self";
+                sym.type = resolveNamedType(i->name);
+                symtab_.define(std::move(sym));
+            }
+            for (auto& p : m.params) {
+                Symbol sym;
+                sym.kind = SymKind::Parameter;
+                sym.name = p.name;
+                sym.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
+                symtab_.define(std::move(sym));
+            }
+            auto retType = m.returnType ? resolveType(*m.returnType) : nullptr;
+            FnCtxGuard fc(*this, retType ? retType->clone() : nullptr, m.throws);
+            checkBlock(*m.defaultBody);
+            symtab_.exitScope();
+        }
+        return;
     }
-    // TypeDecl / InterfaceDecl / ImportDecl 不需要体检查
+    // TypeDecl / ImportDecl 不需要体检查
 }
 
 void SemAnalyzer::checkStmt(const Stmt& stmt) {

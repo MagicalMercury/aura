@@ -94,8 +94,30 @@ CompileUnit CodeGenerator::generate(const Program& program,
         if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
             if (m->isConstructor)
                 registerTypeName(m->receiverType, true);
+            // 适配器默认方法转发判定数据：record 非构造方法名集合
+            if (!m->isConstructor && !m->receiverType.empty())
+                recordMethods_[m->receiverType].insert(m->name);
+            // 显式 impl 组合收集：record 方法声明 → (receiverType, 接口名 → 类型实参)
+            // 接口实现必须显式 impl（无结构匹配）；只收集非泛型 record
+            // （receiverTypeArgs 为空）——泛型 record 的 C++ 类型名是 "Stack<T>"（含模板参数），
+            // 适配器类型名无法对应。v1 泛型 record 接接口 → Sema 报错
+            if (!m->implInterface.empty() && m->receiverTypeArgs.empty()) {
+                std::vector<std::string> argCpp;
+                for (auto& ta : m->implTypeArgs)
+                    argCpp.push_back(ta ? mapType(*ta) : "???");
+                interfaceImplementations_[m->receiverType][m->implInterface] = std::move(argCpp);
+            }
         }
     }
+
+    // 适配器生成需遍历的接口集合 = 用户接口 + 内置接口（interfaces.aurai：Stringer/Comparable/Iterator）
+    std::vector<const InterfaceDecl*> allIfaces;
+    for (auto& d : program.decls) {
+        if (auto* i = dynamic_cast<const InterfaceDecl*>(d.get()))
+            allIfaces.push_back(i);
+    }
+    for (auto& i : BuiltinRegistry::get().auraiInterfaces())
+        allIfaces.push_back(i.get());
 
     // 第二遍：协程判定（提前一轮，函数体内需要知道自己的协程状态）
     for (auto& d : program.decls) {
@@ -134,6 +156,21 @@ CompileUnit CodeGenerator::generate(const Program& program,
         if (!d) continue;
         if (diag_.errorCount() > 10) break;  // 错误过多，停止生成
         genDecl(header, impl, *d, unit, true);
+    }
+
+    // 接口收尾（第三遍 A 之后）：内置接口基类（interfaces.aurai）不在 program.decls 中，
+    // 统一在此生成；随后为所有 record × 接口组合生成适配器——
+    // 此时所有 record struct 已完整定义，适配器内联方法体可安全解引用 record 方法
+    for (auto& i : BuiltinRegistry::get().auraiInterfaces())
+        genInterfaceDecl(header, *i);
+    for (auto* i : allIfaces) {
+        for (auto& [rec, ifaces] : interfaceImplementations_) {
+            if (!ifaces.count(i->name)) continue;
+            std::string key = rec + i->name;
+            if (ifaceAdapterCache_.count(key)) continue;
+            ifaceAdapterCache_.insert(key);
+            genIfaceAdapter(header, rec, *i);
+        }
     }
 
     // 第三遍 B：再生成所有定义
@@ -183,7 +220,8 @@ void CodeGenerator::genDecl(std::ostream& h, std::ostream& cpp,
         return;
     }
     if (auto* i = dynamic_cast<const InterfaceDecl*>(&decl)) {
-        // 接口声明在 A 遍生成
+        // 接口声明在 A 遍生成；适配器在第三遍 A 之后统一生成
+        // （需 record struct 已完整定义，见 genDecl 后的 iface 收尾循环）
         if (declarationsOnly)
             { genInterfaceDecl(h, *i); return; }
         return;

@@ -399,21 +399,25 @@ struct InterfaceMethodSig {
     std::vector<Param> params;
     bool throws = false;
     std::unique_ptr<TypeExpr> returnType;
+    std::unique_ptr<BlockStmt> defaultBody;   // 默认实现（nullptr = 必须实现，纯虚）
 };
 
 struct InterfaceDecl : Decl {
     std::string name;
+    std::vector<std::string> typeParams;          // 泛型参数（如 Iterator<T> 的 T）
     std::vector<InterfaceMethodSig> methods;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<InterfaceDecl>();
         n->name = name;
+        n->typeParams = typeParams;
         for (auto& m : methods) {
             InterfaceMethodSig sig;
             sig.name   = m.name;
             for (auto& p : m.params) sig.params.push_back(cloneParam(p));
             sig.throws = m.throws;
             if (m.returnType) sig.returnType.reset(static_cast<TypeExpr*>(m.returnType->clone().release()));
+            if (m.defaultBody) sig.defaultBody.reset(static_cast<BlockStmt*>(m.defaultBody->clone().release()));
             n->methods.push_back(std::move(sig));
         }
         n->isPublic = isPublic;
@@ -459,7 +463,8 @@ struct MethodDecl : Decl {
     std::string receiverName;
     std::string receiverType;
     std::vector<std::string> receiverTypeArgs; // 接收者泛型参数（如 Stack<T> 中的 T）
-    std::string implInterface;
+    std::string implInterface;                              // 接口名（如 "Comparable"）
+    std::vector<std::unique_ptr<TypeExpr>> implTypeArgs;    // 接口类型实参（如 <Point>），可空
     std::string name;
     bool isConstructor = false;
     std::vector<Param> params;
@@ -473,6 +478,8 @@ struct MethodDecl : Decl {
         n->receiverType  = receiverType;
         n->receiverTypeArgs = receiverTypeArgs;
         n->implInterface = implInterface;
+        for (auto& ta : implTypeArgs)
+            n->implTypeArgs.emplace_back(static_cast<TypeExpr*>(ta->clone().release()));
         n->name          = name;
         n->isConstructor = isConstructor;
         for (auto& p : params) n->params.push_back(cloneParam(p));

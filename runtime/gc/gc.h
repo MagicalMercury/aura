@@ -19,7 +19,7 @@
 // 运行时单例 GcHeap 管理所有 GC 对象、根集合和 GC 周期。
 //
 // 注：本文件拆分自原 runtime/gc.h，实现分布在 gc/*.cpp 中。
-//     句柄模板（GcRootHandle/GcWeakHandle/GcSharedRoot 等）在 handles.h。
+//     句柄模板（GcRootHandle/GcWeakHandle 等）在 handles.h。
 // ============================================================
 
 #include "../types.h"
@@ -42,6 +42,14 @@ namespace aura_rt {
 // 前向声明（GcRootHandle 的构造/析构需要 GcHeap）
 class GcHeap;
 
+// 根持有模式（GcRootHandle 统一三模式）：
+// - Ref：引用外部变量（栈变量包装，线程局部根）
+// - ValueThreadLocal：值持有（接口适配器等临时对象，线程局部根）
+// - ValueGlobal：值持有 + 全局根（闭包捕获/全局缓存）
+enum class GcRootMode : uint8_t { Ref, ValueThreadLocal, ValueGlobal };
+// 值持有模式的根作用域（编译期静态决定，非运行时判断）
+enum class GcRootScope { ThreadLocal, Global };
+
 // ============================================================
 // GcRootHandleBase — GC 根句柄基类（侵入式链表节点）
 //
@@ -62,40 +70,51 @@ public:
 };
 
 // ============================================================
-// GcRootHandle — 根引用包装
+// GcRootHandle — 根引用包装（统一三模式）
 //
-// 编译器生成的代码在声明 GC 指针局部变量时，将其包装为
-// GcRootHandle<T*>。该句柄持有指向实际指针的引用，
-// GC 标记阶段通过它发现从栈/寄存器出发的活对象。
+// 模式 A（Ref）：引用外部变量。编译器生成的代码在声明 GC 指针
+//   局部变量时使用（GcRootHandle<T*> h(ref)），GC 标记阶段通过
+//   ptr_ref_ 发现从栈出发的活对象，compact 时更新用户变量。
+// 模式 B/C（Value）：值持有。接口适配器（ThreadLocal）与闭包捕获/
+//   全局缓存（Global）场景使用，对象指针自身注册为根，GC 期间自动更新。
 //
+// 内存布局 40B：基类 24B + union{ptr_,val_} 8B + mode_ 1B(+padding)。
 // 构造/析构在 GcHeap 完整定义之后实现（见 handles.h）。
 // ============================================================
 template <typename T>
 class GcRootHandle : public GcRootHandleBase {
 public:
+    // 模式 A：引用外部变量（线程局部）← 现有 CodeGen 栈变量，语义零变化
     GcRootHandle(T& ref);
+    // 模式 B/C：值持有。scope 必须显式（无默认值），避免与 T& 重载歧义
+    GcRootHandle(T val, GcRootScope scope);
     ~GcRootHandle();
 
-    // 允许拷贝：新 GcRootHandle 注册独立 GC 根，ptr_ 指向同一栈地址
-    // 安全前提：原 GcRootHandle 的生命周期覆盖拷贝的生命周期
-    // （sync thread 的 waitGroup 保证 worker 任务完成前主线程栈稳定）
+    // 拷贝：按 other.mode_ 分支（Ref→引用同一变量；Value→深拷贝值+独立注册）
     GcRootHandle(const GcRootHandle& other);
     GcRootHandle& operator=(const GcRootHandle&) = delete;
 
-    // 更新被包装的引用目标（用于移动赋值后）
+    // 更新被包装的引用目标（用于移动赋值后；仅 Ref 模式）
     // 同步更新 ptr_ref_，保持 GC 遍历一致性
     void rebind(T& ref) {
         ptr_ = &ref;
         ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
     }
 
-    T& operator*()  const { return *ptr_; }
-    T* operator->() const { return ptr_; }
-    T& get()              { return *ptr_; }  // 非 const：返回引用，可作赋值左侧
-    T  get()        const { return *ptr_; }  // const：返回值，兼容读取场景
+    // 按模式读取：Ref → *ptr_（外部变量）；Value → val_（内部值）
+    T& operator*()        { return mode_ == GcRootMode::Ref ? *ptr_ : val_; }
+    T  operator*()  const { return mode_ == GcRootMode::Ref ? *ptr_ : val_; }
+    T* operator->()       { return mode_ == GcRootMode::Ref ? ptr_ : &val_; }
+    T* operator->() const { return mode_ == GcRootMode::Ref ? ptr_
+                                                             : const_cast<T*>(&val_); }
+    T& get()              { return mode_ == GcRootMode::Ref ? *ptr_ : val_; }
+    T  get()        const { return mode_ == GcRootMode::Ref ? *ptr_ : val_; }
+
+    void set(T v);
 
 private:
-    T* ptr_;
+    union { T* ptr_; T val_; };  // Ref 用 ptr_（&外部变量）；Value 用 val_（内部持值）——共享 8B 槽
+    GcRootMode mode_;            // 1B：拷贝构造与析构据此分支（Ref/ValueTL/ValueGlobal）
     friend class GcHeap;
 };
 
@@ -129,26 +148,6 @@ public:
 };
 
 // ============================================================
-// GcGlobalRoot — 全局根引用（运行时缓存用）
-//
-// 用于 GcString::empty() / from(bool) / from(int) 等运行时缓存的 GC 单例。
-// 构造时注册为全局根，析构时取消。通常作为 static 局部变量。
-// ============================================================
-template <typename T>
-class GcGlobalRoot {
-public:
-    explicit GcGlobalRoot(T* obj);
-    ~GcGlobalRoot();
-    GcGlobalRoot(const GcGlobalRoot&) = delete;
-    GcGlobalRoot& operator=(const GcGlobalRoot&) = delete;
-
-    T* get() const { return ptr_; }
-    T* operator->() const { return ptr_; }
-
-private:
-    T* ptr_;
-};
-
 // Compacting GC 迁移条目（拷贝到新页时使用）
 struct CompactEntry {
     GcObject* oldAddr;

@@ -92,6 +92,7 @@ struct InterfaceSemType : SemType {
         std::vector<std::unique_ptr<SemType>> paramTypes;
         std::unique_ptr<SemType> returnType;
         bool throws = false;
+        bool hasDefault = false;   // 接口默认方法（结构匹配时豁免，实现者无需提供）
     };
     std::vector<MethodSig> methods;
     [[nodiscard]] bool equals(const SemType& other) const override;

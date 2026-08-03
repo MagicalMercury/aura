@@ -245,6 +245,12 @@ InterfaceMethodSig Parser::parseInterfaceMethodSig() {
         sig.returnType = parseType();
     }
 
+    // 接口方法签名后可选函数体（默认实现，Java default / Rust trait 风格）：
+    // 签名后直接 `{` 即默认实现体（与闭包区分：闭包是 `(params) -> T { }` 带箭头返回）
+    if (check(TokType::LBrace)) {
+        sig.defaultBody = parseBlock();
+    }
+
     return sig;
 }
 

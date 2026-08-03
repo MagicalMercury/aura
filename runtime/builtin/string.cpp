@@ -65,13 +65,15 @@ GcString* GcString::make(const std::string& s) {
 // ============================================================
 GcString* GcString::from(int32_t val) {
     // [-1024, 1023] 缓存（裸指针数组 + lazy init，~16KB 静态内存）
-    static GcGlobalRoot<GcString>* _cache[2048] = {};
+    // GcGlobalRoot 已统一为 GcRootHandle 值持有模式（GcRootScope::Global）
+    static GcRootHandle<GcString*>* _cache[2048] = {};
     if (val >= -1024 && val <= 1023) {
         auto& slot = _cache[val + 1024];
         if (!slot) {
             char buf[32];
             int len = snprintf(buf, sizeof(buf), "%d", val);
-            slot = new GcGlobalRoot<GcString>(make(buf, static_cast<size_t>(len)));
+            slot = new GcRootHandle<GcString*>(make(buf, static_cast<size_t>(len)),
+                                               GcRootScope::Global);
         }
         return slot->get();
     }
@@ -98,8 +100,8 @@ GcString* GcString::from(double val) {
 }
 
 GcString* GcString::from(bool val) {
-    static GcGlobalRoot<GcString> _t{make("true")};
-    static GcGlobalRoot<GcString> _f{make("false")};
+    static GcRootHandle<GcString*> _t{make("true"), GcRootScope::Global};
+    static GcRootHandle<GcString*> _f{make("false"), GcRootScope::Global};
     return val ? _t.get() : _f.get();
 }
 
@@ -148,7 +150,7 @@ GcString* concat(double a, GcString* b) {
 }
 GcString* concat(GcString* a, bool b) {
     GcRootHandle<GcString*> a_guard(a);
-    // from(bool) 返回全局缓存，已由 GcGlobalRoot 保护，无需 tmp_guard
+    // from(bool) 返回全局缓存，已由 GcRootHandle 全局根保护，无需 tmp_guard
     return a_guard.get()->concat(*GcString::from(b));
 }
 GcString* concat(bool a, GcString* b) {
@@ -157,7 +159,7 @@ GcString* concat(bool a, GcString* b) {
 }
 
 GcString* GcString::empty() {
-    static GcGlobalRoot<GcString> _e{make("", 0)};
+    static GcRootHandle<GcString*> _e{make("", 0), GcRootScope::Global};
     return _e.get();
 }
 
@@ -658,7 +660,7 @@ void GcRopeNode::flatten_recursive(char* dst, int32_t& pos, int32_t maxDepth) co
 // 字面量 Intern 池
 // ============================================================
 namespace {
-    [[gnu::init_priority(105)]] std::unordered_map<std::string, std::unique_ptr<GcGlobalRoot<GcString>>> g_internPool;
+    [[gnu::init_priority(105)]] std::unordered_map<std::string, std::unique_ptr<GcRootHandle<GcString*>>> g_internPool;
     // 注意：不用 std::shared_mutex，MinGW 下有 bug
     //   https://github.com/msys2/MINGW-packages/issues/25193
     //   现象：lock_shared() 抛 "__ret == 0" 断言。读路径改用独占锁，
@@ -750,7 +752,7 @@ GcString* intern_string(const char* s, size_t len) {
             // 别人已插入，丢弃 newly（等 GC 回收）
             result = it->second->get();
         } else {
-            auto root = std::make_unique<GcGlobalRoot<GcString>>(newly);
+            auto root = std::make_unique<GcRootHandle<GcString*>>(newly, GcRootScope::Global);
             result = root->get();
             g_internPool.emplace(std::move(key), std::move(root));
         }
