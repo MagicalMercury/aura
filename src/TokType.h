@@ -50,6 +50,7 @@ enum class TokType {
     Comma,         // ,
     Semicolon,     // ;
     Hash,          // #
+    Ellipsis,      // ...（C++ 桥接方法声明标记）
 
     Eof,
     Error,

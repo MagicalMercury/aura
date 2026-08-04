@@ -193,6 +193,19 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
             checkThrowsContext(e, callee->name, fn->throws);
             // 与 inferMethodCall 对齐：推断参数类型（CodeGen GcRootHandle 依赖 inferredType）
             for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
+            // some(v)/none()：Optional 构造（T 从实参 / 未知，返回 Optional）
+            if (fn->name == "some") {
+                auto ot = OptionalSemType::make(
+                    e.args.empty() || !e.args[0] || !e.args[0]->inferredType
+                        ? ErrorSemType::make() : e.args[0]->inferredType->clone());
+                typeStore_.push_back(std::move(ot));
+                return typeStore_.back()->clone();
+            }
+            if (fn->name == "none") {
+                auto ot = OptionalSemType::make(ErrorSemType::make());
+                typeStore_.push_back(std::move(ot));
+                return typeStore_.back()->clone();
+            }
             return semTypeFromBuiltinReturn(fn->returns);
         }
         error(*e.callee, "undefined identifier '" + callee->name + "'");
@@ -278,6 +291,31 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
         }
     }
 
+    // Iterator.from(...) 静态调用：receiver 是内置类型名（非符号表条目）
+    // 返回 Iterator<T>，T 从闭包返回类型 Optional<T> 提取
+    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+        if (id->name == "Iterator" && e.method == "from") {
+            for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
+            if (!e.args.empty() && e.args[0]->inferredType) {
+                if (auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType)) {
+                    if (auto* os = dynamic_cast<const OptionalSemType*>(ft->returnType.get())) {
+                        auto g = std::make_unique<GenericSemType>();
+                        g->name = "Iterator";
+                        g->resolvedName = "aura_rt::Iterator<"
+                            + semTypeToCppName(*os->elementType) + ">";
+                        typeStore_.push_back(std::move(g));
+                        return typeStore_.back()->clone();
+                    }
+                }
+            }
+            auto g = std::make_unique<GenericSemType>();
+            g->name = "Iterator";
+            g->resolvedName = "aura_rt::Iterator<int32_t>";
+            typeStore_.push_back(std::move(g));
+            return typeStore_.back()->clone();
+        }
+    }
+
     auto objType = inferExpr(*e.object);
 
     // 接口类型 receiver（接口默认方法体内 self.method(...) 调用）：
@@ -293,6 +331,51 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
         }
         error(e, "interface '" + iface->name + "' has no method '" + e.method + "'");
         return ErrorSemType::make();
+    }
+
+    // Iterator 桥接方法特判（map/filter/collect 为 C++ 桥接，返回类型调用点推导）
+    // 覆盖：range/map/filter/from 返回值（GenericSemType name="Iterator"）
+    if (isIteratorType(objType.get())) {
+        auto elem = elemTypeOf(objType.get());   // 元素类型（Error = 未知，兜底 int32_t）
+        for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
+        if (e.method == "collect") {
+            auto lt = std::make_unique<ListSemType>();
+            lt->elementType = elem ? elem->clone() : ErrorSemType::make();
+            typeStore_.push_back(std::move(lt));
+            return typeStore_.back()->clone();
+        }
+        if (e.method == "map" && !e.args.empty() && e.args[0]->inferredType) {
+            auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType);
+            if (ft && ft->returnType && !dynamic_cast<const ErrorSemType*>(ft->returnType.get())) {
+                auto g = std::make_unique<GenericSemType>();
+                g->name = "Iterator";
+                g->resolvedName = "aura_rt::Iterator<"
+                                  + semTypeToCppName(*ft->returnType) + ">";
+                typeStore_.push_back(std::move(g));
+                return typeStore_.back()->clone();
+            }
+            // U 未知 → 元素类型退化为 int32_t（后续使用会引导标注）
+            auto g = std::make_unique<GenericSemType>();
+            g->name = "Iterator";
+            g->resolvedName = "aura_rt::Iterator<int32_t>";
+            typeStore_.push_back(std::move(g));
+            return typeStore_.back()->clone();
+        }
+        if (e.method == "filter") {
+            auto g = std::make_unique<GenericSemType>();
+            g->name = "Iterator";
+            std::string elemCpp = dynamic_cast<const ErrorSemType*>(elem.get())
+                ? "int32_t" : semTypeToCppName(*elem);
+            g->resolvedName = "aura_rt::Iterator<" + elemCpp + ">";
+            typeStore_.push_back(std::move(g));
+            return typeStore_.back()->clone();
+        }
+        // v1：record receiver 直接调 map/filter/collect → 报错（适配器为栈对象，悬垂）
+        if (dynamic_cast<const RecordSemType*>(objType.get())) {
+            error(e, "call '" + std::string(e.method) +
+                  "' on record directly is not supported in v1; pass it through an Iterator interface first");
+            return ErrorSemType::make();
+        }
     }
 
     // 查 BuiltinRegistry：若对象类型匹配已知内置类型，

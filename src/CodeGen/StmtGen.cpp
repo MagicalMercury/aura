@@ -406,31 +406,32 @@ void CodeGenerator::genWhileStmt(std::ostream& cpp, const WhileStmt& stmt,
     cpp << indentStr() << "}\n";
 }
 
+// 作用域屏蔽 guard：临时移出 GC 根集合/类型集合，析构时恢复
+// （修复：gcRootVarNames_ 无作用域清理，与其他作用域同名 GcRootHandle 变量
+//   状态残留会导致同名标识符被误判生成 .get()；用于 for 迭代变量、spawn 闭包参数等）
+struct IterVarGuard {
+    std::set<std::string>& roots;
+    std::unordered_map<std::string, std::string>& types;
+    std::string name;
+    bool wasRoot;
+    bool hadType;
+    std::string savedType;
+    IterVarGuard(std::set<std::string>& r,
+                 std::unordered_map<std::string, std::string>& t,
+                 const std::string& n)
+        : roots(r), types(t), name(n),
+          wasRoot(r.erase(n) > 0), hadType(false) {
+        auto it = t.find(n);
+        if (it != t.end()) { savedType = it->second; t.erase(it); hadType = true; }
+    }
+    ~IterVarGuard() {
+        if (wasRoot) roots.insert(name);
+        if (hadType) types[name] = savedType;
+    }
+};
+
 void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
                                 bool isCoroutine) {
-    // 迭代变量在循环体内以值方式引用：临时移出 GC 根集合/类型集合
-    // （修复：gcRootVarNames_ 无作用域清理，与其他作用域同名 GcRootHandle 变量
-    //   状态残留会导致迭代变量被误判生成 .get()；循环结束后恢复）
-    struct IterVarGuard {
-        std::set<std::string>& roots;
-        std::unordered_map<std::string, std::string>& types;
-        std::string name;
-        bool wasRoot;
-        bool hadType;
-        std::string savedType;
-        IterVarGuard(std::set<std::string>& r,
-                     std::unordered_map<std::string, std::string>& t,
-                     const std::string& n)
-            : roots(r), types(t), name(n),
-              wasRoot(r.erase(n) > 0), hadType(false) {
-            auto it = t.find(n);
-            if (it != t.end()) { savedType = it->second; t.erase(it); hadType = true; }
-        }
-        ~IterVarGuard() {
-            if (wasRoot) roots.insert(name);
-            if (hadType) types[name] = savedType;
-        }
-    };
     IterVarGuard iterGuard(gcRootVarNames_, gcRootTypes_, safeName(stmt.itemName));
 
     // 检测 range() 调用 — 展开为 std::views::iota 或 step 循环
@@ -461,6 +462,55 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
             cpp << indentStr() << "}\n";
             return;
         }
+    }
+
+    // 检测 Iterator 遍历：for v in it → while + next()/is_none()/unwrap()
+    // 覆盖：内置迭代器表达式（range/map/filter/from 返回值）、Iterator 接口变量/参数、
+    //       record 显式 impl Iterator<T>（其 for-in 语义，record 直接可迭代）
+    bool iterIsIterator = false;
+    if (stmt.iterable->inferredType) {
+        auto* ty = stmt.iterable->inferredType;
+        if (auto* g = dynamic_cast<const GenericSemType*>(ty))
+            iterIsIterator = g->name == "Iterator"
+                          || g->resolvedName.find("Iterator") != std::string::npos;
+        else if (auto* is = dynamic_cast<const InterfaceSemType*>(ty))
+            iterIsIterator = is->name == "Iterator";
+        else if (auto* r = dynamic_cast<const RecordSemType*>(ty)) {
+            // record 显式 impl Iterator<T> → 用接口元素类型生成 next() 循环
+            auto recIt = interfaceImplementations_.find(r->canonicalName);
+            if (recIt != interfaceImplementations_.end()
+                && recIt->second.count("Iterator") > 0)
+                iterIsIterator = true;
+        }
+    }
+    if (iterIsIterator) {
+        std::string var = safeName(stmt.itemName);
+        std::string itExpr = genExpr(*stmt.iterable, isCoroutine);
+        cpp << indentStr() << "{\n";
+        indentLevel_++;
+        // record impl：包一层适配器（持 GcRootHandle<Rec*>，GC compact 安全）
+        bool recAdapter = false;
+        if (auto* r = dynamic_cast<const RecordSemType*>(stmt.iterable->inferredType)) {
+            std::string recName = r->canonicalName;
+            writeLine(cpp, "auto _it = " + safeName(recName) + "Iterator(" + itExpr + ");");
+            recAdapter = true;
+        } else {
+            writeLine(cpp, "auto _it = " + itExpr + ";");
+        }
+        cpp << indentStr() << "while (true) {\n";
+        indentLevel_++;
+        // record 适配器是栈值对象（.next()）；内置迭代器是指针（->next()）
+        writeLine(cpp, "auto _opt = " + std::string(recAdapter ? "_it." : "_it->")
+                       + "next();");
+        writeLine(cpp, "if (_opt->is_none()) break;");
+        writeLine(cpp, "auto " + var + " = _opt->unwrap();");
+        if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+        writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
+        indentLevel_--;
+        cpp << indentStr() << "}\n";
+        indentLevel_--;
+        cpp << indentStr() << "}\n";
+        return;
     }
 
     // 检测 channel 遍历：for val in ch → while + receive 循环
@@ -1007,8 +1057,16 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
     cpp << ") -> aura_rt::task<void> {\n";
     insideSpawn_ = true;
 
-    for (auto& s : stmt.body)
-        if (s) genStmt(cpp, *s, true);
+    // 屏蔽参数名：闭包参数可能与外层同名 GcRootHandle 变量冲突（gcRootVarNames_ 无
+    // 作用域清理），否则参数被误判生成 .get()；块结束（实参生成前）guard 析构恢复外层状态
+    {
+        std::vector<IterVarGuard> guards;
+        for (auto& p : stmt.params)
+            guards.emplace_back(gcRootVarNames_, gcRootTypes_, safeName(p.name));
+
+        for (auto& s : stmt.body)
+            if (s) genStmt(cpp, *s, true);
+    }
 
     insideSpawn_ = false;
     cpp << indentStr() << "    co_return;\n";
@@ -1023,7 +1081,10 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
     } else {
         for (size_t i = 0; i < stmt.params.size(); ++i) {
             if (i > 0) cpp << ", ";
-            cpp << safeName(stmt.params[i].name); // 同名自动绑定
+            // 同名自动绑定：外层 GcRootHandle 变量 → 传 .get() 裸指针（guards 已析构，
+            // gcRootVarNames_ 已恢复外层状态）
+            std::string pname = safeName(stmt.params[i].name); // 同名自动绑定
+            cpp << (gcRootVarNames_.count(pname) ? pname + ".get()" : pname);
         }
     }
     if (!hasIo) cpp << ", io";

@@ -36,6 +36,8 @@ Aura 提供若干内置的 GC 堆对象类型，由运行时管理生命周期�
 | `sync.Mutex` | `sync.Mutex()` | 互斥锁，配合 `lock` 块（见 [§11.6](11-concurrency.md#116-syncmutex-与-lock-块)） |
 | `sync.RWMutex` | `sync.RWMutex()` | 读写锁，`rw.r()` / `rw.w()` 返回读/写视图（见 [§11.6.6](11-concurrency.md#1166-syncrwmutex--读写锁v11)） |
 | `sync.Once` | `sync.Once()` | 一次性执行，`lock (once) { body }` 中 body 仅首次执行（见 [§11.6.7](11-concurrency.md#1167-synconce--一次性执行v11)） |
+| `Optional<T>` | `some(v)` / `none()` | GC 安全可选值封装，规避 `T \| None` 联合的 GC 栈扫描破绽（见 [§7.4](07-methods-interfaces.md#74-内置接口)、[§11.7.3](11-concurrency.md#1173-optionalt--receive-的返回类型)） |
+| `Iterator<T>` | `range(n)` / `Iterator.from(f)` / `it.map(f)` / `it.filter(p)` | 惰性迭代器，GC 对象；record `impl Iterator<T>` 实现 `next()` 即可 `for-in`（见 [§7.4](07-methods-interfaces.md#74-内置接口)） |
 
 > `sync.Mutex` / `sync.RWMutex` / `sync.Once` 是 GC 堆对象，生命周期由 GC 管理。`sync` 是伪模块名，用作类型/构造调用的命名空间前缀，运行时等价于裸 `Mutex` / `RWMutex` / `Once` 类型。`RWMutex.r()` / `rw.w()` 返回的 `ReadGuard` / `WriteGuard` 是虚拟视图类型，仅用于 `lock` 块的类型推断，用户不能直接声明。
 

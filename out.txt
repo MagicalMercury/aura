@@ -1,110 +1,247 @@
-# sync thread 多线程测试调试状态（2026-07-24）
+## 审查报告：change.md（Iterator 实现）
 
-## 当前测试
-example/test.aura 包含 3 个 sync thread 测试：
-1. 基本多线程（无界）：2 个 spawn 输出 "hello from thread N"
-2. 有界并发 max=4：10 个 spawn 输出 "task N"
-3. GC 压力 max=2：100 个 spawn 输出 "string N"
+### 一、整体评估
 
-## 已完成的修复
-### TLAB 实现（已完成，ASAN 验证通过）
-- gc.h/gc.cpp: Tlab 结构、tryAlloc 双路径、flushTlab/refillTlab
-- thread_pool.cpp: workerLoop 用 wait_for 响应 GC safepoint
+change.md 描述的是**待实施方案**，源码现状已实现前置工作（C0 根引用统一、typeMethods_ 映射、isAssignable 结构匹配、genIfaceAdapter 通用路径、interfaceImplementations_ 收集），但 Iterator 特定部分（`...` 语法、runtime iterator.h、Sema/CodeGen 特判）**均未实施**。
 
-### GC 并发数据竞争修复（已完成）
-- gc.h: compactSuspendedCount_ → atomic<int>
-- gc.h: gcPending_ → atomic<bool>
-- gc.h: oomInit_ → atomic<bool>（call_once 不可行，递归调用自死锁）
-- gc.h: 新增 stackRootsM_ 保护 stackRoots_
-- gc.h: 新增 rememberedSetM_ 保护 rememberedSet_
-- gc.cpp: ensureOomError 用 atomic<bool> 替代 call_once
-- gc.cpp: register/unregisterStackRoots 加锁
-- gc.cpp: writeBarrier 加锁
-- gc.cpp: gcPending_ 全部改 load/store
-- gc.cpp: compactSuspendedCount_ 读取改 load
+方案整体架构合理（runtime view 适配器 + CodeGen 直转 + Sema 特判），但存在若干设计 bug 需修复。
 
-## ✅ 已解决：shared_mutex 断言 __ret == 0
-根因：MinGW 下 std::shared_mutex 实现有 bug
-  - 参考：https://github.com/msys2/MINGW-packages/issues/25193
-  - 现象：lock_shared() 抛 "__ret == 0" 断言，多线程测试第一行即崩溃
-修复：runtime/builtin/string.cpp:527-561
-  - 将 g_internMutex 类型从 std::shared_mutex 改为 std::mutex
-  - intern_string 读路径由 std::shared_lock 改为 std::lock_guard（独占锁）
-  - unordered_map::find() 耗时极小，独占锁对并发性能影响可忽略
-  - 移除 #include <shared_mutex>，改为 #include <mutex>
-验证：test.aura 全部 3 个测试通过，退出码 0
-  - 测试 1：2 行 "hello from thread N"
-  - 测试 2：10 行 "task N"（0-9）
-  - 测试 3：100 行 "string N"（0-99）
-  - 最后输出 "done"
-  - 输出顺序有少量交错（如 string 5 在 string 4 前），属多线程并发正常现象
+---
 
-## 此前尝试的相关修复（保留）
-### #1 intern_string 持锁 alloc（已修复）
-- 文件：runtime/builtin/string.cpp:536-561
-- 修改：改为"不持锁 alloc"模式（读锁查找 → 解锁 alloc → 写锁 double-check insert）
+### 二、P0 Bug（阻断性，必须修复）
 
-### #6 cout 无锁并发（已修复）
-- 文件：runtime/builtin/io.cpp:22-48
-- 修改：新增 g_coutM mutex 保护 println/println_sync
+**Bug 1：FuncIter 的 T 类型提取语法错误**（C1，[change.md:349-350](file:///d:/you/Aura/change.md#L349-L350)）
 
-### #7 ensureStarted 无锁初始化（已修复）
-- 文件：runtime/thread_pool.h:68, thread_pool.cpp:20-31
-- 修改：用 std::call_once + ensureStartedOnce_ 保护
+```cpp
+using T = typename OptionalElem<typename std::invoke_result_t<F&>::result_type>::type;
+```
 
-## 审计报告发现但未修复的问题（P0-P3）
-来源：search agent 完整审计 runtime/ 目录
+`std::invoke_result_t<F&>` 是 `Optional<T>*`（裸指针），裸指针**没有 `result_type` 成员**，编译失败。
 
-### P0（严重，可能导致崩溃）
-- #1 intern_string 持锁 alloc → STW 死锁【已修复未解决】
-- #2 GcString::from(int32_t) _cache 数组无锁
-  - 文件：runtime/builtin/string.cpp:61-76
-  - 问题：static GcGlobalRoot<GcString>* _cache[2048] 多线程并发读写
-  - 风险：globalRoots_ 悬垂指针，GC 读野指针崩溃
-- #3 GcRopeNode::flat_cache_ 并发访问无锁
-  - 文件：runtime/builtin/string.cpp:473-488
-  - 问题：mutable GcString* flat_cache_ 多线程并发读写
-- #4 GcString::append 就地修改 GC 共享对象
-  - 文件：runtime/builtin/string.cpp:280-365
-  - 问题：就地 memcpy 修改 length/data，破坏共享不变式
+**修复**：先用 `std::remove_pointer_t` 去指针，再提取：
+```cpp
+using RetType = std::invoke_result_t<F&>;                    // Optional<T>*
+using OptType = std::remove_pointer_t<RetType>;               // Optional<T>
+using T = typename OptionalElem<OptType>::type;               // T
+```
+或更简洁，让 `FuncIter` 显式接受 T 模板参数，不做推导：
+```cpp
+template <typename T, typename F>
+struct FuncIter : GcObject, Iterator<T> { ... };
+// make_iterator_from<T>(f) 显式传 T
+```
 
-### P1（中等）
-- #5 ensureOomError 中 oomError_ 并发读写
-  - 文件：runtime/gc.cpp:274-284
-  - 问题：atomic<bool> oomInit_ 只挡同线程递归，不挡多线程并发
-- #6 cout/cin 无锁【已修复未解决】
-- #7 ensureStarted 无锁【已修复未解决】
+---
 
-### P2（低风险）
-- #8 compactPending_ 非 atomic
-  - 文件：runtime/gc.h:317
-- #9 youngBytes_/oldBytes_/allocatedBytes_/gcCount_/minorGcCount_ 非 atomic
-  - 文件：runtime/gc.h:325-329
-- #10 EventLoop::ready_.empty() 无锁读
-  - 文件：runtime/task.cpp:62
-- #11 ThreadPool::workerCount() 无锁读 workers_
-  - 文件：runtime/thread_pool.h:51
+**Bug 2：genInterfaceDecl 未跳过 Iterator，与 runtime 冲突**（C3.6）
 
-## 下一步建议
-1. 修复 #2 from(int) _cache 无锁（加 mutex 或 call_once）
-2. 修复 #3 GcRopeNode::flat_cache_ 无锁（加 mutex，注意 alloc 期间不持锁）
-3. 修复 #4 GcString::append 就地修改（删除就地修改分支，总是返回新对象）
-4. 若仍崩溃，用 ASAN 模式重新编译 runtime 获取精确栈追踪：
-   - Remove-Item -Recurse -Force build, runtime/build
-   - cmake -S . -B build -DENABLE_ASAN=ON
-   - cmake -S runtime -B runtime/build -DENABLE_ASAN=ON
-   - cmake --build build
-   - cmake --build runtime/build
-   - 手动编译 test.cpp 用 ASAN
-5. 检查是否还有其他持锁触发 GC 的路径（如 GcGlobalRoot 构造时 registerGlobalRoot）
+[CodeGen.cpp:164-165](file:///d:/you/Aura/src/CodeGen/CodeGen.cpp#L164-L165) 现状：
+```cpp
+for (auto& i : BuiltinRegistry::get().auraiInterfaces())
+    genInterfaceDecl(header, *i);
+```
 
-## 关键文件
-- runtime/gc.h / runtime/gc.cpp
-- runtime/thread_pool.h / runtime/thread_pool.cpp
-- runtime/builtin/string.cpp
-- runtime/builtin/io.cpp
-- example/test.aura / example/test.cpp
-- change.md（当前修复记录）
-- change.md.bak.20260724（sync thread 原始 plan）
-- plan/TLAB_implementation.md（TLAB 完整方案）
-- plan/sync_thread_plan.md（sync thread 完整方案）
+这会对 Iterator 调用 `genInterfaceDecl`，在全局命名空间生成 `struct Iterator`，与 `aura_rt::Iterator<T>` **重名冲突**（using namespace aura_rt 后）。
+
+change.md C3.6 要求 `if (decl.name == "Iterator") return;`，但未在 genInterfaceDecl 实施特判。
+
+**修复**：在 [DeclGen.cpp:126](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L126) genInterfaceDecl 入口加：
+```cpp
+if (decl.name == "Iterator") return;  // C++ 形态来自 runtime/builtin/iterator.h
+```
+
+---
+
+**Bug 3：BuiltinRegistry 未注册 Iterator 类型**（C2.1）
+
+[BuiltinRegistry.h:258](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L258) 现状只注册了 Optional，**未注册 Iterator**。change.md C2.1 要求新增：
+```cpp
+{"Iterator", {"Iterator", true, true, BuiltinPrim::Other, "aura_rt::Iterator*"}},
+```
+
+未注册会导致：
+- `mapType` 对 `Iterator<T>` 返回 "auto"（[TypeMap.cpp](file:///d:/you/Aura/src/CodeGen/TypeMap.cpp) 查 BuiltinRegistry 未命中）
+- Sema `resolveNamedType("Iterator")` 返回 ErrorSemType
+- 用户写 `let it: Iterator<int> = range(5)` 类型检查失败
+
+---
+
+**Bug 4：ReturnTypeInfo::Kind 未新增 Iterator 枚举**（C2.2）
+
+[BuiltinRegistry.h:45](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L45) 现状：
+```cpp
+enum class Kind { Named, Generic, None, Generator, Optional };
+```
+
+change.md C2.2 要求新增 `Iterator`，并改 range 签名从 `Generator("int")` → `Iterator("int")`。
+
+[SemAnalyzer.cpp:280-281](file:///d:/you/Aura/src/Sema/SemAnalyzer.cpp#L280-L281) 现状只处理 `Kind::Generator`（返回 IterSemType），未处理 `Kind::Iterator`。
+
+**影响**：range 仍返回 IterSemType，但 change.md C2.7 的 `isIteratorType` 判定 `GenericSemType.name == "Iterator"`，IterSemType 不匹配 → Iterator 桥接方法特判失效。
+
+**修复**：新增 `Kind::Iterator`，semTypeFromBuiltinReturn 加分支返回 `GenericSemType{name="Iterator", resolvedName="aura_rt::Iterator<int32_t>"}`。
+
+---
+
+**Bug 5：Lexer 未支持 Ellipsis token**（C0.1）
+
+[Lexer.cpp:95-100](file:///d:/you/Aura/src/Lexer.cpp#L95-L100) 现状 `'.'` case 只处理数字开头和小数点，**未处理 `...`**。
+
+[TokType.h](file:///d:/you/Aura/src/TokType.h) 未定义 `Ellipsis` 枚举值。
+
+[TypeParser.cpp:250-251](file:///d:/you/Aura/src/Parser/TypeParser.cpp#L250-L251) 现状只支持 `LBrace`（默认方法体），**未支持 Ellipsis**（C++ 桥接）。
+
+**影响**：interfaces.aurai 中 `map(...) -> Iterator<U> ...` 会解析失败（`...` 被拆成三个 Dot token）。
+
+---
+
+### 三、P1 Bug（重要）
+
+**Bug 6：genIfaceAdapter 未特判 Iterator**（C3.6）
+
+[DeclGen.cpp:209-278](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L209-L278) 的 genIfaceAdapter 通用路径生成：
+```cpp
+struct FibIterator final : Iterator<int32_t> {  // ❌ 基类是全局 Iterator，非 aura_rt::Iterator
+    ...
+    Optional<int32_t>* next() const override { ... }  // ❌ const，但 runtime next() 非 const
+};
+```
+
+两个问题：
+1. 基类应为 `aura_rt::Iterator<int32_t>`，但通用路径用 `Iterator<int32_t>`（全局命名空间）
+2. 方法签名 `const override`，但 runtime 的 `next()` 是非 const → override 失败
+
+change.md C3.6 给出特判代码（第 776-788 行），但未实施。
+
+---
+
+**Bug 7：genForStmt 的 Iterator 分支未实施**（C3.4）
+
+[StmtGen.cpp:409-463](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L409-L463) 现状只处理 range() 和 channel，**未处理 Iterator 遍历**。
+
+change.md C3.4 要求新增 Iterator 分支（检测 inferredType 是 GenericSemType/InterfaceSemType/RecordSemType-impl-Iterator），生成 while + next()/is_none()/unwrap() 循环。
+
+---
+
+**Bug 8：genMethodCall 未实施 Iterator 桥接特判**（C3.3）
+
+[ExprGen.cpp:798](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L798) 现状的 genMethodCall 只处理 sync 构造和常规方法调用，**未处理 map/filter/collect/from 直转 runtime**。
+
+change.md C3.3 要求在 `obj = genExpr(...)` 之后插入 Iterator 桥接特判。
+
+---
+
+**Bug 9：genCallExpr 未实施 some/none/range 特判**（C3.1）
+
+[ExprGen.cpp:568-578](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L568-L578) 现状只处理 channel/gc_force/gc_stats/str，**未处理 some/none/range**。
+
+change.md C3.1 要求新增 some→make_optional、none→make_none、range→make_range。
+
+---
+
+**Bug 10：inferMethodCall 未实施 Iterator 桥接特判**（C2.7）
+
+[ExprInfer.cpp:239-319](file:///d:/you/Aura/src/Sema/Checker/ExprInfer.cpp#L239-L319) 现状未处理 Iterator 类型的 map/filter/collect/from 方法。返回类型推导会走 BuiltinRegistry typeKey 分支，但 Iterator 未注册 typeKey → 返回 ErrorSemType。
+
+change.md C2.7 要求在 InterfaceSemType 分支之后、BuiltinRegistry typeKey 分支之前插入 Iterator 特判。
+
+---
+
+**Bug 11：currentReturnElem_ 未实现**（C3.2）
+
+[CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) 未声明 `currentReturnElem_` 成员。change.md C3.2 要求新增，用于 `none()` 推导 T（从当前函数返回类型 Optional\<T\> 提取）。
+
+现状 `none()` 未实施，但实施后若无 currentReturnElem_，`make_none<T>` 的 T 无法推导（兜底 int32_t 在泛型函数中会出错）。
+
+---
+
+**Bug 12：InterfaceMethodSig 未加 bodyKind 字段**（C0.2）
+
+[Stmt.h:397-403](file:///d:/you/Aura/src/AST/Stmt.h#L397-L403) 现状只有 `defaultBody`，**无 bodyKind 枚举**。
+
+change.md C0.2 要求新增 `BodyKind { Pure, DefaultAura, CppBridge }`，用于区分三种形态。
+
+**影响**：无法表达 `...`（C++ 桥接）方法，interfaces.aurai 的 Iterator 接口 map/filter/collect 无法声明。
+
+---
+
+**Bug 13：some/none 未注册到 BuiltinRegistry functions_**（C2.2）
+
+[BuiltinRegistry.h:320-338](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L320-L338) 现状 functions_ 未包含 some/none。
+
+change.md C2.2 要求新增：
+```cpp
+{"some", {{"v", "T"}}, ReturnTypeInfo::None()},
+{"none", {},            ReturnTypeInfo::None()},
+```
+
+**影响**：Sema inferCall 对 some/none 报 "undefined identifier"。
+
+---
+
+### 四、P2 Bug（次要）
+
+**Bug 14：GcRootHandle 不可移动，make_map 退化为拷贝**
+
+[gc.h:84-118](file:///d:/you/Aura/runtime/gc/gc.h#L84-L118) 声明了拷贝构造和 `operator=(const&) = delete`，但**未声明移动构造/移动赋值**。C++ 规则下，声明拷贝构造会抑制默认移动构造。
+
+`make_map` 的 `F(std::move(f))` 若 F 含 GcRootHandle 成员（闭包捕获），会走拷贝构造（深拷贝值 + 独立注册根），而非移动。性能损失，非正确性问题。
+
+**建议**：显式实现移动构造，或 lambda 捕获用 `std::shared_ptr<GcRootHandle>`。
+
+---
+
+**Bug 15：RangeIter 的 T 推导需显式 int32_t**
+
+[change.md:603-606](file:///d:/you/Aura/change.md#L603-L606) 已显式 `make_range<int32_t>` ✓。但 runtime iterator.h 的 `make_range(T start, T end, T step = 1)` 若不显式指定，T 会从字面量推导为 `int`（与 `int32_t` 在多数平台相同，但严格不同）。
+
+change.md C3.1 已显式指定 `<int32_t>` ✓，无 bug。
+
+---
+
+**Bug 16：collect_all 对 GC 指针类型未显式写屏障**
+
+[change.md:377](file:///d:/you/Aura/change.md#L377) `arr->append(o->value_)`。经核查 [array.tcc:222-261](file:///d:/you/Aura/runtime/builtin/array.tcc#L222-L261)，Array::append 内部已用 `gc_write_barrier` 保护 chunk 链接和 chunk_index 更新 ✓。
+
+但 `o->value_` 本身的读取（从 Optional<T>*）若 T 是指针类型，value_ 是 GC 指针。append 参数按值传递（T value），值拷贝指针，无需写屏障 ✓。无 bug。
+
+---
+
+### 五、设计建议
+
+**建议 1：FuncIter 显式模板参数**
+
+FuncIter 的 T 提取依赖 `OptionalElem` 特化，但 `Optional<T>*` 是指针，无法直接提取 T。建议改为显式模板：
+```cpp
+template <typename T, typename F>
+struct FuncIter : GcObject, Iterator<T> {
+    F fn_;
+    Optional<T>* next() override { return fn_(); }
+};
+template <typename T, typename F>
+inline FuncIter<T, F>* make_iterator_from(F f) { ... }
+```
+调用点 CodeGen 显式传 T（从 Sema 推导的 elemType 生成）。
+
+---
+
+**建议 2：Iterator 接口 genInterfaceDecl 跳过机制**
+
+change.md C3.6 用 `if (decl.name == "Iterator") return;` 硬编码特判。但未来若有更多内置接口（如 Stringer/Comparable 也迁移到 runtime），需逐个特判。
+
+**建议**：BuiltinRegistry 新增 `runtimeProvidedInterfaces_` 集合，genInterfaceDecl 遍历时查表跳过：
+```cpp
+if (BuiltinRegistry::get().isRuntimeProvided(decl.name)) return;
+```
+
+---
+
+### 六、审查结论
+
+| 严重度 | 数量 | 关键项 |
+|---|---|---|
+| P0 | 5 | FuncIter T 提取、genInterfaceDecl 跳过、Iterator 类型注册、Kind::Iterator、Ellipsis |
+| P1 | 8 | genIfaceAdapter 特判、genForStmt/genMethodCall/genCallExpr 特判、inferMethodCall 特判、currentReturnElem_、bodyKind、some/none 注册 |
+| P2 | 3 | GcRootHandle 不可移动、RangeIter T 推导、collect_all 写屏障 |
+
+5 个 P0 bug 必须修复后方可实施。P1 bug 多为"未实施"项，按 change.md 步骤实施时需逐一落实。方案整体可行，但 FuncIter 的 T 提取语法错误（Bug 1）和 genInterfaceDecl 跳过（Bug 2）是设计缺陷，需调整方案。

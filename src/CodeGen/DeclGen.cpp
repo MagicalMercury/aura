@@ -125,6 +125,11 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
                                       const InterfaceDecl& decl) {
     std::string name = decl.name;
 
+    // 内置 Iterator：C++ 形态来自 runtime/builtin/iterator.h（aura_rt::Iterator<T>），
+    // 不在此生成抽象基类（避免与 runtime 的 Iterator<T> 重复/冲突）。
+    // interfaces.aurai 中的声明仅供 Sema（方法签名），record impl 适配器走 genIfaceAdapter 特判。
+    if (name == "Iterator") return;
+
     // 泛型接口 → 模板抽象基类（template<typename T> struct Comparable { ... }）
     // 方法签名中的泛型引用（GenericTypeRef → "T"）在模板作用域内有效
     std::string tprefix;
@@ -141,6 +146,9 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
     h << tprefix << "struct " << name << " {\n";
     h << "  virtual ~" << name << "() = default;\n";
     for (auto& m : decl.methods) {
+        // CppBridge（...）：aura 无实现、c++ 有实现，不生成纯虚/虚成员
+        //（返回类型含未绑定 U 等，无法在 C++ 接口中表达；调用点 CodeGen 直转 runtime）
+        if (m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge) continue;
         std::string retType = m.returnType ? mapType(*m.returnType) : "void";
         if (m.defaultBody) {
             // 有默认实现 → 非纯虚；体内 self 映射 this（虚调用，尊重派生 override）
@@ -217,7 +225,8 @@ void CodeGenerator::genIfaceAdapter(std::ostream& h,
     // 同时构建"泛型形参名 → 具体 C++ 类型"映射（T → Point*），
     // 适配器无模板上下文，方法签名中的泛型引用必须替换为具体类型
     std::map<std::string, std::string> tmap;
-    std::string baseType = iface.name;
+    // 内置 Iterator：C++ 形态来自 runtime（aura_rt::Iterator<T>），基类名需带命名空间
+    std::string baseType = (iface.name == "Iterator") ? "aura_rt::Iterator" : iface.name;
     if (!iface.typeParams.empty()) {
         auto recIt = interfaceImplementations_.find(recordName);
         if (recIt != interfaceImplementations_.end()) {
@@ -252,13 +261,31 @@ void CodeGenerator::genIfaceAdapter(std::ostream& h,
     h << "  aura_rt::GcRootHandle<" << recordName << "*> obj;\n";   // 模式 B：值持有 + 线程局部根
     h << "  explicit " << adapterName << "(" << recordName << "* o)\n";
     h << "      : obj(o, aura_rt::GcRootScope::ThreadLocal) {}\n";  // 显式 scope（避免匹配模式 A 构造）
+    // 内置 Iterator：C++ 形态来自 runtime/builtin/iterator.h（非 genInterfaceDecl 生成）
+    // 基类为 aura_rt::Iterator<elem>，next() 非 const override 转 obj.get()->next()
+    if (iface.name == "Iterator") {
+        std::string elem = "int32_t";
+        auto recIt = interfaceImplementations_.find(recordName);
+        if (recIt != interfaceImplementations_.end()) {
+            auto ifIt = recIt->second.find(iface.name);
+            if (ifIt != recIt->second.end() && !ifIt->second.empty())
+                elem = ifIt->second[0];
+        }
+        h << "  aura_rt::Optional<" << elem << ">* next() override {\n";
+        h << "    return obj.get()->next();\n";
+        h << "  }\n";
+        h << "};\n\n";
+        return;
+    }
     for (auto& m : iface.methods) {
-        // 默认方法且 record 未实现 → 不转发（继承基类默认实现，内部虚调用分发）
+        // 默认方法 / C++ 桥接且 record 未实现 → 不转发
+        //（继承基类默认实现内部虚调用分发；CppBridge 由调用点直转 runtime，基类也无此虚方法）
         bool recordHas = false;
         auto recIt = recordMethods_.find(recordName);
         if (recIt != recordMethods_.end())
             recordHas = recIt->second.count(m.name) > 0;
-        if (m.defaultBody && !recordHas) continue;
+        if ((m.defaultBody || m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge)
+            && !recordHas) continue;
         std::string retType = m.returnType ? mapIfaceType(m.returnType.get()) : "void";
         h << "  " << retType << " " << m.name << "(";
         for (size_t i = 0; i < m.params.size(); ++i) {
@@ -392,6 +419,8 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
         : static_cast<std::ostream&>(cpp);
 
     out << tprefix << sig << " {\n";
+    // C3.2: 跟踪当前函数返回 Optional<T> 的元素类型（none() 直转 make_none<T> 用）
+    currentReturnElem_ = optionalElemOf(decl.returnType.get());
     // Bug B 修复：函数体入口为堆类型参数生成 GcRootHandle 包装
     // 签名形如 `Tree<T>* node_raw`，此处生成 `GcRootHandle<decltype(node_raw)> node(node_raw);`
     // 用 decltype 而非显式 ptype，避免泛型闭包（compose(auto transforms)）中
@@ -417,6 +446,7 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     stringVarNames_.clear();
     gcRootVarNames_.clear();
     gcRootTypes_.clear();
+    currentReturnElem_.clear();
 }
 
 std::string CodeGenerator::funSignature(const FunDecl& decl,
@@ -605,6 +635,8 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
 
     out << tprefix << sig << " {\n";
     currentReceiverName_ = decl.receiverName;
+    // C3.2: 跟踪当前方法返回 Optional<T> 的元素类型（none() 直转 make_none<T> 用）
+    currentReturnElem_ = optionalElemOf(decl.returnType.get());
     // Bug B 同步修复：方法体入口为堆类型参数生成 GcRootHandle 包装
     // 签名形如 `Tree<T>::map(Tree<U>* node_raw)`，此处生成 `GcRootHandle<decltype(node_raw)> node(node_raw);`
     // 用 decltype 避免泛型方法中未绑定模板参数无法解析的问题
@@ -623,6 +655,7 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     stringVarNames_.clear();
     gcRootVarNames_.clear();
     gcRootTypes_.clear();
+    currentReturnElem_.clear();
 }
 
 // 构造函数 ============================================================

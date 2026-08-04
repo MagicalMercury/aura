@@ -578,6 +578,26 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
         return "(new aura_rt::Channel<" + targ + ">(" + cap + "))";
     }
 
+    // some(v)/none()：Optional 构造（C++ CTAD 推导 T）
+    if (calleeName == "some" && e.args.size() == 1) {
+        return "aura_rt::make_optional(" + genExpr(*e.args[0], isCoroutine) + ")";
+    }
+    if (calleeName == "none" && e.args.empty()) {
+        // T 从当前函数返回类型（Optional<T>）提取；缺省兜底 int32_t
+        return "aura_rt::make_none<" + (currentReturnElem_.empty()
+                                        ? std::string("int32_t") : currentReturnElem_) + ">()";
+    }
+
+    // range(...) → make_range（iota_view）；for-in 的 range 仍走 iota 特判（性能路径）
+    if (calleeName == "range") {
+        std::vector<std::string> a;
+        for (auto& arg : e.args) a.push_back(genExpr(*arg, isCoroutine));
+        if (a.size() == 1) return "aura_rt::make_range<int32_t>(0, " + a[0] + ")";
+        if (a.size() == 2) return "aura_rt::make_range<int32_t>(" + a[0] + ", " + a[1] + ")";
+        if (a.size() == 3) return "aura_rt::make_range<int32_t>(" + a[0] + ", " + a[1] + ", " + a[2] + ")";
+        return "aura_rt::make_range<int32_t>(0, 0)";
+    }
+
     // GC 内建函数：gc_force() / gc_stats()
     if (calleeName == "gc_force" && e.args.empty()) {
         return "aura_rt::gc_force_major()";
@@ -797,6 +817,57 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
 
     std::string obj = genExpr(*e.object, isCoroutine);
     std::ostringstream oss;
+
+    // ============================================================
+    // Iterator 桥接方法特判（map/filter/collect/from 直转 runtime，不走虚调用）
+    // 模板参数全部由 C++ 参数推导（src: Iterator<T>*, f: lambda → invoke_result_t）
+    // ============================================================
+    bool objIsIterator = false;
+    // 先按 Sema 推断类型判定（覆盖 let 变量/表达式/参数：GenericSemType Iterator 或
+    // InterfaceSemType Iterator）；Identifier 的 inferredType 在 Sema 推断时已填充
+    if (e.object->inferredType) {
+        if (auto* g = dynamic_cast<const GenericSemType*>(e.object->inferredType))
+            objIsIterator = g->name == "Iterator";
+        else if (auto* is = dynamic_cast<const InterfaceSemType*>(e.object->inferredType))
+            objIsIterator = is->name == "Iterator";
+    }
+    // Iterator.from(...) 静态调用（Identifier "Iterator"，无 inferredType）
+    if (auto* id = dynamic_cast<const Identifier*>(e.object.get()))
+        if (id->name == "Iterator") objIsIterator = true;
+    if (objIsIterator) {
+        // 实参（闭包）表达式
+        std::vector<std::string> iArgs;
+        for (size_t i = 0; i < e.args.size(); ++i)
+            iArgs.push_back(genExpr(*e.args[i], isCoroutine));
+        if (e.method == "from" && iArgs.size() == 1) {
+            // FuncIter 无自动推导（T 与 F 无关联）：T 从闭包返回类型 Optional<T> 显式提取
+            std::string elem = "int32_t";
+            if (auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType))
+                if (auto* os = dynamic_cast<const OptionalSemType*>(ft->returnType.get()))
+                    elem = mapSemType(*os->elementType);
+            return "aura_rt::make_iterator_from<" + elem + ">(" + iArgs[0] + ")";
+        }
+        if (e.method == "map" && iArgs.size() == 1) {
+            std::string call = "aura_rt::make_map(" + obj + ", " + iArgs[0] + ")";
+            std::vector<std::pair<std::string, const SemType*>> gArgs;
+            gArgs.emplace_back(obj, e.object->inferredType);
+            gArgs.emplace_back(iArgs[0], e.args[0]->inferredType);
+            return genGcRootedArgs(gArgs, call, isCoroutine);
+        }
+        if (e.method == "filter" && iArgs.size() == 1) {
+            std::string call = "aura_rt::make_filter(" + obj + ", " + iArgs[0] + ")";
+            std::vector<std::pair<std::string, const SemType*>> gArgs;
+            gArgs.emplace_back(obj, e.object->inferredType);
+            gArgs.emplace_back(iArgs[0], e.args[0]->inferredType);
+            return genGcRootedArgs(gArgs, call, isCoroutine);
+        }
+        if (e.method == "collect" && iArgs.empty()) {
+            std::string call = "aura_rt::collect_all(" + obj + ")";
+            std::vector<std::pair<std::string, const SemType*>> gArgs;
+            gArgs.emplace_back(obj, e.object->inferredType);
+            return genGcRootedArgs(gArgs, call, isCoroutine);
+        }
+    }
 
     // 判断是否是 io 调用
     bool isIoCall = false;
@@ -1177,6 +1248,8 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
         if (paramNames.count(name))   continue;
         if (builtins.count(name))     continue;
         if (registeredTypes_.count(name)) continue;
+        // 内置函数（some/none/str/range/Iterator 等）不捕获——调用点直转 runtime
+        if (BuiltinRegistry::get().hasFunctionName(name)) continue;
 
         auto it = registeredTypes_.find(name);
         if (it != registeredTypes_.end() && it->second) {
@@ -1422,6 +1495,9 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
         }
     }
 
+    // C3.2: 闭包返回 Optional<T> 时跟踪元素类型（none() 直转 make_none<T> 用）
+    auto savedReturnElem = currentReturnElem_;
+    currentReturnElem_ = optionalElemOf(e.returnType.get());
     for (auto& s : e.body->stmts) {
         if (s) genStmt(oss, *s, closureIsCoro);
     }
@@ -1438,6 +1514,7 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     // Bug 2 修复：恢复 stringVarNames_ / valueTypeVarNames_，避免污染外层作用域
     stringVarNames_ = savedStringVars;
     valueTypeVarNames_ = savedValueVars;
+    currentReturnElem_ = savedReturnElem;
 
     lastClosureIsCoro_ = closureIsCoro;
     return oss.str();

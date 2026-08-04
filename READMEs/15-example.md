@@ -5,9 +5,8 @@ import path
 
 type User = { id: int, name: string }
 
-interface Stringer {
-    to_string() -> string
-}
+// Stringer 是内置接口（builtins/interfaces.aurai，始终加载），无需重新声明
+// 直接显式 impl 即可：str(user) 自动调用 to_string()
 
 fun (self User) User(id: int, name: string) {
     self.id = id
@@ -67,6 +66,15 @@ fun make_greeter(prefix: string) -> fun(string) -> None {
     }
 }
 
+// Iterator 示例：record 实现 next() 即可 for-in
+type Countdown = { n: int }
+
+fun (self Countdown impl Iterator<int>) next() -> Optional<int> {
+    if self.n <= 0 { return none() }
+    self.n = self.n - 1
+    return some(self.n)
+}
+
 fun main(io: Io) throws {
     // 路径演示
     let p = path.join(path.new("config"), "app.toml")
@@ -91,6 +99,16 @@ fun main(io: Io) throws {
     let nums = [1, 2, 3]
     let doubled = mapper(nums, fun(x: int) -> int { return x * 2 })
     io.println("Doubled: " + doubled[0] + ", " + doubled[1] + ", " + doubled[2])
+
+    // Iterator 惰性链：map 返回新迭代器，collect 收集为数组
+    let squares = range(5).map(fun(x: int) -> int { return x * x }).collect()
+    io.println("Squares: " + squares[0] + "..." + squares[4])   // 0...16
+
+    // Iterator for-in：record 实现 next() 后直接遍历
+    let cd: Countdown = { n = 3 }
+    for v in cd {
+        io.println("cd " + str(v))    // cd 2 / cd 1 / cd 0
+    }
 
     io.println("Done.")
 }

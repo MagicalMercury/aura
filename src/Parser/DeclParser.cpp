@@ -58,7 +58,10 @@ std::unique_ptr<FunDecl> Parser::parseFunDecl() {
         decl->returnType = parseType();
     }
 
-    if (!noBody_) {
+    // '...'：C++ 桥接标记（.aurai 声明文件用，aura 无实现 c++ 有实现）
+    if (match(TokType::Ellipsis)) {
+        decl->hasCppImpl = true;
+    } else if (!noBody_) {
         decl->body = parseBlock();
     }
     return decl;
@@ -188,7 +191,10 @@ std::unique_ptr<MethodDecl> Parser::parseMethodDecl() {
         decl->returnType = parseType();
     }
 
-    if (!noBody_) {
+    // '...'：C++ 桥接标记（.aurai 声明文件用，aura 无实现 c++ 有实现）
+    if (match(TokType::Ellipsis)) {
+        decl->hasCppImpl = true;
+    } else if (!noBody_) {
         decl->body = parseBlock();
     }
     return decl;

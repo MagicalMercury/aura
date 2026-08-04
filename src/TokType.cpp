@@ -73,6 +73,7 @@ std::string tokTypeName(TokType type) {
         {TokType::RBracket,   "]"},
         {TokType::Comma,      ","},
         {TokType::Semicolon,  ";"},
+        {TokType::Ellipsis,   "..."},
 
         {TokType::Eof,   "EOF"},
         {TokType::Error, "ERROR"},

@@ -188,9 +188,14 @@ public:
         bool visit(const SpawnStmt& n, DeclaredCollector& self){ if (n.callExpr) return false; for (auto& sb : n.body) if (sb) self.collectStmt(*sb); return false; }
         bool visit(const ReturnStmt&,  DeclaredCollector&) { return false; }
         bool visit(const ThrowStmt&,   DeclaredCollector&) { return false; }
-        bool visit(const IfStmt&,      DeclaredCollector&) { return false; }
-        bool visit(const WhileStmt&,   DeclaredCollector&) { return false; }
-        bool visit(const LoopStmt&,    DeclaredCollector&) { return false; }
+        bool visit(const IfStmt& n, DeclaredCollector& self) {
+            if (n.thenBranch) self.collectStmt(*n.thenBranch);
+            for (auto& ei : n.elseIfs) if (ei.body) self.collectStmt(*ei.body);
+            if (n.elseBranch) self.collectStmt(*n.elseBranch);
+            return false;
+        }
+        bool visit(const WhileStmt&,      DeclaredCollector&) { return false; }
+        bool visit(const LoopStmt&,       DeclaredCollector&) { return false; }
         bool visit(const ExprStmt&,    DeclaredCollector&) { return false; }
         bool visit(const BreakStmt&,   DeclaredCollector&) { return false; }
         bool visit(const ContinueStmt&,DeclaredCollector&) { return false; }
@@ -230,6 +235,9 @@ private:
     [[nodiscard]] std::string mapParamType(const TypeExpr& type);
     // SemType → C++ 类型（从 ASTNode::inferredType 读取，替代文本启发式）
     [[nodiscard]] std::string mapSemType(const SemType& semType);
+
+    // 从返回类型 TypeExpr 提取 Optional<T> 的 T（C++ 名）；非 Optional 返回空
+    [[nodiscard]] std::string optionalElemOf(const TypeExpr* retType);
 
     // 值类型映射（不加 *）
     [[nodiscard]] std::string mapValueType(const TypeExpr& type);
@@ -460,6 +468,10 @@ private:
 
     // 当前函数的 C++ 返回类型（用于 genReturnStmt 生成正确的 RecordExpr 构造）
     std::string currentReturnCppType_;
+
+    // 当前函数返回 Optional<T> 的元素类型 T（C++ 名），空 = 非 Optional
+    // none() 直转 make_none<T> 时使用（C3.2）
+    std::string currentReturnElem_;
 
     // 字符串类型变量名集合（用于 genBinaryExpr 检测 string + T 拼接）
     std::set<std::string> stringVarNames_;

@@ -245,10 +245,15 @@ InterfaceMethodSig Parser::parseInterfaceMethodSig() {
         sig.returnType = parseType();
     }
 
-    // 接口方法签名后可选函数体（默认实现，Java default / Rust trait 风格）：
-    // 签名后直接 `{` 即默认实现体（与闭包区分：闭包是 `(params) -> T { }` 带箭头返回）
+    // 接口方法签名后三选一：
+    //   { body } → Aura 默认方法（DefaultAura）
+    //   ...      → C++ 桥接方法（CppBridge，aura 无实现 c++ 有实现）
+    //   无       → 纯虚（record 必须实现）
     if (check(TokType::LBrace)) {
+        sig.bodyKind = InterfaceMethodSig::BodyKind::DefaultAura;
         sig.defaultBody = parseBlock();
+    } else if (match(TokType::Ellipsis)) {
+        sig.bodyKind = InterfaceMethodSig::BodyKind::CppBridge;
     }
 
     return sig;

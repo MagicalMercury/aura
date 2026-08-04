@@ -136,6 +136,14 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
     return "/* unknown_type */";
 }
 
+std::string CodeGenerator::optionalElemOf(const TypeExpr* retType) {
+    // 从返回类型提取 Optional<T> 的 T（C++ 名）；非 Optional 返回空（C3.2）
+    auto* nt = retType ? dynamic_cast<const NamedType*>(retType) : nullptr;
+    if (nt && nt->name == "Optional" && !nt->typeArgs.empty())
+        return mapType(*nt->typeArgs[0]);
+    return "";
+}
+
 std::string CodeGenerator::mapNamedType(const std::string& name) {
     // 先查 BuiltinRegistry（内置类型）
     if (auto* ti = Aura::BuiltinRegistry::get().findType(name)) {

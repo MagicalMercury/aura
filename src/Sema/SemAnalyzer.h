@@ -68,6 +68,12 @@ private:
     // 类型等价性
     [[nodiscard]] bool isAssignable(const SemType& target, const SemType& source) const;
 
+    // SemType → C++ 类型名（供 ExprInfer 的 Iterator 桥接方法返回类型推导复用）
+    [[nodiscard]] std::string semTypeToCppName(const SemType& t) const;
+
+    // 判断类型是否为内置迭代器（Iterator 接口 / GenericSemType(name="Iterator")）
+    [[nodiscard]] bool isIteratorType(const SemType* t) const;
+
     // 函数签名匹配辅助：参数列表 + 返回值 + throws
     [[nodiscard]] bool matchFuncSig(
         const std::vector<std::unique_ptr<SemType>>& aParams,

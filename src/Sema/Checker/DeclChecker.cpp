@@ -119,7 +119,7 @@ void SemAnalyzer::verifyImplCompleteness(const Program& program) {
             if (!sym || sym->kind != SymKind::Interface) continue;  // 未找到接口 → 已报错
             auto tmIt = typeMethods_.find(recKey);
             for (auto& m : sym->interfaceMethods) {
-                if (m.hasDefault) continue;  // 默认方法豁免
+                if (m.hasDefault || m.hasCppImpl) continue;  // 默认方法 / C++ 桥接豁免
                 bool found = false;
                 if (tmIt != typeMethods_.end()) {
                     for (auto& rm : tmIt->second) {
@@ -367,11 +367,19 @@ void SemAnalyzer::declareInterface(const InterfaceDecl& i) {
     for (auto& m : i.methods) {
         InterfaceSemType::MethodSig sig;
         sig.name   = m.name;
+        sig.throws = m.throws;
+        sig.hasDefault = m.defaultBody != nullptr;   // Aura 默认方法豁免结构匹配
+        sig.hasCppImpl = m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge;
+        if (m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge) {
+            // C++ 桥接方法（...）：aura 无实现，签名可含接口类型参数之外的
+            // 自由泛型（如 Iterator<T>::map 的 U）。调用点 CodeGen 直转 runtime，
+            // 不需要解析参数/返回类型；仅保留 hasCppImpl 供 verifyImplCompleteness 豁免。
+            sym.interfaceMethods.push_back(std::move(sig));
+            continue;
+        }
         for (auto& p : m.params)
             sig.paramTypes.push_back(p.type ? resolveType(*p.type) : ErrorSemType::make());
         sig.returnType = m.returnType ? resolveType(*m.returnType) : nullptr;
-        sig.throws = m.throws;
-        sig.hasDefault = m.defaultBody != nullptr;   // 默认方法豁免结构匹配
         sym.interfaceMethods.push_back(std::move(sig));
     }
     symtab_.exitScope();

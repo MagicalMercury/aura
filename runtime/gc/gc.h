@@ -46,7 +46,8 @@ class GcHeap;
 // - Ref：引用外部变量（栈变量包装，线程局部根）
 // - ValueThreadLocal：值持有（接口适配器等临时对象，线程局部根）
 // - ValueGlobal：值持有 + 全局根（闭包捕获/全局缓存）
-enum class GcRootMode : uint8_t { Ref, ValueThreadLocal, ValueGlobal };
+// - Moved：已移动（根注册已转移给新句柄，析构跳过注销；不得再读值）
+enum class GcRootMode : uint8_t { Ref, ValueThreadLocal, ValueGlobal, Moved };
 // 值持有模式的根作用域（编译期静态决定，非运行时判断）
 enum class GcRootScope { ThreadLocal, Global };
 
@@ -93,6 +94,11 @@ public:
     // 拷贝：按 other.mode_ 分支（Ref→引用同一变量；Value→深拷贝值+独立注册）
     GcRootHandle(const GcRootHandle& other);
     GcRootHandle& operator=(const GcRootHandle&) = delete;
+
+    // 移动：接管 other 的根注册（O(1) 链表原位重连，无注册/注销开销）
+    // 源标记 Moved 失效，析构跳过注销；移动赋值保持不可用（闭包仅在工厂内
+    // placement-new 构造一次，无需赋值）
+    GcRootHandle(GcRootHandle&& other) noexcept;
 
     // 更新被包装的引用目标（用于移动赋值后；仅 Ref 模式）
     // 同步更新 ptr_ref_，保持 GC 遍历一致性
@@ -253,6 +259,8 @@ public:
     // 构造/析构在 mutator 线程无锁操作自己的链表；GC 在 STW 期间遍历所有线程链表
     void registerRootThreadLocal(GcRootHandleBase* root);
     void unregisterRootThreadLocal(GcRootHandleBase* root);
+    // 原位替换：摘除 oldNode、newNode 插入同一位置（O(1)，移动构造用）
+    void moveRootNode(GcRootHandleBase* newNode, GcRootHandleBase* oldNode);
     ThreadRootList* ensureThreadRootList();   // registerThread 时分配（懒分配）
     void            releaseThreadRootList();  // unregisterThread 时释放
 

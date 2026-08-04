@@ -7,44 +7,11 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-08-02（新增 int()/float()/str() 转换函数 issue）
+# 最近更新：2026-08-04（新增泛型构造函数调用、返回闭包工厂函数代码生成 2 个预存 bug，暂不处理）
 
 ================================================================
 [ 一 ] 内置 API 与模块（plan/plan11.md）
 ================================================================
-
-[x] P0  int() / float() / str() 字符串转换函数  [2026-08-02 提出]
-      - 来源：原 string_to_int / string_to_float 两条（plan11.md:41-42）
-        强化为 Python int()/float()/str() 风格（用户确认方向）
-      - 语言层暴露名（Python 风格）：
-          * int(s: string, base: int = 10) throws -> int
-            — ± 符号 + 前后空白 + 十进制；带 base 时 2-36（超界报错），
-            base=0 按前缀自动判定（strtol base=0 语义，支持 0x/0o/0b）
-          * float(s: string) throws -> float
-            — ± + 小数 + e/E 指数 + inf/Infinity/nan（大小写不敏感）
-          * str(x: int/float/bool/string) -> string
-            — 复用 GcString::from；string 原样返回（from(GcString*) 重载已有）
-      - 默认参数支持（用户要求纳入 plan）：
-          * 现状：Parser 不支持 `name: type = value`（TypeParser.cpp:208-217
-            parseParam 只解析 name + 可选 : type），AST Param 无 default 字段，
-            README 未声明 → 当前完全不支持
-          * 目标：int 用单签名 `int(s, base = 10)`，避免双重载；
-            作为通用语言特性实现（Parser/AST/Sema/CodeGen 全链路），
-            函数/方法/构造函数/闭包参数统一生效
-          * 关注点：默认值表达式可能非常量（C++ 默认参数仅限常量表达式），
-            CodeGen 倾向调用点补实参而非 C++ 默认参数语法
-      - 错误：一律 Error{kind="parse_error", message=...}
-      - runtime：strtol/strtod + endptr 完整消费检查（不用 std::stoi/stod——
-        "12abc" 半解析不报错 + 抛的是 C++ 异常需转换）
-        C++ 函数名避让关键字：aura_rt::string_to_int / string_to_float / string_of
-      - 注册：BuiltinRegistry functions_（int×2 / float / str×4，含 throws 标记）
-      - Sema 补缺口：inferCall BuiltinRegistry 全局函数分支缺 checkThrowsContext
-        （当前 throws 全局函数调用无 try/! 包裹不报错，必须一并修）
-      - CodeGen：genCallExpr 新增全局函数映射表（Aura 名 → aura_rt:: 函数），
-        str 参数走 GcRootHandle 保护
-      - 文件：runtime/builtin/string.h/.cpp、src/Sema/BuiltinRegistry.h、
-        src/Sema/Checker/ExprInfer.cpp、src/CodeGen/ExprGen.cpp
-      - 状态：待起草 plan
 
 [ ] P1  math 内置模块
       - plan/plan11.md:54 规划 math.abs / math.sqrt / math.floor 等 8 个函数
@@ -130,10 +97,38 @@
       - 缺：嵌套层级较深时仍会失败
       - 文件：src/Sema/SemAnalyzer.h:134-141, src/Sema/Checker/DeclChecker.cpp:172-206
 
-[ ] P2  闭包赋值给接口类型参数
+[~] P2  闭包赋值给接口类型参数
       - READMEs/06-generics.md:163 自述"暂不支持"
       - 缺：inferCall 中将闭包包装为接口适配器
       - 文件：src/Sema/Checker/ExprInfer.cpp (无相关逻辑)
+
+[ ] P1  泛型类型构造函数无法调用  [2026-08-04 提出]
+      - 问题：`type Stack<T>` + `fun (self Stack<T>) Stack()` 声明后，
+        `let stack = Stack()` 报 undefined function 'Stack'；`Stack<int>()`
+        显式泛型调用形式也不支持（expected expression）
+      - 根因（调试确认）：TypeAlias 符号 ctorParams 为空——泛型 receiver 的
+        构造函数参数未注册到类型符号（SymbolTable::define 同名填充未命中）
+      - 影响：READMEs/07-methods-interfaces.md 泛型构造函数示例、
+        READMEs/15-example.md 完整示例均无法编译
+      - 文件：src/Sema/Checker/ExprInfer.cpp:189-248、
+              src/Sema/SymbolTable.cpp、src/Parser/DeclParser.cpp:178
+      - 暂不处理：test.aura 无泛型构造调用，不影响现有功能
+
+[ ] P1  返回闭包的工厂函数代码生成有缺陷  [2026-08-04 提出]
+      - 问题：`fun f(n: int) -> fun() -> int { return fun() -> int { return n + 1 } }`
+        这类"工厂函数返回闭包"模式（READMEs/06-generics.md:154、15-example.md 声称支持），
+        生成的 C++ 代码无法编译：
+          * lambda 返回类型被推导为 aura_rt::task<T> 而非 std::function，
+            co_return lambda 实例与函数返回类型 std::function 不匹配
+          * 协程 main 中调用闭包变量 g1() 被错误生成 co_await g1()
+      - 影响：READMEs/15-example.md make_greeter / make_mapper 示例无法编译
+      - 备注：闭包捕获本身 Sema 层正常（生成代码捕获列表 [io] 已正确生成）；
+        15-example 原 make_greeter 还引用未定义的 io（顶层函数无 io 参数），
+        属文档自身错误，与编译器 bug 无关
+      - 文件：src/CodeGen/ExprGen.cpp (genFunExpr / 闭包返回)、
+              src/CodeGen/StmtGen.cpp (闭包调用 co_await 边界)
+      - 暂不处理：test.aura 的闭包均以字面量直接传递（如 Iterator.from(fun ...)），
+        未触发"返回函数类型"路径
 
 [~] P2  字符串遍历 for ch in s
       - READMEs/08-control-flow.md:42-46 承诺
@@ -144,6 +139,20 @@
       - READMEs/12-modules.md:32-40 承诺
       - 现状：Sema 未显式处理，依赖 C++ 编译器隐式转换
       - 缺：Sema 层路径参数类型检查
+
+[ ] P2  修复 `!` 前缀逻辑非（当前始终被识别为错误传播符）  [2026-08-03 提出]
+      - 问题：`!` 仅支持后缀错误传播（`expr!`），前缀逻辑非（`!x`）无法解析，
+        parsePrimary 遇 Bang 报 expected expression（interfaces.aurai 曾因
+        `!self.equal(other)` 崩溃，临时改用 not 绕过）
+      - 现状盘点：not / and / or 关键字已实现逻辑运算（Parser+Sema+CodeGen 全链路）；
+        `!` 前缀未实现；`&&` / `||` 无 token（Lexer 不支持）
+      - 方案（Parser 一个分支）：parseUnary 开头 match(Bang) → UnaryExpr op="not"，
+        复用现有 not 语义，Sema/CodeGen 零改动；前缀/后缀由位置天然区分
+        （`!x` 前缀、`x!` 后缀、`!x!` = !(x!)，无歧义）
+      - 优点：修复成本极低；`!x` 直觉可用，与 C/Go/Rust 一致；not/! 双形式共存
+      - 代价：逻辑非多一种写法需文档约定；`&&`/`||` 仍是独立后续 issue
+      - 暂不处理原因：not 关键字已完全可用，不影响功能
+      - 文件：src/Parser/ExprParser.cpp (parseUnary)、READMEs/08-control-flow.md
 
 ================================================================
 [ 五 ] GC（plan/gc_features_plan.md, plan/gc_promotion_issues.md）

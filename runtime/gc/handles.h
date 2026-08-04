@@ -42,10 +42,36 @@ GcRootHandle<T>::GcRootHandle(T val, GcRootScope scope)
 
 template <typename T>
 GcRootHandle<T>::~GcRootHandle() {
+    if (mode_ == GcRootMode::Moved) return;   // 已移动：根注册已转移，跳过注销
     if (mode_ == GcRootMode::ValueGlobal)
         GcHeap::instance().unregisterGlobalRoot(ptr_ref_);
     else
         GcHeap::instance().unregisterRootThreadLocal(this);
+}
+
+// 移动构造：接管 other 的根注册（无多余注册/注销）
+// - Ref：直接继承 ptr_/ptr_ref_（引用同一外部变量），链表原位重连
+// - ValueThreadLocal：搬值 + moveRootNode 原位重连（O(1)）
+// - ValueGlobal：ptr_ref_ 必须指向本对象 &val_（值已搬走），无法转移 → 注销源 + 注册目标
+// 源置 Moved：析构跳过注销；不得再读源值（未定义行为，仅内部 std::move 使用）
+template <typename T>
+GcRootHandle<T>::GcRootHandle(GcRootHandle&& other) noexcept
+    : GcRootHandleBase(), mode_(other.mode_) {
+    if (other.mode_ == GcRootMode::Ref) {
+        ptr_ = other.ptr_;
+        ptr_ref_ = other.ptr_ref_;                   // 引用同一外部变量
+        GcHeap::instance().moveRootNode(this, &other);
+    } else {
+        val_ = other.get();                          // 搬值
+        ptr_ref_ = reinterpret_cast<GcObject**>(&val_);
+        if (other.mode_ == GcRootMode::ValueGlobal) {
+            GcHeap::instance().registerGlobalRoot(ptr_ref_);
+            GcHeap::instance().unregisterGlobalRoot(other.ptr_ref_);
+        } else {
+            GcHeap::instance().moveRootNode(this, &other);
+        }
+    }
+    other.mode_ = GcRootMode::Moved;                 // 源失效：析构跳过注销
 }
 
 // 拷贝构造：按 other.mode_ 分支

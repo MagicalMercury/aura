@@ -24,6 +24,8 @@ interface Comparable<T> {
 }
 
 interface Iterator<T> {
-    next() -> Optional<T>
-    collect() -> [T] { return [] }       // 默认方法示范（v1 仅支持返回基础类型/列表）
+    next() -> Optional<T>                      // 纯虚：record 必须实现
+    map(f: fun(T) -> U) -> Iterator<U> ...     // C++ 桥接：runtime make_map（惰性链）
+    filter(p: fun(T) -> bool) -> Iterator<T> ... // C++ 桥接：runtime make_filter（惰性链）
+    collect() -> [T] ...                       // C++ 桥接：runtime collect_all
 }

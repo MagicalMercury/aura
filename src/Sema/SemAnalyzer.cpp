@@ -48,28 +48,6 @@ std::string cppNameOf(const std::string& auraName) {
     return auraName;
 }
 
-// 将 SemType 映射为 C++ 类型名（供 canonicalName 模板参数实例化使用）
-std::string semTypeToCppName(const SemType& t) {
-    if (auto* p = dynamic_cast<const PrimSemType*>(&t)) {
-        switch (p->kind) {
-            case PrimSemType::Int:    return "int32_t";
-            case PrimSemType::Float:  return "double";
-            case PrimSemType::Bool:   return "bool";
-            case PrimSemType::String: return "aura_rt::GcString*";
-        }
-    }
-    if (dynamic_cast<const NoneSemType*>(&t)) return "aura_rt::NoneType";
-    if (auto* l = dynamic_cast<const ListSemType*>(&t))
-        return "aura_rt::Array<" + semTypeToCppName(*l->elementType) + ">*";
-    if (auto* r = dynamic_cast<const RecordSemType*>(&t))
-        return r->canonicalName + "*";
-    if (auto* g = dynamic_cast<const GenericSemType*>(&t)) {
-        if (!g->resolvedName.empty()) return g->resolvedName;
-        return cppNameOf(g->name);
-    }
-    return "auto";
-}
-
 // 将 canonicalName（如 "Pair<A, B>"）模板参数列表中名为 name 的形参替换为 cppName
 std::string replaceCanonicalArg(const std::string& canonicalName,
                                 const std::string& name,
@@ -170,6 +148,45 @@ std::unique_ptr<SemType> SemAnalyzer::semTypeFromCppName(const std::string& cppN
     return g;
 }
 
+// SemType → C++ 类型名（提升自匿名命名空间，供 ExprInfer 的 Iterator 桥接方法推导复用）
+std::string SemAnalyzer::semTypeToCppName(const SemType& t) const {
+    if (auto* p = dynamic_cast<const PrimSemType*>(&t)) {
+        switch (p->kind) {
+            case PrimSemType::Int:    return "int32_t";
+            case PrimSemType::Float:  return "double";
+            case PrimSemType::Bool:   return "bool";
+            case PrimSemType::String: return "aura_rt::GcString*";
+        }
+    }
+    if (dynamic_cast<const NoneSemType*>(&t)) return "aura_rt::NoneType";
+    if (auto* l = dynamic_cast<const ListSemType*>(&t))
+        return "aura_rt::Array<" + semTypeToCppName(*l->elementType) + ">*";
+    if (auto* r = dynamic_cast<const RecordSemType*>(&t))
+        return r->canonicalName + "*";
+    if (auto* g = dynamic_cast<const GenericSemType*>(&t)) {
+        if (!g->resolvedName.empty()) return g->resolvedName;
+        return cppNameOf(g->name);
+    }
+    if (auto* o = dynamic_cast<const OptionalSemType*>(&t)) {
+        std::string elem = o->elementType ? semTypeToCppName(*o->elementType) : "int32_t";
+        return "aura_rt::Optional<" + elem + ">*";
+    }
+    if (auto* it = dynamic_cast<const IterSemType*>(&t)) {
+        std::string elem = it->elementType ? semTypeToCppName(*it->elementType) : "int32_t";
+        return "aura_rt::Iterator<" + elem + ">";
+    }
+    return "auto";
+}
+
+bool SemAnalyzer::isIteratorType(const SemType* t) const {
+    if (!t) return false;
+    if (auto* g = dynamic_cast<const GenericSemType*>(t))
+        return g->name == "Iterator" || g->resolvedName.find("Iterator") != std::string::npos;
+    if (auto* is = dynamic_cast<const InterfaceSemType*>(t))
+        return is->name == "Iterator";
+    return false;
+}
+
 std::unique_ptr<SemType> SemAnalyzer::elemTypeOf(const SemType* iterType) {
     if (!iterType) return ErrorSemType::make();
     if (auto* listTy = dynamic_cast<const ListSemType*>(iterType))
@@ -221,6 +238,7 @@ std::unique_ptr<SemType> SemAnalyzer::resolveNamedType(const std::string& name) 
             ms.returnType = m.returnType ? m.returnType->clone() : nullptr;
             ms.throws = m.throws;
             ms.hasDefault = m.hasDefault;
+            ms.hasCppImpl = m.hasCppImpl;
             t->methods.push_back(std::move(ms));
         }
         return t;
@@ -279,6 +297,17 @@ std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(
         }
         case ReturnTypeInfo::Kind::Generator:
             return IterSemType::make(semTypeFromAuraName(ret.typeName));
+        case ReturnTypeInfo::Kind::Iterator: {
+            // Iterator(elemType)：如 range → Iterator<int>（元素类型固定，无需 objType）
+            // 用 GenericSemType{name="Iterator", resolvedName} 表达：
+            //   - CodeGen 特判 name=="Iterator"（C3.3 genMethodCall / C3.4 genForStmt）
+            //   - mapSemType 映射 resolvedName + "*" → aura_rt::Iterator<int32_t>*
+            auto g = std::make_unique<GenericSemType>();
+            g->name = "Iterator";
+            g->resolvedName = "aura_rt::Iterator<" + cppNameOf(ret.typeName) + ">";
+            typeStore_.push_back(std::move(g));
+            return typeStore_.back()->clone();
+        }
         case ReturnTypeInfo::Kind::Optional: {
             // Optional<T>: 从 objType 提取元素类型构造 OptionalSemType
             // sync.Channel<T>.receive() 时 objType 应携带元素类型信息（resolvedName）
@@ -353,6 +382,16 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
             return isAssignable(*lt->elementType, *ls->elementType);
         }
         return false;
+    }
+
+    // Optional<T>：双方元素类型需可赋值；Error 元素（none() 占位/未知类型）静默兼容
+    if (auto* oa = dynamic_cast<const OptionalSemType*>(&target)) {
+        auto* ob = dynamic_cast<const OptionalSemType*>(&source);
+        if (!ob) return false;
+        if (dynamic_cast<const ErrorSemType*>(oa->elementType.get())
+            || dynamic_cast<const ErrorSemType*>(ob->elementType.get()))
+            return true;
+        return isAssignable(*oa->elementType, *ob->elementType);
     }
 
     // 函数类型：逐参数检查（支持泛型参数）

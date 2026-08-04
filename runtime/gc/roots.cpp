@@ -43,6 +43,19 @@ void GcHeap::unregisterRootThreadLocal(GcRootHandleBase* root) {
     if (root->next_) root->next_->prev_ = root->prev_;
 }
 
+// 原位替换：newNode 接管 oldNode 在链表中的位置（O(1)，移动构造用）
+// 前置：oldNode 已在当前线程链表（ThreadLocal 模式移动）；同线程操作无锁
+void GcHeap::moveRootNode(GcRootHandleBase* newNode, GcRootHandleBase* oldNode) {
+    ThreadRootList* list = tl_roots_;
+    if (!list) return;                               // 防御：oldNode 理应已注册
+    newNode->prev_ = oldNode->prev_;
+    newNode->next_ = oldNode->next_;
+    if (oldNode->prev_) oldNode->prev_->next_ = newNode;
+    else                list->head = newNode;
+    if (oldNode->next_) oldNode->next_->prev_ = newNode;
+    oldNode->next_ = oldNode->prev_ = nullptr;       // 源脱离链表
+}
+
 GcHeap::ThreadRootList* GcHeap::ensureThreadRootList() {
     if (tl_roots_) return tl_roots_;
     auto* list = new ThreadRootList();  // 堆分配，避免 thread_local 析构顺序问题

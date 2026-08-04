@@ -42,15 +42,17 @@ struct ParamInfo {
 };
 
 struct ReturnTypeInfo {
-    enum class Kind { Named, Generic, None, Generator, Optional };
+    enum class Kind { Named, Generic, None, Generator, Optional, Iterator };
     Kind kind;
-    std::string typeName;       // Named 时 / Generic fallback / Generator 元素类型 / Optional 元素类型占位
+    std::string typeName;       // Named 时 / Generic fallback / Generator 元素类型 / Optional 元素类型占位 / Iterator 元素类型
     int  genericParamIdx = 0;   // Generic 时：引用第几个参数的类型（0-based）
 
     static ReturnTypeInfo Named(const std::string& tn)    { return {Kind::Named, tn, 0}; }
     static ReturnTypeInfo Generic(int idx, const std::string& fb) { return {Kind::Generic, fb, idx}; }
     static ReturnTypeInfo None()                          { return {Kind::None, "", 0}; }
     static ReturnTypeInfo Generator(const std::string& el){ return {Kind::Generator, el, 0}; }
+    // Iterator(elemType)：元素类型固定（如 range → Iterator<int>）
+    static ReturnTypeInfo Iterator(const std::string& el) { return {Kind::Iterator, el, 0}; }
     // Optional: 元素类型由 objType 推断（ typeName 是占位 "T"，semTypeFromBuiltinReturn 用 objType->clone() ）
     static ReturnTypeInfo Optional(const std::string& elemType) { return {Kind::Optional, elemType, 0}; }
 };
@@ -151,6 +153,13 @@ public:
     }
 
     // ----- 全局函数查询 -----
+    // 是否存在同名全局函数（不检查参数数量；用于闭包捕获/错误提示排除内置名）
+    bool hasFunctionName(const std::string& name) const {
+        for (auto& f : functions_)
+            if (f.name == name) return true;
+        return false;
+    }
+
     const BuiltinGlobalFn* findFunction(const std::string& name, int argCount) const {
         for (auto& f : functions_) {
             if (f.name == name
@@ -256,6 +265,8 @@ private:
             {"sync.Channel", {"sync.Channel", true, true, BuiltinPrim::Other, "aura_rt::ThreadChannel*"}},
             // Optional<T>：T | None 联合类型的 GC 安全封装（堆对象）
             {"Optional", {"Optional", true, true, BuiltinPrim::Other, "aura_rt::Optional*"}},
+            // Iterator<T>：内置迭代器（map/filter/collect/from 为 C++ 桥接方法）
+            {"Iterator", {"Iterator", true, true, BuiltinPrim::Other, "aura_rt::Iterator*"}},
             // 虚拟类型：r()/w() 返回的锁视图，仅用于 Sema 类型推断和 L1 检查
             // 不是堆类型，用户不能直接声明
             {"RWMutexReadView",  {"RWMutexReadView",  false, false, BuiltinPrim::Other, "aura_rt::RWMutex::ReadGuard"}},
@@ -318,9 +329,12 @@ private:
         // 全局函数（始终 C++ 硬编码）
         // ============================================================
         functions_ = {
-            {"range", {{"end", "int"}},                                      ReturnTypeInfo::Generator("int")},
-            {"range", {{"start", "int"}, {"end", "int"}},                    ReturnTypeInfo::Generator("int")},
-            {"range", {{"start", "int"}, {"end", "int"}, {"step", "int"}},   ReturnTypeInfo::Generator("int")},
+            {"range", {{"end", "int"}},                                      ReturnTypeInfo::Iterator("int")},
+            {"range", {{"start", "int"}, {"end", "int"}},                    ReturnTypeInfo::Iterator("int")},
+            {"range", {{"start", "int"}, {"end", "int"}, {"step", "int"}},   ReturnTypeInfo::Iterator("int")},
+            // Optional 构造：some(v) 返回 Optional<T>（T 从实参推导，inferCall 特判）；none() 返回 Optional（元素类型调用点推断）
+            {"some", {{"v", "T"}}, ReturnTypeInfo::None()},
+            {"none", {},           ReturnTypeInfo::None()},
             // path.new / path.join 不再硬编码，由 builtins/path.aurai 按需加载
             // channel 构造函数
             {"channel", {{"cap", "int"}},  ReturnTypeInfo::Named("channel")},

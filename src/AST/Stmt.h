@@ -332,6 +332,7 @@ struct FunDecl : Decl {
     bool throws = false;
     std::unique_ptr<TypeExpr> returnType;
     std::unique_ptr<BlockStmt> body;
+    bool hasCppImpl = false;    // '...'：aura 无实现，c++ 有实现（.aurai 声明文件用）
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<FunDecl>();
@@ -340,6 +341,7 @@ struct FunDecl : Decl {
         n->throws = throws;
         if (returnType) n->returnType.reset(static_cast<TypeExpr*>(returnType->clone().release()));
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
+        n->hasCppImpl = hasCppImpl;
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
@@ -395,11 +397,16 @@ struct TypeDecl : Decl {
 };
 
 struct InterfaceMethodSig {
+    // 接口方法三种形态（声明时确定）
+    enum class BodyKind { Pure,          // 纯虚：record 必须实现
+                          DefaultAura,   // Aura 默认实现（{ body }，如 Comparable 六符号）
+                          CppBridge };   // C++ 桥接（...，aura 无实现 c++ 有实现）
     std::string name;
     std::vector<Param> params;
     bool throws = false;
     std::unique_ptr<TypeExpr> returnType;
-    std::unique_ptr<BlockStmt> defaultBody;   // 默认实现（nullptr = 必须实现，纯虚）
+    std::unique_ptr<BlockStmt> defaultBody;   // 非空 = DefaultAura
+    BodyKind bodyKind = BodyKind::Pure;       // CppBridge 时 defaultBody 为空
 };
 
 struct InterfaceDecl : Decl {
@@ -416,6 +423,7 @@ struct InterfaceDecl : Decl {
             sig.name   = m.name;
             for (auto& p : m.params) sig.params.push_back(cloneParam(p));
             sig.throws = m.throws;
+            sig.bodyKind = m.bodyKind;   // 必须复制：CppBridge（...）标记决定 Sema 豁免
             if (m.returnType) sig.returnType.reset(static_cast<TypeExpr*>(m.returnType->clone().release()));
             if (m.defaultBody) sig.defaultBody.reset(static_cast<BlockStmt*>(m.defaultBody->clone().release()));
             n->methods.push_back(std::move(sig));
@@ -471,6 +479,7 @@ struct MethodDecl : Decl {
     bool throws = false;
     std::unique_ptr<TypeExpr> returnType;
     std::unique_ptr<BlockStmt> body;
+    bool hasCppImpl = false;    // '...'：aura 无实现，c++ 有实现（.aurai 声明文件用）
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<MethodDecl>();
@@ -486,6 +495,7 @@ struct MethodDecl : Decl {
         n->throws = throws;
         if (returnType) n->returnType.reset(static_cast<TypeExpr*>(returnType->clone().release()));
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
+        n->hasCppImpl = hasCppImpl;
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;

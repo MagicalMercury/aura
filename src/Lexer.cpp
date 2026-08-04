@@ -98,6 +98,11 @@ Token Lexer::scanOperatorOrDelimiter(char c) {
             --pos_; --curPos_.col;
             return scanNumber();
         }
+        // '...' → Ellipsis（C++ 桥接方法声明标记）
+        if (peek() == '.' && peekNext() == '.') {
+            advance(); advance();
+            return makeToken(TokType::Ellipsis, "...");
+        }
         return makeToken(TokType::Dot, ".");
 
     case ':':
