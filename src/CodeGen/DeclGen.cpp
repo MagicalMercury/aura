@@ -313,6 +313,9 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
                                 const FunDecl& decl, bool declarationsOnly) {
     bool isCoro = coroutineFunctions_.count(decl.name);
     currentFunctionIsCoroutine_ = isCoro;
+    // Bug 2-B: 函数入口重置闭包协程标记——genFunExpr 在 return 语句中不会被
+    // genLetStmt 消费 lastClosureIsCoro_，残留会污染下一个函数的 let 绑定
+    lastClosureIsCoro_ = false;
 
     std::vector<std::string> tparams = collectFunTParams(decl);
     currentTParams_ = tparams;
@@ -434,12 +437,18 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
             << varName << "(" << varName << "_raw);\n";
     }
     if (decl.body) genBlock(out, *decl.body, isCoro);
+    bool lastIsReturn = decl.body && !decl.body->stmts.empty()
+        && dynamic_cast<const ReturnStmt*>(decl.body->stmts.back().get());
     // 协程函数末尾无 return 时补 co_return，确保 C++20 将其识别为协程
     if (isCoro) {
-        bool lastIsReturn = decl.body && !decl.body->stmts.empty()
-            && dynamic_cast<const ReturnStmt*>(decl.body->stmts.back().get());
         if (!lastIsReturn)
             out << "  co_return;\n";
+    } else if (!lastIsReturn && decl.returnType
+               && mapType(*decl.returnType) == "aura_rt::NoneType") {
+        // 显式 `-> None` 的普通函数返回 NoneType（非 void），体末尾无 return 时
+        // GCC 对"非 void 函数走到末尾"的未定义行为路径插入 ud2 非法指令
+        // → 补 return aura_rt::NoneType{}; 使函数体合法
+        out << "  return aura_rt::NoneType{};\n";
     }
     out << "}\n\n";
     valueTypeVarNames_.clear();
@@ -472,6 +481,19 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
         retType = "auto";
 
     currentReturnCppType_ = retType;
+    // P3b：填充当前函数返回"含堆联合"的变体 C++ 类型列表（供 genReturnStmt 隐式装箱）
+    currentReturnVariantCppTypes_.clear();
+    if (decl.returnType && decl.returnType->inferredType) {
+        if (auto* u = dynamic_cast<const UnionSemType*>(decl.returnType->inferredType)) {
+            std::vector<std::string> cppTypes;
+            bool hasHeap = false;
+            for (auto& v : u->variants) {
+                cppTypes.push_back(v ? mapSemType(*v) : "void");
+                if (v && isHeapSemType(v.get())) hasHeap = true;
+            }
+            if (hasHeap) currentReturnVariantCppTypes_ = std::move(cppTypes);
+        }
+    }
 
     std::string fn = safeName(decl.name);
     // 所有协程：NoneType 返回 → void（task<void> 有 return_void()，task<NoneType> 没有）
@@ -544,6 +566,8 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
 
     bool isCoro = coroutineFunctions_.count(decl.name);
     currentFunctionIsCoroutine_ = isCoro;
+    // Bug 2-B: 方法入口同样重置闭包协程标记（防跨函数泄漏，见 genFunDecl）
+    lastClosureIsCoro_ = false;
 
     std::vector<std::string> tparams = collectMethodTParams(decl);
     currentTParams_ = tparams;
@@ -606,6 +630,19 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
 
     // 存储 C++ 返回类型，供 genReturnStmt 生成正确 RecordExpr
     currentReturnCppType_ = retType;
+    // P3b：填充当前方法返回"含堆联合"的变体 C++ 类型列表（供 genReturnStmt 隐式装箱）
+    currentReturnVariantCppTypes_.clear();
+    if (decl.returnType && decl.returnType->inferredType) {
+        if (auto* u = dynamic_cast<const UnionSemType*>(decl.returnType->inferredType)) {
+            std::vector<std::string> cppTypes;
+            bool hasHeap = false;
+            for (auto& v : u->variants) {
+                cppTypes.push_back(v ? mapSemType(*v) : "void");
+                if (v && isHeapSemType(v.get())) hasHeap = true;
+            }
+            if (hasHeap) currentReturnVariantCppTypes_ = std::move(cppTypes);
+        }
+    }
 
     // 检测方法名与 receiver 的字段名是否冲突，冲突时加 _fun 后缀
     std::string methodCppName = safeName(decl.name);

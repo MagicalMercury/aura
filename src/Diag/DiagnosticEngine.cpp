@@ -83,7 +83,8 @@ std::string DiagnosticEngine::getSourceLine(int line) const {
 void DiagnosticEngine::print(std::ostream& os) const {
     for (auto& diag : diags_) {
         // --- 错误码 + 消息 ---
-        os << "error";
+        if (diag.severity == DiagSeverity::Warning) os << "warning";
+        else os << "error";
         if (diag.code != DiagCode::None) os << "[" << diagCodeStr(diag.code) << "]";
         os << ": " << diag.message << "\n";
 

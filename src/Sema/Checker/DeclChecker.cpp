@@ -4,6 +4,42 @@
 
 namespace Aura {
 
+// P3b 后：Variant<T...> 存储不支持的类型——function（std::function 值）、
+// 接口（抽象类值）、嵌套联合（未扁平化）。这些无法安全放入 Variant storage_，
+// 仍由 P0 报错拦截；其余含堆变体（string/record/list/optional）已由 Variant 支持放行。
+static bool variantStorageUnsafe(const SemType& t) {
+    if (dynamic_cast<const FuncSemType*>(&t))     return true;
+    if (dynamic_cast<const InterfaceSemType*>(&t)) return true;
+    if (dynamic_cast<const UnionSemType*>(&t))    return true;
+    return false;
+}
+
+// ============================================================
+// 联合变体 GC 安全性判定（P0 防崩，见 plan/联合类型GC安全问题.md §4.1）
+// 返回 true → 该变体不能放进 std::variant（内部 GC 指针对 GC 不可见）。
+// 注意：与 CodeGen isHeapSemType（ExprGen.cpp）判定目的不同——
+// isHeapSemType 判"该值是否为 GC 堆对象、需要 GcRootHandle 包装"（function/接口为 false）；
+// 本函数判"该值放 std::variant 内部是否 GC 可达"（闭包可捕获 GC 指针、接口对象可持
+// 堆字段，而 variant 内部存储对 GC 不可见）→ function/接口返回 true。结论相反是正确的。
+// 当前仅用于 P3a 折叠判定（`T | None` 中另一变体为堆类型才折叠为 Optional）。
+// ============================================================
+bool SemAnalyzer::unionVariantGcUnsafe(const SemType& t) {
+    if (auto* p = dynamic_cast<const PrimSemType*>(&t))
+        return p->kind == PrimSemType::String;
+    if (dynamic_cast<const NoneSemType*>(&t))  return false;
+    if (dynamic_cast<const ErrorSemType*>(&t)) return false;
+    if (dynamic_cast<const ListSemType*>(&t))  return true;    // Array<T>* 堆
+    if (dynamic_cast<const OptionalSemType*>(&t)) return true; // Optional<T>* 堆
+    if (dynamic_cast<const RecordSemType*>(&t))   return true; // 用户 record → Name* 堆对象
+    if (dynamic_cast<const FuncSemType*>(&t))     return true; // std::function 捕获 GC 指针，GC 不可见
+    if (dynamic_cast<const InterfaceSemType*>(&t)) return true;// 抽象类值无法入 variant
+    if (auto* u = dynamic_cast<const UnionSemType*>(&t))
+        for (auto& v : u->variants)
+            if (v && unionVariantGcUnsafe(*v)) return true;
+    if (dynamic_cast<const GenericSemType*>(&t)) return false; // 未实例化放行，实例化时二次检查（P3c）
+    return true;
+}
+
 // ============================================================
 // 辅助：遍历 TypeExpr 树，对每个泛型类型引用回调 fn(name)
 // （统一 collectGenericRefs / registerGenericParams 的 6 分支遍历）
@@ -324,9 +360,40 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
         return t;
     }
     if (auto* u = dynamic_cast<const UnionType*>(&astType)) {
+        // P3a：`T | None`（恰 2 变体、其一为 None、另一为堆类型）折叠为 Optional<T>
+        // （顺序无关：None 在前/在后均折叠；全值联合如 int | None 不折叠，保持 std::variant）
+        if (u->types.size() == 2) {
+            auto* na = dynamic_cast<const NamedType*>(u->types[0].get());
+            auto* nb = dynamic_cast<const NamedType*>(u->types[1].get());
+            auto isNoneNamed = [](const NamedType* n) {
+                return n && n->name == "None" && n->typeArgs.empty() && n->namespacePrefix.empty();
+            };
+            bool aIsNone = isNoneNamed(na);
+            bool bIsNone = isNoneNamed(nb);
+            if (aIsNone != bIsNone) {  // 恰一个为 None
+                const auto& other = aIsNone ? u->types[1] : u->types[0];
+                if (other) {
+                    auto ot = resolveType(*other);
+                    if (ot && unionVariantGcUnsafe(*ot)) {  // 另一变体为堆类型才折叠
+                        return OptionalSemType::make(std::move(ot));
+                    }
+                }
+            }
+        }
+        // P0 防崩（P3b 后收窄）：仅拦截 Variant 存储不支持的类型（function/接口/嵌套联合）；
+        // 其余含堆变体（string/record/list）已由 aura_rt::Variant<T...> GC 封装放行（P1/P3b）
         auto t = std::make_unique<UnionSemType>();
         for (auto& v : u->types) {
-            t->variants.push_back(v ? resolveType(*v) : ErrorSemType::make());
+            auto vt = v ? resolveType(*v) : ErrorSemType::make();
+            // P0 去重：同一变体 AST 节点被多次 resolve（如 checkLetDecl 占位 + 显式类型）
+            // 时只报一次错
+            if (vt && variantStorageUnsafe(*vt) && v &&
+                p0ReportedVariants_.insert(v.get()).second)
+                error(*v, "union variant '" + vt->toString() +
+                    "' is not supported in a union; "
+                    "function/interface/nested-union variants cannot be stored safely "
+                    "(Variant<T...> supports single-pointer and POD variants)");
+            t->variants.push_back(std::move(vt));
         }
         return t;
     }

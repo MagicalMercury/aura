@@ -15,6 +15,7 @@
 #include "builtin/channel.h"
 #include "builtin/mutex.h"
 #include "builtin/optional.h"       // Optional<T>
+#include "builtin/variant.h"        // Variant<T...>（P1：含堆联合 GC 堆封装）
 #include "builtin/iterator.h"       // Iterator<T> / RangeIter / MapIter / FilterIter / FuncIter
 #include "builtin/thread_channel.h"
 

@@ -13,6 +13,44 @@ static bool listContainsError(const SemType* t) {
 }
 
 // ============================================================
+// P5：match 常量模式辅助
+// ============================================================
+
+// 常量字面量 → 语义类型（int/float/bool/string/None；其他 → nullptr）
+static std::unique_ptr<SemType> literalSemType(const ASTNode& lit) {
+    if (dynamic_cast<const IntLiteral*>(&lit))    return intType();
+    if (dynamic_cast<const FloatLiteral*>(&lit))  return floatType();
+    if (dynamic_cast<const BoolLiteral*>(&lit))   return boolType();
+    if (dynamic_cast<const StringLiteral*>(&lit)) return stringType();
+    if (dynamic_cast<const NoneLiteral*>(&lit))   return NoneSemType::make();
+    return nullptr;
+}
+
+// 常量字面量 → 去重键（重复常量检测）
+static std::string literalKey(const ASTNode& lit) {
+    if (auto* i = dynamic_cast<const IntLiteral*>(&lit))    return "i:" + std::to_string(i->value);
+    if (auto* f = dynamic_cast<const FloatLiteral*>(&lit))  return "f:" + std::to_string(f->value);
+    if (auto* b = dynamic_cast<const BoolLiteral*>(&lit))   return std::string("b:") + (b->value ? "1" : "0");
+    if (auto* s = dynamic_cast<const StringLiteral*>(&lit)) return "s:" + s->value;
+    if (dynamic_cast<const NoneLiteral*>(&lit))             return "none";
+    return "";
+}
+
+// 常量类型是否与 matchedType 兼容（非联合 equals / 联合存在变体 / Optional 元素或 None）
+static bool constCompatibleWith(const SemType& matched, const SemType& litTy) {
+    if (auto* u = dynamic_cast<const UnionSemType*>(&matched)) {
+        for (auto& v : u->variants)
+            if (v && v->equals(litTy)) return true;
+        return false;
+    }
+    if (auto* o = dynamic_cast<const OptionalSemType*>(&matched)) {
+        if (dynamic_cast<const NoneSemType*>(&litTy)) return true;
+        return o->elementType && o->elementType->equals(litTy);
+    }
+    return matched.equals(litTy);
+}
+
+// ============================================================
 // 块 & 语句检查
 // ============================================================
 
@@ -192,7 +230,40 @@ void SemAnalyzer::checkLoopStmt(const LoopStmt& stmt) {
 
 void SemAnalyzer::checkMatchStmt(const MatchStmt& stmt) {
     auto matchedType = inferExpr(*stmt.expr);
-    for (auto& c : stmt.cases) {
+
+    // P5：重复常量检测 + 每个 case 首个字面量记录（供可达性检查）
+    std::set<std::string> seenConstants;
+    std::vector<const ASTNode*> caseLiterals;  // 与 stmt.cases 并行；无常量 case → nullptr
+
+    for (size_t ci = 0; ci < stmt.cases.size(); ++ci) {
+        auto& c = stmt.cases[ci];
+
+        // 收集当前 case 的所有常量字面量（单常量或 `|` 分组）
+        std::vector<const ASTNode*> lits;
+        if (auto* cp = dynamic_cast<const ConstantPattern*>(c.pattern.get())) {
+            if (cp->value) lits.push_back(cp->value.get());
+        } else if (auto* gp = dynamic_cast<const GroupPattern*>(c.pattern.get())) {
+            for (auto& a : gp->alts)
+                if (auto* ap = dynamic_cast<const ConstantPattern*>(a.get()))
+                    if (ap->value) lits.push_back(ap->value.get());
+        }
+        caseLiterals.push_back(lits.empty() ? nullptr : lits[0]);
+
+        for (auto* lit : lits) {
+            // 类型兼容：字面量类型须与 matchedType 匹配（非联合 equals / 联合存在变体）
+            auto litTy = literalSemType(*lit);
+            if (matchedType && litTy && !constCompatibleWith(*matchedType, *litTy)) {
+                error(*lit, "match constant type '" + litTy->toString() +
+                            "' does not match the matched type '" +
+                            matchedType->toString() + "'");
+            }
+            // 重复常量：同一 match 内相同字面量出现多次 → 编译错（对齐 C++ duplicate case）
+            std::string key = literalKey(*lit);
+            if (!key.empty() && !seenConstants.insert(key).second) {
+                error(*lit, "duplicate match constant; each value may appear only once");
+            }
+        }
+
         // TypePattern 中引入变量
         if (auto* tp = dynamic_cast<const TypePattern*>(c.pattern.get())) {
             symtab_.enterScope();
@@ -217,6 +288,28 @@ void SemAnalyzer::checkMatchStmt(const MatchStmt& stmt) {
             if (!tp->varName.empty()) symtab_.exitScope();
         }
     }
+
+    // P5：可达性警告——常量在其对应类型的 TypePattern 之后（该变体已被全量吞掉）
+    if (matchedType) {
+        for (size_t ci = 0; ci < stmt.cases.size(); ++ci) {
+            const ASTNode* lit = caseLiterals[ci];
+            if (!lit) continue;
+            auto litTy = literalSemType(*lit);
+            if (!litTy) continue;
+            bool shadowed = false;
+            for (size_t j = 0; j < ci; ++j) {
+                if (auto* tp = dynamic_cast<const TypePattern*>(stmt.cases[j].pattern.get())) {
+                    auto resolved = resolveNamedType(tp->typeName);
+                    if (resolved && resolved->equals(*litTy)) { shadowed = true; break; }
+                }
+            }
+            if (shadowed) {
+                diag_.warn(lit->line, lit->col,
+                           "match constant is unreachable: variant already fully covered by a preceding type pattern");
+            }
+        }
+    }
+
     if (matchedType && !isMatchExhaustive(*matchedType, stmt.cases)) {
         error(stmt, DiagCode::E014_MatchNotExhaustive,
               "match is not exhaustive: not all variants are covered");

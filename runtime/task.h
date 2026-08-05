@@ -36,6 +36,17 @@ struct task;
 
 namespace detail {
 
+// ============================================================
+// 长同步链栈深度保护
+// final 恢复走 continuation.resume() 非尾调用逐层压栈，
+// 串行链返回阶段栈深 = 链长。达到 kMaxChainDepth 时转
+// EventLoop 调度：当前 resume 返回后整链 C++ 栈逐层解开，
+// EventLoop 顶层重驱动新链（栈深 O(1)）。
+// ============================================================
+void scheduleOnEventLoop(std::coroutine_handle<> h);  // 由 task.cpp 实现
+inline constexpr int kMaxChainDepth = 512;
+inline thread_local int g_chainDepth = 0;   // 只增不降，超限归零
+
 // promise_type 基类（共享逻辑）
 struct task_promise_base {
     std::exception_ptr exception_;
@@ -47,7 +58,13 @@ struct task_promise_base {
         std::coroutine_handle<> continuation;
         final_awaiter(std::coroutine_handle<> h) : continuation(h) {}
         void await_suspend(std::coroutine_handle<>) noexcept {
-            if (continuation) continuation.resume();
+            if (!continuation) return;
+            if (++g_chainDepth >= kMaxChainDepth) {
+                g_chainDepth = 0;                    // 栈将清空，重新计数
+                scheduleOnEventLoop(continuation);   // 转调度器，不直接 resume
+            } else {
+                continuation.resume();               // 短链同步直连（零开销）
+            }
         }
     };
 

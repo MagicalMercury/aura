@@ -74,23 +74,27 @@ inline constexpr NoneType None{};
 // 内联数组字段描述符（如 ArrayChunk<GcString*> 的数据区在 this + 1 处）
 // 当 chunk 的 T 是指针类型时，data() 区域包含 GC 需要扫描的指针。
 struct InlineArrayField {
-    size_t offset;        // 数据区起始偏移（相对于对象基址）
-    size_t lengthOffset;  // 长度字段偏移（GC 读取它知道数组有多少有效元素）
-    bool   isPtrArray;    // 元素是否是指针（int 不用扫，GcString* 要扫）
-};
+    uint32_t offset;        // 数据区起始偏移（相对于对象基址）
+    uint32_t lengthOffset;  // 长度字段偏移（GC 读取它知道数组有多少有效元素）
+    bool   isPtrArray;      // 元素是否是指针（int 不用扫，GcString* 要扫）
+};                          // 16B → 12B（P2a 压缩）
 
 struct TypeDescriptor {
-    size_t        size;               // 对象总大小（字节），含内联数据
-    size_t        ptrFieldCount;      // 普通指针字段数量
-    const size_t* ptrFieldOffsets;    // 普通指针字段偏移数组
+    uint32_t        size;               // 对象总大小（字节），含内联数据（对象 ≤4GB）
+    uint32_t        ptrFieldCount;      // 普通指针字段数量
+    const size_t* ptrFieldOffsets;      // 普通指针字段偏移数组
 
     // 内联数组字段 — 用于 ArrayChunk 等将数据紧跟在对象体之后的类型
-    size_t              inlineArrayFieldCount = 0;
+    uint32_t              inlineArrayFieldCount = 0;
     const InlineArrayField* inlineArrayFields = nullptr;
 
     // Finalizer：对象被 GC 回收前调用（nullptr 表示无 finalizer）
     void (*finalizer)(GcObject* self) = nullptr;
-};
+
+    // P2b：动态 desc 钩子。对象扫描时先调 dynamicDesc(obj) 取真实 desc
+    // （如 Variant<T...> 按运行时 index_ 返回 per-变体 desc），nullptr = 静态 desc。
+    const TypeDescriptor* (*dynamicDesc)(GcObject* self) = nullptr;
+};                          // 48B → 48B（P2a 压缩 40B + P2b 钩子 8B，净持平）
 
 // ============================================================
 // GcObject — 所有 GC 托管堆对象的基类

@@ -172,6 +172,29 @@ std::unique_ptr<TypeExpr> Parser::parsePrimaryType() {
 // ============================================================
 
 std::unique_ptr<Pattern> Parser::parsePattern() {
+    // P5：Rust 风格 `|` 分组——仅常量模式允许分组
+    //   match x { 1 | 2 | 3 => A, _ => B }
+    // 类型模式分组报错引导分开写（如 User | string）。
+    auto first = parseSinglePattern();
+
+    if (!match(TokType::Bar)) return first;
+
+    auto group = std::make_unique<GroupPattern>();
+    if (!dynamic_cast<ConstantPattern*>(first.get())) {
+        error("type pattern cannot be grouped; write separate cases or use a union type");
+    }
+    group->alts.push_back(std::move(first));
+    do {
+        auto alt = parseSinglePattern();
+        if (!dynamic_cast<ConstantPattern*>(alt.get())) {
+            error("type pattern cannot be grouped; write separate cases or use a union type");
+        }
+        group->alts.push_back(std::move(alt));
+    } while (match(TokType::Bar));
+    return group;
+}
+
+std::unique_ptr<Pattern> Parser::parseSinglePattern() {
     // 通配符 _
     if (check(TokType::Identifier) && peek().lexeme == "_") {
         advance();

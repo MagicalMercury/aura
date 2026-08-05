@@ -1,247 +1,537 @@
-## 审查报告：change.md（Iterator 实现）
+# 审查报告
 
-### 一、整体评估
+## A. 联合类型GC安全问题.md 审查
 
-change.md 描述的是**待实施方案**，源码现状已实现前置工作（C0 根引用统一、typeMethods_ 映射、isAssignable 结构匹配、genIfaceAdapter 通用路径、interfaceImplementations_ 收集），但 Iterator 特定部分（`...` 语法、runtime iterator.h、Sema/CodeGen 特判）**均未实施**。
+### A1. P0 `unionVariantGcUnsafe` 判定与 `isHeapSemType` 口径**不一致**
 
-方案整体架构合理（runtime view 适配器 + CodeGen 直转 + Sema 特判），但存在若干设计 bug 需修复。
+**位置**：plan §4.1 [L78-97](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L78-L97)
+
+**问题**：
+
+`unionVariantGcUnsafe` 与 [ExprGen.cpp:12-30](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L12-L30) `isHeapSemType` 对相同 SemType 的判断结论**会冲突**：
+
+| 类型 | `isHeapSemType`（CodeGen） | `unionVariantGcUnsafe`（Sema P0） | 冲突 |
+|------|--------------------------|----------------------------------|------|
+| `FuncSemType` | false（[L23](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L23)） | true（[L90](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L90)） | ✓ |
+| `InterfaceSemType` | false（[L22](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L22)） | true（[L91](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L91)） | ✓ |
+
+**后果**：
+- P0 报错"`fun \| int` 不安全" → 用户改用 `Optional`/`Variant`
+- 但 CodeGen `isHeapSemType` 返回 false → 不生成 GcRootHandle
+- 用户若硬绕过 P0（如泛型变体 B3 放行）→ 仍走 std::variant → 内部 GC 指针失根
+
+**风险等级**：P1（重要）。plan §9 风险表已提到"Sema 判定与 CodeGen isHeapSemType 口径漂移"，但只是对照测试，**未要求统一逻辑**。应抽公共函数或 P0 同时修 `isHeapSemType`。
+
+### A2. P0 缺少 `Aura::error` 调用语法核对
+
+**位置**：plan §4.1 [L108-111](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L108-L111)
+
+**问题**：
+
+```cpp
+errorAt(/*v 位置*/,
+    "union type contains GC heap variant '%s' which is not GC-safe yet; "
+    "use Optional<T> for 'T | None' (Variant<T...> coming)",
+    vt->toString().c_str());
+```
+
+而实际源码 [DeclChecker.cpp:326-332](file:///d:/you/Aura/src/Sema/Checker/DeclChecker.cpp#L326-L332) 中 `resolveType` 内部用的是 `SemAnalyzer::error`，签名是 `error(const ASTNode&, const std::string&)`（单消息），不是 C 风格 `printf` 变参。
+
+**修复建议**：
+
+```cpp
+if (vt && unionVariantGcUnsafe(*vt)) {
+    error(*v, "union type contains GC heap variant '" + vt->toString() +
+        "' which is not GC-safe yet; use Optional<T> for 'T | None' "
+        "(Variant<T...> coming)");
+}
+```
+
+**风险等级**：P2（重要，会导致编译失败）。
+
+### A3. P2a `desc->size` 读取点核对**遗漏了 alloc 路径**
+
+**位置**：plan §4.2 [L145](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L145)
+
+**plan 声称**："`desc->size` 唯一读取点 mark_sweep.cpp:102（`== 0` 判定）不受影响；alloc 走显式 size 参数，不依赖 desc->size。"
+
+**实际源码**：
+
+`desc->size` 实际**不止一处**读取：
+- [mark_sweep.cpp:102](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L102)：`== 0` 判定
+- [compact.cpp:188](file:///d:/you/Aura/runtime/gc/compact.cpp#L188)：`std::memcpy(entry.newAddr, entry.oldAddr, entry.size)` — `entry.size` 来自 `entry.allocSize`（uint32_t），**不是** desc->size，✓ 安全
+
+但 plan 没核对 [gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 中 `alloc` 函数是否真的不读 `desc->size`。GcObject::allocSize_ 是 uint32_t（[types.h:108](file:///d:/you/Aura/runtime/types.h#L108)），但 `setAllocSize(size_t s)` 在 [types.h:144](file:///d:/you/Aura/runtime/types.h#L144) 做 `static_cast<uint32_t>(s)` 截断。如果 size > 4GB 会丢失高位——但实际不会，✓ 安全。
+
+**结论**：plan 描述准确，但核对不彻底（只查了 2 处）。建议 P2a 增加全量 `grep "desc->size"` 步骤。
+
+**风险等级**：P2（次要）。
+
+### A4. P2b `dynamicDesc` 钩子遗漏 `updateInlineArrayElements` 与 `markInlineArrayFields`
+
+**位置**：plan §4.3 [L149-167](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L149-L167)
+
+**问题**：
+
+plan 只在 `markFields`（[mark_sweep.cpp:179](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L179)）和 `updateObjectFields`（[compact.cpp:397](file:///d:/you/Aura/runtime/gc/compact.cpp#L397)）加 `dynamicDesc` 钩子。
+
+但实际 GC 还有两个路径：
+1. **`markInlineArrayFields`**（[mark_sweep.cpp:185](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L185)，被 `markObject` 调用 [L176](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L176)）
+2. **`updateInlineArrayElements`**（[compact.cpp:419](file:///d:/you/Aura/runtime/gc/compact.cpp#L419)，被 [L347-348, L350-351, L655-656](file:///d:/you/Aura/runtime/gc/compact.cpp#L347) 调用）
+
+这两个函数同样读 `desc`。虽然 Variant 设计上**没有 inlineArrayFields**（desc 初始化为 0/nullptr），即使不接钩子也不会扫描错（提前 return）。**但 forwarding 状态下 desc 可能被覆盖为 forwardingPtr**，`updateInlineArrayElements` 走的是 `savedDescs_` 分支（[compact.cpp:422-423](file:///d:/you/Aura/runtime/gc/compact.cpp#L422-L423)），需确认 `dynamicDesc` 钩子也能通过 savedDescs_ 取到的 desc 工作。
+
+**结论**：plan 的钩子接入不完整，但因为 Variant 无 inline array 字段，**不会产生正确性问题**，只是统一性建议。建议 P2b 在两处也加钩子分支保持一致性。
+
+**风险等级**：P2（次要）。
+
+### A5. P1 `Variant::desc()` 缺失且与 `dynamicDesc` 关系不明
+
+**位置**：plan §4.4 [L176-200](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L176-L200)
+
+**问题**：
+
+plan 展示了 `descFor(i)` 和 `dynamicDesc`，但 `make_variant` 调用的是 `Variant<Ts...>::desc()`（[L196](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L196)）：
+
+```cpp
+GcHeap::instance().alloc(sizeof(Variant<Ts...>), &Variant<Ts...>::desc()));
+```
+
+而 `Variant::desc()` **未定义**，只定义了 `descFor(i)`。且 `desc()` 应返回什么？
+
+- 若返回"默认变体的 desc" → 分配时 storage_ 还未初始化，index_=0 → 返回 `kDescs[0]`（即第 0 变体的 desc）
+- 但 `make_variant` 立即设置 index_ 后 `desc()` 仍返回第 0 变体 desc → 与实际变体不符
+
+**正确做法**：alloc 用占位 desc（如 nullptr 或第 0 变体 desc），赋值后由 GC 通过 `dynamicDesc` 钩子读取真实 desc。
+
+plan 没说清这个时序。建议明确：
+- `Variant::desc()` 返回 `kDescs[0]`（占位）
+- `dynamicDesc(obj)` 根据 `obj->index_` 返回对应 desc
+- alloc 时 `desc()` 的作用仅是"占位让 GC 不误判为无 desc 对象"，实际扫描走 `dynamicDesc`
+
+**风险等级**：P1（重要，影响实施）。
+
+### A6. P1 `make_variant` 未指明"对应变体大小"如何获取
+
+**位置**：plan §4.4 [L198](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L198)
+
+```cpp
+std::memcpy(v->storage_, value, /*对应变体大小*/);
+```
+
+**问题**：注释占位"对应变体大小"未给出实现。应为 `std::get<I>(std::make_tuple(sizeof(Ts)...))` 或模板特化 `variantSize<I>()`。
+
+**风险等级**：P2（实现细节）。
+
+### A7. P3a `T | None` 折叠规则未覆盖 `None | T` 顺序
+
+**位置**：plan §4.5 [L211](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L211)
+
+**问题**：plan 说"恰 2 变体、其一为 NoneSemType、另一为堆类型"，但未说明 None 在前（`None | T`）还是后（`T | None`）都折叠。Parser 是否两种顺序都允许？
+
+**建议**：明确两种顺序均折叠为 `Optional<T>`，与 Aura 联合类型无序语义一致（[SemType.cpp:82-90](file:///d:/you/Aura/src/Sema/SemType.cpp#L82-L90) `equals` 按序比较，但语义上 `A|B == B|A` 是否合法需确认）。
+
+**风险等级**：P2（次要）。
+
+### A8. P3b `mapType` 全值联合保留 `std::variant` 与 P5 适配冲突
+
+**位置**：plan §4.6-1 [L215](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L215)
+
+**问题**：
+
+> 全值 → 保留 `std::variant<...>`（避免破坏现有 match/赋值语义，全值 variant 无 GC 问题）
+
+但 P5 [L393](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L393) 又说：
+
+> P3b 后：含堆联合（Variant 路径）常量匹配生成 `is<I> && get<I> == 常量`
+
+**冲突**：全值联合（`int | float`）保留 `std::variant` → P5 常量匹配需走 `holds_alternative + get`（[L388](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L388)）；含堆联合走 `Variant` 指针 → 走 `is<I> + get<I>`。**两套路径并存**，genMatchStmt 需根据目标类型分派。
+
+plan §4.6-3 [L217-221](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L217-L221) 已提到"按目标类型区分"，但 P5 §4.10 [L408](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L408) 实现位置只说"P3b 后适配 Variant 路径"，**未说明 std::variant 路径也要适配**。
+
+**建议**：P5 实施步骤 11 (P5c) 明确"std::variant 路径常量匹配（holds_alternative + get）"和"Variant 路径常量匹配（is + get）"两套都要实现。
+
+**风险等级**：P1（重要）。
+
+### A9. P4 动态分派 `TypeError` 与现有 `Error` 对象语义混淆
+
+**位置**：plan §4.9 [L308](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L308)
+
+**问题**：
+
+> 复用现有 `make_type_error`（runtime/builtin/error.h:23-27，返回 `Error{intern_string("TypeError"), msg}`）。与 Optional.unwrap 抛错同级，**不需显式 throws 标注**（异常可传播，对齐 unwrap 先例）。
+
+但 `Error` 对象的 `kind` 字段是 `GcString*`（[types.h:177](file:///d:/you/Aura/runtime/types.h#L177)），内容为 `"TypeError"`。Aura catch 用 `catch kind == "..."` 匹配，需保证 intern 表中存在 `"TypeError"` 字面量。若动态生成字符串，需 `intern_string("TypeError")`，但 plan 没说明 `make_type_error` 是否走 intern。
+
+**建议**：明确 `make_type_error` 内部用 `intern_string` 保证 `kind` 与用户 catch 的字面量匹配。
+
+**风险等级**：P2（次要）。
+
+### A10. P0 Generic 变体放行 → P3 实例化时二次检查缺失
+
+**位置**：plan §4.1 [L95](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L95)
+
+```cpp
+if (dynamic_cast<const GenericSemType*>(&t)) return false; // 未实例化放行，实例化时二次检查（P3 强化）
+```
+
+**问题**：
+
+P3 步骤 [L505-506](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L505-506) 只提"P3a resolveType 折叠 T|None"，**未提 Generic 实例化时的二次检查**。
+
+例如 `type Tree<T> = { children: [Tree<T> | T] }`，T 未实例化时 P0 放行；实例化为 `Tree<string>` 时，`T` → `string`（堆类型），此时应触发检查。
+
+**建议**：P3 增加步骤"P3c：Generic 实例化时对 UnionSemType 重新调用 `unionVariantGcUnsafe` 检查（substitute 后）"。
+
+**风险等级**：P1（重要，B3 边界未闭环）。
+
+### A11. P5 GroupPattern 与联合类型表达式 `|` 歧义**未充分分析**
+
+**位置**：plan §4.10 [L346](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L346)
+
+**问题**：
+
+> `|` 分组，Rust 风格；case 分隔符已是逗号，逗号分组有歧义，`|` 与联合类型语法精神一致且无歧义
+
+但 Aura 联合类型语法 `A | B` 在**表达式上下文**也用 `|`（如 `let x = a | b` 位或？还是联合？）。虽然 plan §9 风险表 [L528](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L528) 说"分组仅在 parsePattern 内消费"，但需核对 Parser 当前是否在 match 上下文外能识别 `|`。
+
+**实际源码**：[TypeParser.cpp:13-28](file:///d:/you/Aura/src/Parser/TypeParser.cpp#L13-L28) `Bar` token 在类型上下文解析联合类型。parsePattern 在 match 上下文调用，与表达式 `|` 不冲突。✓ 无歧义。
+
+但**嵌套场景**未说明：`match v { User | string => ... }` 中的 `User | string` 是分组还是联合类型模式？plan 说"类型模式分组报错引导分开写"，但 Parser 怎么区分"类型模式 + 类型模式分组"vs"联合类型变量绑定"？
+
+**建议**：P5a 明确 Parser 解析顺序——先尝试 `parsePattern`（单模式），若遇 `|` 且当前模式是 `ConstantPattern` → 收集为 GroupPattern；若是 `TypePattern` → 报错。
+
+**风险等级**：P2（次要）。
+
+### A12. P5b `isMatchExhaustive` 与 GroupPattern 递归未给出具体算法
+
+**位置**：plan §4.10 [L401](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L401)
+
+> 穷尽性不变：常量不覆盖联合变体（值域无限），仍须 TypePattern 或 `_` 补齐（保持 ExprInfer.cpp:554-590 现状，仅 GroupPattern 内 None 参与 None 变体覆盖判定）
+
+**问题**：未说明 GroupPattern 内 None 如何参与穷尽性判定。现有 [ExprInfer.cpp:557](file:///d:/you/Aura/src/Sema/Checker/ExprInfer.cpp#L557) 的逻辑是"每个 variant 必须在 cases 中被覆盖"，GroupPattern 作为单个 case，需递归检查其 alts 是否含 None。
+
+**建议**：P5b 明确算法：
+```
+GroupPattern 被视为一个 case，但穷尽性检查时：
+  若 alts 中含 None 常量 → 视为覆盖 None 变体
+  否则 → 不覆盖任何变体
+```
+
+**风险等级**：P2（次要）。
 
 ---
 
-### 二、P0 Bug（阻断性，必须修复）
+## B. 协程同步链栈深度保护.md 审查
 
-**Bug 1：FuncIter 的 T 类型提取语法错误**（C1，[change.md:349-350](file:///d:/you/Aura/change.md#L349-L350)）
+### B1. `g_chainDepth` 只增不降设计**正确但描述有误导**
 
+**位置**：plan §4.3 [L101](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L101)
+
+> 不需要递减：栈解开时若递减会与归零冲突（第 256 层归零后，外层 255 层 resume 返回各自 `--` 会把计数打成负数）
+
+**实际源码核对**：
+
+[task.h:49-51](file:///d:/you/Aura/runtime/task.h#L49-L51) 现状：
 ```cpp
-using T = typename OptionalElem<typename std::invoke_result_t<F&>::result_type>::type;
+void await_suspend(std::coroutine_handle<>) noexcept {
+    if (continuation) continuation.resume();
+}
 ```
 
-`std::invoke_result_t<F&>` 是 `Optional<T>*`（裸指针），裸指针**没有 `result_type` 成员**，编译失败。
-
-**修复**：先用 `std::remove_pointer_t` 去指针，再提取：
+plan 改为：
 ```cpp
-using RetType = std::invoke_result_t<F&>;                    // Optional<T>*
-using OptType = std::remove_pointer_t<RetType>;               // Optional<T>
-using T = typename OptionalElem<OptType>::type;               // T
-```
-或更简洁，让 `FuncIter` 显式接受 T 模板参数，不做推导：
-```cpp
-template <typename T, typename F>
-struct FuncIter : GcObject, Iterator<T> { ... };
-// make_iterator_from<T>(f) 显式传 T
+if (++g_chainDepth >= kMaxChainDepth) {
+    g_chainDepth = 0;
+    scheduleOnEventLoop(continuation);
+} else {
+    continuation.resume();
+}
 ```
 
----
+**问题分析**：
 
-**Bug 2：genInterfaceDecl 未跳过 Iterator，与 runtime 冲突**（C3.6）
+"第 256 层归零后，外层 255 层 resume 返回各自 `--` 会把计数打成负数"——这个描述**只在采用递减方案时才成立**。plan 选择不递减，所以这个"冲突"本身不存在。描述是"解释为什么不递减"，但读起来像"递减方案有 bug"。
 
-[CodeGen.cpp:164-165](file:///d:/you/Aura/src/CodeGen/CodeGen.cpp#L164-L165) 现状：
+**实际真正的风险**（plan 未提）：只增不降 → **每次 EventLoop 顶层 resume 都从 0 开始**，但如果 EventLoop::processReady 内 batch 循环 resume 多个协程（[task.cpp:103-106](file:///d:/you/Aura/runtime/task.cpp#L103-L106)），每个 resume 是新链，但 `g_chainDepth` 不重置——**只有归零后才重置**。
+
+例如：
+1. processReady resume 协程 A，A final resume B，B final resume C，g_chainDepth=3
+2. C 完成，g_chainDepth 仍为 3
+3. processReady resume 协程 D（新链），D final resume E，g_chainDepth=5
+4. E 完成，g_chainDepth=5
+5. ... 累积到 512 触发 scheduleOnEventLoop
+
+**后果**：多个独立短链被错误视为一个长链，提前触发 scheduleOnEventLoop。plan §4.3 [L101](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L101) 说"无害（多一轮队列，语义等价）"，✓ 正确。但**建议在文档中明确**：g_chainDepth 是"线程级累计 final 恢复次数"，不是"当前链深度"。
+
+**风险等级**：P2（描述清晰度）。
+
+### B2. `scheduleOnEventLoop` 跨命名空间声明/定义分裂
+
+**位置**：plan §4.1 [L61](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L61) + §4.2 [L90-94](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L90-L94)
+
+**问题**：
+
+task.h 中：
 ```cpp
-for (auto& i : BuiltinRegistry::get().auraiInterfaces())
-    genInterfaceDecl(header, *i);
+namespace detail {
+void scheduleOnEventLoop(std::coroutine_handle<> h);  // 声明
+}
 ```
 
-这会对 Iterator 调用 `genInterfaceDecl`，在全局命名空间生成 `struct Iterator`，与 `aura_rt::Iterator<T>` **重名冲突**（using namespace aura_rt 后）。
-
-change.md C3.6 要求 `if (decl.name == "Iterator") return;`，但未在 genInterfaceDecl 实施特判。
-
-**修复**：在 [DeclGen.cpp:126](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L126) genInterfaceDecl 入口加：
+task.cpp 中：
 ```cpp
-if (decl.name == "Iterator") return;  // C++ 形态来自 runtime/builtin/iterator.h
+namespace detail {
+void scheduleOnEventLoop(std::coroutine_handle<> h) {
+    EventLoop::instance().schedule(h);
+}
+}
 ```
 
----
+但 [task.cpp:16](file:///d:/you/Aura/runtime/task.cpp#L16) 当前是 `namespace aura_rt {`，plan §4.2 说"放在 `namespace aura_rt {` 内、`EventLoop::instance()` 定义之后"，但 `detail` 命名空间是 `aura_rt::detail`（[task.h:37](file:///d:/you/Aura/runtime/task.h#L37) 在 `namespace aura_rt` 内）。
 
-**Bug 3：BuiltinRegistry 未注册 Iterator 类型**（C2.1）
+**需确认**：task.cpp 的 `namespace detail { ... }` 实际是 `aura_rt::detail`（因为 task.cpp 已在 `namespace aura_rt {` 内）。✓ 一致。但 plan 未明示这个嵌套关系，实施时可能误写为顶层 `namespace detail`。
 
-[BuiltinRegistry.h:258](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L258) 现状只注册了 Optional，**未注册 Iterator**。change.md C2.1 要求新增：
+**建议**：plan §4.2 明确"在 `namespace aura_rt {` 内、`EventLoop::instance()` 定义之后，开 `namespace detail { ... }` 块"。
+
+**风险等级**：P2（次要）。
+
+### B3. 长链压力测试代码 `aura_rt::run_event_loop(t)` 类型不匹配
+
+**位置**：plan §7.1 [L139](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L139)
+
 ```cpp
-{"Iterator", {"Iterator", true, true, BuiltinPrim::Other, "aura_rt::Iterator*"}},
-```
+aura_rt::task<void> chain(int n) {
+    if (n == 0) co_return;
+    co_await chain(n - 1);
+}
 
-未注册会导致：
-- `mapType` 对 `Iterator<T>` 返回 "auto"（[TypeMap.cpp](file:///d:/you/Aura/src/CodeGen/TypeMap.cpp) 查 BuiltinRegistry 未命中）
-- Sema `resolveNamedType("Iterator")` 返回 ErrorSemType
-- 用户写 `let it: Iterator<int> = range(5)` 类型检查失败
-
----
-
-**Bug 4：ReturnTypeInfo::Kind 未新增 Iterator 枚举**（C2.2）
-
-[BuiltinRegistry.h:45](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L45) 现状：
-```cpp
-enum class Kind { Named, Generic, None, Generator, Optional };
-```
-
-change.md C2.2 要求新增 `Iterator`，并改 range 签名从 `Generator("int")` → `Iterator("int")`。
-
-[SemAnalyzer.cpp:280-281](file:///d:/you/Aura/src/Sema/SemAnalyzer.cpp#L280-L281) 现状只处理 `Kind::Generator`（返回 IterSemType），未处理 `Kind::Iterator`。
-
-**影响**：range 仍返回 IterSemType，但 change.md C2.7 的 `isIteratorType` 判定 `GenericSemType.name == "Iterator"`，IterSemType 不匹配 → Iterator 桥接方法特判失效。
-
-**修复**：新增 `Kind::Iterator`，semTypeFromBuiltinReturn 加分支返回 `GenericSemType{name="Iterator", resolvedName="aura_rt::Iterator<int32_t>"}`。
-
----
-
-**Bug 5：Lexer 未支持 Ellipsis token**（C0.1）
-
-[Lexer.cpp:95-100](file:///d:/you/Aura/src/Lexer.cpp#L95-L100) 现状 `'.'` case 只处理数字开头和小数点，**未处理 `...`**。
-
-[TokType.h](file:///d:/you/Aura/src/TokType.h) 未定义 `Ellipsis` 枚举值。
-
-[TypeParser.cpp:250-251](file:///d:/you/Aura/src/Parser/TypeParser.cpp#L250-L251) 现状只支持 `LBrace`（默认方法体），**未支持 Ellipsis**（C++ 桥接）。
-
-**影响**：interfaces.aurai 中 `map(...) -> Iterator<U> ...` 会解析失败（`...` 被拆成三个 Dot token）。
-
----
-
-### 三、P1 Bug（重要）
-
-**Bug 6：genIfaceAdapter 未特判 Iterator**（C3.6）
-
-[DeclGen.cpp:209-278](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L209-L278) 的 genIfaceAdapter 通用路径生成：
-```cpp
-struct FibIterator final : Iterator<int32_t> {  // ❌ 基类是全局 Iterator，非 aura_rt::Iterator
+int main() {
+    auto t = chain(20000);
+    aura_rt::run_event_loop(t);
     ...
-    Optional<int32_t>* next() const override { ... }  // ❌ const，但 runtime next() 非 const
-};
+}
 ```
 
-两个问题：
-1. 基类应为 `aura_rt::Iterator<int32_t>`，但通用路径用 `Iterator<int32_t>`（全局命名空间）
-2. 方法签名 `const override`，但 runtime 的 `next()` 是非 const → override 失败
+**问题**：
 
-change.md C3.6 给出特判代码（第 776-788 行），但未实施。
+[task.h:207](file:///d:/you/Aura/runtime/task.h#L207) 签名是 `void run_event_loop(task<void>& mainTask);`，要求**左值引用**。`auto t = chain(20000)` 是左值，✓ 可绑定。但 `chain` 返回 `task<void>` 是**协程返回对象**，构造时 `task(task&& other)` 移动构造（[task.h:91](file:///d:/you/Aura/runtime/task.h#L91)），移动后原 handle_ 置空。
 
----
+但 `chain(20000)` 是右值，`auto t = chain(20000)` 触发移动构造，✓ 正常。
 
-**Bug 7：genForStmt 的 Iterator 分支未实施**（C3.4）
+**结论**：测试代码正确。无 bug。
 
-[StmtGen.cpp:409-463](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L409-L463) 现状只处理 range() 和 channel，**未处理 Iterator 遍历**。
+**风险等级**：无。
 
-change.md C3.4 要求新增 Iterator 分支（检测 inferredType 是 GenericSemType/InterfaceSemType/RecordSemType-impl-Iterator），生成 while + next()/is_none()/unwrap() 循环。
+### B4. `final_awaiter::await_suspend` 改造未考虑 `noexcept` 语义
 
----
+**位置**：plan §4.1 [L71-79](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L71-L79)
 
-**Bug 8：genMethodCall 未实施 Iterator 桥接特判**（C3.3）
+**问题**：
 
-[ExprGen.cpp:798](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L798) 现状的 genMethodCall 只处理 sync 构造和常规方法调用，**未处理 map/filter/collect/from 直转 runtime**。
-
-change.md C3.3 要求在 `obj = genExpr(...)` 之后插入 Iterator 桥接特判。
-
----
-
-**Bug 9：genCallExpr 未实施 some/none/range 特判**（C3.1）
-
-[ExprGen.cpp:568-578](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L568-L578) 现状只处理 channel/gc_force/gc_stats/str，**未处理 some/none/range**。
-
-change.md C3.1 要求新增 some→make_optional、none→make_none、range→make_range。
-
----
-
-**Bug 10：inferMethodCall 未实施 Iterator 桥接特判**（C2.7）
-
-[ExprInfer.cpp:239-319](file:///d:/you/Aura/src/Sema/Checker/ExprInfer.cpp#L239-L319) 现状未处理 Iterator 类型的 map/filter/collect/from 方法。返回类型推导会走 BuiltinRegistry typeKey 分支，但 Iterator 未注册 typeKey → 返回 ErrorSemType。
-
-change.md C2.7 要求在 InterfaceSemType 分支之后、BuiltinRegistry typeKey 分支之前插入 Iterator 特判。
-
----
-
-**Bug 11：currentReturnElem_ 未实现**（C3.2）
-
-[CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h) 未声明 `currentReturnElem_` 成员。change.md C3.2 要求新增，用于 `none()` 推导 T（从当前函数返回类型 Optional\<T\> 提取）。
-
-现状 `none()` 未实施，但实施后若无 currentReturnElem_，`make_none<T>` 的 T 无法推导（兜底 int32_t 在泛型函数中会出错）。
-
----
-
-**Bug 12：InterfaceMethodSig 未加 bodyKind 字段**（C0.2）
-
-[Stmt.h:397-403](file:///d:/you/Aura/src/AST/Stmt.h#L397-L403) 现状只有 `defaultBody`，**无 bodyKind 枚举**。
-
-change.md C0.2 要求新增 `BodyKind { Pure, DefaultAura, CppBridge }`，用于区分三种形态。
-
-**影响**：无法表达 `...`（C++ 桥接）方法，interfaces.aurai 的 Iterator 接口 map/filter/collect 无法声明。
-
----
-
-**Bug 13：some/none 未注册到 BuiltinRegistry functions_**（C2.2）
-
-[BuiltinRegistry.h:320-338](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L320-L338) 现状 functions_ 未包含 some/none。
-
-change.md C2.2 要求新增：
 ```cpp
-{"some", {{"v", "T"}}, ReturnTypeInfo::None()},
-{"none", {},            ReturnTypeInfo::None()},
+void await_suspend(std::coroutine_handle<>) noexcept {
+    if (!continuation) return;
+    if (++g_chainDepth >= kMaxChainDepth) {
+        g_chainDepth = 0;
+        scheduleOnEventLoop(continuation);   // 可能抛？
+    } else {
+        continuation.resume();               // 可能抛？
+    }
+}
 ```
 
-**影响**：Sema inferCall 对 some/none 报 "undefined identifier"。
+现状 [task.h:49-50](file:///d:/you/Aura/runtime/task.h#L49-L50) 标 `noexcept`。`scheduleOnEventLoop` → `EventLoop::schedule` → `std::lock_guard<std::mutex>` + `std::queue::push`，**push 可能抛 `std::bad_alloc`**。在 `noexcept` 函数中抛出 → `std::terminate`。
 
----
+**建议**：
+- `scheduleOnEventLoop` 内 try/catch 吞掉异常（日志记录，不传播）
+- 或 plan 明确"schedule 失败 = OOM，terminate 可接受"
 
-### 四、P2 Bug（次要）
+**风险等级**：P1（重要，OOM 场景崩溃行为变化）。
 
-**Bug 14：GcRootHandle 不可移动，make_map 退化为拷贝**
+### B5. `thread_local` 跨静态库/可执行链接**未实际验证**
 
-[gc.h:84-118](file:///d:/you/Aura/runtime/gc/gc.h#L84-L118) 声明了拷贝构造和 `operator=(const&) = delete`，但**未声明移动构造/移动赋值**。C++ 规则下，声明拷贝构造会抑制默认移动构造。
+**位置**：plan §9 [L166](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L166)
 
-`make_map` 的 `F(std::move(f))` 若 F 含 GcRootHandle 成员（闭包捕获），会走拷贝构造（深拷贝值 + 独立注册根），而非移动。性能损失，非正确性问题。
+> `inline thread_local` 跨静态库/可执行文件单定义合并 | C++17 inline 语义保证；单 TU 内测试先行
 
-**建议**：显式实现移动构造，或 lambda 捕获用 `std::shared_ptr<GcRootHandle>`。
+**问题**：
 
----
+Aura runtime 是静态库 `libaura_rt.a`（[AGENTS.md](file:///d:/you/Aura/AGENTS.md) 构建 runtime/build）。`inline thread_local` 在静态库 + 主可执行文件链接时，**MSVC/MinGW 可能产生多个符号副本**（不同编译器对 inline thread_local 的合并行为不一致）。
 
-**Bug 15：RangeIter 的 T 推导需显式 int32_t**
+虽然 plan 说"C++17 inline 语义保证"，但 MinGW (UCRT64 g++) 实际行为需验证。如果 g_chainDepth 在静态库和主可执行中各有一份，则计数分裂，保护失效。
 
-[change.md:603-606](file:///d:/you/Aura/change.md#L603-L606) 已显式 `make_range<int32_t>` ✓。但 runtime iterator.h 的 `make_range(T start, T end, T step = 1)` 若不显式指定，T 会从字面量推导为 `int`（与 `int32_t` 在多数平台相同，但严格不同）。
+**建议**：plan §7 增加"先在单 TU 内验证计数正确，再全量链接 runtime 验证 g_chainDepth 地址唯一（打印 &g_chainDepth）"。
 
-change.md C3.1 已显式指定 `<int32_t>` ✓，无 bug。
+**风险等级**：P1（重要，平台特定）。
 
----
+### B6. `when_all` 长列表**未实际触发保护**
 
-**Bug 16：collect_all 对 GC 指针类型未显式写屏障**
+**位置**：plan §5 [L107](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L107)
 
-[change.md:377](file:///d:/you/Aura/change.md#L377) `arr->append(o->value_)`。经核查 [array.tcc:222-261](file:///d:/you/Aura/runtime/builtin/array.tcc#L222-L261)，Array::append 内部已用 `gc_write_barrier` 保护 chunk 链接和 chunk_index 更新 ✓。
+> `when_all`（task.h:190-195）串行 co_await 同样受益。
 
-但 `o->value_` 本身的读取（从 Optional<T>*）若 T 是指针类型，value_ 是 GC 指针。append 参数按值传递（T value），值拷贝指针，无需写屏障 ✓。无 bug。
+**问题**：
 
----
-
-### 五、设计建议
-
-**建议 1：FuncIter 显式模板参数**
-
-FuncIter 的 T 提取依赖 `OptionalElem` 特化，但 `Optional<T>*` 是指针，无法直接提取 T。建议改为显式模板：
+[task.h:190-195](file:///d:/you/Aura/runtime/task.h#L190-L195) `when_all` 实现：
 ```cpp
-template <typename T, typename F>
-struct FuncIter : GcObject, Iterator<T> {
-    F fn_;
-    Optional<T>* next() override { return fn_(); }
-};
-template <typename T, typename F>
-inline FuncIter<T, F>* make_iterator_from(F f) { ... }
+inline task<void> when_all(std::vector<task<void>> tasks) {
+    for (auto& t : tasks) {
+        if (t) co_await t;
+    }
+    co_return;
+}
 ```
-调用点 CodeGen 显式传 T（从 Sema 推导的 elemType 生成）。
 
----
+每个 `co_await t` → `t` 的 `final_awaiter::await_suspend` → continuation = when_all 协程 → `continuation.resume()`。
 
-**建议 2：Iterator 接口 genInterfaceDecl 跳过机制**
+但 `when_all` 协程的 final 又恢复其 continuation（调用者）。**链结构**：
+```
+caller → when_all → t1 → when_all → t2 → when_all → ... 
+```
 
-change.md C3.6 用 `if (decl.name == "Iterator") return;` 硬编码特判。但未来若有更多内置接口（如 Stringer/Comparable 也迁移到 runtime），需逐个特判。
+每两层 `when_all → t_i` 之间，`t_i` final 恢复 `when_all`，`when_all` 恢复 `caller`（如果 when_all 已 co_return）。实际上 when_all 在 for 循环中 co_await，**final 恢复 caller** 只发生在 when_all 完成时。
 
-**建议**：BuiltinRegistry 新增 `runtimeProvidedInterfaces_` 集合，genInterfaceDecl 遍历时查表跳过：
+**深度分析**：每个 `co_await t_i` 是独立链（t_i 的 final 恢复 when_all），不是长链。只有 caller → when_all 是一层。所以 when_all 长列表**不会**触发长链保护，plan 说"同样受益"**不准确**。
+
+**建议**：plan §5 修正描述："when_all 内部每个 `co_await t` 是短链（深度 1），不触发保护；但 when_all 自身的 final 恢复 caller 是一层，无长链风险"。
+
+**风险等级**：P2（描述不准确）。
+
+### B7. 边界 B6"计数漂移"测试"大量短链循环"未给出具体用例
+
+**位置**：plan §6 [L120](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L120)
+
+> B6 | 计数漂移 | — | 超限归零 + 偶发调度 | 大量短链循环
+
+**问题**：§7.2 [L151](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L151) 说"循环 10 万次 `co_await` 单层任务（链深 1），确认偶发调度不改变输出"，但未给出测试代码。
+
+**建议**：plan §7.2 补充测试代码：
 ```cpp
-if (BuiltinRegistry::get().isRuntimeProvided(decl.name)) return;
+aura_rt::task<void> noop() { co_return; }
+aura_rt::task<void> loop() {
+    for (int i = 0; i < 100000; ++i) co_await noop();
+}
 ```
+
+**风险等级**：P2（次要）。
 
 ---
 
-### 六、审查结论
+## C. 综合审查结论
+
+### C1. 联合类型GC安全问题.md
 
 | 严重度 | 数量 | 关键项 |
-|---|---|---|
-| P0 | 5 | FuncIter T 提取、genInterfaceDecl 跳过、Iterator 类型注册、Kind::Iterator、Ellipsis |
-| P1 | 8 | genIfaceAdapter 特判、genForStmt/genMethodCall/genCallExpr 特判、inferMethodCall 特判、currentReturnElem_、bodyKind、some/none 注册 |
-| P2 | 3 | GcRootHandle 不可移动、RangeIter T 推导、collect_all 写屏障 |
+|--------|------|--------|
+| P1 | 4 | A1 口径漂移、A5 desc 时序、A8 std::variant/Variant 双路径、A10 Generic 二次检查缺失 |
+| P2 | 8 | A2 error 语法、A3 desc->size 核对不彻底、A4 钩子不完整、A6 变体大小、A7 None 顺序、A9 TypeError intern、A11 GroupPattern 歧义、A12 穷尽性算法 |
 
-5 个 P0 bug 必须修复后方可实施。P1 bug 多为"未实施"项，按 change.md 步骤实施时需逐一落实。方案整体可行，但 FuncIter 的 T 提取语法错误（Bug 1）和 genInterfaceDecl 跳过（Bug 2）是设计缺陷，需调整方案。
+### C2. 协程同步链栈深度保护.md
+
+| 严重度 | 数量 | 关键项 |
+|--------|------|--------|
+| P1 | 2 | B4 noexcept + schedule 可能抛、B5 thread_local 链接验证 |
+| P2 | 5 | B1 描述误导、B2 命名空间嵌套、B6 when_all 不受益、B7 测试代码缺失 |
+
+### C3. 优先修复建议
+
+**联合类型 plan 实施 P0 前必须修**：
+1. A2 `error` 调用语法（否则编译失败）
+2. A1 `unionVariantGcUnsafe` 与 `isHeapSemType` 口径统一
+
+**联合类型 plan 实施 P1 前必须修**：
+1. A5 `Variant::desc()` 时序明确
+2. A10 P3 增加 Generic 实例化二次检查步骤
+
+**协程链 plan 实施前必须修**：
+1. B4 `scheduleOnEventLoop` 异常处理
+2. B5 thread_local 链接验证步骤
+
+审查完毕。
+
+---
+
+# D. 迭代器 × GC 交互崩溃发现（issue 记录，待研究）
+
+> 提出时间：2026-08-05
+> 状态：**暂停修复**，转为 issue 供用户仔细研究后完成。
+> 相关文件：`example/iter_gc_test.cpp`（手工测试，change.md §6.5）、`runtime/builtin/iterator.h`、
+> `runtime/gc/gc.h`、`runtime/gc/compact.cpp`。
+
+## D.1 现象
+
+`iter_gc_test.exe` 运行 `test_chain_gc_pressure` 时崩溃（0xC0000005）：
+- 迭代中途触发 `forceGc()`（mark-sweep + compact）后，root 的 `fit`（`FilterIter*`）变量被改写为 **vtable 地址**，
+  下次 `fit->next()` 调用空/错位 vtable → 段错误。
+- 并非偶尔：只要 GC 发生 compact 且迭代器链存活，必然复现。
+
+## D.2 根因（已定位）：多继承布局违反 GC 核心假设
+
+**GC 核心假设**：`GcObject*` 地址 == 堆对象起始地址（offset 0）。
+`GcRootHandle` 的 `ptr_ref_` 指向用户变量地址，GC 直接按 `GcObject*` 读写该地址（[gc.h](file:///d:/you/Aura/runtime/gc/gc.h) 中
+`markPhase`/`updateAllReferences` 均如此）。
+
+**C++ 多继承布局**：`struct FilterIter : GcObject, Iterator<T>` 中，
+- `Iterator<T>`（含虚函数 `virtual next()`）成为 **primary base**，排在 **offset 0**（放 vptr）；
+- `GcObject` 子对象被排到 **offset 8**。
+
+于是：
+1. `fit`（`FilterIter*`）首 8 字节是 **vptr**，不是 `desc`；
+2. GC 按 `GcObject*` 读 `fit` → `obj->desc` 实际读到 **vptr**；
+3. `markObject`/`markFields` 按错误 desc 偏移扫描 → 标记错位；
+4. compact 的 `setForwardingPtr` 把 `fit` 变量更新成 forwardingPtr → `fit` 变成 vtable 地址；
+5. 用户代码再调 `fit->next()` → 0xC0000005。
+
+### 插桩证据（已删除，记录如下）
+
+```
+fit dump: 30 f6 ab 3d f7 7f 00 00 | 80 f4 ab 3d f7 7f 00 00
+           └ offset 0-7  = vtable 0x7ff73dabf630
+             offset 8-15 = 真实 desc 0x7ff73dabf480
+[DBG-mark] root %p -> obj=0x...00d0 desc=0x7ff73dabf630   ← GC 把 vptr 当 desc 读
+[DBG-upd]  root %p: 0x...00d0 fwd -> 0x7ff73dabf630        ← fit 被更新成 vtable 地址
+```
+
+## D.3 影响范围
+
+- 所有多继承 `GcObject` 派生对象（内置迭代器 `RangeIter/MapIter/FilterIter/FuncIter`）在 GC 下**全部不安全**，
+  不限于 compact，mark-sweep 的字段扫描也已错位。
+- 迭代器链一旦作为 GC 根存活且触发 GC，即崩溃或静默内存损坏。
+- 阻塞 change.md §6.5「迭代器 × GC 交互测试」（0 泄漏 0 悬垂）验收。
+
+## D.4 当前代码状态（探索性修改，未完成、未验证）
+
+以下修改是为定位/尝试修复而加的，**保留在工作区作为 issue 起点**，不属于本轮提交：
+
+| 文件 | 修改内容 | 结论 |
+| ---- | ---- | ---- |
+| `runtime/builtin/iterator.h` | `Iterator<T>` 加 `kGcSize=16` + `fromGc/toGc` 布局转换；`MapIter/FilterIter` 加 `srcGc_` 字段，desc 偏移改用 `offsetof(Self, srcGc_)`；`next()` 经 `srcGc_` 恢复接口指针；`make_map/make_filter` 用 `isGCAddress` 判定内置/适配器源；`collect_all` 加 GcRootHandle 保护链顶端 + 结果数组 | **未解决崩溃** |
+| `runtime/gc/gc.h` | `isGCAddress` 声明 | 配套 |
+| `runtime/gc/compact.cpp` | `isGCAddress` 实现（遍历小/中/大页 data 区） | 配套 |
+
+**失败原因**：根因是 `GcObject` 子对象不在 offset 0（多继承下偏移更深）。
+`toGc(src)` 反推的"对象起始"实际是 vptr 所在地址，`srcGc_` 记录的仍不是对象真实起始；
+GC 对 `srcGc_` 字段的扫描同样错位。即：**只要 `GcObject*` ≠ 对象起始，任何"字段记录 + 扫描"修补都治标不治本**。
+
+## D.5 候选修复方案
+
+- **方案 A（推荐）**：给 `GcObject` 加 `virtual ~GcObject() = default;`，使 `GcObject` 成为 primary base 回到
+  offset 0，恢复「对象起始 == `GcObject*`」假设，迭代器多继承布局自动正确。
+  代价：所有 GC 对象 +8 字节 vptr（对象头 16 → 24）。
+- **方案 B**：迭代器改为单继承 `GcObject`，内部持有接口指针/纯虚接口拆为单独 vtable 结构；
+  代价：迭代器类层次重写（CodeGen 桥接 `make_range/make_map/make_filter/collect_all` 调用点同步调整）。
+- **方案 C**：GC 支持「对象头偏移」记录（TypeDescriptor 加 headOffset，所有 `obj->desc` 读取点先换算真实头）；
+  代价：GC 全量改造，侵入面最大，不建议优先。
+
+## D.6 复现与验证
+
+```powershell
+g++ -std=gnu++20 -fcoroutines -w -g -I runtime example/iter_gc_test.cpp runtime/build/libaura_rt.a -o example/iter_gc_test.exe
+.\example\iter_gc_test.exe
+```
+
+- 复现：`test_chain_gc_pressure`（step % 3 时 forceGc）。
+- 验收：4 个测试全过（0 泄漏 0 悬垂），`ALL ITER-GC TESTS PASSED`。
+- 验证方案 A 前注意：GcObject 加虚析构后，`static_assert(kGcSize == 16)` 与
+  `offsetof` 系断言需同步更新；`gcConstruct` 的 placement-new 路径不受影响。

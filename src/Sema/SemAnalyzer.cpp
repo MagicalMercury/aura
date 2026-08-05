@@ -208,6 +208,10 @@ std::unique_ptr<SemType> SemAnalyzer::elemTypeOf(const SemType* iterType) {
 }
 
 std::unique_ptr<SemType> SemAnalyzer::resolveNamedType(const std::string& name) {
+    // None 只能作为联合变体 / match 常量出现（E017 在 AST 层拦截独立标注）
+    // semTypeFromAuraName 对 None_ 返回 ErrorSemType，此处先特判保证 `T | None` 变体正确
+    if (name == "None") return NoneSemType::make();
+
     // 先查 BuiltinRegistry（int→intType、Io/Path→GenericSemType 占位等）
     auto builtin = semTypeFromAuraName(name);
     if (!dynamic_cast<const ErrorSemType*>(builtin.get()))
@@ -332,6 +336,10 @@ std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(
                 }
                 return ErrorSemType::make();
             }
+            // fallback == "T" → 返回列表元素类型（front/back/pop/remove）
+            if (ret.typeName == "T") {
+                return elemTypeOf(objType);
+            }
             // fallback == "string" → 返回 string
             if (ret.typeName == "string") {
                 return stringType();
@@ -371,6 +379,13 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
             if (v && isAssignable(*v, source))
                 return true;
         }
+        // none() 占位（Optional<error>，元素类型未知）→ 联合含 None 变体时视为 None 赋值放行
+        if (auto* os = dynamic_cast<const OptionalSemType*>(&source)) {
+            if (dynamic_cast<const ErrorSemType*>(os->elementType.get())) {
+                for (auto& v : u->variants)
+                    if (v && dynamic_cast<const NoneSemType*>(v.get())) return true;
+            }
+        }
         return false;
     }
 
@@ -385,13 +400,17 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
     }
 
     // Optional<T>：双方元素类型需可赋值；Error 元素（none() 占位/未知类型）静默兼容
+    // 非 Optional 源：None 值允许；T 值允许隐式包装为 some(T)（T | None → Optional<T> 语法糖）
     if (auto* oa = dynamic_cast<const OptionalSemType*>(&target)) {
-        auto* ob = dynamic_cast<const OptionalSemType*>(&source);
-        if (!ob) return false;
-        if (dynamic_cast<const ErrorSemType*>(oa->elementType.get())
-            || dynamic_cast<const ErrorSemType*>(ob->elementType.get()))
-            return true;
-        return isAssignable(*oa->elementType, *ob->elementType);
+        if (auto* ob = dynamic_cast<const OptionalSemType*>(&source)) {
+            if (dynamic_cast<const ErrorSemType*>(oa->elementType.get())
+                || dynamic_cast<const ErrorSemType*>(ob->elementType.get()))
+                return true;
+            return isAssignable(*oa->elementType, *ob->elementType);
+        }
+        if (dynamic_cast<const NoneSemType*>(&source)) return true;
+        if (dynamic_cast<const ErrorSemType*>(oa->elementType.get())) return true;
+        return isAssignable(*oa->elementType, source);
     }
 
     // 函数类型：逐参数检查（支持泛型参数）
@@ -472,6 +491,20 @@ std::unique_ptr<SemType> SemAnalyzer::substitute(
         auto n = std::make_unique<UnionSemType>();
         for (auto& v : u->variants)
             n->variants.push_back(v ? substitute(*v, genericName, concrete) : nullptr);
+        // P3c：泛型实例化二次检查——替换后无 GenericSemType 残留时，若任一变体
+        // GC 不安全（如 T→string 后得 string | int）→ 报错（P0 对未实例化 Generic 放行）。
+        bool hasGeneric = false;
+        for (auto& v : n->variants)
+            if (v && dynamic_cast<const GenericSemType*>(v.get())) { hasGeneric = true; break; }
+        if (!hasGeneric) {
+            for (auto& v : n->variants)
+                if (v && unionVariantGcUnsafe(*v)) {
+                    error(0, 0, "generic instantiation: union contains GC heap variant '" +
+                          v->toString() + "' which is not GC-safe yet; "
+                          "use Optional<T> for 'T | None'");
+                    break;
+                }
+        }
         return n;
     }
     if (auto* l = dynamic_cast<const ListSemType*>(&type)) {
@@ -715,10 +748,20 @@ void SemAnalyzer::propagateCanonicalName(const ASTNode& expr, const SemType* typ
         return;
     }
 
-    // UnionSemType：试每个变体，取第一个可匹配的（如 children: [Tree<T>] | T）
+    // UnionSemType：试每个变体，取第一个形态可匹配的（如 children: [Tree<T>] | T）
+    // 只传播与表达式形态匹配的变体：RecordExpr 匹配 record/泛型变体，ListExpr 匹配 list 变体；
+    // 其他表达式（int/string 字面量等）不改写 inferredType——否则 int | [int] 中 [1,2]
+    // 会被错误标注为 int 变体，导致 CodeGen 隐式装箱选错变体索引
     if (auto* us = dynamic_cast<const UnionSemType*>(type)) {
         for (auto& v : us->variants) {
-            if (v) { propagateCanonicalName(expr, v.get()); return; }
+            if (!v) continue;
+            bool shapeMatch =
+                (dynamic_cast<const RecordExpr*>(&expr) &&
+                 (dynamic_cast<const RecordSemType*>(v.get()) ||
+                  dynamic_cast<const GenericSemType*>(v.get())))
+                || (dynamic_cast<const ListExpr*>(&expr) &&
+                    dynamic_cast<const ListSemType*>(v.get()));
+            if (shapeMatch) { propagateCanonicalName(expr, v.get()); return; }
         }
         return;
     }
@@ -925,7 +968,8 @@ ModuleExports SemAnalyzer::extractExports() const {
             switch (sym.kind) {
                 case SymKind::TypeAlias:
                     e.types[name] = sym.type ? sym.type->clone() : ErrorSemType::make();
-                    if (!sym.ctorParams.empty()) {
+                    // ctorDeclared：无参构造函数 ctorParams 为空，不能用 !empty() 判断
+                    if (sym.ctorDeclared) {
                         const SemType* ctorRet = sym.ctorReturnType ? sym.ctorReturnType.get()
                                                  : sym.type.get();
                         e.ctors[name] = buildFuncExport(sym.ctorParams, ctorRet, sym.throws);

@@ -46,6 +46,9 @@ struct Symbol {
     // 构造函数信息（当 fun (self T) T(...) 与 type T = ... 同名时填充）
     std::vector<SymParam> ctorParams;
     std::unique_ptr<SemType> ctorReturnType;
+    // 已声明构造函数（与 ctorParams 非空解耦：无参构造函数的 params 为空，
+    // 不能依赖 ctorParams 非空判断"是否有构造函数"）
+    bool ctorDeclared = false;
 
     // ——— 仅 Interface ———
     std::vector<InterfaceSemType::MethodSig> interfaceMethods;

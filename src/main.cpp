@@ -168,6 +168,8 @@ int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
             diag.print(std::cerr);
             return 1;
         }
+        // 成功路径：输出警告（不阻塞编译）
+        if (diag.hasWarnings()) diag.print(std::cerr);
 
         // 确定 cpp 输出路径
         std::string cppPath = opts.cppOutput;

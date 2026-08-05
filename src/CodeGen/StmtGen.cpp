@@ -1,6 +1,7 @@
 #include "CodeGen.h"
 #include "../Sema/BuiltinRegistry.h"
 #include "../Sema/SemType.h"
+#include <sstream>
 
 namespace Aura {
 
@@ -63,6 +64,76 @@ void CodeGenerator::genStmt(std::ostream& cpp, const Stmt& stmt,
 // 变量声明
 // ============================================================
 
+// P3b：识别 none() 调用（Optional 占位构造，make_none<T>）
+// 当赋值目标是"含 None 变体的联合"（int | None）时，应生成 NoneType 值 aura_rt::None
+bool CodeGenerator::isNoneCallExpr(const ASTNode& e) {
+    if (auto* ce = dynamic_cast<const CallExpr*>(&e)) {
+        if (auto* id = dynamic_cast<const Identifier*>(ce->callee.get()))
+            return id->name == "none" && ce->args.empty();
+    }
+    return false;
+}
+
+// ============================================================
+// P3b 隐式装箱（genUnionBoxing）
+// 目标为含堆联合（aura_rt::Variant<T...>*）且初始值为非联合值时，
+// 按初始值 SemType 定位变体索引 I，生成：
+//   [&]() -> auto {
+//     auto _bxN = (expr);
+//     aura_rt::GcRootHandle<decltype(_bxN)> _bhxN(_bxN);   // 仅堆值
+//     return aura_rt::make_variant<T1, T2, ...>(I, &_bhxN.get());
+//   }()
+// GcRootHandle 保护：make_variant 内部 alloc 触发 GC 时，堆临时值不被回收。
+// ============================================================
+std::string CodeGenerator::genUnionBoxing(const UnionSemType& u,
+                                          const ASTNode& init,
+                                          bool isCoroutine) {
+    // 变体 C++ 类型列表 + 含堆判定
+    std::vector<std::string> cppTypes;
+    bool hasHeap = false;
+    for (auto& v : u.variants) {
+        cppTypes.push_back(v ? mapSemType(*v) : "void");
+        if (v && isHeapSemType(v.get())) hasHeap = true;
+    }
+    if (!hasHeap) return "";  // 全值联合（std::variant 路径）不走装箱
+    return genUnionBoxingImpl(cppTypes, init, isCoroutine);
+}
+
+std::string CodeGenerator::genUnionBoxingImpl(
+    const std::vector<std::string>& cppTypes,
+    const ASTNode& init, bool isCoroutine) {
+    // 定位变体索引 I：初始值 C++ 类型 == 某变体 C++ 类型
+    // （record 需 canonicalName 已传播，如 let 场景 checkLetDecl 的 propagateCanonicalName）
+    int idx = -1;
+    if (init.inferredType) {
+        std::string initCpp = mapSemType(*init.inferredType);
+        for (size_t k = 0; k < cppTypes.size(); ++k) {
+            if (cppTypes[k] == initCpp) { idx = static_cast<int>(k); break; }
+        }
+    }
+    if (idx < 0) return "";  // 未匹配（联合值直接赋值 / Sema 应已报错）
+
+    std::string expr = genExpr(init, isCoroutine);
+    int bid = unionBoxingCounter_++;
+    bool initIsHeap = isHeapSemType(init.inferredType);
+    std::ostringstream oss;
+    oss << "[&]() -> auto {\n";
+    oss << "    auto _bx" << bid << " = (" << expr << ");\n";
+    if (initIsHeap)
+        oss << "    aura_rt::GcRootHandle<decltype(_bx" << bid << ")> _bhx"
+            << bid << "(_bx" << bid << ");\n";
+    oss << "    return aura_rt::make_variant<";
+    for (size_t k = 0; k < cppTypes.size(); ++k) {
+        if (k > 0) oss << ", ";
+        oss << cppTypes[k];
+    }
+    // 堆值：经 GcRootHandle 解引用取最新指针（GC compact 后更新）；值/指针裸值：直接取地址
+    oss << ">(" << idx << ", &" << (initIsHeap ? "_bhx" : "_bx")
+        << bid << (initIsHeap ? ".get()" : "") << ");\n";
+    oss << "  }()";
+    return oss.str();
+}
+
 void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     std::string type;
     if (decl.type) {
@@ -117,13 +188,18 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
             // 检查是否有可用的记录类型名（含 decl.type 或 inferredType 中的 canonicalName）
             bool hasRecordType = false;
             std::string recType;
-            if (decl.type) {
+            // P3b：目标为联合（decl.inferredType 是 UnionSemType）时不走 record 构造，
+            // record 字面量应作为联合变体装箱（make_variant），由下方隐式装箱逻辑处理
+            bool targetIsUnion = dynamic_cast<const UnionSemType*>(decl.inferredType) != nullptr;
+            if (!targetIsUnion && decl.type) {
                 recType = mapType(*decl.type);
                 hasRecordType = true;
-            } else if (auto* rs = dynamic_cast<const RecordSemType*>(decl.inferredType)) {
-                if (!rs->canonicalName.empty()) {
-                    recType = rs->canonicalName + "*";
-                    hasRecordType = true;
+            } else if (!targetIsUnion) {
+                if (auto* rs = dynamic_cast<const RecordSemType*>(decl.inferredType)) {
+                    if (!rs->canonicalName.empty()) {
+                        recType = rs->canonicalName + "*";
+                        hasRecordType = true;
+                    }
                 }
             }
             if (hasRecordType) {
@@ -160,7 +236,54 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
             }
         }
 
-        init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
+        // P3b：目标为"含 None 变体的联合"（int | None）且初始化为 none() 时，
+        // 生成 NoneType 值（aura_rt::None），而非 Optional 指针（make_none<T>）
+        bool unionHasNone = false;
+        if (auto* u = dynamic_cast<const UnionSemType*>(decl.inferredType)) {
+            for (auto& v : u->variants)
+                if (v && dynamic_cast<const NoneSemType*>(v.get())) { unionHasNone = true; break; }
+        }
+        if (unionHasNone && decl.initializer && isNoneCallExpr(*decl.initializer)) {
+            init = "aura_rt::None";
+        } else {
+            // P3b 隐式装箱：目标为含堆联合（Variant 指针）且初始值为非联合值
+            // （int/string/record/list 字面量或表达式）→ 生成 make_variant<I> 装箱
+            std::string boxed;
+            if (auto* u = dynamic_cast<const UnionSemType*>(decl.inferredType)) {
+                boxed = genUnionBoxing(*u, *decl.initializer, currentFunctionIsCoroutine_);
+            }
+            if (!boxed.empty()) {
+                init = boxed;
+            } else if (auto* os = dynamic_cast<const OptionalSemType*>(decl.inferredType)) {
+                // P3a 折叠（T | None → Optional<T>）的 let 初始化：
+                //   none() → make_none<elem>；普通值 → make_optional<elem>(值)，
+                //   堆值经 GcRootHandle 保护（make_optional 内 alloc 可能触发 GC）
+                std::string elemCpp = os->elementType ? mapSemType(*os->elementType) : "";
+                if (isNoneCallExpr(*decl.initializer)) {
+                    init = "aura_rt::make_none<" + elemCpp + ">()";
+                } else if (!elemCpp.empty()) {
+                    int oid = unionBoxingCounter_++;
+                    std::string ov = "_ox" + std::to_string(oid);
+                    std::string oh = "_ohx" + std::to_string(oid);
+                    bool heap = isHeapSemType(decl.initializer->inferredType);
+                    std::ostringstream oss;
+                    oss << "[&]() -> auto {\n";
+                    oss << "    auto " << ov << " = ("
+                        << genExpr(*decl.initializer, currentFunctionIsCoroutine_) << ");\n";
+                    if (heap)
+                        oss << "    aura_rt::GcRootHandle<decltype(" << ov << ")> " << oh
+                            << "(" << ov << ");\n";
+                    oss << "    return aura_rt::make_optional<" << elemCpp << ">("
+                        << (heap ? oh + ".get()" : ov) << ");\n";
+                    oss << "  }()";
+                    init = oss.str();
+                } else {
+                    init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
+                }
+            } else {
+                init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
+            }
+        }
         if (lastClosureIsCoro_) {
             coroClosureNames_.insert(safeName(decl.name));
             lastClosureIsCoro_ = false;
@@ -270,8 +393,28 @@ void CodeGenerator::genConstStmt(std::ostream& cpp, const ConstDecl& decl) {
         }
     }
 
-    std::string init = decl.initializer
-        ? genExpr(*decl.initializer, currentFunctionIsCoroutine_) : "";
+    // P3b：目标为"含 None 变体的联合"且初始化为 none() 时生成 NoneType 值
+    std::string init;
+    if (decl.initializer) {
+        bool unionHasNone = false;
+        if (auto* u = dynamic_cast<const UnionSemType*>(decl.inferredType)) {
+            for (auto& v : u->variants)
+                if (v && dynamic_cast<const NoneSemType*>(v.get())) { unionHasNone = true; break; }
+        }
+        if (unionHasNone && isNoneCallExpr(*decl.initializer)) {
+            init = "aura_rt::None";
+        } else {
+            // P3b 隐式装箱：目标为含堆联合（Variant 指针）且初始值为非联合值 → make_variant
+            std::string boxed;
+            if (auto* u = dynamic_cast<const UnionSemType*>(decl.inferredType)) {
+                boxed = genUnionBoxing(*u, *decl.initializer, currentFunctionIsCoroutine_);
+            }
+            if (!boxed.empty())
+                init = boxed;
+            else
+                init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
+        }
+    }
 
     expectedTemplateArgs_.clear();
 
@@ -297,6 +440,17 @@ void CodeGenerator::genConstStmt(std::ostream& cpp, const ConstDecl& decl) {
 void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
                                    bool isCoroutine) {
     std::string prefix = isCoroutine ? "co_return" : "return";
+
+    // P3b：函数返回"含堆联合"（Variant 指针）且返回值为非联合值时 → 隐式装箱 make_variant<I>
+    // 优先于 RecordExpr 特判：record 字面量作为联合变体时经 genRecordExpr 生成 T* 后装箱
+    bool returnIsUnion = !currentReturnVariantCppTypes_.empty() && stmt.expr;
+    if (returnIsUnion && !dynamic_cast<const UnionSemType*>(stmt.expr->inferredType)) {
+        std::string boxed = genUnionBoxingImpl(currentReturnVariantCppTypes_, *stmt.expr, isCoroutine);
+        if (!boxed.empty()) {
+            writeLine(cpp, prefix + " " + boxed + ";");
+            return;
+        }
+    }
 
     // RecordExpr 在 return 语句中 → 生成 gc_alloc + 字段赋值
     if (stmt.expr && dynamic_cast<const RecordExpr*>(stmt.expr.get())) {
@@ -689,6 +843,11 @@ void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
 
     // 5. 成功分支
     writeLine(cpp, "auto " + varName + " = std::get<" + resultType + ">(_try);");
+    // GC 安全：resultType 为 GC 指针时用 GcRootHandle 保护（对齐错误分支 kind/message/extra 保护），
+    // 后续 stmts 中若触发 GC（co_await compact），varName 指向的堆对象不会被回收/悬垂。
+    if (isGcPointerType(resultType)) {
+        writeLine(cpp, "aura_rt::GcRootHandle<" + resultType + "> _" + varName + "_root(" + varName + ");");
+    }
     for (size_t i = letIdx + 1; i < stmts.size(); ++i) {
         if (stmts[i]) genStmt(cpp, *stmts[i], isCoroutine);
     }
@@ -1373,6 +1532,23 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
                                   bool isCoroutine) {
     std::string expr = genExpr(*stmt.expr, isCoroutine);
 
+    // 匹配值类别（依据 Sema inferredType）：
+    //   - UnionSemType 含堆变体 → aura_rt::Variant<T...>*（->is<I>() / ->get<I>()）
+    //   - OptionalSemType → aura_rt::Optional<T>*（is_none() / unwrap()，P3a 折叠的 T | None）
+    //   - 其他（含全值 std::variant）→ 现有 holds_alternative / get 路径
+    const SemType* mt = stmt.expr ? stmt.expr->inferredType : nullptr;
+    bool isVariantPtr = false;   // aura_rt::Variant<T...>*
+    bool isOptional   = false;   // aura_rt::Optional<T>*
+    std::vector<std::string> variantCppTypes;  // 各变体 C++ 类型（索引对应；std::variant 与 Variant 路径共用）
+    if (auto* u = dynamic_cast<const UnionSemType*>(mt)) {
+        for (auto& v : u->variants) {
+            if (v && isHeapSemType(v.get())) isVariantPtr = true;
+            variantCppTypes.push_back(v ? mapSemType(*v) : "void");
+        }
+    } else if (dynamic_cast<const OptionalSemType*>(mt)) {
+        isOptional = true;
+    }
+
     // 使用 if/else 链代替 std::visit，以正确支持 co_await
     // plan2 §4.7: match → std::visit，但 co_await 无法在 visitor 泛型 lambda 中使用
     // 改用 std::holds_alternative + std::get 替代方案
@@ -1380,26 +1556,130 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
     indentLevel_++;
     writeLine(cpp, "auto&& _match_val = " + expr + ";");
 
+    // P5：常量匹配条件生成（联合/含堆 Variant/Optional 路径先判定变体再比值；非联合直接比较）
+    auto genConstCond = [&](const ASTNode* lit) -> std::string {
+        // None 常量：匹配 None 变体（Variant is<I> / Optional is_none / std::variant holds_alternative）
+        if (dynamic_cast<const NoneLiteral*>(lit)) {
+            if (isVariantPtr) {
+                for (size_t k = 0; k < variantCppTypes.size(); ++k)
+                    if (variantCppTypes[k] == "aura_rt::NoneType")
+                        return "_match_val->is<" + std::to_string(k) + ">()";
+                return "false";
+            }
+            if (isOptional) return "_match_val->is_none()";
+            if (mt && dynamic_cast<const UnionSemType*>(mt)) {
+                for (size_t k = 0; k < variantCppTypes.size(); ++k)
+                    if (variantCppTypes[k] == "aura_rt::NoneType")
+                        return "std::holds_alternative<aura_rt::NoneType>(_match_val)";
+            }
+            return "true";  // 非联合 None：值恒为 None，直接命中
+        }
+
+        std::string litExpr = genExpr(*lit, isCoroutine);
+        // 定位字面量对应的变体 C++ 类型（联合 / Variant 路径）
+        auto findVariantIdx = [&]() -> int {
+            std::string want;
+            if (dynamic_cast<const IntLiteral*>(lit)) want = "int32_t";
+            else if (dynamic_cast<const FloatLiteral*>(lit)) want = "double";
+            else if (dynamic_cast<const BoolLiteral*>(lit)) want = "bool";
+            else if (dynamic_cast<const StringLiteral*>(lit)) want = "aura_rt::GcString*";
+            if (want.empty()) return -1;
+            for (size_t k = 0; k < variantCppTypes.size(); ++k)
+                if (variantCppTypes[k] == want) return static_cast<int>(k);
+            return -1;
+        };
+
+        if (isVariantPtr) {
+            int idx = findVariantIdx();
+            if (idx < 0) return "false";
+            std::string prefix = "_match_val->is<" + std::to_string(idx) + ">() && ";
+            std::string cmp = "_match_val->get<" + std::to_string(idx) + ">()";
+            if (dynamic_cast<const StringLiteral*>(lit))
+                return prefix + "aura_rt::string_eq(" + cmp + ", " + litExpr + ")";
+            return prefix + cmp + " == " + litExpr;
+        }
+        if (isOptional) {
+            if (dynamic_cast<const StringLiteral*>(lit))
+                return "!_match_val->is_none() && aura_rt::string_eq(_match_val->unwrap(), " + litExpr + ")";
+            return "!_match_val->is_none() && _match_val->unwrap() == " + litExpr;
+        }
+        if (mt && dynamic_cast<const UnionSemType*>(mt)) {
+            int idx = findVariantIdx();
+            if (idx < 0) return "false";
+            std::string t = variantCppTypes[static_cast<size_t>(idx)];
+            if (dynamic_cast<const StringLiteral*>(lit))
+                return "std::holds_alternative<" + t + ">(_match_val) && aura_rt::string_eq(std::get<" + t + ">(_match_val), " + litExpr + ")";
+            return "std::holds_alternative<" + t + ">(_match_val) && std::get<" + t + ">(_match_val) == " + litExpr;
+        }
+        // 非联合：直接比较
+        if (dynamic_cast<const StringLiteral*>(lit))
+            return "aura_rt::string_eq(_match_val, " + litExpr + ")";
+        return "_match_val == " + litExpr;
+    };
+
     for (size_t i = 0; i < stmt.cases.size(); ++i) {
         auto& c = stmt.cases[i];
         std::string branchIntro = (i > 0) ? "} else " : "";
 
         if (auto* tp = dynamic_cast<const TypePattern*>(c.pattern.get())) {
             std::string cppType = mapNamedType(tp->typeName);
-            cpp << indentStr() << branchIntro
-                << "if (std::holds_alternative<" << cppType << ">(_match_val)) {\n";
-        } else {
-            // None / wildcard 落在 else 分支
-            cpp << indentStr() << branchIntro << "{\n";
-        }
-
-        indentLevel_++;
-
-        if (auto* tp = dynamic_cast<const TypePattern*>(c.pattern.get())) {
-            if (!tp->varName.empty()) {
-                writeLine(cpp, "auto& " + safeName(tp->varName) +
-                          " = std::get<" + mapNamedType(tp->typeName) + ">(_match_val);");
+            std::string cond;
+            std::string binding;
+            if (isVariantPtr) {
+                // 定位变体索引（TypePattern 类型 == 某变体 C++ 类型）
+                int idx = -1;
+                for (size_t k = 0; k < variantCppTypes.size(); ++k)
+                    if (variantCppTypes[k] == cppType) { idx = static_cast<int>(k); break; }
+                if (idx >= 0) {
+                    cond = "_match_val->is<" + std::to_string(idx) + ">()";
+                    if (!tp->varName.empty())
+                        binding = "auto& " + safeName(tp->varName) +
+                                  " = _match_val->get<" + std::to_string(idx) + ">();";
+                } else {
+                    cond = "false";  // 类型模式与任何变体不匹配（Sema 应已拦截）
+                }
+            } else if (isOptional) {
+                cond = "!_match_val->is_none()";
+                if (!tp->varName.empty())
+                    binding = "auto " + safeName(tp->varName) + " = _match_val->unwrap();";
+            } else if (mt && dynamic_cast<const UnionSemType*>(mt)) {
+                // 全值联合（std::variant 路径）：holds_alternative / get
+                cond = "std::holds_alternative<" + cppType + ">(_match_val)";
+                if (!tp->varName.empty())
+                    binding = "auto& " + safeName(tp->varName) +
+                              " = std::get<" + cppType + ">(_match_val);";
+            } else {
+                // 普通类型：类型静态已知，条件恒真，直接绑定
+                cond = "true";
+                if (!tp->varName.empty())
+                    binding = "auto&& " + safeName(tp->varName) + " = _match_val;";
             }
+            cpp << indentStr() << branchIntro << "if (" << cond << ") {\n";
+            indentLevel_++;
+            if (!binding.empty()) writeLine(cpp, binding);
+        } else if (dynamic_cast<const ConstantPattern*>(c.pattern.get())
+                   || dynamic_cast<const GroupPattern*>(c.pattern.get())) {
+            // P5：常量 / `|` 分组匹配（if/else if 链，语义等价 C++ switch 多 case 合并）
+            std::vector<const ASTNode*> lits;
+            if (auto* cp = dynamic_cast<const ConstantPattern*>(c.pattern.get())) {
+                if (cp->value) lits.push_back(cp->value.get());
+            } else if (auto* gp = dynamic_cast<const GroupPattern*>(c.pattern.get())) {
+                for (auto& a : gp->alts)
+                    if (auto* ap = dynamic_cast<const ConstantPattern*>(a.get()))
+                        if (ap->value) lits.push_back(ap->value.get());
+            }
+            std::string cond;
+            for (size_t k = 0; k < lits.size(); ++k) {
+                if (k > 0) cond += " || ";
+                cond += genConstCond(lits[k]);
+            }
+            if (cond.empty()) cond = "false";  // 防御：空分组
+            cpp << indentStr() << branchIntro << "if (" << cond << ") {\n";
+            indentLevel_++;
+        } else {
+            // wildcard 落在 else 分支
+            cpp << indentStr() << branchIntro << "{\n";
+            indentLevel_++;
         }
 
         if (c.body) {

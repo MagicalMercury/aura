@@ -113,12 +113,50 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
         return "/* inline record */ aura_rt::GcObject*";
     }
     if (auto* u = dynamic_cast<const UnionType*>(&type)) {
-        std::string result = "std::variant<";
+        // P3a：`T | None`（恰 2 变体、另一为堆类型）→ aura_rt::Optional<elem>*（与 Sema 折叠一致）
+        if (u->types.size() == 2) {
+            auto* na = dynamic_cast<const NamedType*>(u->types[0].get());
+            auto* nb = dynamic_cast<const NamedType*>(u->types[1].get());
+            auto isNoneNamed = [](const NamedType* n) {
+                return n && n->name == "None" && n->typeArgs.empty() && n->namespacePrefix.empty();
+            };
+            bool aIsNone = isNoneNamed(na);
+            bool bIsNone = isNoneNamed(nb);
+            if (aIsNone != bIsNone) {
+                const auto& other = aIsNone ? u->types[1] : u->types[0];
+                // 堆判定与 Sema unionVariantGcUnsafe 对齐：类型标注处无 SemType
+                // （如 [int] | None 的 [int] 是 ListType），按 C++ 名回退（指针 = 堆）
+                bool otherHeap = false;
+                if (other && other->inferredType) {
+                    otherHeap = isHeapSemType(other->inferredType);
+                } else if (other) {
+                    std::string cpp = mapType(*other);
+                    otherHeap = !cpp.empty() && cpp.back() == '*';
+                }
+                if (otherHeap)
+                    return "aura_rt::Optional<" + mapType(*other) + ">*";
+            }
+        }
+        // P3b：含堆变体 → aura_rt::Variant<...>*（GC 堆封装）；全值 → std::variant<...>
+        bool hasHeap = false;
+        for (auto& v : u->types) {
+            if (!v) continue;
+            bool heap = false;
+            if (v->inferredType) {
+                heap = isHeapSemType(v->inferredType);
+            } else {
+                // 无 SemType（如类型声明处）：按 C++ 名回退判断（指针类型 = 堆）
+                std::string cpp = mapType(*v);
+                heap = !cpp.empty() && cpp.back() == '*';
+            }
+            if (heap) { hasHeap = true; break; }
+        }
+        std::string result = hasHeap ? "aura_rt::Variant<" : "std::variant<";
         for (size_t i = 0; i < u->types.size(); ++i) {
             if (i > 0) result += ", ";
             result += u->types[i] ? mapType(*u->types[i]) : "???";
         }
-        result += ">";
+        result += hasHeap ? ">*" : ">";
         return result;
     }
     if (auto* f = dynamic_cast<const FunctionType*>(&type)) {
@@ -218,6 +256,31 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
         // Optional<T> → aura_rt::Optional<T>*（堆对象指针）
         std::string elem = o->elementType ? mapSemType(*o->elementType) : "void";
         return "aura_rt::Optional<" + elem + ">*";
+    }
+    if (auto* u = dynamic_cast<const UnionSemType*>(&semType)) {
+        // P3a：`T | None`（含堆）折叠 → Optional（与 resolveType 一致，顺序无关）
+        if (u->variants.size() == 2) {
+            const SemType* noneV = nullptr;
+            const SemType* otherV = nullptr;
+            for (auto& v : u->variants) {
+                if (!v) continue;
+                if (dynamic_cast<const NoneSemType*>(v.get())) noneV = v.get();
+                else otherV = v.get();
+            }
+            if (noneV && otherV && isHeapSemType(otherV))
+                return "aura_rt::Optional<" + mapSemType(*otherV) + ">*";
+        }
+        // P3b：含堆 → Variant 指针；全值 → std::variant
+        bool hasHeap = false;
+        for (auto& v : u->variants)
+            if (v && isHeapSemType(v.get())) { hasHeap = true; break; }
+        std::string result = hasHeap ? "aura_rt::Variant<" : "std::variant<";
+        for (size_t i = 0; i < u->variants.size(); ++i) {
+            if (i > 0) result += ", ";
+            result += u->variants[i] ? mapSemType(*u->variants[i]) : "void";
+        }
+        result += hasHeap ? ">*" : ">";
+        return result;
     }
     if (auto* r = dynamic_cast<const RecordSemType*>(&semType)) {
         if (!r->canonicalName.empty()) {

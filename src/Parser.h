@@ -109,6 +109,8 @@ private:
 
     // --- 解析模式 ---
     std::unique_ptr<Pattern> parsePattern();
+    // P5：单个模式（parsePattern 的 `|` 分组内单元）
+    std::unique_ptr<Pattern> parseSinglePattern();
 
     // --- 解析参数 ---
     Param parseParam();

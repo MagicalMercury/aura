@@ -225,7 +225,8 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
         return applyGenericMap(std::move(result), genericMap);
     }
     // TypeAlias 有显式构造函数（fun (self T) T(...)）→ 作为构造函数调用
-    if (sym->kind == SymKind::TypeAlias && !sym->ctorParams.empty()) {
+    // 用 ctorDeclared 判断（ctorParams 为空 = 无参构造函数，!empty() 会误判）
+    if (sym->kind == SymKind::TypeAlias && sym->ctorDeclared) {
         std::vector<const SemType*> formalTypes;
         for (auto& p : sym->ctorParams) formalTypes.push_back(p.type.get());
         size_t dc = 0;
@@ -317,6 +318,43 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     }
 
     auto objType = inferExpr(*e.object);
+
+    // P4：联合接收者动态分派——在变体集合上查找方法（至少一个变体支持 → 通过）
+    // 返回类型合并：全部相同 → 单类型；否则 → UnionSemType（各返回类型并集）
+    if (auto* u = dynamic_cast<const UnionSemType*>(objType.get())) {
+        std::vector<std::unique_ptr<SemType>> retTypes;
+        std::vector<bool> supported(u->variants.size(), false);
+        for (size_t k = 0; k < u->variants.size(); ++k) {
+            if (!u->variants[k]) continue;
+            if (dynamic_cast<const NoneSemType*>(u->variants[k].get())) continue;  // None 无方法
+            auto ret = inferMethodCallOnVariant(*u->variants[k], e);
+            if (ret) { supported[k] = true; retTypes.push_back(std::move(ret)); }
+        }
+        bool any = false;
+        for (bool s : supported) any = any || s;
+        if (!any) {
+            error(e, "no variant of union type '" + u->toString() +
+                  "' supports method '" + e.method + "'");
+            return ErrorSemType::make();
+        }
+        // 参数类型推断（CodeGen GcRootHandle 依赖 inferredType）
+        for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
+        if (retTypes.empty()) return ErrorSemType::make();
+        // 合并返回类型
+        bool allSame = true;
+        for (size_t k = 1; k < retTypes.size(); ++k)
+            if (!retTypes[k]->equals(*retTypes[0])) { allSame = false; break; }
+        if (allSame) return retTypes[0]->clone();
+        // 多返回类型 → UnionSemType 并集（去重）
+        auto ures = std::make_unique<UnionSemType>();
+        auto pushVariant = [&](std::unique_ptr<SemType>&& t) {
+            for (auto& v : ures->variants)
+                if (v && v->equals(*t)) return;
+            ures->variants.push_back(std::move(t));
+        };
+        for (auto& t : retTypes) pushVariant(std::move(t));
+        return ures;
+    }
 
     // 接口类型 receiver（接口默认方法体内 self.method(...) 调用）：
     // 在接口方法集中查找，返回声明返回类型（参数逐个校验 v1 简化，由接口定义保证）
@@ -440,6 +478,36 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     return ErrorSemType::make();
 }
 
+// P4：在单个变体类型上推断方法调用返回类型（联合动态分派用）
+// 该变体不支持该调用时返回 nullptr
+std::unique_ptr<SemType> SemAnalyzer::inferMethodCallOnVariant(
+    const SemType& variantType, const MethodCallExpr& e) {
+    // 接口变体：在接口方法集中查找
+    if (auto* iface = dynamic_cast<const InterfaceSemType*>(&variantType)) {
+        for (auto& m : iface->methods)
+            if (m.name == e.method)
+                return m.returnType ? m.returnType->clone() : NoneSemType::make();
+        return nullptr;
+    }
+    // 内置类型变体（string / [T] / 内置泛型）
+    std::string typeKey;
+    if (auto* p = dynamic_cast<const PrimSemType*>(&variantType)) {
+        if (p->kind == PrimSemType::String) typeKey = "string";
+    } else if (dynamic_cast<const ListSemType*>(&variantType)) {
+        typeKey = "[T]";
+    } else if (auto* g = dynamic_cast<const GenericSemType*>(&variantType)) {
+        if (BuiltinRegistry::get().findType(g->name)) typeKey = g->name;
+    }
+    if (!typeKey.empty()) {
+        if (auto* entry = BuiltinRegistry::get().findMethod(typeKey, e.method, (int)e.args.size()))
+            return semTypeFromBuiltinReturn(entry->returns, &variantType);
+        return nullptr;
+    }
+    // record / None / Optional / 嵌套联合：保守按不支持（无法静态判定方法集，
+    // 参数兼容过滤的语义——无法兼容的变体排除出支持集合）
+    return nullptr;
+}
+
 std::unique_ptr<SemType> SemAnalyzer::inferMemberAccess(const MemberAccessExpr& e) {
     auto objType = inferExpr(*e.object);
     if (auto* rec = dynamic_cast<const RecordSemType*>(objType.get())) {
@@ -458,7 +526,29 @@ std::unique_ptr<SemType> SemAnalyzer::inferMemberAccess(const MemberAccessExpr& 
 std::unique_ptr<SemType> SemAnalyzer::inferIndexExpr(const IndexExpr& e) {
     auto objType = inferExpr(*e.object);
     if (auto* list = dynamic_cast<const ListSemType*>(objType.get())) {
+        if (e.index) (void)inferExpr(*e.index);
         return list->elementType ? list->elementType->clone() : ErrorSemType::make();
+    }
+    // P4：联合接收者索引——各 ListSemType 变体的元素类型并集（与 inferMethodCallOnVariant 合并一致）
+    if (auto* u = dynamic_cast<const UnionSemType*>(objType.get())) {
+        if (e.index) (void)inferExpr(*e.index);
+        std::vector<std::unique_ptr<SemType>> elems;
+        for (auto& v : u->variants) {
+            if (!v) continue;
+            if (auto* ls = dynamic_cast<const ListSemType*>(v.get())) {
+                if (ls->elementType) elems.push_back(ls->elementType->clone());
+            }
+        }
+        if (elems.empty()) return ErrorSemType::make();
+        if (elems.size() == 1) return elems[0]->clone();
+        auto ures = std::make_unique<UnionSemType>();
+        auto push = [&](std::unique_ptr<SemType>&& t) {
+            for (auto& v : ures->variants)
+                if (v && v->equals(*t)) return;
+            ures->variants.push_back(std::move(t));
+        };
+        for (auto& t : elems) push(std::move(t));
+        return ures;
     }
     // 泛型或其他：编译时无法确定元素类型
     return ErrorSemType::make();
@@ -575,6 +665,19 @@ bool SemAnalyzer::isMatchExhaustive(const SemType& matchedType,
                             break;
                         }
                     }
+                }
+                // P5：`|` 分组视为单个 case，递归检查各 alt（仅常量，Parser 已拦类型模式）
+                if (auto* gp = dynamic_cast<const GroupPattern*>(c.pattern.get())) {
+                    for (auto& alt : gp->alts) {
+                        auto* acp = dynamic_cast<const ConstantPattern*>(alt.get());
+                        if (acp && acp->value &&
+                            dynamic_cast<const NoneLiteral*>(acp->value.get()) &&
+                            dynamic_cast<const NoneSemType*>(variant.get())) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                    if (covered) break;
                 }
                 if (dynamic_cast<const WildcardPattern*>(c.pattern.get())) {
                     covered = true;

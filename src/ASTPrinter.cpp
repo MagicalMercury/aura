@@ -243,6 +243,14 @@ void WildcardPattern::print(std::ostream& os, int indent) const {
     os << "WildcardPattern: _" << '\n';
 }
 
+void GroupPattern::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "GroupPattern" << '\n';
+    for (auto& a : alts) {
+        if (a) a->print(os, indent + 1);
+    }
+}
+
 // ---- Stmt 实现 ----
 
 void ExprStmt::print(std::ostream& os, int indent) const {

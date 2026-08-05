@@ -68,7 +68,9 @@ void GcHeap::markPhase(bool youngOnly) {
         for (GcRootHandleBase* node = list->head; node; node = node->next_) {
             GcObject* obj;
             std::memcpy(&obj, node->ptr_ref_, sizeof(GcObject*));
-            if (obj) markObject(obj);
+            if (obj) {
+                markObject(obj);
+            }
         }
     }
 
@@ -178,6 +180,7 @@ void GcHeap::markObject(GcObject* obj) {
 
 void GcHeap::markFields(GcObject* obj) {
     const TypeDescriptor* desc = obj->desc;
+    if (desc && desc->dynamicDesc) desc = desc->dynamicDesc(obj);  // P2b
     if (!desc || desc->ptrFieldCount == 0) return;
 
     const size_t* offsets = desc->ptrFieldOffsets;
@@ -194,6 +197,7 @@ void GcHeap::markFields(GcObject* obj) {
 
 void GcHeap::markInlineArrayFields(GcObject* obj) {
     const TypeDescriptor* desc = obj->desc;
+    if (desc && desc->dynamicDesc) desc = desc->dynamicDesc(obj);  // P2b
     if (!desc || desc->inlineArrayFieldCount == 0 || !desc->inlineArrayFields) return;
 
     char* base = reinterpret_cast<char*>(obj);

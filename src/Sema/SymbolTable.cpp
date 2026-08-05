@@ -19,6 +19,7 @@ bool Scope::define(Symbol sym) {
                 && sym.name == name) {
                 it->second.ctorParams = std::move(sym.params);
                 it->second.ctorReturnType = std::move(sym.type);
+                it->second.ctorDeclared = true;  // 无参构造函数 params 为空，需独立标志
                 return true;
             }
             // 其他不同种类 → 不覆盖

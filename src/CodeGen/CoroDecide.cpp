@@ -8,8 +8,9 @@ namespace Aura {
 // ============================================================
 class CodeGenerator::CoroScanner {
 public:
-    explicit CoroScanner(const std::set<std::string>& coroFns, bool ioSync = false)
-        : coroFns_(coroFns), ioSync_(ioSync) {}
+    explicit CoroScanner(const std::set<std::string>& coroFns, bool ioSync = false,
+                         bool skipClosureBody = false)
+        : coroFns_(coroFns), ioSync_(ioSync), skipClosureBody_(skipClosureBody) {}
 
     // 统一入口：自动区分 Stmt/Expr
     bool scan(const ASTNode& node) {
@@ -145,8 +146,10 @@ public:
     bool visit(const Identifier&,       CoroScanner&) { return false; }
 
     // 闭包 — 穿透扫描闭包体：闭包内的 io.xxx / 协程函数调用会传播到外层函数
+    // Bug 2-A: 外层函数返回函数类型（fun -> T）时，闭包作为返回值不执行，
+    // 闭包体生成普通 lambda（io 走 _sync 路径），其体内挂起点不传播到外层
     bool visit(const FunExpr& n, CoroScanner& self) {
-        if (n.body)
+        if (!self.skipClosureBody_ && n.body)
             for (auto& s : n.body->stmts)
                 if (s && self.scanStmt(*s)) return true;
         return false;
@@ -179,6 +182,7 @@ private:
 
     const std::set<std::string>& coroFns_;
     bool ioSync_ = false;
+    bool skipClosureBody_ = false;
 };
 
 // ============================================================
@@ -194,7 +198,12 @@ private:
 
 CoroDecision CodeGenerator::decideCoro(const FunDecl& decl) {
     if (!decl.body) return CoroDecision::Plain;
-    CoroScanner scanner(coroutineFunctions_, ioSync_);
+    // Bug 2-A: 外层函数返回函数类型（fun -> T，映射为 std::function）时，
+    // 闭包作为返回值生成普通 lambda，闭包体内挂起点不传播（否则外层被误判为协程，
+    // 生成 task<std::function<...>>，与 std::function 无法容纳协程 lambda 冲突）
+    bool skipClosure = decl.returnType
+        && dynamic_cast<const FunctionType*>(decl.returnType.get()) != nullptr;
+    CoroScanner scanner(coroutineFunctions_, ioSync_, skipClosure);
     if (scanner.scan(*decl.body))
         return CoroDecision::Coroutine;
     return CoroDecision::Plain;
@@ -202,7 +211,9 @@ CoroDecision CodeGenerator::decideCoro(const FunDecl& decl) {
 
 CoroDecision CodeGenerator::decideCoro(const MethodDecl& decl) {
     if (!decl.body) return CoroDecision::Plain;
-    CoroScanner scanner(coroutineFunctions_, ioSync_);
+    bool skipClosure = decl.returnType
+        && dynamic_cast<const FunctionType*>(decl.returnType.get()) != nullptr;
+    CoroScanner scanner(coroutineFunctions_, ioSync_, skipClosure);
     if (scanner.scan(*decl.body))
         return CoroDecision::Coroutine;
     return CoroDecision::Plain;

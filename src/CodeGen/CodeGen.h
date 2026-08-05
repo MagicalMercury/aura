@@ -17,6 +17,11 @@ namespace Aura {
 
 class SemAnalyzer;
 
+// P4/P3b：SemType 层级前向声明（genUnionDispatch / genMatchStmt 用）
+struct SemType;
+struct UnionSemType;
+struct OptionalSemType;
+
 // ============================================================
 // PendingMethod — 暂存方法签名，供 genRecordStruct 嵌入 struct
 // ============================================================
@@ -251,6 +256,9 @@ private:
     // 判断 SemType 是否对应 GC 堆对象指针（用于 GcRootHandle 包装决策）
     [[nodiscard]] bool isHeapSemType(const SemType* type) const;
 
+    // P3b：识别 none() 调用（Optional 占位构造），联合赋值时特判为 NoneType 值
+    [[nodiscard]] static bool isNoneCallExpr(const ASTNode& e);
+
     // 判断 C++ 类型字符串是否为 GC 指针类型（如 GcString*, User*, Array<T>*）
     [[nodiscard]] bool isGcPointerType(const std::string& cppType) const;
 
@@ -354,6 +362,25 @@ private:
     [[nodiscard]] std::string genUnaryExpr(const UnaryExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genCallExpr(const CallExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genMethodCall(const MethodCallExpr& e, bool isCoroutine);
+    // P4：联合接收者动态分派——生成运行时类型判定（单变体检查直调 / 多变体 switch），
+    // 激活变体不支持该调用时抛 TypeError（make_type_error）
+    [[nodiscard]] std::string genUnionDispatch(const MethodCallExpr& e,
+                                               const UnionSemType& u,
+                                               bool isCoroutine);
+    // P4：联合索引分派（v[i] 在变体集合上按 index_ 分派）
+    [[nodiscard]] std::string genUnionIndexDispatch(const IndexExpr& e,
+                                                    const UnionSemType& u,
+                                                    bool isCoroutine);
+    // P3b：隐式装箱——目标为含堆联合（Variant 指针）、值为非联合值（int/string/record/list...）
+    // 时，按值 SemType 定位变体索引 I，生成 make_variant<T1,...>(I, &tmp)。
+    // 非含堆联合（std::variant 路径）或不匹配时返回空串（调用方保持原逻辑）。
+    [[nodiscard]] std::string genUnionBoxing(const UnionSemType& u,
+                                             const ASTNode& init,
+                                             bool isCoroutine);
+    // 装箱核心：按变体 C++ 类型字符串列表定位索引并生成 make_variant（let/const/assign/return 共用）
+    [[nodiscard]] std::string genUnionBoxingImpl(const std::vector<std::string>& cppTypes,
+                                                 const ASTNode& init,
+                                                 bool isCoroutine);
 
     // 为 GC 堆类型参数生成 IIFE + GcRootHandle 包装
     // args: (expr_string, inferredType) 对；callExpr: 包装后的调用表达式
@@ -457,6 +484,7 @@ private:
     int listCounter_ = 0;
     int recordAllocCounter_ = 0;
     int argHandleCounter_ = 0;  // concat_multi 参数 GcRootHandle 变量名计数器
+    int unionBoxingCounter_ = 0;  // P3b 隐式装箱临时变量名计数器
 
     // 当前正在生成的函数的协程状态
     bool currentFunctionIsCoroutine_ = false;
@@ -468,6 +496,10 @@ private:
 
     // 当前函数的 C++ 返回类型（用于 genReturnStmt 生成正确的 RecordExpr 构造）
     std::string currentReturnCppType_;
+
+    // P3b：当前函数返回"含堆联合"时其变体 C++ 类型列表（顺序 = 声明顺序；空 = 非含堆联合返回）
+    // 由 funSignature/methodSignature 设置，genReturnStmt 隐式装箱使用
+    std::vector<std::string> currentReturnVariantCppTypes_;
 
     // 当前函数返回 Optional<T> 的元素类型 T（C++ 名），空 = 非 Optional
     // none() 直转 make_none<T> 时使用（C3.2）

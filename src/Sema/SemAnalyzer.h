@@ -12,6 +12,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace Aura {
@@ -61,6 +62,16 @@ private:
     [[nodiscard]] std::unique_ptr<SemType> semTypeFromAuraName(const std::string& name);
     // 从 C++ 类型名映射回 Aura SemType（供 resolvedName 元素类型提取）
     [[nodiscard]] std::unique_ptr<SemType> semTypeFromCppName(const std::string& cppName);
+
+    // 联合变体是否 GC 不安全（P0 防崩：含堆联合禁止走 std::variant，见 plan/联合类型GC安全问题.md §4.1）
+    // 判定目的与 CodeGen isHeapSemType 不同：isHeapSemType 判"要不要根保护"，
+    // 本函数判"该值放 std::variant 内部是否 GC 可达"（对 function/接口结论相反是正确）。
+    [[nodiscard]] static bool unionVariantGcUnsafe(const SemType& t);
+
+    // P4：在单个变体类型上推断方法调用返回类型（联合动态分派用）；
+    // 该变体不支持该调用时返回 nullptr
+    [[nodiscard]] std::unique_ptr<SemType> inferMethodCallOnVariant(
+        const SemType& variantType, const MethodCallExpr& e);
 
     // 从迭代器/列表/泛型通道类型推导元素类型（for / sync for 迭代变量类型）
     [[nodiscard]] std::unique_ptr<SemType> elemTypeOf(const SemType* iterType);
@@ -273,6 +284,11 @@ private:
         const NamedType& n);
     // 正在解析中的类型名集合（用于检测自引用，如 Tree<T> = {..., children: [Tree<T>]}）
     std::set<std::string> resolvingTypes_;
+
+    // ============ 联合类型 P0 拦截去重 ============
+    // 同一 UnionType 变体 AST 节点会被 resolveType 多次解析（如 checkLetDecl 的
+    // 占位符号 + 显式类型），P0 错误只对每个变体节点报一次
+    std::unordered_set<const TypeExpr*> p0ReportedVariants_;
 
     // ============ #config 配置 ============
     bool ioSync_ = false;       // #io.sync = true → 同步模式

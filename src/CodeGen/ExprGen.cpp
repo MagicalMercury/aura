@@ -48,11 +48,14 @@ std::string CodeGenerator::genGcRootedArgs(
     }
 
     bool hasHeap = false;
+    bool hasArgAwait = false;
     for (auto& [e, type] : args) {
-        if (isHeapSemType(type)) { hasHeap = true; break; }
+        if (isHeapSemType(type)) hasHeap = true;
+        // Bug 2-C: 参数表达式顶层带 co_await（协程闭包调用作为实参）
+        if (e.compare(0, coAwaitKw.size(), coAwaitKw) == 0) hasArgAwait = true;
     }
-    if (!hasHeap) {
-        // 无堆类型参数：直接替换占位符返回
+    if (!hasHeap && !hasArgAwait) {
+        // 无堆类型参数且无 co_await 参数：直接替换占位符返回
         std::string result = expr;
         for (size_t i = 0; i < args.size(); ++i) {
             std::string placeholder = "{" + std::to_string(i) + "}";
@@ -77,13 +80,23 @@ std::string CodeGenerator::genGcRootedArgs(
         auto& [argExpr, type] = args[i];
         std::string vi = "_a" + std::to_string(hid) + "_" + std::to_string(i);
         bool isHeap = isHeapSemType(type);
+        // Bug 2-C: 参数顶层 co_await 不能出现在推导返回类型 lambda（IIFE）内，
+        // 绑定移到 IIFE 外（外层是协程函数体，co_await 合法）
+        bool argIsAwait = argExpr.compare(0, coAwaitKw.size(), coAwaitKw) == 0;
         if (isHeap) {
-            // 堆类型：IIFE 内 auto + GcRootHandle
-            inner << "    auto " << vi << " = (" << argExpr << ");\n";
-            inner << "    aura_rt::GcRootHandle<decltype(" << vi << ")> _h"
-                  << hid << "_" << i << "(" << vi << ");\n";
-        } else if (!awaitPrefix.empty()) {
-            // 非堆 + 协程调用：IIFE 外 auto 值拷贝，生命周期跨越 co_await
+            if (argIsAwait) {
+                // 堆 + 协程参数：IIFE 外 auto 值拷贝 + GcRootHandle，生命周期跨越 co_await
+                outer << "auto " << vi << " = (" << argExpr << ");\n";
+                outer << "aura_rt::GcRootHandle<decltype(" << vi << ")> _h"
+                      << hid << "_" << i << "(" << vi << ");\n";
+            } else {
+                // 堆类型：IIFE 内 auto + GcRootHandle
+                inner << "    auto " << vi << " = (" << argExpr << ");\n";
+                inner << "    aura_rt::GcRootHandle<decltype(" << vi << ")> _h"
+                      << hid << "_" << i << "(" << vi << ");\n";
+            }
+        } else if (!awaitPrefix.empty() || argIsAwait) {
+            // 非堆 + 协程调用（或参数含 co_await）：IIFE 外 auto 值拷贝，生命周期跨越 co_await
             outer << "auto " << vi << " = (" << argExpr << ");\n";
         } else {
             // 非堆 + 非协程：IIFE 内 const auto& 引用绑定
@@ -773,6 +786,11 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
 }
 
 std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCoroutine) {
+    // P4：联合接收者动态分派——receiver 是 UnionSemType 时生成运行时类型判定分派
+    if (e.object && e.object->inferredType) {
+        if (auto* u = dynamic_cast<const UnionSemType*>(e.object->inferredType))
+            return genUnionDispatch(e, *u, isCoroutine);
+    }
     // sync.Mutex() / sync.RWMutex() / sync.Once() / sync.Channel<T>(cap) 构造特殊处理
     // 解析为 MethodCallExpr(object=Identifier("sync"), method="Mutex"/.../"Channel")
     // Aura 暴露 sync.Channel<T>，C++ Runtime 仍叫 ThreadChannel<T>（与协程 Channel<T> 区分）
@@ -1079,7 +1097,161 @@ std::string CodeGenerator::genMemberAccess(const MemberAccessExpr& e) {
     return obj + access + safeName(e.member);
 }
 
+// ============================================================
+// P4：联合接收者动态分派（方法调用）
+// 生成运行时类型判定：单支持变体 → 检查 index 后直调；多变体 → switch 分派。
+// 激活变体不支持该调用时抛 TypeError（make_type_error）。
+// 注：IIFE 内不能含 co_await（C++ 限制），参数含 co_await 的联合分派 v1 不支持。
+// ============================================================
+std::string CodeGenerator::genUnionDispatch(const MethodCallExpr& e,
+                                            const UnionSemType& u,
+                                            bool isCoroutine) {
+    // 支持变体判定（镜像 Sema inferMethodCallOnVariant）：
+    //   - 接口变体：方法在接口方法集中
+    //   - 内置类型变体（string / [T] / 内置泛型）：BuiltinRegistry 有该方法
+    //   - record / None / Optional / 嵌套联合：不支持（无法静态判定，参数兼容过滤语义）
+    std::vector<size_t> sups;
+    for (size_t k = 0; k < u.variants.size(); ++k) {
+        auto& v = u.variants[k];
+        if (!v) continue;
+        if (dynamic_cast<const NoneSemType*>(v.get())) continue;
+        if (auto* iface = dynamic_cast<const InterfaceSemType*>(v.get())) {
+            for (auto& m : iface->methods)
+                if (m.name == e.method) { sups.push_back(k); break; }
+            continue;
+        }
+        std::string typeKey;
+        if (auto* p = dynamic_cast<const PrimSemType*>(v.get()))
+            if (p->kind == PrimSemType::String) typeKey = "string";
+        if (dynamic_cast<const ListSemType*>(v.get())) typeKey = "[T]";
+        if (auto* g = dynamic_cast<const GenericSemType*>(v.get()))
+            if (BuiltinRegistry::get().findType(g->name)) typeKey = g->name;
+        if (typeKey.empty()) continue;
+        if (BuiltinRegistry::get().findMethod(typeKey, e.method, (int)e.args.size()))
+            sups.push_back(k);
+    }
+    if (sups.empty()) {
+        // Sema 已静态拦截；防御：运行时 TypeError（正常编译产物不可达）
+        return "([]{ throw aura_rt::make_type_error(\"TypeError: variant has no method '"
+               + e.method + "'\"); })()";
+    }
+
+    std::string obj = genExpr(*e.object, isCoroutine);
+    std::vector<std::string> argExprs;
+    for (size_t i = 0; i < e.args.size(); ++i)
+        argExprs.push_back(e.args[i] ? genExpr(*e.args[i], isCoroutine) : "???");
+
+    // 返回类型：Sema 合并结果（合并为联合时 v1 用 auto 推导，用户需保证各变体返回一致）
+    std::string retType = "auto";
+    if (e.inferredType && !dynamic_cast<const UnionSemType*>(e.inferredType))
+        retType = mapSemType(*e.inferredType);
+    // NoneType 返回（如 append）→ IIFE 返回 void，调用点不 return 值
+    bool retIsVoid = retType == "aura_rt::NoneType";
+    if (retIsVoid) retType = "void";
+
+    std::ostringstream out;
+    out << "[&]() -> " << retType << " {\n";
+    indentLevel_++;
+    out << indentStr() << "auto&& _dsp_v = (" << obj << ");\n";
+    if (sups.size() == 1) {
+        // 单支持变体：运行时类型检查 + 直调
+        size_t I = sups[0];
+        out << indentStr() << "if (_dsp_v->index() != " << I
+            << ") throw aura_rt::make_type_error(\"TypeError: variant active variant has no method '"
+            << e.method << "'\");\n";
+        out << indentStr();
+        if (!retIsVoid) out << "return ";
+        out << "_dsp_v->get<" << I << ">()->" << safeName(e.method) << "(";
+        for (size_t i = 0; i < argExprs.size(); ++i) {
+            if (i > 0) out << ", ";
+            out << argExprs[i];
+        }
+        if (retIsVoid)
+            out << "); return;\n";
+        else
+            out << ");\n";
+    } else {
+        // 多变体：switch 分派，default 抛 TypeError
+        out << indentStr() << "switch (_dsp_v->index()) {\n";
+        indentLevel_++;
+        for (size_t k : sups) {
+            out << indentStr() << "case " << k << ": ";
+            if (!retIsVoid) out << "return ";
+            out << "_dsp_v->get<" << k << ">()->" << safeName(e.method) << "(";
+            for (size_t i = 0; i < argExprs.size(); ++i) {
+                if (i > 0) out << ", ";
+                out << argExprs[i];
+            }
+            if (retIsVoid)
+                out << "); return;\n";
+            else
+                out << ");\n";
+        }
+        out << indentStr() << "default: throw aura_rt::make_type_error(\"TypeError: variant ("
+            << u.toString() << ") active variant has no method '" << e.method << "'\");\n";
+        indentLevel_--;
+        out << indentStr() << "}\n";
+    }
+    indentLevel_--;
+    out << indentStr() << "}()";
+    return out.str();
+}
+
+// ============================================================
+// P4：联合索引分派（v[i]）
+// 支持变体判定：仅数组变体（ListSemType）。生成方式同 genUnionDispatch。
+// ============================================================
+std::string CodeGenerator::genUnionIndexDispatch(const IndexExpr& e,
+                                                 const UnionSemType& u,
+                                                 bool isCoroutine) {
+    std::string obj = genExpr(*e.object, isCoroutine);
+    std::string idx = genExpr(*e.index, isCoroutine);
+
+    std::vector<size_t> sups;
+    for (size_t k = 0; k < u.variants.size(); ++k) {
+        auto& v = u.variants[k];
+        if (v && dynamic_cast<const ListSemType*>(v.get())) sups.push_back(k);
+    }
+    if (sups.empty()) {
+        return "([]{ throw aura_rt::make_type_error(\"TypeError: variant has no index operator\"); })()";
+    }
+
+    std::string retType = "auto";
+    if (e.inferredType && !dynamic_cast<const UnionSemType*>(e.inferredType))
+        retType = mapSemType(*e.inferredType);
+
+    std::ostringstream out;
+    out << "[&]() -> " << retType << " {\n";
+    indentLevel_++;
+    out << indentStr() << "auto&& _dsp_v = (" << obj << ");\n";
+    if (sups.size() == 1) {
+        size_t I = sups[0];
+        out << indentStr() << "if (_dsp_v->index() != " << I
+            << ") throw aura_rt::make_type_error(\"TypeError: variant active variant has no index operator\");\n";
+        out << indentStr() << "return (*_dsp_v->get<" << I << ">())["
+            << idx << "];\n";
+    } else {
+        out << indentStr() << "switch (_dsp_v->index()) {\n";
+        indentLevel_++;
+        for (size_t k : sups) {
+            out << indentStr() << "case " << k << ": return (*_dsp_v->get<" << k << ">())["
+                << idx << "];\n";
+        }
+        out << indentStr() << "default: throw aura_rt::make_type_error(\"TypeError: variant active variant has no index operator\");\n";
+        indentLevel_--;
+        out << indentStr() << "}\n";
+    }
+    indentLevel_--;
+    out << indentStr() << "}()";
+    return out.str();
+}
+
 std::string CodeGenerator::genIndexExpr(const IndexExpr& e, bool isCoroutine) {
+    // P4：联合索引分派
+    if (e.object && e.object->inferredType) {
+        if (auto* u = dynamic_cast<const UnionSemType*>(e.object->inferredType))
+            return genUnionIndexDispatch(e, *u, isCoroutine);
+    }
     std::string obj   = genExpr(*e.object, false);
     std::string idx   = genExpr(*e.index, isCoroutine);
     return "(*" + obj + ")[" + idx + "]";
@@ -1091,7 +1263,27 @@ std::string CodeGenerator::genIndexExpr(const IndexExpr& e, bool isCoroutine) {
 
 std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) {
     std::string target = genExpr(*e.target, isCoroutine);
-    std::string value  = genExpr(*e.value, isCoroutine);
+    // P3b：目标为"含 None 变体的联合"且赋 none() 时，生成 NoneType 值而非 Optional 指针
+    std::string value;
+    if (isNoneCallExpr(*e.value)) {
+        bool unionHasNone = false;
+        if (auto* u = dynamic_cast<const UnionSemType*>(e.inferredType)) {
+            for (auto& v : u->variants)
+                if (v && dynamic_cast<const NoneSemType*>(v.get())) { unionHasNone = true; break; }
+        }
+        value = unionHasNone ? "aura_rt::None" : genExpr(*e.value, isCoroutine);
+    } else {
+        // P3b 隐式装箱：目标为含堆联合（Variant 指针）且赋非联合值 → make_variant<I>
+        std::string boxed;
+        if (e.target && e.target->inferredType) {
+            if (auto* u = dynamic_cast<const UnionSemType*>(e.target->inferredType))
+                boxed = genUnionBoxing(*u, *e.value, isCoroutine);
+        }
+        if (!boxed.empty())
+            value = boxed;
+        else
+            value = genExpr(*e.value, isCoroutine);
+    }
 
     // stripGet 辅助：去掉 GcRootHandle 变量的 ".get()" 后缀，返回裸变量名
     auto stripGet = [](const std::string& s) -> std::string {
@@ -1225,7 +1417,12 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     if (!e.body) return "[]{}";
 
     // 检测闭包体内是否包含 io.xxx 调用 — 若有则在协程上下文中生成协程 lambda
-    bool closureIsCoro = isCoroutine && !ioSync_ && IoDetector::scan(*e.body);
+    // Bug 2-A: 外层函数返回 std::function<...>（fun 类型）时，闭包必须是普通 lambda
+    // （协程闭包返回 task<T>，与 std::function<T()> 不兼容），不能协程化。
+    // currentReturnCppType_ 在 funSignature/methodSignature 中已赋值。
+    bool outerRetIsFunction = currentReturnCppType_.find("std::function<") != std::string::npos;
+    bool closureIsCoro = isCoroutine && !ioSync_ && !outerRetIsFunction
+                         && IoDetector::scan(*e.body);
 
     // === 1. 捕获分析（复用 IdRefCollector + DeclaredCollector） ===
     std::set<std::string> allRefs;
@@ -1501,12 +1698,19 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     for (auto& s : e.body->stmts) {
         if (s) genStmt(oss, *s, closureIsCoro);
     }
+    bool lastIsReturn = !e.body->stmts.empty()
+        && dynamic_cast<const ReturnStmt*>(e.body->stmts.back().get());
     // 协程闭包末尾补 co_return; 确保 C++20 将其识别为协程
     if (closureIsCoro) {
-        bool lastIsReturn = !e.body->stmts.empty()
-            && dynamic_cast<const ReturnStmt*>(e.body->stmts.back().get());
         if (!lastIsReturn)
             oss << indentStr() << "co_return;\n";
+    } else if (!lastIsReturn && e.returnType
+               && mapType(*e.returnType) == "aura_rt::NoneType") {
+        // 显式 `-> None` 的闭包返回 NoneType（非 void），体末尾无 return 时
+        // GCC 对"非 void 函数走到末尾"的未定义行为路径插入 ud2 非法指令
+        // （Bug 2-A 修复前该闭包是协程、会补 co_return，故此前未暴露）
+        // → 补 return aura_rt::NoneType{}; 使函数体合法
+        oss << indentStr() << "return aura_rt::NoneType{};\n";
     }
     indentLevel_--;
     oss << indentStr() << "}";

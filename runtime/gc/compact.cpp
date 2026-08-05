@@ -404,6 +404,8 @@ void GcHeap::updateObjectFields(GcObject* obj) {
     } else {
         desc = obj->desc;
     }
+    // P2b：动态 desc 钩子应用在 desc 恢复之后（dynamicDesc 依赖运行时字段如 index_）
+    if (desc && desc->dynamicDesc) desc = desc->dynamicDesc(obj);
 
     if (!desc || desc->ptrFieldCount == 0) return;
 
@@ -425,6 +427,8 @@ void GcHeap::updateInlineArrayElements(GcObject* obj) {
     } else {
         desc = obj->desc;
     }
+    // P2b：钩子应用在 desc 恢复之后
+    if (desc && desc->dynamicDesc) desc = desc->dynamicDesc(obj);
 
     if (!desc || desc->inlineArrayFieldCount == 0 || !desc->inlineArrayFields) return;
 

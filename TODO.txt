@@ -7,7 +7,8 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-08-04（新增泛型构造函数调用、返回闭包工厂函数代码生成 2 个预存 bug，暂不处理）
+# 最近更新：2026-08-04（新增泛型构造函数调用、返回闭包工厂函数代码生成 2 个预存 bug 已修复；
+#            新增协程同步链栈深度保护 issue，暂不处理）
 
 ================================================================
 [ 一 ] 内置 API 与模块（plan/plan11.md）
@@ -27,7 +28,7 @@
 [ 二 ] 高级类型 / 迭代器扩展（实验性，plan/range_implementation.md）
 ================================================================
 
-[ ] P1  Interface 改造：C++ 虚函数层限制 + 内置常见接口  [2026-08-02 提出]
+[x] P1  Interface 改造：C++ 虚函数层限制 + 内置常见接口  [2026-08-02 提出]
       - 要做的事（详细现状见 plan/interface_rework_issue.md）：
           * 接口在 C++ 层真正以虚函数生效：实现接口的 record 生成时继承抽象基类并 override
           * 补齐 Sema"具体类型→接口"结构匹配（当前 isAssignable 对具体类型直接
@@ -35,7 +36,7 @@
           * 内置接口：Stringer（Printable 更名，对象可 to_string()）、Comparable、Iterator
             （Iterator 与下方 Iterator<T> 高级类型条目整合）
 
-[ ] P2  Iterator<T> 高级类型（与当前 IterSemType 整合）
+[x] P2  Iterator<T> 高级类型（与当前 IterSemType 整合）
       - 现状：IterSemType 仅 range 使用，无 .map / .filter / .collect 链式
       - 设计要点：
           * .map(f: fun(T)->U) -> Iterator<U>
@@ -56,28 +57,49 @@
       - 设计要点：用 type 别名 + union 实现，无需新 SemType
       - 备注：可作为示例库先在 builtins/ 提供
 
-[ ] P1  联合类型 T | None 的 GC 安全问题（已知缺陷）  [2026-07-31 提出]
-      - 问题：Aura 联合类型 `T | None` 映射为 `std::variant<T, NoneType>`
-        （src/CodeGen/TypeMap.cpp:92-97）。当 T 为 GC 堆类型（string/Array<T>*/record*）
-        时存在致命问题：
+[ ] P1  联合类型 GC 安全问题（扩展到所有含堆类型的联合）  [2026-07-31 提出，2026-08-04 扩展]
+      - 问题：Aura 联合类型 `T1 | T2 | ... | Tn` 映射为 `std::variant<...>`
+        （src/CodeGen/TypeMap.cpp:115-123）。只要任一变体是 GC 堆类型
+        （string/Array<T>*/record*/Optional<T>* 等）即存在致命问题：
           1. variant 是值语义存于栈上，GC 栈扫描无法安全识别内部指针
-             （NoneType 时 offset 0 为垃圾数据，被误当指针 → 崩溃或误标记）
+             （非激活变体 offset 为垃圾数据，被误当指针 → 崩溃或误标记）
           2. isGcPointerType 检查类型字符串是否以 `*` 结尾，variant 不符合
              → 不会被 GcRootHandle 包装 → 内部 GC 指针失去根保护
-          3. 堆字段的 TypeDescriptor 静态注册无法表达 variant discriminator 动态语义
-      - 当前缓解：新增 `Optional<T>` GC 堆类型作为 `T | None` 的安全封装
+          3. TypeDescriptor 静态注册无法表达 variant discriminator 动态语义
+             （同一 offset 当前是指针还是值，取决于运行时 index_）
+      - 受影响场景（不仅限于 `T | None`）：
+          * `Array<int> | string`（双堆类型联合）
+          * `User* | None`（堆 + 非堆）
+          * `Tree<T> | T`（T 实例化为 string 时）
+          * `A* | int`（堆 + 值类型，int 值误判为指针风险最高）
+      - 当前缓解：`Optional<T>` GC 堆类型仅覆盖 `T | None` 双态场景
         （见 plan/channel_thread_issue.md §三）
-      - 根本修复方向（远期）：
-          * 方案 A：Sema 层禁止 `T | None` 中 T 为 GC 堆类型，强制用 Optional<T>
-          * 方案 B：CodeGen 为含 GC 栆类型的联合生成特殊的 box 包装（复杂）
-          * 方案 C：精确栈扫描支持 variant discriminator 感知（需 GC 大改）
+      - 修复方案（对标 C++ 标准库 optional/variant 分工）：
+          * 默认语法糖（Sema 层转换，用户无感）：
+            - `T | None`  → `Optional<T>`（无论 T 是否为泛型）
+            - `A | B | C | ...` → `Variant<A, B, C, ...>`（无论是否有泛型）
+          * 实现 `Variant<T1, ..., Tn>` GC 堆类型（runtime/builtin/variant.h）：
+            - 继承 GcObject，堆分配，存 index_ + aligned storage_
+            - TypeDescriptor 新增 `isPtrActive(obj, offset)` 钩子
+              → GC 扫描时根据运行时 index_ 判断 offset 是否为有效指针
+            - GC 扫描器接入钩子（runtime/gc/mark_sweep.cpp）
+          * Optional 保留：双态场景 API 精简，Variant 也能表达但臃肿
+      - 不采用方案：
+          * 自做 GC-aware variant 但不修 GC（仍依赖栈扫描，治标不治本）
+          * Either<A, B> 嵌套表达多变体（API 丑、与 Aura n 选 1 语义不符）
+          * Sema 层全面禁止含堆类型联合（破坏 Tree<T> | T 等现有用法，无替代）
+      - 实施分阶段：
+          * P0: Sema 层禁止含堆类型联合走 std::variant 路径，报错提示待 Variant 实现
+          * P1: 实现 Variant<T1, ..., Tn> runtime 类型 + isPtrActive 钩子
+          * P2: GC 扫描器接入 isPtrActive 钩子
+          * P3: Sema 层语法糖转换（T | None → Optional<T>，A | B | C → Variant<A, B, C>）
       - 关联：project_memory 中联合类型相关约束
 
 ================================================================
 [ 三 ] 跨模块可见性（plan/cross_module_visibility.md）
 ================================================================
 
-[~] P1  pub 修饰符强制化
+[x] P1  pub 修饰符强制化
       - 现状：Parser/AST/Symbol 已支持 pub 关键字
       - 缺：Symbol::isPublic 默认 true（向后兼容），未强制要求 pub 才导出
       - 文件：src/Sema/Symbol.h:52 (isPublic=true 默认)
@@ -102,7 +124,7 @@
       - 缺：inferCall 中将闭包包装为接口适配器
       - 文件：src/Sema/Checker/ExprInfer.cpp (无相关逻辑)
 
-[ ] P1  泛型类型构造函数无法调用  [2026-08-04 提出]
+[x] P1  泛型类型构造函数无法调用  [2026-08-04 提出]
       - 问题：`type Stack<T>` + `fun (self Stack<T>) Stack()` 声明后，
         `let stack = Stack()` 报 undefined function 'Stack'；`Stack<int>()`
         显式泛型调用形式也不支持（expected expression）
@@ -114,7 +136,7 @@
               src/Sema/SymbolTable.cpp、src/Parser/DeclParser.cpp:178
       - 暂不处理：test.aura 无泛型构造调用，不影响现有功能
 
-[ ] P1  返回闭包的工厂函数代码生成有缺陷  [2026-08-04 提出]
+[x] P1  返回闭包的工厂函数代码生成有缺陷  [2026-08-04 提出]
       - 问题：`fun f(n: int) -> fun() -> int { return fun() -> int { return n + 1 } }`
         这类"工厂函数返回闭包"模式（READMEs/06-generics.md:154、15-example.md 声称支持），
         生成的 C++ 代码无法编译：
@@ -281,6 +303,29 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
       - 触发条件（满足任一即可启动）：
           * 优化 1 实施完成，GcRootHandle 构造零开销
           * 出现因裸指针传递导致的 GC 安全 bug（如 compact 期间悬垂）
+
+[ ] P2  协程同步链栈深度保护（长链防栈溢出）  [2026-08-04 提出]
+      - 背景：协程恢复走 final_awaiter::continuation.resume()（runtime/task.h:46-52），
+        非尾调用、逐层压栈；串行同步链 A co_await B co_await C ... 的返回阶段
+        栈深度 = 链长 × 单层帧大小，链长上万时爆掉默认 1MB 线程栈。
+        2026-08-04 排查 test_bug_fixes 崩溃时 gdb 确认了该压栈链；
+        本次崩溃根因虽是 NoneType 闭包缺 return 生成的 ud2，但长链栈溢出
+        是独立真实隐患
+      - 方案（深度阈值 + 超限转调度器清栈，与用户"达到一定深度清空一次"一致）：
+          * detail 命名空间加 thread_local int g_chainDepth + kMaxChainDepth(=512)
+          * final_awaiter::await_suspend 改造：
+            - ++depth < 阈值 → continuation.resume()（短链同步直连，零开销）
+            - ≥ 阈值 → 计数归零 + EventLoop::schedule(continuation)
+              → 当前 resume 返回后整链 C++ 栈逐层解开，EventLoop 从顶层
+              重驱动新链，栈完全清空
+          * task.h 仅声明 detail::scheduleOnEventLoop(coroutine_handle)，
+            task.cpp 实现（避免 task.h ↔ event_loop.h 循环依赖）
+      - 优点：短链性能不变；最坏栈深被钳制在 ~512 层（几十 KB），不会溢出
+      - 代价：计数只增不降，短链累计到阈值会偶发一次调度（无害）
+      - 验证：构造递归长链 chain(n){ n==0 ? return : co_await chain(n-1) }
+        1 万层——修复前栈溢出崩溃、修复后通过
+      - 文件：runtime/task.h、runtime/task.cpp
+      - 暂不处理原因：当前测试链深仅 ~9 层，不阻塞现有功能
 
 ----------------------------------------------------------------
 

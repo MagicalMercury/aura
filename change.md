@@ -1,979 +1,655 @@
-# change.md — Interface Iterator 实现
+# change.md — 协程同步链栈深度保护 + 联合类型 GC 安全（统一实施变更）
 
-**目标**：Iterator 双角色（接口 + 内置类型）落地。
-- record 显式 impl Iterator\<T\> 只需实现 `next()`，map/filter/collect 为 C++ 桥接方法（aura 无实现，c++ 有实现，语法标记 `...`）
-- `Iterator<T>` 内置类型直接可用：`Iterator.from(闭包)`（Python 生成器等价物）、`map`/`filter` 惰性链、`collect()` 收集
-- `range()` 返回值改名 `generator<int>` → `iterator<int>`，实现改为模仿 std::ranges 的 view 适配器
-- `some(v)` / `none()` 全局函数构造 Optional
-
-**关键机制（Q1 已确认）**：与 Comparable 六符号"编译期静态转译 + 模板实例化 + 虚调用"不同，Iterator 的 `...` 桥接方法由调用点 CodeGen 特判直转 runtime（`make_map` 等），不经接口虚调用。
+> 工作流 4（实施）统一变更文档。由已审查的两份细化实施方案合并而来：
+> - [plan/协程同步链栈深度保护.md](file:///d:/you/Aura/plan/协程同步链栈深度保护.md)
+> - [plan/联合类型GC安全问题.md](file:///d:/you/Aura/plan/联合类型GC安全问题.md)
+>
+> 状态：**待审查**。批准后按 §5 实施顺序执行。
 
 ---
 
-## C0 `...` 语法（C++ 桥接声明）
+## 0. 概览
 
-### C0.1 Lexer（src/TokType.h + src/Lexer.cpp）
+| 项目 | 内容 |
+| ---- | ---- |
+| 变更 A（协程） | TODO「六」`[ ] P2 协程同步链栈深度保护`（TODO.txt L307-328） |
+| 变更 B（联合类型） | TODO「二」`[ ] P1 联合类型 GC 安全问题`（TODO.txt L60-96） |
+| 变更 A 关联模块 | `runtime/task.h`、`runtime/task.cpp`、`runtime/event_loop.h` |
+| 变更 B 关联模块 | `src/Sema`（SemType.h/cpp、SemAnalyzer、Checker/DeclChecker、BuiltinRegistry.h）、`src/CodeGen`（TypeMap.cpp、StmtGen.cpp、ExprGen.cpp）、`src/Parser/TypeParser.cpp`、`src/AST/Stmt.h`、`runtime/gc/`（types.h、mark_sweep.cpp、compact.cpp）、`runtime/builtin/`（optional.h、variant.h 新增） |
+| 文件重叠 | **无**（A 组仅 task.h/task.cpp；B 组在 src/ + gc/ + builtin/）。可独立交付与回滚 |
 
-TokType.h 枚举加：
+**总目标**：
+1. **A 组**：长同步协程链（深度数千层）的 C++ 栈消耗钳制在阈值内，杜绝栈溢出；短链（< 512 层）保持同步直连零开销。
+2. **B 组**：消除含堆联合走 `std::variant` 的 GC 崩溃/误标记/失根三类问题；P0 先行防崩，P1/P2 交付 `Variant<T...>` GC 堆类型，P3 完成语言级映射，P4 提供联合动态分派，P5 补全 match 值模式（C++ switch 风格）。
+
+---
+
+## 1. 变更 A：协程同步链栈深度保护（独立，先行）
+
+### 背景（已确认）
+
+- **挂起 = 对称转移**：`task<T>::operator co_await` 的 `await_suspend` 返回被等待 handle（task.h:106-109）→ 编译器尾调用，当前栈帧弹出。
+- **恢复 = 真实压栈**：`task_promise_base::final_awaiter::await_suspend` 内 `continuation.resume()`（task.h:49-51），非尾调用，**每层压栈**。
+- 串行链返回阶段栈深 = 链长 × 单层帧（~100-500B）。链长 1 万层 ≈ 数 MB > 默认 1MB 线程栈。2026-08-04 gdb 已确认该压栈链（当时崩溃根因是 NoneType `ud2`，长链栈溢出是独立真实隐患）。
+
+### A.1 `runtime/task.h` — detail 命名空间新增（L37 `namespace detail {` 之后、`task_promise_base` 之前）
 
 ```cpp
-    Semicolon,     // ;
-    Hash,          // #
-    Ellipsis,      // ...（C++ 桥接方法声明标记）
-```
+namespace detail {
 
-Lexer.cpp `scanOperatorOrDelimiter` 的 `'.'` case 改：
+// ============================================================
+// 长同步链栈深度保护
+// final 恢复走 continuation.resume() 非尾调用逐层压栈，
+// 串行链返回阶段栈深 = 链长。达到 kMaxChainDepth 时转
+// EventLoop 调度：当前 resume 返回后整链 C++ 栈逐层解开，
+// EventLoop 顶层重驱动新链（栈深 O(1)）。
+// ============================================================
+void scheduleOnEventLoop(std::coroutine_handle<> h);  // 由 task.cpp 实现
+inline constexpr int kMaxChainDepth = 512;
+inline thread_local int g_chainDepth = 0;   // 只增不降，超限归零
 
-```cpp
-    case '.':
-        if (std::isdigit(static_cast<unsigned char>(peek()))) {
-            --pos_; --curPos_.col;
-            return scanNumber();
+struct task_promise_base {
+    // ...（原有内容不动）...
+
+    struct final_awaiter : std::suspend_always {
+        std::coroutine_handle<> continuation;
+        final_awaiter(std::coroutine_handle<> h) : continuation(h) {}
+        void await_suspend(std::coroutine_handle<>) noexcept {
+            if (!continuation) return;
+            if (++g_chainDepth >= kMaxChainDepth) {
+                g_chainDepth = 0;                    // 栈将清空，重新计数
+                scheduleOnEventLoop(continuation);   // 转调度器，不直接 resume
+            } else {
+                continuation.resume();               // 短链同步直连（零开销）
+            }
         }
-        // '...' → Ellipsis（C++ 桥接标记）
-        if (peek() == '.' && peekNext() == '.') {
-            advance(); advance();
-            return makeToken(TokType::Ellipsis, "...");
-        }
-        return makeToken(TokType::Dot, ".");
-```
-
-tokTypeName（Lexer.cpp 或 TokType 实现处）补 `case TokType::Ellipsis: return "Ellipsis";`。
-
-### C0.2 AST（src/AST/Stmt.h）
-
-InterfaceMethodSig 加 bodyKind 枚举：
-
-```cpp
-struct InterfaceMethodSig {
-    // 接口方法三种形态（声明时确定）
-    enum class BodyKind { Pure,          // 纯虚：record 必须实现
-                          DefaultAura,   // Aura 默认实现（{ body }，如 Comparable 六符号）
-                          CppBridge };   // C++ 桥接（...，aura 无实现 c++ 有实现）
-    std::string name;
-    std::vector<Param> params;
-    bool throws = false;
-    std::unique_ptr<TypeExpr> returnType;
-    std::unique_ptr<BlockStmt> defaultBody;   // 非空 = DefaultAura
-    BodyKind bodyKind = BodyKind::Pure;       // CppBridge 时 defaultBody 为空
-};
-```
-
-MethodDecl / FunDecl 各加一个标记（`...` 仅声明文件合法）：
-
-```cpp
-struct FunDecl : Decl {
-    ...
-    bool hasCppImpl = false;    // '...'：aura 无实现，c++ 有实现（.aurai 声明文件用）
-    ...
-};
-struct MethodDecl : Decl {
-    ...
-    bool hasCppImpl = false;    // 同上
-    ...
-};
-```
-
-clone() 同步：FunDecl/MethodDecl 的 clone 各加 `n->hasCppImpl = hasCppImpl;`。
-
-### C0.3 Parser
-
-TypeParser.cpp `parseInterfaceMethodSig` 签名后分支改：
-
-```cpp
-    // 接口方法签名后三选一：
-    //   { body } → Aura 默认方法（DefaultAura）
-    //   ...      → C++ 桥接方法（CppBridge，aura 无实现 c++ 有实现）
-    //   无       → 纯虚（record 必须实现）
-    if (check(TokType::LBrace)) {
-        sig.bodyKind = InterfaceMethodSig::BodyKind::DefaultAura;
-        sig.defaultBody = parseBlock();
-    } else if (match(TokType::Ellipsis)) {
-        sig.bodyKind = InterfaceMethodSig::BodyKind::CppBridge;
-    }
-```
-
-DeclParser.cpp `parseFunDecl` 签名后改（aurai 声明文件才有 `...`）：
-
-```cpp
-    if (match(TokType::Ellipsis)) {
-        decl->hasCppImpl = true;
-    } else if (!noBody_) {
-        decl->body = parseBlock();
-    }
-```
-
-`parseMethodDecl` 签名后改（L191-193 区域）：
-
-```cpp
-    if (match(TokType::Ellipsis)) {
-        decl->hasCppImpl = true;
-    } else if (!noBody_) {
-        decl->body = parseBlock();
-    }
-```
-
-### C0.4 Sema
-
-SemType.h InterfaceSemType::MethodSig 加：
-
-```cpp
-    struct MethodSig {
-        std::string name;
-        std::vector<std::unique_ptr<SemType>> paramTypes;
-        std::unique_ptr<SemType> returnType;
-        bool throws = false;
-        bool hasDefault = false;   // DefaultAura 默认方法（结构匹配豁免）
-        bool hasCppImpl = false;   // CppBridge（record 无需实现，同豁免）
     };
+};
+} // namespace detail
 ```
 
-DeclChecker.cpp `declareInterface`（L374 区域）改：
+### A.2 `runtime/task.cpp` — 实现 scheduleOnEventLoop
+
+`task.cpp` 顶层已是 `namespace aura_rt {`（L16），故下面的 `namespace detail {` 实际是 `aura_rt::detail`——与 task.h:37 一致，**绝不可写成顶层 `namespace detail`**。放在 `EventLoop::instance()` 定义之后（task.cpp:21 后）：
 
 ```cpp
-        sig.hasDefault = m.defaultBody != nullptr;   // Aura 默认方法豁免
-        sig.hasCppImpl = m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge;
-```
-
-`verifyImplCompleteness`（L122）豁免 CppBridge：
-
-```cpp
-            for (auto& m : sym->interfaceMethods) {
-                if (m.hasDefault || m.hasCppImpl) continue;  // 默认方法 / C++ 桥接豁免
-```
-
-其余 Sema 默认方法豁免点（如 isAssignable 接口分支的 hasDefault 判断）同步改为 `m.hasDefault || m.hasCppImpl`。
-
-### C0.5 CodeGen
-
-DeclGen.cpp `genInterfaceDecl`（L143 循环内）加分支——CppBridge 不生成纯虚、不生成虚成员（返回类型含未绑定 U，无法表达）：
-
-```cpp
-    for (auto& m : decl.methods) {
-        if (m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge) continue;
-        std::string retType = m.returnType ? mapType(*m.returnType) : "void";
-        if (m.defaultBody) {
-            ...现有默认方法分支...
-        } else {
-            ...现有纯虚分支...
-        }
+namespace detail {
+void scheduleOnEventLoop(std::coroutine_handle<> h) {
+    try {
+        EventLoop::instance().schedule(h);
+    } catch (...) {
+        // B4：EventLoop::schedule 内 std::queue::push 可能抛 std::bad_alloc。
+        // await_suspend 是 noexcept（C++ 协程要求），异常必须在此吞掉，
+        // 否则越过 noexcept → std::terminate（比栈溢出更恶劣）。
+        std::fprintf(stderr, "[aura_rt] scheduleOnEventLoop: schedule failed (OOM), coroutine dropped\n");
     }
-```
-
-`genIfaceAdapter`（L261）跳过 CppBridge（record 无此方法、基类也无 → 不生成转发）：
-
-```cpp
-        if ((m.defaultBody || m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge)
-            && !recordHas) continue;
-```
-
-### C0.6 全部 aurai 文件补充 `...`
-
-凡"aura 无实现、c++ 有实现"的声明均加 `...`（唯一例外：interfaces.aurai 的 Comparable 默认方法有 Aura 体 `{ body }`，不加）。
-
-**builtins/builtin.aurai**：
-
-```aura
-fun gc_force() -> None ...
-fun gc_stats() -> string ...
-
-fun int(s: string, base: int = 10) throws -> int ...
-fun float(s: string) throws -> float ...
-fun str(x: int) -> string ...
-fun str(x: float) -> string ...
-fun str(x: bool) -> string ...
-fun str(x: string) -> string ...
-```
-
-**builtins/io.aurai**：全部方法加 `...`（println/readln/read_file/write_file/file_exists/mkdir/remove/list_dir/cwd）。
-
-**builtins/path.aurai**：path.new/path.join ×2/Path 方法（parent/file_name/extension/is_absolute/to_string）全部加 `...`。
-
-**builtins/channel.aurai**（文档性质）：channel\<T\> 方法 send/receive/close 加 `...`。
-
-**builtins/mutex.aurai**（文档性质）：sync.Mutex/RWMutex/Once 构造 + r()/w() 加 `...`。
-
-**builtins/interfaces.aurai** Iterator 接口（C4 详细）：
-
-```aura
-interface Iterator<T> {
-    next() -> Optional<T>                     // 纯虚：record 必须实现
-    map(f: fun(T) -> U) -> Iterator<U> ...    // C++ 桥接：runtime make_map
-    filter(p: fun(T) -> bool) -> Iterator<T> ...
-    collect() -> [T] ...
 }
+} // namespace detail
 ```
 
-> 说明：`...` 方法签名中未绑定的大写标识符（U）解析为 GenericSemType 占位（resolveNamedType 未找到 → ErrorSemType，无诊断），返回类型由 Sema/CodeGen 调用点特判推导，不依赖声明处签名精确。
+需在 task.cpp 顶部补充 `#include <cstdio>`（如已有则忽略）。
+
+### A.3 工作原理
+
+- **栈清空**：超阈值时把 continuation 塞进就绪队列 → 当前 `await_suspend` 返回 → 当前协程 final 完成 → 上层 `continuation.resume()` 调用逐层返回 → 整链 C++ 栈解开 → `processReady` 从队列顶层 resume。
+- **最坏栈深**：512 层 × ~500B ≈ 256KB，远低于 1MB。
+- **计数语义**：`g_chainDepth` 是**线程级累计 final 恢复次数**，不是"当前链深度"。只增不降、超限归零：
+  - `processReady` 每 resume 一条新链时**不重置**计数——多个独立短链会被累加，可能提前触发一次调度（无害：多一轮队列，语义等价）。
+  - 只有超限归零才重置。
+  - **不需要递减**：若递减，第 k 层归零后外层 `--` 会把计数打成负数。
+- **`when_all` 不受益**：内部每个 `co_await t` 链深 1，长列表不构成深链，无影响。
+
+### A.4 影响分析
+
+- ⚠️ 无 BREAKING（不改语义/API）。
+- `task<void>` 与 `task<T>` 共享 `task_promise_base::final_awaiter`，同时受保护。
+- 性能：短链零开销；偶发调度 = 一次队列 push/pop + 间接 resume（累计 512 次 final 一次，~0.2% 成本可忽略）。
+- 依赖假设：所有协程由单线程 EventLoop 驱动；`thread_local` 计数保证多线程互不干扰。
 
 ---
 
-## C1 runtime 迭代器（runtime/builtin/iterator.h 新）
+## 2. 变更 B：联合类型 GC 安全（分阶段 P0–P5）
 
-模仿 std::ranges view 适配器：`iota_view` → RangeIter、`transform_view` → MapIter、`filter_view` → FilterIter、`to<vector>` → collect_all、函数生成器 → FuncIter。
+### 背景（已确认）
 
-GC 布局：具体迭代器类多继承 `GcObject, Iterator<T>`（GcObject 在前 offset 0，Iterator\<T\> 在 offset 16 含 vptr）——GC 统一按 GcObject* 处理；裸指针源字段（src_）经 TypeDescriptor 注册，compact 自动更新；std::function 闭包（fn_）是 RT 对象不归 GC 扫描，finalizer 显式析构（ThreadChannel inner_ 模式），释放闭包内 GcRootHandle 副本（摘除 root 链表）。
+`T1 | T2 | ... | Tn` 映射为 `std::variant<...>`（TypeMap.cpp:115-123）。任一变体为 GC 堆类型即致命：
+1. variant 值语义存栈 + 非激活变体垃圾字节 → GC 保守扫描误判指针。
+2. `isGcPointerType` 按 `*` 结尾判断 → variant 不包装 GcRootHandle → 内部 GC 指针失根。
+3. `TypeDescriptor` 静态 offset 无法表达 discriminator 动态语义 → mark/compact 按错误变体扫描。
+4. compact 整块 memcpy 后 `updateObjectFields` 按 desc 更新字段 → variant 失效。
+5. `mapSemType` 无 UnionSemType 分支 → 落 `/* unknown_semtype */`（P3 一并修复）。
+6. `isHeapSemType` 对 UnionSemType 返回"任一变体堆即堆" → 联合被 GcRootHandle 包装，**但包装的是 variant 整体，内部指针仍不可扫描**。
+
+数据流：`A | B | C`（Parser Bar 语法）→ UnionType AST → UnionSemType（DeclChecker.cpp:326-332）→ `std::variant<...>`（TypeMap.cpp:115-123）→ 使用点 match（StmtGen.cpp:1372-1419）/ try/catch（StmtGen.cpp:659/715）/ 参数/字段/数组元素/返回值。
+
+---
+
+### B.0 P0：Sema 层禁止含堆联合（防崩，先行交付）
+
+**新增判定函数**（`src/Sema/SemAnalyzer.h` 声明 + `SemType.cpp` 或 `SemAnalyzer.cpp` 实现）：
 
 ```cpp
-#pragma once
-// ============================================================
-// aura_rt/builtin/iterator.h — Iterator<T> 内置迭代器（模仿 std::ranges view 适配器）
-//
-// 类层次（多继承，GcObject 在前保证 GC 统一按 GcObject* 处理）：
-//   RangeIter<T>   ← iota_view          （range() 返回）
-//   MapIter<T,U>   ← transform_view     （map，惰性单步）
-//   FilterIter<T>  ← filter_view        （filter，跳过不匹配）
-//   FuncIter<T>    ← 函数生成器          （Iterator.from(闭包)）
-//   collect_all    ← to<vector>
-// ============================================================
-
-#include "../types.h"
-#include "../gc/gc.h"
-#include "optional.h"
-#include <functional>
-#include <type_traits>
-
-namespace aura_rt {
-
-// ============================================================
-// Iterator<T> 抽象基类（接口 Iterator<T> 的 C++ 形态）
-// ============================================================
-template <typename T>
-struct Iterator {
-    virtual ~Iterator() = default;
-    virtual Optional<T>* next() = 0;   // None = 迭代结束
-};
-
-// ============================================================
-// RangeIter<T> — 对应 std::ranges::iota_view（惰性递增）
-// ============================================================
-template <typename T>
-struct RangeIter : GcObject, Iterator<T> {
-    T cur_, end_, step_;
-    static const TypeDescriptor& desc() {
-        static const TypeDescriptor d = { sizeof(RangeIter<T>), 0, nullptr, 0, nullptr, nullptr };
-        return d;
+// 联合变体是否 GC 不安全（镜像 CodeGen isHeapSemType 且更严）
+static bool unionVariantGcUnsafe(const SemType& t) {
+    if (auto* p = dynamic_cast<const PrimSemType*>(&t))
+        return p->kind == PrimSemType::String;
+    if (dynamic_cast<const NoneSemType*>(&t))  return false;
+    if (dynamic_cast<const ErrorSemType*>(&t)) return false;
+    if (dynamic_cast<const ListSemType*>(&t))  return true;   // Array<T>* 堆
+    if (dynamic_cast<const OptionalSemType*>(&t)) return true; // Optional<T>* 堆
+    if (auto* n = dynamic_cast<const NamedSemType*>(&t)) {
+        if (n->name == "int" || n->name == "float" || n->name == "bool") return false;
+        return true;  // 用户 record / 其他内置堆类型 → 保守按堆
     }
-    Optional<T>* next() override {
-        if (step_ > 0 ? cur_ >= end_ : cur_ <= end_) return make_none<T>();
-        T v = cur_;
-        cur_ += step_;
-        return make_optional<T>(v);
-    }
-};
-
-template <typename T>
-inline RangeIter<T>* make_range(T start, T end, T step = 1) {
-    auto* it = static_cast<RangeIter<T>*>(
-        GcHeap::instance().alloc(sizeof(RangeIter<T>), &RangeIter<T>::desc()));
-    it->cur_ = start; it->end_ = end; it->step_ = step;
-    return it;
+    if (dynamic_cast<const FuncSemType*>(&t))     return true; // std::function 捕获 GC 指针不可见
+    if (dynamic_cast<const InterfaceSemType*>(&t)) return true;// 抽象类值无法入 variant
+    if (auto* u = dynamic_cast<const UnionSemType*>(&t))
+        for (auto& v : u->variants)
+            if (v && unionVariantGcUnsafe(*v)) return true;
+    if (dynamic_cast<const GenericSemType*>(&t)) return false; // 未实例化放行，实例化二次检查（B.6）
+    return true;
 }
+```
 
-// ============================================================
-// MapIter<T,U,F> — 对应 std::ranges::transform_view（惰性单步）
-// F = std::function<U(T)>；U 由调用点 Sema 推导，C++ 侧 invoke_result_t 兜底
-// ============================================================
-template <typename T, typename F>
-struct MapIter : GcObject, Iterator<typename std::invoke_result_t<F&, T>> {
-    using U = typename std::invoke_result_t<F&, T>;
-    Iterator<T>* src_;   // 裸指针：desc 注册，GC compact 自动更新
-    F fn_;               // std::function：finalizer 显式析构
+**插入点**：`resolveType` 的 UnionType 分支（DeclChecker.cpp:326-332）构建 UnionSemType 后：
 
+```cpp
+if (auto* u = dynamic_cast<const UnionType*>(&astType)) {
+    auto t = std::make_unique<UnionSemType>();
+    for (auto& v : u->types) {
+        auto vt = v ? resolveType(*v) : ErrorSemType::make();
+        if (vt && unionVariantGcUnsafe(*vt))
+            error(*v, "union type contains GC heap variant '" + vt->toString() +
+                "' which is not GC-safe yet; use Optional<T> for 'T | None' "
+                "(Variant<T...> coming)");
+        t->variants.push_back(std::move(vt));
+    }
+    return t;
+}
+```
+
+（`SemAnalyzer::error` 签名为 `error(const ASTNode&, const std::string&)`（SemAnalyzer.h:50），**非 printf 变参**——消息用 `+` 拼接。）
+
+**语义辨析**：`unionVariantGcUnsafe` 与 CodeGen `isHeapSemType`（ExprGen.cpp:12-30）**判定目的不同，非冲突**：
+- `isHeapSemType` 回答"该值是否为 GC 堆对象，需要 GcRootHandle 包装"——function/接口为 false。
+- `unionVariantGcUnsafe` 回答"该值放 `std::variant` 内部是否 GC 可达"——闭包可捕获 GC 指针、接口对象可持堆字段，而 variant 内部存储对 GC 不可见 → true。
+- 两者对 function/接口结论相反是**正确的**。交付时在函数注释中写明辨析 + 对照测试锁定（同输入断言 `isHeapSemType ⇒ unionVariantGcUnsafe`）。
+
+**覆盖**：类型别名、参数、返回类型、record 字段、Array 元素、泛型实例化（走 resolveType 的路径全部拦截）。Generic 变体放行（实例化二次检查见 B.6）。
+
+---
+
+### B.1 P2a：TypeDescriptor / InlineArrayField 字段压缩
+
+`runtime/gc/types.h`：
+
+```cpp
+struct InlineArrayField {
+    uint32_t offset;        // size_t → uint32_t
+    uint32_t lengthOffset;  // size_t → uint32_t
+    bool     isPtrArray;
+};                          // 16B → 12B
+
+struct TypeDescriptor {
+    uint32_t      size;               // size_t → uint32_t（对象 ≤4GB）
+    uint32_t      ptrFieldCount;      // size_t → uint32_t
+    const size_t* ptrFieldOffsets;    // 保持 size_t
+    uint32_t      inlineArrayFieldCount = 0;
+    const InlineArrayField* inlineArrayFields = nullptr;
+    void (*finalizer)(GcObject* self) = nullptr;
+    // P2b 追加：
+    const TypeDescriptor* (*dynamicDesc)(GcObject* self) = nullptr;
+};                          // 48B → 48B（压缩 40B + 钩子 8B，净持平）
+```
+
+**影响核对**：实施时先全量 `grep "desc->size"` 锁定全部读取点（已知：mark_sweep.cpp:102 `== 0` 判定；compact memcpy 走 `entry.allocSize` uint32_t，不读 desc->size；alloc 走显式 size 参数 alloc.cpp:24），逐一确认 uint32_t 化后无 narrowing 语义变化。18 处 desc 初始化点（types.cpp:13/32、string.cpp:35/562、mutex.cpp:16/33/51、thread_channel.h:105、array.tcc:43/873/881/911、optional.h:33/38、iterator.h:67/98/135/166）全为编译期常量，brace-init 可表示，**不触发 narrowing**（兜底 `static_cast<uint32_t>`）。
+
+---
+
+### B.2 P2b：dynamicDesc 钩子接入 GC
+
+`runtime/gc/mark_sweep.cpp` markFields（L179-181）：
+
+```cpp
+void GcHeap::markFields(GcObject* obj) {
+    const TypeDescriptor* desc = obj->desc;
+    if (desc && desc->dynamicDesc) desc = desc->dynamicDesc(obj);  // P2b
+    if (!desc || desc->ptrFieldCount == 0) return;
+    // ...其余不变
+}
+```
+
+`runtime/gc/compact.cpp` updateObjectFields（L397-408，转发/非转发两分支后统一）：
+
+```cpp
+    // 分支恢复 desc 后：
+    if (desc && desc->dynamicDesc) desc = desc->dynamicDesc(obj);
+    if (!desc || desc->ptrFieldCount == 0) return;
+    // ...其余不变
+```
+
+**同源一致性**：另两处读 desc 的路径同样接钩子（保持"desc 一律先过钩子"的统一契约）：
+- `markInlineArrayFields`（mark_sweep.cpp:195-197）：`const TypeDescriptor* desc = obj->desc; if (desc && desc->dynamicDesc) desc = desc->dynamicDesc(obj);`
+- `updateInlineArrayElements`（compact.cpp:419-421）：同上模式，含 `savedDescs_` 恢复分支——钩子应用在 desc 恢复**之后**（dynamicDesc 依赖 `index_` 字段，savedDescs_ 仅保存容器 desc 指针，钩子每次现算变体 desc，天然兼容转发态）。
+
+整块 memcpy（compact.cpp:188）不动：`sizeof(Variant)` 固定。
+
+---
+
+### B.3 P1：`Variant<T1, ..., Tn>` GC 堆类型（runtime/builtin/variant.h 新增）
+
+**前置假设**：变体为"单 GC 指针"或"POD 值"（P0 已禁 function/接口/嵌套联合）→ **变体 trivially copyable，storage_ 不管理生命周期，直接 memcpy**。
+
+```cpp
+template <typename... Ts>
+struct Variant : GcObject {
+    size_t index_ = 0;   // 激活变体下标
+    alignas(std::max({alignof(Ts)...})) unsigned char storage_[
+        std::max({sizeof(Ts)...})];   // 共享存储，全部变体 offset 相同
+
+    // 容器 desc（alloc 传入）：ptrFieldCount = 0，但带 dynamicDesc 钩子——
+    // GC 扫描 markFields/updateObjectFields 先过钩子得到 per-变体 desc
     static const TypeDescriptor& desc() {
-        static const size_t offsets[] = { offsetof(MapIter<T, F>, src_) };
-        static const TypeDescriptor d = {
-            sizeof(MapIter<T, F>), 1, offsets, 0, nullptr,
-            [](GcObject* obj) { static_cast<MapIter<T, F>*>(obj)->fn_.~F(); }
+        static const TypeDescriptor kContainerDesc = {
+            sizeof(Variant<Ts...>), 0, nullptr, 0, nullptr, nullptr,
+            &Variant<Ts...>::dynamicDesc    // 第 7 字段（P2a 布局）
         };
-        return d;
+        return kContainerDesc;
     }
-    Optional<U>* next() override {
-        auto* o = src_->next();
-        if (!o->has_value_) return make_none<U>();
-        return make_optional<U>(fn_(o->value_));
+
+    // per-变体 desc：指针变体 { sizeof(Variant), 1, &kStorageOffset }；
+    //                值变体   { sizeof(Variant), 0, nullptr }
+    static const TypeDescriptor& descFor(size_t i) { return kDescs[i]; }
+    static const TypeDescriptor* dynamicDesc(GcObject* self) {
+        return &kDescs[static_cast<Variant*>(self)->index_];
     }
+
+    template <size_t I> bool is() const { return index_ == I; }
+    template <size_t I> const Ts...[I]& get() const;   // 断言 index_ == I
+    size_t index() const { return index_; }
 };
-
-template <typename T, typename F>
-inline MapIter<T, F>* make_map(Iterator<T>* src, F f) {
-    auto* it = static_cast<MapIter<T, F>*>(
-        GcHeap::instance().alloc(sizeof(MapIter<T, F>), &MapIter<T, F>::desc()));
-    it->src_ = src;
-    ::new (&it->fn_) F(std::move(f));
-    return it;
+template <typename... Ts>
+inline Variant<Ts...>* make_variant(size_t index, const void* value) {
+    auto* v = static_cast<Variant<Ts...>*>(
+        GcHeap::instance().alloc(sizeof(Variant<Ts...>), &Variant<Ts...>::desc()));
+    v->index_ = index;
+    std::memcpy(v->storage_, value, variantSize<Ts...>(index));   // 见下
+    return v;
 }
-
-// ============================================================
-// FilterIter<T,F> — 对应 std::ranges::filter_view（跳过不匹配）
-// ============================================================
-template <typename T, typename F>
-struct FilterIter : GcObject, Iterator<T> {
-    Iterator<T>* src_;
-    F pred_;
-    static const TypeDescriptor& desc() {
-        static const size_t offsets[] = { offsetof(FilterIter<T, F>, src_) };
-        static const TypeDescriptor d = {
-            sizeof(FilterIter<T, F>), 1, offsets, 0, nullptr,
-            [](GcObject* obj) { static_cast<FilterIter<T, F>*>(obj)->pred_.~F(); }
-        };
-        return d;
-    }
-    Optional<T>* next() override {
-        while (true) {
-            auto* o = src_->next();
-            if (!o->has_value_) return make_none<T>();
-            if (pred_(o->value_)) return o;
-        }
-    }
-};
-
-template <typename T, typename F>
-inline FilterIter<T, F>* make_filter(Iterator<T>* src, F p) {
-    auto* it = static_cast<FilterIter<T, F>*>(
-        GcHeap::instance().alloc(sizeof(FilterIter<T, F>), &FilterIter<T, F>::desc()));
-    it->src_ = src;
-    ::new (&it->pred_) F(std::move(p));
-    return it;
-}
-
-// ============================================================
-// FuncIter<T,F> — Iterator.from(闭包)（Python 生成器等价物）
-// 显式模板参数 T：F 返回 Optional<T>*，T 无法经 invoke_result_t 提取
-//（invoke_result_t 得到的是 Optional<T>* 裸指针，没有 result_type 成员），
-// 由调用点 CodeGen 从 Sema 推导的闭包返回类型显式指定（见 C3.3）
-// ============================================================
-template <typename T, typename F>
-struct FuncIter : GcObject, Iterator<T> {
-    F fn_;
-    static const TypeDescriptor& desc() {
-        static const TypeDescriptor d = { sizeof(FuncIter<T, F>), 0, nullptr, 0, nullptr,
-            [](GcObject* obj) { static_cast<FuncIter<T, F>*>(obj)->fn_.~F(); } };
-        return d;
-    }
-    Optional<T>* next() override { return fn_(); }
-};
-
-template <typename T, typename F>
-inline FuncIter<T, F>* make_iterator_from(F f) {
-    auto* it = static_cast<FuncIter<T, F>*>(
-        GcHeap::instance().alloc(sizeof(FuncIter<T, F>), &FuncIter<T, F>::desc()));
-    ::new (&it->fn_) F(std::move(f));
-    return it;
-}
-
-// ============================================================
-// collect_all — 迭代收集为 Array<T>（对应 ranges::to<vector>）
-// ============================================================
-template <typename T>
-inline Array<T>* collect_all(Iterator<T>* it) {
-    auto* arr = Array<T>::make(0);
-    while (true) {
-        auto* o = it->next();
-        if (!o->has_value_) break;
-        arr->append(o->value_);
-    }
-    return arr;
-}
-
-} // namespace aura_rt
 ```
 
-> 注：模板推导——`make_map(src, f)` 的 T 从 src（Iterator\<T\>*）推导，F 从 lambda 推导，U 由 invoke_result_t 推导；CodeGen 特判**无需显式模板参数**。`make_iterator_from` 例外：T 与 F 无关联（F 返回 Optional\<T\>\*，invoke_result_t 只得裸指针，无法推出 T），调用点必须显式传 `<T>`（见 C3.3）。src 必须是 Iterator\<T\>* 类型表达式（内置迭代器 / 接口参数 / range/map 链返回值）。
+**alloc/扫描时序**：alloc 时 `index_` 尚未赋值，传入的是**容器 desc**（带钩子，ptrFieldCount=0）——GC 若在此窗口扫描，钩子按默认 `index_=0` 返回 kDescs[0]（占位，不崩溃）。`make_variant` 立即写入 `index_` 与 `storage_` 后，任何扫描经钩子按真实 `index_` 取 per-变体 desc。**绝不能让 alloc 直接传 per-变体 desc**（kDescs[i] 无钩子，index_=j≠i 时按错误变体扫描）。
+
+关键点：
+- `kStorageOffset` 编译期 `offsetof(Variant, storage_)`；`kDescs` 编译期数组（`std::index_sequence` 生成，per-变体 desc **不设** dynamicDesc 字段）。
+- **变体大小获取**：`template <size_t I> constexpr size_t variantSize() { return std::get<I>(std::make_tuple(sizeof(Ts)...)); }`——`make_variant` 按 `index` 静态分发（switch/index_sequence），memcpy 复制字节数 = `variantSize<index>()`。
+- 指针变体的 GC 指针在 storage_ 起始 → desc 注册 1 个 ptrField（offset = kStorageOffset）→ mark/compact 正确扫描与更新。
+- 值变体（int/float/bool/NoneType）0 指针字段，storage_ 垃圾字节不会被扫描。
+- `is<I>()/get<I>()` 为**编译器内部 API**（仅 match 翻译使用），**不注册为 Aura 方法**。
 
 ---
 
-### C1.5 GcRootHandle 移动语义（Bug 14 修复）
+### B.4 P3a：`T | None` 语法糖 → `Optional<T>`
 
-现状 [gc.h:94-95](file:///d:/you/Aura/runtime/gc/gc.h#L94-L95)：只有拷贝构造 + `operator=(const&) = delete`，声明拷贝构造**抑制了默认移动构造**。`make_map`/`make_filter`/`make_iterator_from` 的 `::new (&it->fn_) F(std::move(f))` 中闭包 F 含 GcRootHandle 成员时 `std::move` 实际退化为拷贝构造（多余一次值拷贝 + 根注册）。增加移动构造，O(1) 转移根注册。
+`resolveType` UnionType 分支：恰 2 变体、其一为 NoneSemType、另一为堆类型 → 直接构造 `OptionalSemType`（替代 UnionSemType），复用现有 Optional 全链路（SemAnalyzer.cpp:170-172 已映射 `aura_rt::Optional<T>*`）。全值联合（int|float|bool）不折叠。
 
-**gc.h 改动**：
-
-1. `GcRootMode` 加第 4 值 `Moved`（移动后源失效标记，复用 mode_ 字段、零布局变化）：
-
-```cpp
-enum class GcRootMode : uint8_t { Ref, ValueThreadLocal, ValueGlobal, Moved };
-```
-
-2. `GcRootHandle` 声明移动构造（移动赋值保持不可用——闭包仅在工厂内 placement-new 构造一次，无需赋值）：
-
-```cpp
-    // 移动构造：接管 other 的根注册（O(1) 链表原位重连）；源标记 Moved 失效
-    GcRootHandle(GcRootHandle&& other) noexcept;
-```
-
-3. `GcHeap` 声明新接口（roots.cpp 实现）：
-
-```cpp
-    // 线程局部链表原位替换：摘除 oldNode、newNode 插入同一位置（O(1)）
-    void moveRootNode(GcRootHandleBase* newNode, GcRootHandleBase* oldNode);
-```
-
-**handles.h 实现**（移动构造 + 析构加 Moved 短路）：
-
-```cpp
-// 移动构造：
-// - Ref：直接继承 ptr_/ptr_ref_（引用同一外部变量），链表原位重连
-// - ValueThreadLocal：搬值 + moveRootNode 原位重连（无注册/注销开销）
-// - ValueGlobal：ptr_ref_ 必须指向本对象 &val_（值已搬走），无法转移 → 注销源 + 注册目标
-template <typename T>
-GcRootHandle<T>::GcRootHandle(GcRootHandle&& other) noexcept
-    : GcRootHandleBase(), mode_(other.mode_) {
-    if (other.mode_ == GcRootMode::Ref) {
-        ptr_ = other.ptr_;
-        ptr_ref_ = other.ptr_ref_;                   // 引用同一外部变量
-        GcHeap::instance().moveRootNode(this, &other);
-    } else {
-        val_ = other.get();                          // 搬值
-        ptr_ref_ = reinterpret_cast<GcObject**>(&val_);
-        if (other.mode_ == GcRootMode::ValueGlobal) {
-            GcHeap::instance().registerGlobalRoot(ptr_ref_);
-            GcHeap::instance().unregisterGlobalRoot(other.ptr_ref_);
-        } else {
-            GcHeap::instance().moveRootNode(this, &other);
-        }
-    }
-    other.mode_ = GcRootMode::Moved;                 // 源失效：析构跳过注销
-}
-
-// 析构：Moved 的 handle 注册已转移，跳过（避免双重注销）
-template <typename T>
-GcRootHandle<T>::~GcRootHandle() {
-    if (mode_ == GcRootMode::Moved) return;
-    if (mode_ == GcRootMode::ValueGlobal)
-        GcHeap::instance().unregisterGlobalRoot(ptr_ref_);
-    else
-        GcHeap::instance().unregisterRootThreadLocal(this);
-}
-```
-
-**roots.cpp 实现**：
-
-```cpp
-// 原位替换：newNode 接管 oldNode 在链表中的位置（源脱离链表，随后置 Moved）
-void GcHeap::moveRootNode(GcRootHandleBase* newNode, GcRootHandleBase* oldNode) {
-    ThreadRootList* list = tl_roots_;
-    if (!list) return;                               // 防御：oldNode 理应已注册
-    newNode->prev_ = oldNode->prev_;
-    newNode->next_ = oldNode->next_;
-    if (oldNode->prev_) oldNode->prev_->next_ = newNode;
-    else                list->head = newNode;
-    if (oldNode->next_) oldNode->next_->prev_ = newNode;
-    oldNode->next_ = oldNode->prev_ = nullptr;       // 源脱离链表
-}
-```
-
-> 安全性：moveRootNode 与注册/摘除同线程（工厂在当前 mutator 线程内构造闭包）→ 无锁；GC STW 期间链表静止，不涉并发。移动后源 handle 不得再被读取（未定义行为，仅内部 `std::move` 使用，语义受控）。拷贝已移动的 handle 亦为 UB，编译器不会生成此类代码。
+**顺序无关**：`None | T` 与 `T | None` **均折叠**——判定只查"是否存在 NoneSemType 变体 + 是否存在非 None 变体"，不依赖 `None` 在 variants 中的位置。elementType 取非 None 的那个变体。
 
 ---
 
-## C2 BuiltinRegistry + Sema 特判
+### B.5 P3b：CodeGen 映射切换
 
-### C2.1 类型注册（BuiltinRegistry.h init() types_）
+1. **mapType UnionType 分支**（TypeMap.cpp:115-123）：含堆 → `aura_rt::Variant<...>*`；全值 → 保留 `std::variant<...>`（避免破坏现有 match/赋值语义，全值 variant 无 GC 问题）。
+2. **mapSemType**（TypeMap.cpp:201-247）新增 UnionSemType 分支：同样含堆 → Variant 指针、全值 → std::variant（修复"unknown_semtype"）。
+3. **genMatchStmt**（StmtGen.cpp:1372-1419）：按目标类型区分——
+   - `std::variant`（全值）：保持 holds_alternative/get；
+   - `Variant<T...>*`（含堆）：`_match_val->is<I>()` + `auto& v = _match_val->get<I>()`（`_match_val` 是指针，需 `->`）。
+   - 变体序 I 由 UnionSemType::variants 顺序决定（与 mapType 一致）。
+   - **match 是含堆联合类型化访问的唯一通道**（用户不写 `v.get<T>()`）。
+4. **try/catch 成功分支**（StmtGen.cpp:691）：`auto varName = std::get<resultType>(_try);` 后若 resultType 为 GC 指针，追加 `GcRootHandle` 包装（对齐 L680-682 错误分支既有做法）。
+5. **isGcPointerType**（TypeMap.cpp:32-39）：`aura_rt::Variant<...>*` 以 `*` 结尾 → 天然 true，无需改；`isHeapSemType` 对 UnionSemType 已返回 true → Variant 变量被 GcRootHandle 包装 ✓。
 
-```cpp
-            {"Optional", {"Optional", true, true, BuiltinPrim::Other, "aura_rt::Optional*"}},
-            // Iterator<T>：内置迭代器（map/filter/collect/from 为 C++ 桥接方法）
-            {"Iterator", {"Iterator", true, true, BuiltinPrim::Other, "aura_rt::Iterator*"}},
-```
+**Aura 暴露 API（用户可见表面）**：
 
-### C2.2 range 签名改 Kind::Iterator + some/none 注册
+| 类别 | Aura 语法 | 生成代码 | 注册点 |
+| ---- | ---- | ---- | ---- |
+| 类型 | `Variant` | `aura_rt::Variant<...>*` | BuiltinRegistry types_ |
+| 构造（隐式装箱） | 联合变量赋值/传参/返回 | `make_variant<I>(expr)`（I 编译期定位） | genAssignExpr / genCallExpr / genReturnStmt 特判 |
+| 类型化访问 | `match v { T x => ... }` | `if (v->is<I>()) { auto& x = v->get<I>(); ... }` | genMatchStmt |
+| 调试辅助 | `v.index() -> int` | `v->index()` | BuiltinRegistry methods_ |
 
-ReturnTypeInfo 加 Kind：
+- 显式工厂不提供；`T|None` 由 P3a 折叠为 Optional，`none()` 构造走既有路径。
+- 用户快速类型判断需 match 单分支表达（轻微麻烦，可接受）。
 
-```cpp
-    enum class Kind { Named, Generic, None, Generator, Optional, Iterator };
-    // Iterator(elemType)：元素类型固定（如 range → Iterator<int>）
-    static ReturnTypeInfo Iterator(const std::string& el) { return {Kind::Iterator, el, 0}; }
-```
-
-init() functions_ 改：
-
-```cpp
-            {"range", {{"end", "int"}},                                      ReturnTypeInfo::Iterator("int")},
-            {"range", {{"start", "int"}, {"end", "int"}},                    ReturnTypeInfo::Iterator("int")},
-            {"range", {{"start", "int"}, {"end", "int"}, {"step", "int"}},   ReturnTypeInfo::Iterator("int")},
-            // Optional 构造：some(v) 返回 Optional<T>（T 从实参推导，inferCall 特判）
-            {"some", {{"v", "T"}}, ReturnTypeInfo::None()},
-            {"none", {},                    ReturnTypeInfo::None()},
-```
-
-### C2.3 semTypeFromBuiltinReturn（SemAnalyzer.cpp）加 Iterator 分支
-
-```cpp
-        case ReturnTypeInfo::Kind::Iterator: {
-            auto g = std::make_unique<GenericSemType>();
-            g->name = "Iterator";
-            g->resolvedName = "aura_rt::Iterator<" + cppNameOf(ret.typeName) + ">";
-            typeStore_.push_back(std::move(g));
-            return typeStore_.back()->clone();
-        }
-```
-
-（cppNameOf("int") → "int32_t"，已有。）
-
-### C2.4 semTypeToCppName 提升为成员
-
-SemAnalyzer.cpp 匿名命名空间里的 `semTypeToCppName` 移入 SemAnalyzer 类（头文件加声明，改 static 成员或保留普通成员），供 ExprInfer.cpp 的 inferMethodCall 特判使用。同时接口方法签名 U 的 C++ 名推导复用它。
-
-### C2.5 inferCall 特判 some/none（ExprInfer.cpp inferCallExpr）
-
-在 findFunction 命中处（L194 区域）加：
-
-```cpp
-            // some(v)/none()：Optional 构造（T 从实参 / 未知，返回 Optional）
-            if (fn->name == "some") {
-                auto ot = OptionalSemType::make(
-                    e.args.empty() || !e.args[0] || !e.args[0]->inferredType
-                        ? ErrorSemType::make() : e.args[0]->inferredType->clone());
-                typeStore_.push_back(std::move(ot));
-                return typeStore_.back()->clone();
-            }
-            if (fn->name == "none") {
-                auto ot = OptionalSemType::make(ErrorSemType::make());
-                typeStore_.push_back(std::move(ot));
-                return typeStore_.back()->clone();
-            }
-```
-
-### C2.6 isAssignable Optional 宽容（SemAnalyzer.cpp）
-
-isAssignable 的 OptionalSemType 分支（若已有）加：双方 elementType 任一为 ErrorSemType → true（`return none()` 赋给 `Optional<int>` 时 Optional{Error} 兼容）。若无 Optional 分支，补：
-
-```cpp
-    // Optional<T>：双方 elementType 需可赋值；Error 元素（none() 占位）静默兼容
-    if (auto* oa = dynamic_cast<const OptionalSemType*>(&target)) {
-        auto* ob = dynamic_cast<const OptionalSemType*>(&source);
-        if (!ob) return false;
-        if (dynamic_cast<const ErrorSemType*>(oa->elementType.get())
-            || dynamic_cast<const ErrorSemType*>(ob->elementType.get()))
-            return true;
-        return isAssignable(*oa->elementType, *ob->elementType);
-    }
-```
-
-### C2.7 inferMethodCall 特判 Iterator 桥接方法（ExprInfer.cpp）
-
-在 InterfaceSemType 分支（L285）之后、BuiltinRegistry typeKey 分支之前加：
-
-```cpp
-    // Iterator 桥接方法特判（map/filter/collect 为 C++ 桥接，返回类型调用点推导）
-    if (isIteratorType(objType.get())) {
-        auto elem = elemTypeOf(objType.get());   // GenericSemType resolvedName 提取
-        for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
-        if (e.method == "collect") {
-            auto lt = std::make_unique<ListSemType>();
-            lt->elementType = elem ? elem->clone() : ErrorSemType::make();
-            typeStore_.push_back(std::move(lt));
-            return typeStore_.back()->clone();
-        }
-        if (e.method == "map" && !e.args.empty() && e.args[0]->inferredType) {
-            auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType);
-            if (ft && ft->returnType && !dynamic_cast<const ErrorSemType*>(ft->returnType.get())) {
-                auto g = std::make_unique<GenericSemType>();
-                g->name = "Iterator";
-                g->resolvedName = "aura_rt::Iterator<"
-                                  + semTypeToCppName(*ft->returnType) + ">";
-                typeStore_.push_back(std::move(g));
-                return typeStore_.back()->clone();
-            }
-            // U 未知 → 元素类型退化为 Error（后续使用会引导标注）
-            auto g = std::make_unique<GenericSemType>();
-            g->name = "Iterator";
-            g->resolvedName = "aura_rt::Iterator<int32_t>";
-            typeStore_.push_back(std::move(g));
-            return typeStore_.back()->clone();
-        }
-        if (e.method == "filter") {
-            auto g = std::make_unique<GenericSemType>();
-            g->name = "Iterator";
-            std::string elemCpp = dynamic_cast<const ErrorSemType*>(elem.get())
-                ? "int32_t" : semTypeToCppName(*elem);
-            g->resolvedName = "aura_rt::Iterator<" + elemCpp + ">";
-            typeStore_.push_back(std::move(g));
-            return typeStore_.back()->clone();
-        }
-        if (e.method == "from" && !e.args.empty() && e.args[0]->inferredType) {
-            // from(f: fun() -> Optional<T>)：T 从 f 返回的 Optional 元素提取
-            if (auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType)) {
-                if (auto* os = dynamic_cast<const OptionalSemType*>(ft->returnType.get())) {
-                    auto g = std::make_unique<GenericSemType>();
-                    g->name = "Iterator";
-                    g->resolvedName = "aura_rt::Iterator<"
-                        + semTypeToCppName(*os->elementType) + ">";
-                    typeStore_.push_back(std::move(g));
-                    return typeStore_.back()->clone();
-                }
-            }
-        }
-        // v1：record receiver 直接调 map/filter/collect → 报错（适配器为栈对象，悬垂）
-        if (dynamic_cast<const RecordSemType*>(objType.get())) {
-            error(e, "call '" + std::string(e.method) +
-                  "' on record directly is not supported in v1; pass it through an Iterator interface first");
-            return ErrorSemType::make();
-        }
-    }
-```
-
-其中 `isIteratorType` 判断（SemAnalyzer.h 声明，cpp 实现）：
-
-```cpp
-bool SemAnalyzer::isIteratorType(const SemType* t) const {
-    if (!t) return false;
-    if (auto* g = dynamic_cast<const GenericSemType*>(t))
-        return g->name == "Iterator" || g->resolvedName.find("Iterator") != std::string::npos;
-    if (auto* is = dynamic_cast<const InterfaceSemType*>(t))
-        return is->name == "Iterator";
-    return false;
-}
-```
-
-> 注：`Iterator.from(...)` 的 receiver 是 Identifier "Iterator"（类型名）。inferMethodCall Phase A 先查符号表/模块——"Iterator" 未注册为模块，走到 objType = inferExpr(Identifier "Iterator") → symtab lookup 未找到 → error "undefined identifier 'Iterator'"！必须特判：inferMethodCall 开头（Phase A 后）加：
-
-```cpp
-    // Iterator.from(...) 静态调用：receiver 是内置类型名
-    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
-        if (id->name == "Iterator" && e.method == "from") {
-            for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
-            if (!e.args.empty() && e.args[0]->inferredType) {
-                if (auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType)) {
-                    if (auto* os = dynamic_cast<const OptionalSemType*>(ft->returnType.get())) {
-                        auto g = std::make_unique<GenericSemType>();
-                        g->name = "Iterator";
-                        g->resolvedName = "aura_rt::Iterator<"
-                            + semTypeToCppName(*os->elementType) + ">";
-                        typeStore_.push_back(std::move(g));
-                        return typeStore_.back()->clone();
-                    }
-                }
-            }
-            auto g = std::make_unique<GenericSemType>();
-            g->name = "Iterator";
-            g->resolvedName = "aura_rt::Iterator<int32_t>";
-            typeStore_.push_back(std::move(g));
-            return typeStore_.back()->clone();
-        }
-    }
-```
-
-（与 C2.7 的 from 分支逻辑一致，可提取共用小函数，v1 直接并列两份即可。）
-
----
-
-## C3 CodeGen 特判（直转 runtime）
-
-### C3.1 genCallExpr：some / none / range（ExprGen.cpp L569 开头）
-
-在 channel 构造特判后加：
-
-```cpp
-    // some(v)/none()：Optional 构造（C++ CTAD 推导 T）
-    if (calleeName == "some" && e.args.size() == 1) {
-        return "aura_rt::make_optional(" + genExpr(*e.args[0], isCoroutine) + ")";
-    }
-    if (calleeName == "none" && e.args.empty()) {
-        // T 从当前函数返回类型（Optional<T>）提取；缺省兜底 int32_t
-        return "aura_rt::make_none<" + (currentReturnElem_.empty()
-                                        ? std::string("int32_t") : currentReturnElem_) + ">()";
-    }
-
-    // range(...) → make_range（iota_view）；for-in 的 range 仍走 iota 特判（性能路径）
-    if (calleeName == "range") {
-        std::vector<std::string> a;
-        for (auto& arg : e.args) a.push_back(genExpr(*arg, isCoroutine));
-        if (a.size() == 1) return "aura_rt::make_range<int32_t>(0, " + a[0] + ")";
-        if (a.size() == 2) return "aura_rt::make_range<int32_t>(" + a[0] + ", " + a[1] + ")";
-        if (a.size() == 3) return "aura_rt::make_range<int32_t>(" + a[0] + ", " + a[1] + ", " + a[2] + ")";
-        return "aura_rt::make_range<int32_t>(0, 0)";
-    }
-```
-
-### C3.2 currentReturnElem_ 跟踪（CodeGen.h + DeclGen.cpp/ExprGen.cpp）
-
-CodeGen.h 加成员：
-
-```cpp
-    std::string              currentReturnElem_;  // 当前函数返回 Optional<T> 的 T（C++ 名），空 = 非 Optional
-```
-
-提取辅助（CodeGen.h 声明，TypeMap.cpp 实现）：
-
-```cpp
-// 从返回类型 TypeExpr 提取 Optional<T> 的 T（C++ 名）；非 Optional 返回空
-std::string CodeGenerator::optionalElemOf(const TypeExpr* retType) {
-    auto* nt = retType ? dynamic_cast<const NamedType*>(retType) : nullptr;
-    if (nt && nt->name == "Optional" && !nt->typeArgs.empty())
-        return mapType(*nt->typeArgs[0]);
-    return "";
-}
-```
-
-设置点（函数体生成前，函数体结束后清理）：
-- DeclGen.cpp `genFunDecl`：函数头生成后 `currentReturnElem_ = optionalElemOf(decl.returnType.get());`，函数体 `}` 后 `currentReturnElem_.clear();`
-- DeclGen.cpp `genMethodDecl`：同样处理
-- DeclGen.cpp `genInterfaceDecl` 默认方法体（默认方法返回 Optional 时，如接口无此场景，可不设）
-- ExprGen.cpp `genFunExpr`（闭包）：闭包体前 `currentReturnElem_ = optionalElemOf(e.returnType.get());`，体后清理
-
-### C3.3 genMethodCall：Iterator 桥接方法直转（ExprGen.cpp L798 obj 生成后）
-
-在 `std::string obj = genExpr(*e.object, isCoroutine);` 之后、oss 构建之前加：
-
-```cpp
-    // ============================================================
-    // Iterator 桥接方法特判（map/filter/collect/from 直转 runtime，不走虚调用）
-    // 模板参数全部由 C++ 参数推导（src: Iterator<T>*, f: lambda → invoke_result_t）
-    // ============================================================
-    bool objIsIterator = false;
-    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
-        if (id->name == "Iterator") objIsIterator = true;  // Iterator.from(...) 静态
-    } else if (e.object->inferredType) {
-        if (auto* g = dynamic_cast<const GenericSemType*>(e.object->inferredType))
-            objIsIterator = g->name == "Iterator";
-        else if (dynamic_cast<const InterfaceSemType*>(e.object->inferredType))
-            objIsIterator = true;   // 接口参数/变量：运行时是具体迭代器，静态类型 Iterator<T>*
-    }
-    if (objIsIterator) {
-        // 实参（闭包）表达式
-        std::vector<std::string> iArgs;
-        for (size_t i = 0; i < e.args.size(); ++i)
-            iArgs.push_back(genExpr(*e.args[i], isCoroutine));
-        if (e.method == "from" && iArgs.size() == 1) {
-            // FuncIter 无自动推导（T 与 F 无关联）：T 从闭包返回类型 Optional<T> 显式提取
-            std::string elem = "int32_t";
-            if (auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType))
-                if (auto* os = dynamic_cast<const OptionalSemType*>(ft->returnType.get()))
-                    elem = mapSemType(*os->elementType);
-            return "aura_rt::make_iterator_from<" + elem + ">(" + iArgs[0] + ")";
-        }
-        if (e.method == "map" && iArgs.size() == 1) {
-            std::string call = "aura_rt::make_map(" + obj + ", " + iArgs[0] + ")";
-            std::vector<std::pair<std::string, const SemType*>> gArgs;
-            gArgs.emplace_back(obj, e.object->inferredType);
-            gArgs.emplace_back(iArgs[0], e.args[0]->inferredType);
-            return genGcRootedArgs(gArgs, call, isCoroutine);
-        }
-        if (e.method == "filter" && iArgs.size() == 1) {
-            std::string call = "aura_rt::make_filter(" + obj + ", " + iArgs[0] + ")";
-            std::vector<std::pair<std::string, const SemType*>> gArgs;
-            gArgs.emplace_back(obj, e.object->inferredType);
-            gArgs.emplace_back(iArgs[0], e.args[0]->inferredType);
-            return genGcRootedArgs(gArgs, call, isCoroutine);
-        }
-        if (e.method == "collect" && iArgs.empty()) {
-            std::string call = "aura_rt::collect_all(" + obj + ")";
-            std::vector<std::pair<std::string, const SemType*>> gArgs;
-            gArgs.emplace_back(obj, e.object->inferredType);
-            return genGcRootedArgs(gArgs, call, isCoroutine);
-        }
-    }
-```
-
-> 注意：`genIdentifier` 对 Identifier "Iterator" 会走 safeName 返回 "Iterator"（未注册变量）——静态调用 `Iterator.from` 时 obj="Iterator" 直接用作 C++ 类型名上下文，安全。genExpr(*e.object) 对 Identifier "Iterator" 在 genIdentifier 中：currentReceiverName_ 非 "Iterator" → safeName("Iterator") = "Iterator" ✓。
-
-### C3.4 genForStmt：Iterator 分支（StmtGen.cpp，range 特判之后、channel 之前）
-
-```cpp
-    // 检测 Iterator 遍历：for v in it → while + next()/is_none()/unwrap()
-    // 覆盖：内置迭代器表达式（range/map/filter/from 返回值）、Iterator 接口变量/参数、
-    //       record 显式 impl Iterator<int>（其 for-in 语义，record 直接可迭代）
-    bool iterIsIterator = false;
-    if (stmt.iterable->inferredType) {
-        auto* ty = stmt.iterable->inferredType;
-        if (auto* g = dynamic_cast<const GenericSemType*>(ty))
-            iterIsIterator = g->name == "Iterator"
-                          || g->resolvedName.find("Iterator") != std::string::npos;
-        else if (auto* is = dynamic_cast<const InterfaceSemType*>(ty))
-            iterIsIterator = is->name == "Iterator";
-        else if (auto* r = dynamic_cast<const RecordSemType*>(ty)) {
-            // record 显式 impl Iterator<T> → 用接口元素类型生成 next() 循环
-            auto recIt = interfaceImplementations_.find(r->canonicalName);
-            if (recIt != interfaceImplementations_.end()
-                && recIt->second.count("Iterator") > 0)
-                iterIsIterator = true;
-        }
-    }
-    if (iterIsIterator) {
-        std::string var = safeName(stmt.itemName);
-        std::string itExpr = genExpr(*stmt.iterable, isCoroutine);
-        cpp << indentStr() << "{\n";
-        indentLevel_++;
-        writeLine(cpp, "auto _it = " + itExpr + ";");
-        cpp << indentStr() << "while (true) {\n";
-        indentLevel_++;
-        writeLine(cpp, "auto _opt = _it->next();");
-        writeLine(cpp, "if (_opt->is_none()) break;");
-        writeLine(cpp, "auto " + var + " = _opt->unwrap();");
-        if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
-        writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
-        indentLevel_--;
-        cpp << indentStr() << "}\n";
-        indentLevel_--;
-        cpp << indentStr() << "}\n";
-        return;
-    }
-```
-
-> record impl 场景：`fib` 是 Fib*（record），`_it = fib` 赋给 `auto _it` 类型是 Fib*——不是 Iterator\<T\>*，无法调 next()！需适配器：`auto _it = FibIterator(fib)`。但适配器是栈临时 + `_it` 在循环内存活（循环内每轮 GC safepoint 可能 compact）——适配器持 GcRootHandle\<Fib*\>（自身 obj 值持有）✓ GC 安全，但适配器自身在栈上（无 GC 移动）→ 安全。生成：
-
-```cpp
-        // record impl：包一层适配器（持 GcRootHandle<Rec*>，GC compact 安全）
-        if (auto* r = dynamic_cast<const RecordSemType*>(stmt.iterable->inferredType)) {
-            std::string recName = r->canonicalName;
-            writeLine(cpp, "auto _it = " + safeName(recName) + "Iterator(" + itExpr + ");");
-        } else {
-            writeLine(cpp, "auto _it = " + itExpr + ";");
-        }
-```
-
-> 注意：`_it` 是适配器栈对象，循环体内每轮 `_it->next()` 虚调用 → 适配器 override → `obj.get()->next()` ✓。
-
-### C3.5 类型映射（TypeMap.cpp）
-
-`mapSemType` GenericSemType 分支（L231-237）已支持 resolvedName → `resolvedName + "*"`，range/map 返回的 Iterator 类型直接可用，无需改动。`mapNamedType`（L139-162）查 BuiltinRegistry findType("Iterator") → cppType "aura_rt::Iterator*" + mapType typeArgs 注入 → `aura_rt::Iterator<T>*` ✓。
-
-### C3.6 CodeGen 第一遍扫描/适配器（CodeGen.cpp / DeclGen.cpp）
-
-- record impl Iterator\<int\> 的适配器：interfaceImplementations_[rec]["Iterator"] = ["int32_t"]（现有收集逻辑，泛型接口带类型实参）→ genIfaceAdapter 生成 `RecIterator final : Iterator<int32_t>`，override 仅 next()（CppBridge 跳过，C0.5）✓
-- genInterfaceDecl 对 Iterator 接口：生成 `template<typename T> struct Iterator { virtual ~Iterator() = default; virtual Optional<T>* next() const = 0; };`——注意 CppBridge 方法跳过 → 只留 next() 纯虚 ✓
-- 接口默认方法生成处的 `virtual Optional<T>* next() const = 0;`——接口方法是 const？适配器 override `Optional<T>* next() const override`。但 runtime 的 `Iterator<T>::next()` 是非 const 纯虚！**签名冲突**：Aura 接口方法生成的基类 next() 是 `const`（genInterfaceDecl 统一加 const），而 runtime 的 Iterator<T>::next() 非 const。适配器同时继承两者（RecIterator : Iterator<int32_t> 由 genIfaceAdapter 生成——基类是接口生成的 Iterator<int32_t>，**不是** runtime 的 aura_rt::Iterator<int32_t>！）
-
-⚠️ **重要**：genInterfaceDecl 生成的 `Iterator<T>`（Aura 接口的 C++ 形态）与 runtime 的 `aura_rt::Iterator<T>` 是**两个不同的类**！Aura 接口生成在全局命名空间 `struct Iterator`，runtime 在 `aura_rt::Iterator`。plan §2 说"Iterator<T> 是抽象基类（即接口的 C++ 形态）"——要求两者统一！
-
-**方案**：interfaces.aurai 的 Iterator 接口**不再由 genInterfaceDecl 生成 C++ 类**（避免与 runtime 重复），改为：BuiltinRegistry 登记 Iterator 类型（C2.1）+ interfaces.aurai 接口声明仅供 Sema（方法签名）。CodeGen genInterfaceDecl 对 interfaces.aurai 加载的接口**跳过**（它们由 runtime 提供 C++ 形态）。record impl Iterator 的适配器基类改为 `aura_rt::Iterator<int32_t>`：
-
-```cpp
-struct RecIterator final : aura_rt::Iterator<int32_t> {
-    aura_rt::GcRootHandle<Rec*> obj;
-    explicit RecIterator(Rec* o) : obj(o, aura_rt::GcRootScope::ThreadLocal) {}
-    aura_rt::Optional<int32_t>* next() override { return obj.get()->next(); }
-};
-```
-
-实现：CodeGen 需区分"interfaces.aurai 内置接口"（C++ 形态在 runtime）与"用户接口"（genInterfaceDecl 生成）。判定：BuiltinRegistry::auraiInterfaces() 中的接口名。genInterfaceDecl 对内置接口名跳过生成；genIfaceAdapter 对内置接口用 `aura_rt::<name><类型实参>` 作基类，且接口方法签名类型映射走 runtime 形态。
-
-> v1 简化：**内置接口只有 Iterator 是特例**（Stringer/Comparable 仍由 genInterfaceDecl 生成，record impl 走现有适配器）。因此特判只针对 name == "Iterator"：
-> - genInterfaceDecl：`if (decl.name == "Iterator") return;`（跳过生成，C++ 形态来自 runtime/builtin/iterator.h）
-> - genIfaceAdapter：`if (iface.name == "Iterator")` → 基类 `aura_rt::Iterator<类型实参>`，方法 next() override 转 `obj.get()->next()`（**非 const、非 mapIfaceType**，直接硬编码 `aura_rt::Optional<` + 实参 + `>* next() override`）
-> - C++ 侧需 `#include "builtin/iterator.h"`（runtime 头文件链：确认 test.cpp 头部 include 或 types.h 引入；在 CodeGen 生成文件头部追加 include）
-
-C3.6 具体代码（genIfaceAdapter 内）:
-
-```cpp
-    if (iface.name == "Iterator") {
-        // 内置 Iterator：C++ 形态来自 runtime/builtin/iterator.h（非 genInterfaceDecl 生成）
-        std::string elem = ifIt->second.empty() ? "int32_t" : ifIt->second[0];
-        h << "struct " << adapterName << " final : aura_rt::Iterator<" << elem << "> {\n";
-        h << "  aura_rt::GcRootHandle<" << recordName << "*> obj;\n";
-        h << "  explicit " << adapterName << "(" << recordName << "* o)\n";
-        h << "      : obj(o, aura_rt::GcRootScope::ThreadLocal) {}\n";
-        h << "  aura_rt::Optional<" << elem << ">* next() override {\n";
-        h << "    return obj.get()->next();\n";
-        h << "  }\n";
-        h << "};\n\n";
-        return;
-    }
-```
-
-（插在 genIfaceAdapter 泛型基类构建之前，适配器名仍是 RecIterator。）
-
----
-
-## C4 interfaces.aurai Iterator 接口（interfaces.aurai）
+**Aura 调用示例（P3 完成后）**：
 
 ```aura
-interface Iterator<T> {
-    next() -> Optional<T>                     // 纯虚：record 必须实现
-    map(f: fun(T) -> U) -> Iterator<U> ...    // C++ 桥接：runtime make_map
-    filter(p: fun(T) -> bool) -> Iterator<T> ...
-    collect() -> [T] ...
+type User = { name: string, age: int }
+
+fun parse(kind: string, val: int) -> User | string {
+    if kind == "user" {
+        return { name = "u" + val, age = val }   // record 字面量 → 变体 User（隐式装箱）
+    }
+    return "err:" + kind                          // string → 变体 string
+}
+
+fun main(io: Io) -> None {
+    let v: User | string = parse("user", 42)
+    match v {
+        User u   => io.println(u.name),
+        string s => io.println(s)
+    }
+    io.println("index = " + v.index())
 }
 ```
 
-- next() 纯虚：record impl 必须提供，适配器 override 转 `obj.get()->next()`
-- map/filter/collect：C++ 桥接（`...`），record 无需实现；调用点 CodeGen 直转 make_map/make_filter/collect_all
-- Sema 侧 Iterator 是 InterfaceSemType（符号表接口）+ GenericSemType（BuiltinRegistry 类型名，map/range 返回值）双形态，C2.7 isIteratorType 统一识别
+**实现侧难点（P3b 需覆盖）**：联合上下文中的**匿名 record 字面量**（`return { ... }`）需在联合目标下推断为变体 User 后定位 I；数组字面量 `[User | string]` 逐元素定位变体装箱。
 
 ---
 
-## C5 README 更新（READMEs/07-methods-interfaces.md）
+### B.6 P3c：Generic 变体实例化二次检查
 
-- 7.3 接口三形态：纯虚 / `{ body }` 默认方法 / `...` C++ 桥接（新增）
-- 7.4 内置接口：Iterator\<T\> 改写——record 只需实现 next()；`Iterator.from` 生成器；map/filter/collect 惰性链；range 返回 Iterator\<int\>
-- 8 控制流：for-in 支持 Iterator（含 record impl）
-- 附录 B 速查表：Iterator 方法 + some/none
+泛型 substitute 完成后，对含 `GenericSemType` 的 UnionSemType **重新调用 `unionVariantGcUnsafe`**（此时 T 已替换为具体类型，如 `Tree<string>` 的 `T→string`）；不安全 → 编译错。验证：`Tree<T>` 实例化为 `Tree<string>` 报错、全值实例化通过。
 
 ---
 
-## 测试方案（example/test.aura 追加 + 回归）
+### B.7 P4：联合动态分派（`v.append(1)`）
+
+**目标**：联合值可直接调用方法/索引，编译器生成运行时类型判定；激活变体不支持该调用时抛 `TypeError`。用户书写无感，代价是静态类型安全稀释为运行时判定。
+
+**语义**：
+- **静态（Sema）**：方法查找在**变体集合**上进行——至少一个变体支持该调用 → 通过；无 → 编译报错。
+- **运行时（CodeGen）**：按激活 `index_` 判定——单支持变体：`if (index != I) throw TypeError; 直调`；多支持变体：`switch (index_)` 分派，default 抛 TypeError。
+- **TypeError**：复用 `make_type_error`（runtime/builtin/error.h:23-27）。已确认其内部 `Error{intern_string("TypeError"), make_string(msg)}` 的 `kind` 走 `intern_string`——与用户 `catch kind == "TypeError"` 的字面量可正常匹配。与 Optional.unwrap 抛错同级，不需显式 throws 标注。
+
+**生成代码（多变体 switch，`string | [int]` 调 len）**：
+
+```cpp
+// let v: string | [int] = ...
+int32_t _dsp_r;                       // 返回类型合并结果（此处单类型 int32_t）
+switch (v->index()) {
+    case 0: _dsp_r = v->get<0>()->len(); break;   // string.len()
+    case 1: _dsp_r = v->get<1>()->len(); break;   // [int].len()
+    default:
+        throw aura_rt::make_type_error(
+            "TypeError: variant (string | [int]) active variant has no method 'len'");
+}
+```
+
+**Sema 返回类型合并规则**：
+- 单支持变体 → 直接取该变体返回类型。
+- 多支持变体 → 各返回类型**合并**：全部相同 → 该类型；否则 → `UnionSemType`（各返回类型的并）。合并为联合时调用点递归走 P3 联合链路。
+- 参数兼容：实参逐个按现有方法匹配规则检查各支持变体签名；无法兼容的变体排除出支持集合（不纳入 switch）。
+
+**覆盖范围**（分层交付）：
+
+| 表达式 | 生成策略 | 多变体支持 |
+| ---- | ---- | ---- |
+| 方法调用 `v.method(args)` | 单变体检查+直调 / 多变体 switch | ✓ switch 分派 |
+| 索引 `v[i]` | 同方法调用 | ✓ switch 分派 |
+| 成员访问 `v.field` | 仅单支持变体（record 变体字段）；多变体报编译错引导 match | ✗ 报错 |
+
+- 依赖 P3 的 Variant 指针 + 隐式装箱（P3 前含堆联合被 P0 拦截）。
+- 全值联合（`int|float`，std::variant 路径）动态分派：P4 初始不覆盖，标注为低成本后续扩展。
+
+---
+
+### B.8 P5：match 值模式（C++ switch 风格）
+
+**背景（已确认）**：Parser（TypeParser.cpp:174-201）已解析 4 类模式——TypePattern/ConstantPattern/WildcardPattern；但 `genMatchStmt`（StmtGen.cpp:1372-1419）只生成 TypePattern 分支，**ConstantPattern 一律静默落 else**（半成品）。穷尽性检查（ExprInfer.cpp:554-590）仅把 `None` 字面量作为 None 变体覆盖特例。值比较基建已就绪：`GcString::operator==`、`aura_rt::string_eq`、`NoneType::operator==`。
+
+**语法**（`|` 分组，Rust 风格）：
 
 ```aura
-// C1: runtime 迭代器（range 改名 + collect）
-let r = range(5)
-io.println("collect: " + str(r.collect().len()))        // 5
-
-// C2: 链式 p.map(process).collect()（用户核心用例）
-fun process(x: int) -> int { return x * 10 }
-let chain = range(3).map(process).collect()
-io.println("chain: " + str(chain.len()) + "/" + str(chain[0]))   // 3/0
-
-// C3: map/filter 惰性链
-let m = range(5).map(fun(x: int) -> int { return x * 2 })
-io.println("map: " + str(m.collect().len()))            // 5
-let f2 = range(10).filter(fun(x: int) -> bool { return x % 2 == 0 })
-io.println("filter: " + str(f2.collect().len()))        // 5
-
-// C4: record impl Iterator + for-in
-type Fib = { n: int, a: int, b: int, cnt: int }
-fun (self Fib impl Iterator<int>) next() -> Optional<int> {
-    if self.cnt >= self.n { return none() }
-    let v = self.a
-    self.b = self.a + self.b
-    self.a = self.b - self.a
-    self.cnt = self.cnt + 1
-    return some(v)
+match x {                      // x: int
+    1 | 2 | 3 => "small",      // 多常量分组（C++ case 1: case 2: 合并）
+    0         => "zero",
+    _         => "large"       // default
 }
-let fib: Fib = { n = 8, a = 1, b = 1, cnt = 0 }
-let fibSum = 0
-for v in fib { fibSum = fibSum + v }
-io.println("fib sum: " + str(fibSum))                   // 33 (1+1+2+3+5+8+13+21)
 
-// C5: Python 生成器风格（from 闭包）
-fun counter(n: int) -> Iterator<int> {
-    let i = 0
-    return Iterator.from(fun() -> Optional<int> {
-        if i >= n { return none() }
-        let v = i
-        i = i + 1
-        return some(v)
-    })
+match v {                      // v: int | string（类型 + 常量共存，按书写顺序）
+    string s  => "str: " + s,
+    0         => "zero",       // 常量：先判定 int 变体再比值
+    int n     => "int: " + n,
+    _         => "other"
 }
-io.println("counter: " + str(counter(4).collect().len()))   // 4
-
-// C6: 回归
-for i in range(3) { io.println("iota " + str(i)) }     // iota 特判保留
-io.println("ALL TESTS PASSED")
 ```
 
-**回归**：example/used 全量 + 现有 test.aura 接口测试（welcome/str(ps)/Comparable）。
+**AST 变更**：新增 `GroupPattern`（持 `std::vector<std::unique_ptr<Pattern>> alts`），`parsePattern` 解析单模式后 `while (check(Bar))` 收集——**仅常量模式允许分组**，类型模式分组报错引导分开写。
+
+**解析顺序（P5a）**：
+1. `parsePattern` 先按现有逻辑解析**单模式**（TypePattern / ConstantPattern / WildcardPattern）。
+2. 解析成功后 `while (check(Bar))`：
+   - 当前是 `ConstantPattern` → 继续解析下一个常量，收集为 `GroupPattern`（alts 全为常量）。
+   - 当前是 `TypePattern`（如 `User | string`）→ **报错**"type pattern cannot be grouped; write separate cases or use a union type"。
+   - 表达式上下文（`a | b` 位或/联合）不受影响——`|` 仅在 match 的 pattern 解析路径消费。
+
+**值比较生成**（if/else if 链，语义等价 C++ switch；不生成 C++ `switch` 关键字——float/string 非整型，且 if/else if 天然兼容 co_await 分支体）：
+
+```cpp
+// match x { 1 | 2 | 3 => A, _ => B }    x: int
+{
+    auto&& _mv = x;
+    if (_mv == 1 || _mv == 2 || _mv == 3) { A }
+    else { B }
+}
+```
+
+各类型常量比较规则：
+
+| 常量类型 | 比较生成 | 说明 |
+| ---- | ---- | ---- |
+| int / float / bool | `_mv == 字面量` | 直接 `==` |
+| string | `aura_rt::string_eq(_mv, aura_rt::intern_string("..."))` | **内容比较**（拼接串不在 intern 表）|
+| None | 联合：`std::holds_alternative<NoneType>(_mv)` / `_mv->is<I_None>()`；非联合 None：直接 true | 复用既有 None 分支判定 |
+
+**联合 + 常量**（std::variant 路径，先判定变体再比值）：
+
+```cpp
+// match v { 0 => A, int n => B }    v: int | None
+{
+    auto&& _mv = v;
+    if (std::holds_alternative<int32_t>(_mv) && std::get<int32_t>(_mv) == 0) { A }
+    else if (std::holds_alternative<int32_t>(_mv)) { auto& n = std::get<int32_t>(_mv); B }
+    else { /* 无可达分支：None 未覆盖 */ }
+}
+```
+
+Variant 路径（P3b 后）：`_mv->is<I>() && _mv->get<I>() == 0` 同理。
+
+**顺序语义**：按书写顺序生成 if/else if，**先匹配 wins**（与 Rust 一致）。
+
+**Sema 检查**（StmtChecker.cpp checkMatchStmt 扩展）：
+- **类型兼容**：常量字面量类型须与 matchedType 匹配——非联合：字面量类型 == matchedType；联合：存在对应变体；否则编译错。
+- **重复常量**：同一 match 内相同字面量出现多次 → 编译错（对齐 C++ duplicate case）。
+- **可达性**：常量模式在其类型模式之后（int 变体已被 `int n` 全量吞掉）→ 警告 "unreachable"（先文档 + 警告）。
+- **穷尽性**：`isMatchExhaustive` 对 GroupPattern 视为**单个 case**，递归检查其 alts：常量 alt 为 None → 覆盖 {None 变体}；常量 alt 非 None → 覆盖 ∅；TypePattern alt 不允许（P5a 已拦）。其余规则不变：每个 variant 必须被某个 case 覆盖（TypePattern/None 常量/`_`），否则非穷尽报错。
+
+**实现位置**：
+- `src/Parser/TypeParser.cpp` parsePattern（L174-201）：`|` 分组（限常量）
+- `src/AST/Stmt.h`：GroupPattern
+- `src/Sema/Checker/StmtChecker.cpp` checkMatchStmt（L193-224）：兼容/重复/可达性
+- `src/Sema/Checker/ExprInfer.cpp` isMatchExhaustive（L554-590）：GroupPattern 递归 + None 特例
+- `src/CodeGen/StmtGen.cpp` genMatchStmt（L1372-1419）：常量/分组比较分支（修复半成品）；P3b 后适配 Variant 路径（is<I>）
+- `src/ASTPrinter.cpp` / ASTWalker：GroupPattern 打印/遍历
 
 ---
 
-## 实施顺序
+## 3. 影响分析汇总
 
-1. C0 `...` 语法（Lexer/AST/Parser/Sema/CodeGen）+ 全部 aurai 文件补充 `...`
-2. C1 runtime/builtin/iterator.h（新文件）+ CMakeLists 纳入（检查 runtime 构建文件源列表是否通配）+ **C1.5 GcRootHandle 移动语义**（gc.h/handles.h/roots.cpp，先行于 C1 工厂的 `F(std::move(f))`）
-3. C2 BuiltinRegistry（Iterator 类型、range 签名、some/none）+ Sema 特判 + semTypeToCppName 提升
-4. C3 CodeGen 特判（genCallExpr/genMethodCall/genForStmt/currentReturnElem_）+ C3.6 内置 Iterator 适配器特判
-5. C4 interfaces.aurai
-6. C5 README
-7. 测试 + 全量回归
+| 变更 | 影响 | ⚠️ BREAKING |
+| ---- | ---- | ----------- |
+| A 组 | task.h/task.cpp；语义/API 不变 | 无 |
+| B-P0 | 含堆联合编译期报错（从"运行崩溃"变"编译错误"） | ⚠️ 行为变更（防御性，正向） |
+| B-P2a | TypeDescriptor 布局 48→40B；全量重编 runtime | 无（同版本统一重建） |
+| B-P2b | TypeDescriptor 40→48B（净持平）；mark/compact 加钩子分支 | 无 |
+| B-P1 | 新增 runtime 类型 + make_variant | 无 |
+| B-P3a | `T\|None`（含堆）编译产物变 Optional | ⚠️ 编译产物变化（用户无感） |
+| B-P3b | 含堆联合 C++ 表示变 Variant；match/try 适配 | ⚠️ BREAKING（需 READMEs/示例同步） |
+| B-P3c | 泛型实例化二次检查 | 无（新检查，正向） |
+| B-P4 | 联合方法/索引动态分派；静态安全稀释为运行时 TypeError | ⚠️ 新能力（文档说明运行时错误语义） |
+| B-P5 | match 常量/分组匹配生效（修复静默落 else）；C++ switch 风格可用 | ⚠️ 行为变更（正向修复；READMEs/09 需同步） |
 
-## 风险与边界
+升级/降级：A 组独立；B 组 P0-P2 独立交付；P3 与文档同步；P4 独立开关式交付（可整体 revert）；P5 独立交付（Parser/AST/Sema/CodeGen 一组，可整体 revert）。P2a/P2b/P1 绑定（desc 布局耦合）。
 
-- **内置 Iterator 双类冲突**（C3.6）：interfaces.aurai 的 Iterator 接口生成会与 runtime 的 aura_rt::Iterator 冲突 → genInterfaceDecl 跳过 name=="Iterator" 是硬性要求
-- **record 适配器悬垂**：v1 record 直接调 map/filter/collect → Sema 报错（C2.7）；for-in 用适配器（栈，GcRootHandle 值持有）安全
-- **none() 的 T**：依赖 currentReturnElem_（函数返回 Optional\<T\>），缺省兜底 int32_t；Sema 侧 Optional{Error} 宽容（C2.6）
-- **make_iterator_from 的 T 缺失**：FuncIter 无自动推导（T 与 F 无关联），CodeGen 从闭包返回类型 Optional\<T\> 提取，缺省兜底 int32_t；Sema C2.7 from 分支已保证推导
-- **GcRootHandle 移动后源失效**：moveRootNode 后源 handle 析构安全（Moved 跳过注销），但不得再读源值（UB）；仅内部工厂 `std::move` 使用，语义受控
-- **finalizer 析构 std::function**：GC 回收迭代器时释放闭包（含 GcRootHandle 副本摘链表），防泄漏；finalizer 内不可触发 GC（仅析构 std::function，安全）
-- **闭包捕获**：genFunExpr 对捕获的 GC 根变量生成 GcRootHandle 值副本（Global scope），map/filter 闭包捕获迭代器变量时同样适用
+---
+
+## 4. 边界条件处理策略（合并）
+
+### 4.1 A 组（协程）
+
+| # | 边界 | 现状 | 计划处理 | 测试 |
+| - | ---- | ---- | -------- | ---- |
+| A1 | continuation 为空（链头/顶层） | `if (continuation)` 跳过 | 保持 | 顶层 main 回归 |
+| A2 | 短链（< 512） | 同步直连 | 保持 | 现有 test.aura 全量 |
+| A3 | 长链（≥ 512） | 栈溢出 | schedule 清栈 | 递归链 20000 层 |
+| A4 | 多线程并发链 | 无保护 | `thread_local` 隔离 | sync/spawn 回归 |
+| A5 | 协程体异常 | 存入 exception_ | 不变 | throws 用例 |
+| A6 | 计数漂移 | — | 超限归零 + 偶发调度 | 大量短链循环 |
+| A7 | when_all 长列表 | 链深 1 | 不受益，无影响 | when_all 1000 任务 |
+
+### 4.2 B 组（联合类型）
+
+| # | 边界 | 现状 | 计划处理 | 测试 |
+| - | ---- | ---- | -------- | ---- |
+| B1 | 嵌套联合 `(A\|B)\|C` | 递归 variant | P0 递归判定拦截；P3 扁平化 | 嵌套联合用例 |
+| B2 | function/接口变体 | 未处理 | P0 报错 | 含 fun 变体用例 |
+| B3 | 泛型未实例化（`Tree<T>\|T`） | 无判定 | P0 放行 Generic；实例化二次检查（B.6） | 泛型联合字段 |
+| B4 | 联合作 record 字段 / Array 元素 | variant 内嵌 | P3 映射后 Variant 指针自然嵌入 | record+Array 用例 |
+| B5 | `A* \| int` | 崩溃 | P0 报错 | 报错用例 |
+| B6 | try/catch resultType 为堆指针 | 成功分支裸指针悬垂 | P3 GcRootHandle 包装 | try/catch 返回 GcString* + GC |
+| B7 | match None/通配符 else | if/else 链 | 保持，仅换 API | 现有 match 回归 |
+| B8 | compact 移动 Variant | desc 更新失效 | P2b 钩子 | 强制 compact 后访问 |
+| B9 | 全值联合 int\|float\|bool | 安全 | 保留 std::variant | 现有用例回归 |
+| B10 | desc 压缩后各类型读取 | — | P2a 回归 desc() | 全类型 desc 回归 |
+| B11 | 激活变体不支持该调用 | 运行时崩溃 | switch default 抛 TypeError | 运行抛错用例（catch kind=="TypeError"）|
+| B12 | 多支持变体签名不同 | — | switch 按各变体签名分派 | 双变体分派用例 |
+| B13 | 返回类型合并为联合 | — | 调用点递归走 P3 联合链路 | 合并用例（`v[0]` 等）|
+| B14 | 成员访问多变体支持 | — | 编译错引导 match | 报错用例 |
+| B15 | 链式调用 | — | 返回联合时递归动态分派 | 链式用例 |
+| B16 | 全值联合动态分派 | — | P4 初始不覆盖，标注后续扩展 | 无（文档标注）|
+| B17 | 常量分组（含单常量） | 落 else（半成品） | GroupPattern 生成 `\|\|` 比较链 | 分组用例 |
+| B18 | 常量类型与联合变体不匹配 | 落 else | Sema 编译错 | 报错用例 |
+| B19 | 重复常量 | 落 else | Sema 编译错（对齐 duplicate case） | 报错用例 |
+| B20 | string 常量内容匹配 | 指针比较隐患 | `string_eq` 内容比较 | 拼接串匹配用例 |
+| B21 | None 常量（联合/非联合） | None 特例已覆盖 | 保留 + 适配 is\<I_None\> | 现有 + Variant 路径 |
+| B22 | 常量在类型模式之后（不可达） | — | Sema 警告 "unreachable" | 警告用例 |
+| B23 | float NaN 常量 | 恒 false | 文档标注 | 文档标注 |
+| B24 | 非联合值域无穷尽（无 `_`） | 默认穷尽 | 不报错（同 C++ switch） | 无 `_` 用例通过 |
+| B25 | 类型模式分组 | 不支持 | 报错引导分开写 | 报错用例 |
+
+---
+
+## 5. 实施顺序（合并编排）
+
+**第一阶段：变更 A（协程栈深度保护，独立、改动最小、最快消除栈溢出隐患）**
+
+1. 改 `runtime/task.h`：detail 命名空间加计数器/声明 + final_awaiter 改造（§1 A.1）。→ 验证：`cmake --build runtime/build` 通过。
+2. 改 `runtime/task.cpp`：加 `detail::scheduleOnEventLoop`（§1 A.2）。→ 验证：重建通过。
+3. 重建 runtime：`Normal_Test.ps1`（清 runtime/build → cmake → build）。→ 产物：`runtime/build/libaura_rt.a`。
+4. 长链验证：§6.1 chain(20000)。→ 预期输出 `chain 20000 OK`。
+5. 全量回归：`test.aura` → `ALL TESTS PASSED`。
+
+**第二阶段：变更 B（联合类型 GC 安全，按 P0→P2a→P2b→P1→P3a→P3b→P3c→P4→P5）**
+
+6. **B.0 P0**：SemAnalyzer 新增 `unionVariantGcUnsafe` + resolveType UnionType 分支报错。→ 验证：含堆联合报错、全值联合通过；test.aura 全量回归。
+7. **B.1 P2a**：types.h 字段压缩。→ 验证：全量重编 runtime + test.aura 回归 + `sizeof(TypeDescriptor)==48 && sizeof(InlineArrayField)==12` 静态断言（含 P2b 字段后为 48B）。
+8. **B.2 P2b**：TypeDescriptor 加 `dynamicDesc` + markFields/updateObjectFields/markInlineArrayFields/updateInlineArrayElements 钩子分支。→ 验证：GC/compact 压力测试 + ASAN。
+9. **B.3 P1**：实现 variant.h（Variant + kDescs + make_variant + is/get）。→ 验证：§6.2 用例。
+10. **B.4 P3a**：resolveType 折叠 `T|None`（含堆）→ OptionalSemType。→ 验证：编译产物为 Optional。
+11. **B.5 P3b**：mapType/mapSemType Union 分支 + genMatchStmt 适配 + try/catch varName 根保护 + 隐式装箱特判。→ 验证：test.aura + READMEs 示例全量。
+12. **B.6 P3c**：Generic 变体实例化后二次检查。→ 验证：`Tree<T>` 实例化为 `Tree<string>` 报错、全值实例化通过。
+13. **B.7 P4a（Sema 放宽）**：联合接收者方法查找在变体集合上进行 + 返回类型合并规则。→ 验证：单/多变体静态通过、无支持变体报错。
+14. **B.7 P4b（CodeGen 分派）**：genMethodCall 联合接收者分支（单变体检查直调 + 多变体 switch，default 抛 `make_type_error`）+ genIndexExpr 联合分支。→ 验证：§6.3 用例全量 + ASAN。
+15. **B.8 P5a（Parser/AST）**：GroupPattern + parsePattern `|` 分组（限常量）。→ 验证：解析 AST 打印正确。
+16. **B.8 P5b（Sema）**：checkMatchStmt 常量类型兼容/重复/可达性 + isMatchExhaustive GroupPattern 递归。→ 验证：报错/警告用例 + test.aura 回归。
+17. **B.8 P5c（CodeGen，std::variant 路径）**：genMatchStmt 常量/分组比较生成，修复半成品。→ 验证：§6.4 用例全量（全值联合 + 非联合）。
+18. **B.8 P5d（CodeGen，Variant 路径）**：含堆联合常量匹配生成 `is<I> && get<I> == 常量`。→ 验证：含堆联合常量匹配用例。
+
+**第三阶段：收尾**
+
+19. 全量回归 + READMEs/09/示例同步（P3/P5 破坏性变更）。
+20. 更新 TODO.txt 勾选两项 issue。
+
+**回滚**：
+- A 组：revert task.h/task.cpp 两处改动即可恢复；无数据迁移。
+- B 组：P0 独立可退（删报错逻辑）；P2a/P2b/P1 捆绑回退（desc 布局耦合）；P3 与文档同步回退；P4 独立回退（不影响 P0-P3）；P5 独立回退（不影响 P0-P4）。
+
+---
+
+## 6. 测试方案
+
+### 6.1 A 组长链压力测试（`example/` 手工 test.cpp）
+
+```cpp
+#include "../runtime/task.h"
+#include "../runtime/gc.h"
+#include <cstdio>
+
+aura_rt::task<void> chain(int n) {
+    if (n == 0) co_return;
+    co_await chain(n - 1);   // 对称转移，链长 = n
+}
+
+int main() {
+    auto t = chain(20000);
+    aura_rt::run_event_loop(t);
+    std::printf("chain 20000 OK\n");
+    return 0;
+}
+```
+
+验证步骤：先用当前未修复 runtime 编译运行 → 预期栈溢出崩溃（0xC00000FD 或 SIGSEGV）；修复后 → 输出 `chain 20000 OK`。
+
+**回归**：
+- 短链循环（链深 1 × 10 万次）：`task<void> noop() { co_return; }` + `for (int i = 0; i < 100000; ++i) co_await noop();`，断言输出不变（偶发调度不影响结果）。
+- B5 thread_local 验证：长链测试程序里打印 `&aura_rt::detail::g_chainDepth`，断言运行时地址唯一（MinGW UCRT64 静态库 + 可执行文件 inline thread_local 需实测合并行为；若分裂 → 改 `extern thread_local` + task.cpp 定义）。
+- `test.aura` 全量 `ALL TESTS PASSED`（含 try/catch + co_await、when_all、spawn）。
+
+### 6.2 B 组 P0-P3 测试
+
+- **P0**：报错 `Array<int> | string`、`User* | None`、`A* | int`、含 fun 变体 → 编译错误信息含"not GC-safe / Optional<T>"；放行 `int | float`、`int | None`（全值）、泛型定义 `Tree<T> | T`（未实例化）。
+- **P2a**：`sizeof(TypeDescriptor)==48`（含钩子）、`sizeof(InlineArrayField)==12` 静态断言；全量回归各类型 `desc()` 读取正确。
+- **P1/P2b**（example 手工 test.cpp）：`make_variant` 构造/`is<I>()`/`get<I>()` 正确性；分配后强制触发 GC（含 compact）再访问激活变体 → 值正确、无悬垂（ASAN）；Variant 作 record 字段 / Array 元素 GC 后正确；值变体激活时 GC 不误扫 storage_ 垃圾字节。
+- **P3**：`T | None`（含堆）编译产物为 `Optional<T>*`；match 含堆联合生成 `->is<I>()/->get<I>()`；try/catch 返回堆类型 varName 有 GcRootHandle 保护；全值联合 match 输出不变。
+
+### 6.3 B 组 P4 测试（test.aura 动态分派用例）
+
+- 单变体直调：`let v: int | [int] = [1,2]` 后 `v.append(3)` → 数组生效；
+- 双变体 switch：`string | [int]` 调 `len`（结果随激活变体不同）；
+- TypeError：激活为 int 时调 append → catch 捕获 `kind == "TypeError"`；
+- 索引分派：`v[0]` 返回元素；返回类型合并：`v.front()` 返回 `int | None` 的调用点走 P3 链路；
+- 成员访问多变体报编译错；链式调用；与协程组合（分派调用在 co_await 前后输出不变）。
+
+### 6.4 B 组 P5 测试（test.aura match 值模式用例）
+
+- int switch 风格分组 `1 | 2 | 3 => ..., _ => ...` 生效；
+- string 常量（含拼接串内容比较）；float 常量；
+- 联合混合：`int | string` 上类型 + 常量 + None 共存，按顺序匹配；
+- 重复常量 → 编译错；类型不匹配 → 编译错；常量在类型模式后 → unreachable 警告；
+- co_await 出现在常量分支体内；
+- P3 后：含堆联合（Variant 路径）常量匹配生成 `is<I> && get<I> == 常量`。
+
+---
+
+## 7. 风险与缓解
+
+| 风险 | 缓解 |
+| ---- | ---- |
+| A：`inline thread_local` 跨静态库/可执行文件单定义合并 | MinGW UCRT64 实测（§6.1 打印地址）；若分裂 → 改 `extern thread_local` + task.cpp 单点定义 |
+| A：偶发调度引入时序可观察差异 | 语义等价（就绪队列 FIFO，同线程）；阈值内无感知 |
+| A：计数归零与栈解开顺序耦合 | "只增不降"设计，避开递减冲突 |
+| A：`scheduleOnEventLoop` 抛异常越过 noexcept → terminate | 实现内 try/catch 吞掉 + stderr 日志（§1 A.2） |
+| B：per-变体 desc 仅覆盖单指针/POD 变体 | P0 同步禁 function/接口/嵌套联合；预留"变体引用内部 desc"通用扩展 |
+| B：Generic 变体放行后实例化含堆 → 运行时风险 | P3c 实例化二次检查闭环 |
+| B：P3 破坏性变更波及 READMEs | 与文档更新同 commit；全量回归 |
+| B：Sema 判定与 CodeGen isHeapSemType 口径漂移 | 已辨析（§B.0）：两者目的不同；对照测试断言 `isHeapSemType ⇒ unionVariantGcUnsafe` 锁定 |
+| B：narrowing 个别初始化点报错 | 全为编译期常量，理论上不触发；兜底显式 `static_cast<uint32_t>` |
+| B：动态分派稀释静态类型安全 | P4 独立交付；文档明确运行时 TypeError 语义；错误信息含类型名与期望方法 |
+| B：返回类型合并为联合的连锁 | Sema 复用 P3 联合链路；合并用例覆盖 |
+| B：switch 分派与 co_await 交互 | 分派 switch 在普通代码生成，co_await 仅出现于分支体内（match if/else 链已证可行） |
+| B：多变体签名兼容误判 | 参数按各变体签名逐个匹配；无法兼容的变体排除出支持集合 |
+| B：`\|` 分组与联合类型位或表达式歧义 | 分组仅在 parsePattern 内消费 `\|`（模式上下文），表达式上下文不受影响 |
+| B：常量落 else 的存量代码在 P5 后行为突变 | 这是修复而非破坏：常量分支从"永不生效"变"正确匹配"；文档/示例同步更新 |
+| B：string 常量比较误用指针 | 统一走 `string_eq`（内容比较），CodeGen 单一出口 |
+| B：GroupPattern 引入 AST/Walker 遍历遗漏 | 实现位置清单含 ASTPrinter/ASTWalker；回归跑 AST 打印 + 闭包捕获/协程扫描路径 |

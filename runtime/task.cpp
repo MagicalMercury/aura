@@ -20,6 +20,20 @@ namespace aura_rt {
 namespace { EventLoop g_eventLoop; }
 EventLoop& EventLoop::instance() { return g_eventLoop; }
 
+namespace detail {
+void scheduleOnEventLoop(std::coroutine_handle<> h) {
+    try {
+        EventLoop::instance().schedule(h);
+    } catch (...) {
+        // EventLoop::schedule 内 std::queue::push 可能抛 std::bad_alloc。
+        // await_suspend 是 noexcept（C++ 协程要求），异常必须在此吞掉，
+        // 否则越过 noexcept → std::terminate（比栈溢出更恶劣）。
+        // 吞掉后该 continuation 暂时不调度（任务丢弃）——OOM 场景下的降级行为。
+        std::fprintf(stderr, "[aura_rt] scheduleOnEventLoop: schedule failed (OOM), coroutine dropped\n");
+    }
+}
+} // namespace detail
+
 void EventLoop::schedule(std::coroutine_handle<> cont) {
     std::lock_guard<std::mutex> lk(ready_m_);
     ready_.push(cont);

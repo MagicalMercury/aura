@@ -64,6 +64,18 @@ struct WildcardPattern : Pattern {
     }
 };
 
+// P5：`|` 分组模式（Rust 风格，C++ switch 多 case 合并语义）
+// 仅常量模式允许分组（Parser 拦截类型模式分组），语义 = 任一 alt 匹配即命中
+struct GroupPattern : Pattern {
+    std::vector<std::unique_ptr<Pattern>> alts;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<Pattern> clone() const override {
+        auto n = std::make_unique<GroupPattern>();
+        for (auto& a : alts) n->alts.push_back(a ? a->clone() : nullptr);
+        return n;
+    }
+};
+
 // ============================================================
 // Stmt ─ 语句节点
 // ============================================================
