@@ -86,6 +86,10 @@ struct FuncSemType : SemType {
 
 struct InterfaceSemType : SemType {
     std::string name;
+    // 泛型接口实例化实参（如 Comparable<Point> 的 [Point]）；非泛型接口为空。
+    // P2b：union 变体为泛型接口视图时，mapSemType 需要实参生成完整 C++ 类型名
+    // （Comparable<Point*>），否则生成裸模板名 "Comparable" 无法编译。
+    std::vector<std::unique_ptr<SemType>> typeArgs;
     // 方法签名列表（在定义接口时填充）
     struct MethodSig {
         std::string name;

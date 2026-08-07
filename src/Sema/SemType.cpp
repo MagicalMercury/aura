@@ -178,11 +178,22 @@ bool InterfaceSemType::equals(const SemType& other) const {
     return true;
 }
 std::string InterfaceSemType::toString() const {
-    return "interface " + name;
+    std::string s = "interface " + name;
+    if (!typeArgs.empty()) {
+        s += "<";
+        for (size_t i = 0; i < typeArgs.size(); ++i) {
+            if (i > 0) s += ", ";
+            s += typeArgs[i] ? typeArgs[i]->toString() : "?";
+        }
+        s += ">";
+    }
+    return s;
 }
 std::unique_ptr<SemType> InterfaceSemType::clone() const {
     auto n = std::make_unique<InterfaceSemType>();
     n->name = name;
+    for (auto& a : typeArgs)
+        n->typeArgs.push_back(a ? a->clone() : nullptr);
     for (auto& m : methods) {
         MethodSig ms;
         ms.name = m.name;
@@ -201,7 +212,13 @@ std::unique_ptr<SemType> InterfaceSemType::clone() const {
 // ============================================================
 bool GenericSemType::equals(const SemType& other) const {
     auto* o = dynamic_cast<const GenericSemType*>(&other);
-    return o && o->name == name;
+    if (!o || o->name != name) return false;
+    // P0.5 精确化：两者均解析出具体 C++ 名时（Iterator<int32_t> vs Iterator<std::string>）
+    // 必须比较 resolvedName，防止同名不同实参的类型混淆；
+    // 任一未解析（泛型形参 T）时退化为只比 name（泛型函数体内行为不变）
+    if (!resolvedName.empty() && !o->resolvedName.empty())
+        return resolvedName == o->resolvedName;
+    return true;
 }
 std::string GenericSemType::toString() const {
     if (!resolvedName.empty()) return resolvedName;

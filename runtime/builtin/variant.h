@@ -19,9 +19,23 @@
 #include <algorithm>         // std::max({...}) initializer_list 版本
 #include <cstring>
 #include <tuple>
+#include <type_traits>       // is_pointer_v, void_t, enable_if_t, is_convertible_v
 #include <utility>
 
 namespace aura_rt {
+
+// 检测 T 是否为接口视图（含 GcObject* self 字段的值类型视图，如 Stringer / Iterator<T>）
+// P2b：Variant 变体为接口视图时，storage_ 起始 + 视图内 self 子偏移 = 有效 GC 指针
+template <typename T, typename = void>
+struct is_iface_view : std::false_type {};
+template <typename T>
+struct is_iface_view<T, std::void_t<
+    decltype(std::declval<T&>().self),
+    std::enable_if_t<std::is_convertible_v<
+        decltype(std::declval<T&>().self), GcObject*>>
+>> : std::true_type {};
+template <typename T>
+inline constexpr bool is_iface_view_v = is_iface_view<T>::value;
 
 template <typename... Ts>
 struct Variant : GcObject {
@@ -48,12 +62,19 @@ struct Variant : GcObject {
     }
 
     // per-变体 desc：指针变体 { sizeof(Variant), 1, &kStorageOffset }；
-    //                值变体   { sizeof(Variant), 0, nullptr }
+    //                接口视图变体 { sizeof(Variant), 1, &(kStorageOffset + offsetof(T, self)) }；
+    //                值变体     { sizeof(Variant), 0, nullptr }
     template <size_t I>
     static const TypeDescriptor& descForI() {
         using T = std::tuple_element_t<I, std::tuple<Ts...>>;
         if constexpr (std::is_pointer_v<T>) {
             static const size_t offs[] = { kStorageOffset };
+            static const TypeDescriptor d = { sizeof(Variant<Ts...>), 1, offs, 0, nullptr, nullptr };
+            return d;
+        } else if constexpr (is_iface_view_v<T>) {
+            // 接口视图变体：storage_ 起始 + 视图内 self 子偏移 = GC 指针
+            // （与 genRecordStruct 的 "field+ViewType" 复合偏移同型）
+            static const size_t offs[] = { kStorageOffset + offsetof(T, self) };
             static const TypeDescriptor d = { sizeof(Variant<Ts...>), 1, offs, 0, nullptr, nullptr };
             return d;
         } else {

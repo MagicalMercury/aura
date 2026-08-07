@@ -99,6 +99,32 @@ std::string CodeGenerator::genUnionBoxing(const UnionSemType& u,
     return genUnionBoxingImpl(cppTypes, init, isCoroutine);
 }
 
+// record → 接口视图适配器 view() 预转换 IIFE（提取自 genLetStmt §3.10，供其与 genUnionBoxingImpl 共用）
+// 生成：
+//   [&]() -> auto {
+//     RecName* _ar = (expr);
+//     aura_rt::GcRootHandle<RecName*> _ah(_ar);
+//     auto* _ad = aura_rt::gcConstruct<RecNameIface>(&RecNameIface::desc(), _ah.get());
+//     return RecNameIface::view(_ad);
+//   }()
+std::string CodeGenerator::genRecordToViewIIFE(const std::string& expr,
+                                               const std::string& recName,
+                                               const std::string& viewCppType) {
+    // viewCppType → 接口基名（去模板参数，如 "Comparable<Point*>" → "Comparable"），
+    // 用于拼适配器名 safeName(recName) + 基名（与 genIfaceAdapter 的 adapterName 一致）
+    std::string ifaceBaseName = viewCppType;
+    size_t lt = ifaceBaseName.find('<');
+    if (lt != std::string::npos) ifaceBaseName = ifaceBaseName.substr(0, lt);
+    std::string adName = safeName(recName) + ifaceBaseName;
+    return "[&]() -> auto {\n"
+           "    " + recName + "* _ar = (" + expr + ");\n"
+           "    aura_rt::GcRootHandle<" + recName + "*> _ah(_ar);\n"
+           "    auto* _ad = aura_rt::gcConstruct<" + adName
+           + ">(&" + adName + "::desc(), _ah.get());\n"
+           "    return " + adName + "::view(_ad);\n"
+           "  }()";
+}
+
 std::string CodeGenerator::genUnionBoxingImpl(
     const std::vector<std::string>& cppTypes,
     const ASTNode& init, bool isCoroutine) {
@@ -111,30 +137,80 @@ std::string CodeGenerator::genUnionBoxingImpl(
             if (cppTypes[k] == initCpp) { idx = static_cast<int>(k); break; }
         }
     }
+    // 缺口 2 修复：idx 匹配失败但 init 是 record 且某变体是接口视图
+    // → record→适配器 view() 预转换后装箱（复用 genRecordToViewIIFE）
+    std::string viewCppType;
+    if (idx < 0 && init.inferredType
+        && dynamic_cast<const RecordSemType*>(init.inferredType)) {
+        for (size_t k = 0; k < cppTypes.size(); ++k) {
+            if (isIfaceViewTypeName(cppTypes[k])) {
+                viewCppType = cppTypes[k];
+                idx = static_cast<int>(k);
+                break;
+            }
+        }
+    }
     if (idx < 0) return "";  // 未匹配（联合值直接赋值 / Sema 应已报错）
 
-    std::string expr = genExpr(init, isCoroutine);
+    std::string expr;
+    bool isIfaceViewVariant = isIfaceViewTypeName(cppTypes[idx]);
+    if (!viewCppType.empty()) {
+        // 缺口 2：record→适配器 view() 预转换（先生成 record 指针表达式，再包 IIFE）
+        auto* rt = dynamic_cast<const RecordSemType*>(init.inferredType);
+        expr = genRecordToViewIIFE(genExpr(init, isCoroutine), rt->canonicalName, viewCppType);
+    } else {
+        expr = genExpr(init, isCoroutine);
+    }
+
     int bid = unionBoxingCounter_++;
     bool initIsHeap = isHeapSemType(init.inferredType);
     std::ostringstream oss;
     oss << "[&]() -> auto {\n";
     oss << "    auto _bx" << bid << " = (" << expr << ");\n";
-    if (initIsHeap)
+    if (isIfaceViewVariant) {
+        // 缺口 1 修复：接口视图变体用 ViewRoot 包裹（保护 self，不破坏视图）
+        // ViewRoot 内部 GcRootHandle<GcObject*> 持 _bx.self（正确的 GC 指针）；
+        // 不能用 GcRootHandle<视图值>——compact 会把视图值前 8 字节（函数指针）当指针覆写
+        oss << "    aura_rt::ViewRoot<decltype(_bx" << bid << ")> _vr" << bid
+            << "(_bx" << bid << ", aura_rt::GcRootScope::ThreadLocal);\n";
+        oss << "    auto* _mv" << bid << " = aura_rt::make_variant<";
+        for (size_t k = 0; k < cppTypes.size(); ++k) {
+            if (k > 0) oss << ", ";
+            oss << cppTypes[k];
+        }
+        // 先 memcpy 视图值（fn 字段不受 GC 影响），再覆写 self：
+        // make_variant 内部 alloc 窗口若触发 compact，_bx.self（栈上裸指针）
+        // 已悬垂，用 _vr.h.get()（GcRootHandle 由 GC 更新）取最新适配器地址
+        oss << ">(" << idx << ", &_bx" << bid << ");\n";
+        oss << "    _mv" << bid << "->get<" << idx << ">().self = _vr" << bid << ".h.get();\n";
+        oss << "    return _mv" << bid << ";\n";
+    } else if (initIsHeap) {
+        // 原路径：普通堆值用 GcRootHandle<T> 包裹
         oss << "    aura_rt::GcRootHandle<decltype(_bx" << bid << ")> _bhx"
             << bid << "(_bx" << bid << ");\n";
-    oss << "    return aura_rt::make_variant<";
-    for (size_t k = 0; k < cppTypes.size(); ++k) {
-        if (k > 0) oss << ", ";
-        oss << cppTypes[k];
+        oss << "    return aura_rt::make_variant<";
+        for (size_t k = 0; k < cppTypes.size(); ++k) {
+            if (k > 0) oss << ", ";
+            oss << cppTypes[k];
+        }
+        oss << ">(" << idx << ", &_bhx" << bid << ".get());\n";
+    } else {
+        // 值/指针裸值：直接取地址
+        oss << "    return aura_rt::make_variant<";
+        for (size_t k = 0; k < cppTypes.size(); ++k) {
+            if (k > 0) oss << ", ";
+            oss << cppTypes[k];
+        }
+        oss << ">(" << idx << ", &_bx" << bid << ");\n";
     }
-    // 堆值：经 GcRootHandle 解引用取最新指针（GC compact 后更新）；值/指针裸值：直接取地址
-    oss << ">(" << idx << ", &" << (initIsHeap ? "_bhx" : "_bx")
-        << bid << (initIsHeap ? ".get()" : "") << ");\n";
     oss << "  }()";
     return oss.str();
 }
 
 void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
+    // P1：非空 = 视图 let（接口视图 / 迭代器视图）→ 值绑定 + ViewRoot 包裹
+    // 视图含 GC 指针 self，compact 不重写栈上裸指针，必须注册 self 为 GcRootHandle
+    std::string viewRootType;
     std::string type;
     if (decl.type) {
         type = mapType(*decl.type);
@@ -151,7 +227,11 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                 type = rs->canonicalName + "*";
         } else if (auto* gs = dynamic_cast<const GenericSemType*>(decl.inferredType)) {
             if (!gs->resolvedName.empty()) {
-                type = gs->resolvedName + "*";
+                // 内置 Iterator：resolvedName 即值视图类型（aura_rt::Iterator<T>，无 *）；
+                // 其余泛型（Channel 等）是堆指针，追加 *
+                type = (gs->name == "Iterator") ? gs->resolvedName
+                                                : gs->resolvedName + "*";
+                if (gs->name == "Iterator") viewRootType = type;   // P1：迭代器视图 → ViewRoot
             } else if (auto* ti = BuiltinRegistry::get().findType(gs->name)) {
                 // BuiltinPrim::Other 类型无显式类型标注时（如 let m = sync.Mutex()）
                 // 用 BuiltinRegistry.cppType（如 "aura_rt::Mutex*"）
@@ -310,8 +390,42 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
 
     std::string varName = safeName(decl.name);
 
-    // GC 指针类型 → 包装为 GcRootHandle，注册为 GC 根
-    if (isGcPointerType(type) && !init.empty()) {
+    // P1：接口视图类型 let 绑定（let s: Stringer = rec / let c: Comparable<Point> = p）
+    // init 为 record 指针 → IIFE gcConstruct 适配器 + view()；
+    // 接口变量透传（init 已是视图）→ 直接赋值，不包装
+    if (decl.type && !init.empty()) {
+        if (dynamic_cast<const NamedType*>(decl.type.get())) {
+            if (isIfaceViewTypeName(mapType(*decl.type))) {
+                if (decl.initializer
+                    && dynamic_cast<const RecordSemType*>(decl.initializer->inferredType)) {
+                    auto* rt = dynamic_cast<const RecordSemType*>(decl.initializer->inferredType);
+                    // 复用提取出的公共方法（原内联 IIFE，行为一致）
+                    init = genRecordToViewIIFE(init, rt->canonicalName, mapType(*decl.type));
+                }
+                // 接口视图变量：成员访问用 "."（.to_string()/.less() 等）
+                valueTypeVarNames_.insert(varName);
+                viewRootType = type;   // P1：接口视图 → ViewRoot 包裹（self 跨 GC 保护）
+            }
+        }
+    }
+    // 无类型标注的接口视图 let（let g = make_greeting()，inferredType 为 InterfaceSemType）：
+    // 同样注册 valueTypeVarNames_，保证 g.greet() 用 "." 访问
+    if (!decl.type && decl.inferredType) {
+        if (auto* is = dynamic_cast<const InterfaceSemType*>(decl.inferredType)) {
+            valueTypeVarNames_.insert(varName);
+            viewRootType = is->name;   // P1：接口视图 → ViewRoot 包裹
+        }
+    }
+
+    // P1：视图 let（接口视图 / 迭代器视图）→ 值绑定 raw + ViewRoot 包裹
+    // 视图含 self 裸指针，GC compact 不重写栈上指针，ViewRoot 内 GcRootHandle<GcObject*>
+    // 在 GC 时被更新（updateAllReferences 步骤 1），get() 重建视图取最新 self
+    if (!viewRootType.empty() && !init.empty()) {
+        writeLine(cpp, viewRootType + " " + varName + "_raw = " + init + ";");
+        writeLine(cpp, "aura_rt::ViewRoot<" + viewRootType + "> " + varName + "(" + varName + "_raw);");
+        viewRootVarNames_.insert(varName);
+        viewRootTypes_[varName] = viewRootType;   // P2b：闭包捕获转 Global ViewRoot 用
+    } else if (isGcPointerType(type) && !init.empty()) {
         writeLine(cpp, type + " " + varName + "_raw = " + init + ";");
         writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + varName + "(" + varName + "_raw);");
         gcRootVarNames_.insert(varName);
@@ -642,20 +756,30 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
         std::string itExpr = genExpr(*stmt.iterable, isCoroutine);
         cpp << indentStr() << "{\n";
         indentLevel_++;
-        // record impl：包一层适配器（持 GcRootHandle<Rec*>，GC compact 安全）
-        bool recAdapter = false;
+        // record impl：GC 化适配器（desc 扫描 owner，GC compact 安全）+ view → 值视图
+        //（IIFE 先 root record 指针：gcConstruct 内 alloc 可能触发 GC）
         if (auto* r = dynamic_cast<const RecordSemType*>(stmt.iterable->inferredType)) {
             std::string recName = r->canonicalName;
-            writeLine(cpp, "auto _it = " + safeName(recName) + "Iterator(" + itExpr + ");");
-            recAdapter = true;
+            std::string adName = safeName(recName) + "Iterator";
+            writeLine(cpp, "auto _it_raw = [&]() -> auto {");
+            writeLine(cpp, "    " + recName + "* _ar = (" + itExpr + ");");
+            writeLine(cpp, "    aura_rt::GcRootHandle<" + recName + "*> _ah(_ar);");
+            writeLine(cpp, "    auto* _ad = aura_rt::gcConstruct<" + adName
+                      + ">(&" + adName + "::desc(), _ah.get());");
+            writeLine(cpp, "    return " + adName + "::view(_ad);");
+            writeLine(cpp, "  }();");
         } else {
-            writeLine(cpp, "auto _it = " + itExpr + ";");
+            // 内置迭代器：表达式即值视图（make_range/make_map/make_filter/视图变量）
+            writeLine(cpp, "auto _it_raw = " + itExpr + ";");
         }
+        // P1：迭代器视图含 self 裸指针，循环体内 alloc/gc_safepoint 可能触发 GC compact，
+        //     compact 不重写栈上裸指针 → ViewRoot 注册 self 为 GcRootHandle，
+        //     循环内每次 _it.get() 重建视图取最新 self（与 iter_gc_test 手动 ViewRoot 同机制）
+        writeLine(cpp, "aura_rt::ViewRoot<decltype(_it_raw)> _it(_it_raw);");
         cpp << indentStr() << "while (true) {\n";
         indentLevel_++;
-        // record 适配器是栈值对象（.next()）；内置迭代器是指针（->next()）
-        writeLine(cpp, "auto _opt = " + std::string(recAdapter ? "_it." : "_it->")
-                       + "next();");
+        // 视图统一用 .next()（值视图 {nextFn, self}；self 经 ViewRoot 保护）
+        writeLine(cpp, "auto _opt = _it.get().next();");
         writeLine(cpp, "if (_opt->is_none()) break;");
         writeLine(cpp, "auto " + var + " = _opt->unwrap();");
         if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
@@ -1539,6 +1663,9 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
     const SemType* mt = stmt.expr ? stmt.expr->inferredType : nullptr;
     bool isVariantPtr = false;   // aura_rt::Variant<T...>*
     bool isOptional   = false;   // aura_rt::Optional<T>*
+    std::string elemCppType;                 // Optional 元素 C++ 类型（步骤 5 用）
+    bool elemIsHeap = false;                 // Optional 元素是否为堆类型（步骤 5 用）
+    std::vector<std::string> gcTmpVars;      // 本分支临时注册的 GC 根变量名（步骤 4/5 注册、步骤 6 清理）
     std::vector<std::string> variantCppTypes;  // 各变体 C++ 类型（索引对应；std::variant 与 Variant 路径共用）
     if (auto* u = dynamic_cast<const UnionSemType*>(mt)) {
         for (auto& v : u->variants) {
@@ -1547,6 +1674,14 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
         }
     } else if (dynamic_cast<const OptionalSemType*>(mt)) {
         isOptional = true;
+        // 步骤 5：提取 Optional 元素堆判定（binding 保护用）
+        // isHeapSemType 为成员函数：定义于 ExprGen.cpp L12，声明于 CodeGen.h L257（跨文件调用无障碍）
+        if (auto* os = dynamic_cast<const OptionalSemType*>(mt)) {
+            elemCppType = mapSemType(*os->elementType);
+            elemIsHeap = isHeapSemType(os->elementType.get());
+            if (!elemIsHeap && !elemCppType.empty() && elemCppType.back() == '*')
+                elemIsHeap = true;  // C++ 名以 * 结尾回退判定
+        }
     }
 
     // 使用 if/else 链代替 std::visit，以正确支持 co_await
@@ -1554,7 +1689,15 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
     // 改用 std::holds_alternative + std::get 替代方案
     cpp << indentStr() << "{\n";
     indentLevel_++;
-    writeLine(cpp, "auto&& _match_val = " + expr + ";");
+    if (isVariantPtr || isOptional) {
+        // 与 genLetStmt L428-432 / genUnionBoxingImpl L189-190 对齐：Ref 模式（T& 构造）
+        // GC compact 经 ptr_ref_ 直接更新 _match_val 变量本身，后续 _match_val->... 拼接零改动
+        writeLine(cpp, "auto _match_val = " + expr + ";");
+        writeLine(cpp, "aura_rt::GcRootHandle<decltype(_match_val)> _match_rh(_match_val);");
+    } else {
+        // 全值 std::variant / 普通类型：无 GC 指针跨栈窗口，保持现状 auto&&（避免拷贝）
+        writeLine(cpp, "auto&& _match_val = " + expr + ";");
+    }
 
     // P5：常量匹配条件生成（联合/含堆 Variant/Optional 路径先判定变体再比值；非联合直接比较）
     auto genConstCond = [&](const ASTNode* lit) -> std::string {
@@ -1620,6 +1763,9 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
     for (size_t i = 0; i < stmt.cases.size(); ++i) {
         auto& c = stmt.cases[i];
         std::string branchIntro = (i > 0) ? "} else " : "";
+        // P2b：本 case 临时注册的视图分支变量名（接口视图分支 ViewRoot 绑定，
+        // 分支体生成完毕后 viewRootVarNames_.erase 移除，见循环末尾）
+        std::string viewTmpVar;
 
         if (auto* tp = dynamic_cast<const TypePattern*>(c.pattern.get())) {
             std::string cppType = mapNamedType(tp->typeName);
@@ -1632,16 +1778,65 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
                     if (variantCppTypes[k] == cppType) { idx = static_cast<int>(k); break; }
                 if (idx >= 0) {
                     cond = "_match_val->is<" + std::to_string(idx) + ">()";
-                    if (!tp->varName.empty())
-                        binding = "auto& " + safeName(tp->varName) +
-                                  " = _match_val->get<" + std::to_string(idx) + ">();";
+                    if (!tp->varName.empty()) {
+                        std::string varName = safeName(tp->varName);
+                        if (isIfaceViewTypeName(cppType)) {
+                            // 缺口 3 修复：接口视图变体分支用 ViewRoot 包裹绑定值
+                            // ViewRoot 持 self（适配器指针），分支体内 alloc 触发 GC 时
+                            // self 由 GcRootHandle 更新（compact 后 .get() 取最新地址）
+                            binding = "auto " + varName + "_raw = _match_val->get<"
+                                    + std::to_string(idx) + ">();"
+                                    + " aura_rt::ViewRoot<" + cppType + "> " + varName + "("
+                                    + varName + "_raw, aura_rt::GcRootScope::ThreadLocal);";
+                            // 分支体内访问 varName 走 .get()：临时注册，分支体结束后移除
+                            viewRootVarNames_.insert(varName);
+                            // 视图是值类型（成员访问用 "."，genMethodCall 靠此判定）
+                            valueTypeVarNames_.insert(varName);
+                            viewTmpVar = varName;
+                        } else {
+                            // 步骤 4：值拷贝到独立栈变量 +（堆指针变体）GcRootHandle Ref 模式包裹
+                            // 原 auto& 为 Variant storage 槽位引用，分支体内 alloc 后悬垂；
+                            // varName_raw 为独立栈变量（get 返回 T&，auto 拷贝为 T 值），
+                            // varName 句柄经 ptr_ref_ 引用之 → compact 更新 varName_raw 本体，
+                            // genIdentifier 对 varName 生成 .get()（与函数参数 _raw 模式一致）
+                            std::string rawName = varName + "_raw";
+                            binding = "auto " + rawName + " = _match_val->get<"
+                                      + std::to_string(idx) + ">();";
+                            if (isGcPointerType(cppType)) {
+                                binding += " aura_rt::GcRootHandle<decltype(" + rawName
+                                           + ")> " + varName + "(" + rawName + ");";
+                                gcRootVarNames_.insert(varName);
+                                gcRootTypes_[varName] = "decltype(" + rawName + ")";
+                                gcTmpVars.push_back(varName);
+                            } else {
+                                // 值类型变体：仅拷贝（无 GC 指针，无需包裹）
+                                binding = "auto " + varName + " = _match_val->get<"
+                                          + std::to_string(idx) + ">();";
+                            }
+                        }
+                    }
                 } else {
                     cond = "false";  // 类型模式与任何变体不匹配（Sema 应已拦截）
                 }
             } else if (isOptional) {
                 cond = "!_match_val->is_none()";
-                if (!tp->varName.empty())
-                    binding = "auto " + safeName(tp->varName) + " = _match_val->unwrap();";
+                if (!tp->varName.empty()) {
+                    // 步骤 5：值拷贝到独立栈变量 +（堆元素）GcRootHandle Ref 模式包裹
+                    // 原裸指针拷贝在分支体内 alloc 后悬垂；值元素仅拷贝不包裹
+                    std::string varName = safeName(tp->varName);
+                    if (elemIsHeap) {
+                        std::string rawName = varName + "_raw";
+                        binding = "auto " + rawName + " = _match_val->unwrap();"
+                                + " aura_rt::GcRootHandle<decltype(" + rawName
+                                + ")> " + varName + "(" + rawName + ");";
+                        gcRootVarNames_.insert(varName);
+                        gcRootTypes_[varName] = "decltype(" + rawName + ")";
+                        gcTmpVars.push_back(varName);
+                    } else {
+                        // 值元素：仅拷贝（无 GC 指针，无需包裹）
+                        binding = "auto " + varName + " = _match_val->unwrap();";
+                    }
+                }
             } else if (mt && dynamic_cast<const UnionSemType*>(mt)) {
                 // 全值联合（std::variant 路径）：holds_alternative / get
                 cond = "std::holds_alternative<" + cppType + ">(_match_val)";
@@ -1690,6 +1885,19 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
                 writeLine(cpp, bodyExpr + ";");
             }
         }
+
+        // P2b：接口视图分支的临时 viewRootVarNames_ 注册，分支体生成完毕后移除
+        // （嵌套闭包捕获 varName 的分支体内仍能查到，走 genFunExpr 的 Global 转换）
+        if (!viewTmpVar.empty()) {
+            viewRootVarNames_.erase(viewTmpVar);
+            valueTypeVarNames_.erase(viewTmpVar);
+        }
+        // 步骤 4/5：清理本分支临时注册的 GC 根（成对 erase 两个集合，防泄漏）
+        for (auto& v : gcTmpVars) {
+            gcRootVarNames_.erase(v);
+            gcRootTypes_.erase(v);
+        }
+        gcTmpVars.clear();
 
         indentLevel_--;
     }

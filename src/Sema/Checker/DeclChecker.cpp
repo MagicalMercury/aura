@@ -5,12 +5,18 @@
 namespace Aura {
 
 // P3b 后：Variant<T...> 存储不支持的类型——function（std::function 值）、
-// 接口（抽象类值）、嵌套联合（未扁平化）。这些无法安全放入 Variant storage_，
-// 仍由 P0 报错拦截；其余含堆变体（string/record/list/optional）已由 Variant 支持放行。
+// 嵌套联合（未扁平化）。这些无法安全放入 Variant storage_，
+// 仍由 P0 报错拦截；其余含堆变体（string/record/list/optional/接口视图）
+// 已由 Variant 支持放行（接口视图：P2b 后 descForI 按 self 子偏移扫描 + ViewRoot 保护）。
 static bool variantStorageUnsafe(const SemType& t) {
     if (dynamic_cast<const FuncSemType*>(&t))     return true;
-    if (dynamic_cast<const InterfaceSemType*>(&t)) return true;
     if (dynamic_cast<const UnionSemType*>(&t))    return true;
+    // P0.4：内置迭代器（GenericSemType "Iterator"）联合变体编译期拦截。
+    // 视图含 GC 指针 self，Variant storage_ 内 union 无法注册子偏移供 GC 扫描/compact
+    // 更新（B+W 落地前视图实现为值类型，isPtrActive 不支持子偏移）→ 一律拦截。
+    // B+W 落地后重新评估（见 plan 迭代器GC安全修复 §10.4）
+    if (auto* g = dynamic_cast<const GenericSemType*>(&t))
+        if (g->name == "Iterator") return true;
     return false;
 }
 
@@ -158,9 +164,36 @@ void SemAnalyzer::verifyImplCompleteness(const Program& program) {
                 if (m.hasDefault || m.hasCppImpl) continue;  // 默认方法 / C++ 桥接豁免
                 bool found = false;
                 if (tmIt != typeMethods_.end()) {
+                    // 泛型接口签名代换（与 checkInterfaceImpl 一致）：用 impl 的类型实参
+                    // 替换接口签名中的形参（如 Iterator<T> 的 next() -> Optional<T> → int），
+                    // 否则 Optional<T> 与 Optional<int32_t> 经 P0.5 equals 精确比较不等 → 误报"未实现"
+                    const MethodDecl* argAnchor = nullptr;
+                    for (auto& d : program.decls) {
+                        if (auto* md = dynamic_cast<const MethodDecl*>(d.get())) {
+                            if (md->implInterface == ifaceName && !md->receiverType.empty()
+                                && recordTypeKey(md->receiverType) == recKey) {
+                                argAnchor = md;
+                                break;
+                            }
+                        }
+                    }
+                    auto substIface = [&](const SemType& t) -> std::unique_ptr<SemType> {
+                        std::unique_ptr<SemType> cur = t.clone();
+                        if (!argAnchor) return cur;
+                        for (size_t k = 0; k < sym->typeParams.size()
+                                          && k < argAnchor->implTypeArgs.size(); ++k) {
+                            auto concrete = resolveType(*argAnchor->implTypeArgs[k]);
+                            cur = substitute(*cur, sym->typeParams[k], *concrete);
+                        }
+                        return cur;
+                    };
                     for (auto& rm : tmIt->second) {
                         if (rm.name != m.name) continue;
-                        found = matchFuncSig(m.paramTypes, m.returnType.get(), m.throws,
+                        std::vector<std::unique_ptr<SemType>> ifaceParams;
+                        for (auto& p : m.paramTypes)
+                            ifaceParams.push_back(p ? substIface(*p) : nullptr);
+                        auto ifaceRet = m.returnType ? substIface(*m.returnType) : nullptr;
+                        found = matchFuncSig(ifaceParams, ifaceRet.get(), m.throws,
                                              rm.paramTypes, rm.returnType.get(), rm.throws);
                         break;
                     }
@@ -339,6 +372,13 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
                 // 用户自定义泛型：applyTypeArgs 替换形参为实参 + materializeCanonicalName
                 result = applyTypeArgs(std::move(result), *sym, n->typeArgs);
                 materializeCanonicalName(result, *n);
+            } else if (auto* is = dynamic_cast<InterfaceSemType*>(result.get())) {
+                // 泛型接口实例化（如 Comparable<Point>）：resolveNamedType 返回
+                // InterfaceSemType（name 仅基名），此处填充 typeArgs 供 CodeGen
+                // mapSemType 生成完整 C++ 类型名（Comparable<Point*>）。
+                // 实参数与接口 typeParams 一致性由 DeclChecker 接口声明阶段检查。
+                for (auto& a : n->typeArgs)
+                    is->typeArgs.push_back(a ? resolveType(*a) : ErrorSemType::make());
             } else {
                 // 内置泛型（如 sync.Channel<int> / channel<int>）：result 为 GenericSemType
                 // 无 typeParams 可替换，仅设置 resolvedName 供 CodeGen / for-in 提取元素类型

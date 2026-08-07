@@ -15,18 +15,38 @@ bool CodeGenerator::isHeapSemType(const SemType* type) const {
         return p->kind == PrimSemType::String;
     if (dynamic_cast<const NoneSemType*>(type)) return false;
     if (dynamic_cast<const ErrorSemType*>(type)) return false;
-    // 接口/函数类型不是 GC 堆对象：
-    //   - 接口是抽象类，按 const& 传递，不归 GC 管理
-    //   - std::function 是 C++ RT 对象，不在 GC 堆中
-    // 两者若误判为 heap，genGcRootedArgs 会生成 auto 值拷贝（接口是抽象类→编译失败）
-    if (dynamic_cast<const InterfaceSemType*>(type)) return false;
+    // P1：接口语义类型按堆处理——接口值是"值视图 + 堆适配器"复合形态，视图含
+    // GC 指针 self。接收者保护/字段赋值等场景需要 GC 参与决策；
+    // 具体传参包装由 genGcRootedArgs 的视图排他判定（isIfaceView）另行排除。
+    // std::function 是 C++ RT 值，不在 GC 堆中，恒非堆。
+    if (dynamic_cast<const InterfaceSemType*>(type)) return true;
     if (dynamic_cast<const FuncSemType*>(type)) return false;
+    // 内置 Iterator：值视图（{nextFn, self}，16B），非 GC 堆对象。
+    // 视图不能被 GcRootHandle<View> 包裹（视图非指针，模板参数不成立），
+    // self 由保守栈扫描 / 视图字段 desc 子偏移（genTypeDescriptor）保护。
+    // 误判为 heap 会在 record 字段赋值/传参处生成 GcRootHandle<Iterator<T>> → 编译失败
+    if (auto* g = dynamic_cast<const GenericSemType*>(type))
+        if (g->name == "Iterator") return false;
     if (auto* u = dynamic_cast<const UnionSemType*>(type)) {
         for (auto& v : u->variants)
             if (isHeapSemType(v.get())) return true;
         return false;
     }
     return true;
+}
+
+// P1：视图类型判定（值视图 { 函数指针, self }，非 GC 堆对象）
+//   - 内置 Iterator<T>（GenericSemType "Iterator"）
+//   - 接口视图（InterfaceSemType：Stringer/Comparable/用户接口）
+// 视图不能被 GcRootHandle<View> 包裹（视图非指针，模板参数不成立），
+// 传参/包装时按非堆值处理，self 由保守栈扫描 / 视图字段 desc 子偏移保护。
+static bool isIfaceView(const SemType* t) {
+    if (!t) return false;
+    if (auto* g = dynamic_cast<const GenericSemType*>(t))
+        return g->name == "Iterator";
+    if (dynamic_cast<const InterfaceSemType*>(t))
+        return true;
+    return false;
 }
 
 // ============================================================
@@ -50,7 +70,7 @@ std::string CodeGenerator::genGcRootedArgs(
     bool hasHeap = false;
     bool hasArgAwait = false;
     for (auto& [e, type] : args) {
-        if (isHeapSemType(type)) hasHeap = true;
+        if (isHeapSemType(type) && !isIfaceView(type)) hasHeap = true;
         // Bug 2-C: 参数表达式顶层带 co_await（协程闭包调用作为实参）
         if (e.compare(0, coAwaitKw.size(), coAwaitKw) == 0) hasArgAwait = true;
     }
@@ -79,7 +99,7 @@ std::string CodeGenerator::genGcRootedArgs(
     for (size_t i = 0; i < args.size(); ++i) {
         auto& [argExpr, type] = args[i];
         std::string vi = "_a" + std::to_string(hid) + "_" + std::to_string(i);
-        bool isHeap = isHeapSemType(type);
+        bool isHeap = isHeapSemType(type) && !isIfaceView(type);
         // Bug 2-C: 参数顶层 co_await 不能出现在推导返回类型 lambda（IIFE）内，
         // 绑定移到 IIFE 外（外层是协程函数体，co_await 合法）
         bool argIsAwait = argExpr.compare(0, coAwaitKw.size(), coAwaitKw) == 0;
@@ -96,8 +116,22 @@ std::string CodeGenerator::genGcRootedArgs(
                       << hid << "_" << i << "(" << vi << ");\n";
             }
         } else if (!awaitPrefix.empty() || argIsAwait) {
-            // 非堆 + 协程调用（或参数含 co_await）：IIFE 外 auto 值拷贝，生命周期跨越 co_await
-            outer << "auto " << vi << " = (" << argExpr << ");\n";
+            if (isIfaceView(type)) {
+                // 接口视图 + 协程调用：IIFE 外裸值拷贝会跨 co_await 挂起，
+                // 挂起期间其他协程 GC compact 不重写协程帧内裸 self → 悬垂。
+                // ViewRoot 包裹注册 self 为 GcRootHandle（ThreadLocal 根，compact 时重写），
+                // 恢复后 .get() 重建视图取最新 self（与 P1 ViewRoot 机制一致）
+                outer << "auto " << vi << "_raw = (" << argExpr << ");\n";
+                outer << "aura_rt::ViewRoot<decltype(" << vi << "_raw)> " << vi
+                      << "(" << vi << "_raw);\n";
+            } else {
+                // 非堆 + 协程调用（或参数含 co_await）：IIFE 外 auto 值拷贝，生命周期跨越 co_await
+                outer << "auto " << vi << " = (" << argExpr << ");\n";
+            }
+        } else if (isIfaceView(type)) {
+            // 接口视图（含 self 的值类型）：视图成员函数均非 const（默认方法体内
+            // 调用非 const 转发成员），const auto& 绑定无法调用 → 值拷贝（~16-24B 可接受）
+            inner << "    auto " << vi << " = (" << argExpr << ");\n";
         } else {
             // 非堆 + 非协程：IIFE 内 const auto& 引用绑定
             inner << "    const auto& " << vi << " = (" << argExpr << ");\n";
@@ -112,8 +146,13 @@ std::string CodeGenerator::genGcRootedArgs(
     for (size_t i = 0; i < args.size(); ++i) {
         std::string placeholder = "{" + std::to_string(i) + "}";
         std::string repl;
-        if (isHeapSemType(args[i].second)) {
+        if (isHeapSemType(args[i].second) && !isIfaceView(args[i].second)) {
             repl = "_h" + std::to_string(hid) + "_" + std::to_string(i) + ".get()";
+        } else if (isIfaceView(args[i].second)
+                   && (!awaitPrefix.empty()
+                       || args[i].first.compare(0, coAwaitKw.size(), coAwaitKw) == 0)) {
+            // 视图 + 协程调用：outer 分支 ViewRoot 包裹 → .get() 重建视图取最新 self
+            repl = "_a" + std::to_string(hid) + "_" + std::to_string(i) + ".get()";
         } else {
             repl = "_a" + std::to_string(hid) + "_" + std::to_string(i);
         }
@@ -203,6 +242,12 @@ std::string CodeGenerator::genIdentifier(const Identifier& e) {
 
     // 已注册为 GcRootHandle 的变量 → 生成 .get() 解引用
     if (gcRootVarNames_.count(name)) {
+        return name + ".get()";
+    }
+
+    // ViewRoot 包裹的视图变量（接口视图/迭代器视图）→ .get() 重建视图
+    // （GC compact 后 self 由 ViewRoot 内 GcRootHandle 更新为新地址）
+    if (viewRootVarNames_.count(name)) {
         return name + ".get()";
     }
 
@@ -453,9 +498,11 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
                 std::vector<std::pair<std::string, const SemType*>> cmpArgs;
                 cmpArgs.emplace_back(left, e.left->inferredType);
                 cmpArgs.emplace_back(right, e.right->inferredType);
-                // 基类实例化 Comparable<Point*>：方法参数已是 Point*（record 指针），
-                // 只需第一个操作数包适配器，第二个直接传 record 指针
-                std::string callExpr = adapter + "({0})." + method + "({1})";
+                // P1 视图分派：gcConstruct 分配堆适配器（record 指针 {0} 已由
+                // genGcRootedArgs 保护，gcConstruct 内 alloc 触发 GC 安全），
+                // view() 构造视图，第二个操作数直接传 record 指针（视图方法参数 T=record*）
+                std::string callExpr = adapter + "::view(aura_rt::gcConstruct<"
+                    + adapter + ">(&" + adapter + "::desc(), {0}))." + method + "({1})";
                 return genGcRootedArgs(cmpArgs, callExpr, isCoroutine);
             }
         }
@@ -637,9 +684,14 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
                 auto recIt = interfaceImplementations_.find(recName);
                 if (recIt != interfaceImplementations_.end()
                     && recIt->second.count("Stringer") > 0) {
+                    std::string adName = safeName(recName) + "Stringer";
                     std::vector<std::pair<std::string, const SemType*>> stArgs;
                     stArgs.emplace_back(argExprs[0], e.args[0]->inferredType);
-                    return genGcRootedArgs(stArgs, "{0}->to_string()", isCoroutine);
+                    // P1 视图分派：同比较运算符，适配器由 gcConstruct 分配（{0} 已保护），
+                    // view().to_string() 转发到 owner->to_string()
+                    std::string callExpr = adName + "::view(aura_rt::gcConstruct<"
+                        + adName + ">(&" + adName + "::desc(), {0})).to_string()";
+                    return genGcRootedArgs(stArgs, callExpr, isCoroutine);
                 }
             }
         }
@@ -712,11 +764,30 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
                         // 接口变量透传（已在传参处构造适配器）：不包装
                     } else if (auto* rt = dynamic_cast<const RecordSemType*>(argTy)) {
                         // 具体 record → 适配器构造（v1 仅非泛型 record）
+                        // 适配器已 GC 化（单继承 GcObject）：
+                        // 先 root record 指针（gcConstruct 内 alloc 可能触发 GC），
+                        // gcConstruct 分配适配器，view 返回视图传给接口参数
                         std::string recName = rt->canonicalName;
-                        arg = safeName(recName) + ifaceName + "(" + arg + ")";
+                        std::string adName = (ifaceName == "Iterator")
+                            ? safeName(recName) + "Iterator"
+                            : safeName(recName) + ifaceName;
+                        arg = "[&]() -> auto {\n"
+                              "    " + recName + "* _ar = (" + arg + ");\n"
+                              "    aura_rt::GcRootHandle<" + recName + "*> _ah(_ar);\n"
+                              "    auto* _ad = aura_rt::gcConstruct<" + adName
+                              + ">(&" + adName + "::desc(), _ah.get());\n"
+                              "    return " + adName + "::view(_ad);\n"
+                              "  }()";
                     } else {
-                        // 闭包/其他路径：直接包装为 IfaceFunc
-                        arg = ifaceName + "Func(" + arg + ")";
+                        // 闭包 → XFunc GC 化：值拷贝 std::function 后 gcConstruct 分配适配器
+                        // （func 捕获的 GcRootHandle 为全局根 ValueGlobal，alloc 期间安全；
+                        //   finalizer 析构 func，见 genInterfaceDecl XFunc）
+                        arg = "[&]() -> auto {\n"
+                              "    auto _cf = (" + arg + ");\n"
+                              "    auto* _cd = aura_rt::gcConstruct<" + ifaceName + "Func>"
+                              "(&" + ifaceName + "Func::desc(), std::move(_cf));\n"
+                              "    return " + ifaceName + "Func::view(_cd);\n"
+                              "  }()";
                     }
                     break;
                 }
@@ -1547,6 +1618,14 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
             std::string type = gcRootTypes_[captures[i]];
             oss << cn << " = aura_rt::GcRootHandle<" << type << ">(" << cn << ".get(), "
                 << "aura_rt::GcRootScope::Global)";
+        } else if (viewRootVarNames_.count(captures[i])) {
+            // 视图根变量 → init-capture 创建 ViewRoot 副本（Global 根，闭包跨线程安全）
+            // 复用 relocateGlobalRootPtrs 机制：ThreadLocal 句柄被闭包值捕获进 GC 堆
+            // （如 MapIter::fn_ / StringerFunc::func）后 node(this) 悬垂 → 转 Global 根
+            // 如 [viewVar = aura_rt::ViewRoot<Iterator<int32_t>>(viewVar.v, viewVar.h.get(), aura_rt::GcRootScope::Global)]
+            std::string type = viewRootTypes_[captures[i]];
+            oss << cn << " = aura_rt::ViewRoot<" << type << ">(" << cn << ".v, "
+                << cn << ".h.get(), aura_rt::GcRootScope::Global)";
         } else {
             oss << cn;
         }
@@ -1618,22 +1697,7 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     auto savedStringVars = stringVarNames_;
     auto savedValueVars  = valueTypeVarNames_;
     for (auto& p : e.params) {
-        std::string pname = safeName(p.name);
-        if (!p.type) continue;
-        std::string ptype = mapType(*p.type);
-        // string 参数 → stringVarNames_
-        if (ptype.find("aura_rt::GcString*") != std::string::npos)
-            stringVarNames_.insert(pname);
-        // 接口参数 → valueTypeVarNames_（引用用 . 不是 ->）
-        if (auto* nt = dynamic_cast<const NamedType*>(p.type.get()))
-            if (interfaceNames_.count(nt->name))
-                valueTypeVarNames_.insert(pname);
-        // 值类型参数 → valueTypeVarNames_
-        if (auto* nt = dynamic_cast<const NamedType*>(p.type.get()))
-            if ((registeredTypes_.count(nt->name) && !registeredTypes_[nt->name])
-                || (BuiltinRegistry::get().findType(nt->name) != nullptr
-                    && !BuiltinRegistry::get().isHeapType(nt->name)))
-                valueTypeVarNames_.insert(pname);
+        registerParamTracking(p);   // 填充临时集合；lambda 结束时由 restore 恢复外层
     }
 
     // invoke_result_t 推导声明（使用 F&& 完美转发）

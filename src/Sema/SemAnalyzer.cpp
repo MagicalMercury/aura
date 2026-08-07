@@ -359,9 +359,18 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
     if (dynamic_cast<const ErrorSemType*>(&target) || dynamic_cast<const ErrorSemType*>(&source))
         return true;
 
-    // 泛型参数接受一切（实例化时再检查）
-    if (dynamic_cast<const GenericSemType*>(&target))
+    // 泛型形参（未解析，resolvedName 为空，如泛型函数体内的 T）接受一切（实例化时再检查）
+    // 已解析的泛型类型（如 Iterator<string>）与同为泛型的 source 必须精确比较
+    // （P0.5：equals 比较 resolvedName，防止 Iterator<int> ≡ Iterator<string> 混淆）；
+    // source 为结构化推断类型（如 some() 的 OptionalSemType）时保持旧放行语义——
+    // 类型标注 Optional<int> 物化为 GenericSemType 而工厂推断为 OptionalSemType，
+    // 二者同义，直接比较会误报（历史表示不一致，不在本次修复范围）
+    if (auto* gt = dynamic_cast<const GenericSemType*>(&target)) {
+        if (gt->resolvedName.empty()) return true;
+        if (auto* gs = dynamic_cast<const GenericSemType*>(&source))
+            return gt->equals(*gs);
         return true;
+    }
 
     // 泛型参数作为 source：查类型别名获取实际类型再做兼容检查
     // 处理递归类型引用（如 Tree<T> 内 children: [Tree<T>]，自引用产生 GenericSemType("Tree")）
@@ -424,6 +433,10 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
 
     // 接口类型：单方法接口可由函数类型（闭包）满足；具体 record 结构匹配（结构类型系统）
     if (auto* iface = dynamic_cast<const InterfaceSemType*>(&target)) {
+        // 0. 接口视图 → 接口：同名接口视图值可直接透传（P1 视图按值传参，
+        //    视图 { 方法Fn, self } 已由 let/参数构造，直接转发给同接口参数）
+        if (auto* si = dynamic_cast<const InterfaceSemType*>(&source))
+            return iface->name == si->name;
         // 1. 闭包 → 单方法接口（现有路径保留）
         if (auto* func = dynamic_cast<const FuncSemType*>(&source)) {
             if (iface->methods.size() == 1) {
@@ -467,6 +480,19 @@ std::unique_ptr<SemType> SemAnalyzer::substitute(
     // GenericSemType(name) → concrete；否则深拷贝
     if (auto* g = dynamic_cast<const GenericSemType*>(&type)) {
         if (g->name == genericName) return concrete.clone();
+        // 已物化的内置泛型（如 Optional<T> → resolvedName="aura_rt::Optional<T>"）：
+        // 形参名嵌在 resolvedName 内，须同步替换（复用 RecordSemType canonicalName 的
+        // replaceCanonicalArg），否则接口签名代换失效 → Optional<T> ≠ Optional<int> 误报
+        if (!g->resolvedName.empty()) {
+            std::string newName = replaceCanonicalArg(g->resolvedName, genericName,
+                                                      semTypeToCppName(concrete));
+            if (newName != g->resolvedName) {
+                auto n = std::make_unique<GenericSemType>();
+                n->name = g->name;
+                n->resolvedName = newName;
+                return n;
+            }
+        }
     }
     // 复合类型递归替换
     if (auto* f = dynamic_cast<const FuncSemType*>(&type)) {
@@ -682,12 +708,21 @@ void SemAnalyzer::materializeCanonicalName(
         return;
     }
 
-    // GenericSemType 分支：内置泛型类型（如 sync.Channel<int> / channel<int>）
+    // GenericSemType 分支：内置泛型类型（如 sync.Channel<int> / channel<int> / Iterator<T>）
     // 无 typeArgs 时无需处理；有 typeArgs 时设置 resolvedName 供后续提取元素类型
     auto* gs = dynamic_cast<GenericSemType*>(result.get());
     if (!gs || n.typeArgs.empty()) return;
 
-    std::string fullName = gs->name + "<";
+    // P0.4 前缀统一：BuiltinRegistry 命中的内置泛型名（如 Iterator → "aura_rt::Iterator*"）
+    // 用 cppType 去 * 作基名拼模板参数 → "aura_rt::Iterator<int32_t>"，
+    // 与 range() 返回路径（semTypeFromBuiltinReturn Iterator 分支）保持一致；
+    // 未命中的用户泛型名保持裸名
+    std::string base = gs->name;
+    if (auto* ti = BuiltinRegistry::get().findType(gs->name)) {
+        base = ti->cppType;
+        if (!base.empty() && base.back() == '*') base.pop_back();
+    }
+    std::string fullName = base + "<";
     for (size_t i = 0; i < n.typeArgs.size(); ++i) {
         if (i > 0) fullName += ", ";
         std::string auraName;
@@ -795,7 +830,10 @@ void SemAnalyzer::propagateCanonicalName(const ASTNode& expr, const SemType* typ
         return;
     }
 
-    // 叶节点：仅标注 inferredType
+    // 叶节点：仅标注 inferredType（Identifier 除外——其类型来自符号表，
+    // 若被声明类型改写会丢失 record 具体类型；CodeGen 接口视图绑定
+    // （genLetStmt §3.10）依赖 initializer 保持 RecordSemType 以识别 record 指针）
+    if (dynamic_cast<const Identifier*>(&expr)) return;
     const_cast<ASTNode&>(expr).inferredType = type;
 }
 

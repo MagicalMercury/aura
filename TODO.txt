@@ -7,8 +7,13 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-08-04（新增泛型构造函数调用、返回闭包工厂函数代码生成 2 个预存 bug 已修复；
-#            新增协程同步链栈深度保护 issue，暂不处理）
+# 最近更新：2026-08-07（联合变体含接口已放开：Variant::descForI is_iface_view self
+#            子偏移 + genUnionBoxing ViewRoot 包裹，p2.1 u1-u4 用例通过；
+#            内置 Iterator 变体仍保持拦截，见 [二] P2 评估放开 issue）
+#            2026-08-06（compact 悬垂 rootPtr 地址 issue 已修复并通过 iter_gc_test
+#            全 5 用例 + ASAN 验证：compact 期间用 oldAddr→newAddr 映射重定位堆内
+#            globalRoots rootPtr + 同步改写对象内 GcRootHandle::ptr_ref_ 槽位；
+#            详见 plan/compact全局根地址重定位修复.md）
 
 ================================================================
 [ 一 ] 内置 API 与模块（plan/plan11.md）
@@ -27,23 +32,6 @@
 ================================================================
 [ 二 ] 高级类型 / 迭代器扩展（实验性，plan/range_implementation.md）
 ================================================================
-
-[x] P1  Interface 改造：C++ 虚函数层限制 + 内置常见接口  [2026-08-02 提出]
-      - 要做的事（详细现状见 plan/interface_rework_issue.md）：
-          * 接口在 C++ 层真正以虚函数生效：实现接口的 record 生成时继承抽象基类并 override
-          * 补齐 Sema"具体类型→接口"结构匹配（当前 isAssignable 对具体类型直接
-            return false，与 README"结构类型自动实现"承诺矛盾）
-          * 内置接口：Stringer（Printable 更名，对象可 to_string()）、Comparable、Iterator
-            （Iterator 与下方 Iterator<T> 高级类型条目整合）
-
-[x] P2  Iterator<T> 高级类型（与当前 IterSemType 整合）
-      - 现状：IterSemType 仅 range 使用，无 .map / .filter / .collect 链式
-      - 设计要点：
-          * .map(f: fun(T)->U) -> Iterator<U>
-          * .filter(p: fun(T)->bool) -> Iterator<T>
-          * .collect() -> [T]
-      - 缺：方法注册 / 类型推导（U 通过 f 的返回类型推断）/ CodeGen 桥接 std::views
-
 [ ] P2  Callable<T> 概念类型（统一函数类型与接口适配）
       - 现状：FuncSemType + 单方法 InterfaceSemType 已能互相赋值
       - 设计要点：
@@ -52,12 +40,38 @@
       - 缺：是否引入新 SemType 还是依赖接口结构匹配（建议先做接口扩展）
       - 备注：当前不实现也能用，是"语法糖"性质
 
-[x] P2  Optional<T> 标准库类型
-      - 现状：错误处理走 try/catch + ! 传播，无需 Result<T, E>
-      - 设计要点：用 type 别名 + union 实现，无需新 SemType
-      - 备注：可作为示例库先在 builtins/ 提供
+[x] P2  联合类型含内置迭代器变体（Iterator<T> | X）的拦截与支持  [2026-08-06 提出；拦截已完成]
+      - 背景：`Iterator<int> | int` 当前是"半拦截"（实测验证）：
+          * 用户接口（Stringer/Comparable）→ Sema 已拦截（variantStorageUnsafe）
+          * 内置 Iterator → GenericSemType 漏拦截，生成 make_variant<Iterator<int>*>
+            缺 aura_rt:: 前缀（resolvedName 两处来源不一致）→ g++ 编译错误；
+            修复前缀后仍是运行时 GC 崩溃（接口子对象地址被 GC 当堆指针扫）
+      - 本次修复（plan/迭代器GC安全修复.md §P0.4+P0.5，已完成）：
+          * 统一 resolvedName 前缀（materializeCanonicalName 用 BuiltinRegistry
+            cppType 基名，SemAnalyzer.cpp:690-703，与 range() 返回路径 L311 对齐）
+          * GenericSemType::equals 精确化（SemType.cpp:202-204）：name 相同且
+            两者 resolvedName 均非空时比较 resolvedName → Iterator<int> ≠ Iterator<string>
+          * variantStorageUnsafe 拦截 name=="Iterator" 的 GenericSemType
+            （DeclChecker.cpp:10-15）→ 编译期报错，杜绝坏代码（过渡安全网）
+          * 实施期补充（P0.5 暴露路径，2026-08-06 修复）：
+            - isAssignable 对已解析 GenericSemType 走 equals（SemAnalyzer.cpp:362-373），
+              修复 L363 短路放行绕过 equals 的遗漏
+            - substitute 对已物化 GenericSemType 的 resolvedName 内形参做替换
+              （复用 replaceCanonicalArg，SemAnalyzer.cpp:474-489），修复接口签名
+              Optional<T> 代换失效 → 泛型接口 impl 误报
+            - verifyImplCompleteness 增加泛型接口签名代换（DeclChecker.cpp:166-199），
+              与 checkInterfaceImpl 对齐
+      - 用户决策（2026-08-06）：P1 全接口去虚化完成后**保持拦截**（plan §P1 步骤 11），
+        联合变体支持推迟——需 Variant::isPtrActive 识别视图内 self 子偏移（已标记 TODO）
+      - 完成结论（2026-08-06，plan/迭代器GC安全修复.md P0+P1 全部落地）：
+          * P0：迭代器视图化 + compact 重定位 + iter_gc_test 5 用例 + ASAN 通过
+          * P1：全接口去虚化 + XFunc GC 化 + ViewRoot 机制（修正 compact 跳过
+            栈扫描假设，视图 self 注册 GcRootHandle）；V1-V4 用例 + 全量回归通过
+      - 文件：src/Sema/Checker/DeclChecker.cpp、src/Sema/SemAnalyzer.cpp、
+              src/Sema/SemType.cpp、src/CodeGen/TypeMap.cpp、src/CodeGen/DeclGen.cpp、
+              src/CodeGen/StmtGen.cpp、src/CodeGen/ExprGen.cpp、src/CodeGen/CodeGen.h
 
-[ ] P1  联合类型 GC 安全问题（扩展到所有含堆类型的联合）  [2026-07-31 提出，2026-08-04 扩展]
+[x] P1  联合类型 GC 安全问题（扩展到所有含堆类型的联合）  [2026-07-31 提出，2026-08-04 扩展]
       - 问题：Aura 联合类型 `T1 | T2 | ... | Tn` 映射为 `std::variant<...>`
         （src/CodeGen/TypeMap.cpp:115-123）。只要任一变体是 GC 堆类型
         （string/Array<T>*/record*/Optional<T>* 等）即存在致命问题：
@@ -95,6 +109,36 @@
           * P3: Sema 层语法糖转换（T | None → Optional<T>，A | B | C → Variant<A, B, C>）
       - 关联：project_memory 中联合类型相关约束
 
+[x] P2  联合变体含接口（Variant 视图 self 子偏移支持）  [2026-08-06 提出，2026-08-07 完成]
+      - 背景：plan/迭代器GC安全修复.md §8 步骤 11（B+W 全接口去虚化后重新评估）。
+        接口值是值视图 { 纯虚方法Fn..., self }（self 位于视图内 8~16B 子偏移处），
+        联合变体含接口时（Variant<Stringer, int> 等），GC 扫描需判定该存储
+        offset 是否含有效 GC 指针
+      - 完成（change.md 联合变体含接口 + threadRootLists node 重定位 步骤 6）：
+          * variant.h descForI 增加 is_iface_view_v<T> 分支：视图变体 desc 注册
+            kStorageOffset + offsetof(T, self) 子偏移——Variant 激活变体固定时
+            desc 静态确定，无需 isPtrActive 动态钩子（与 plan 修复方向不同但等价）
+          * genUnionBoxingImpl 对视图变体用 ViewRoot 包裹（make_variant alloc 窗口
+            内 self 悬垂由 GcRootHandle 兜底，alloc 后覆写 self 为最新地址）
+          * DeclChecker variantStorageUnsafe 对 InterfaceSemType 放行
+          * 验证：p2.1 u1-u4 用例（record→Stringer 视图变体 / Stringer|int|string）
+            通过 + 全量回归 ALL TESTS PASSED
+      - 未覆盖：内置 Iterator 变体仍保持 P0.4 拦截（下方独立 issue 评估放开）
+      - 依赖：联合类型 GC 安全（上方 [x] P1）的 Variant<T1..Tn> runtime 类型
+      - 关联：plan/迭代器GC安全修复.md §10.4、change.md §6 L5、project_memory
+
+[ ] P2  评估放开内置 Iterator 联合变体拦截（Variant<Iterator<T>, X>）  [2026-08-07 提出]
+      - 背景：change.md（联合变体含接口 + threadRootLists node 重定位）步骤 6
+        实施后，用户接口（Stringer/Comparable 等）变体已放开，但内置 Iterator
+        （GenericSemType "Iterator"，DeclChecker.cpp:18-19）仍保持 P0.4 拦截
+      - 评估流程：临时移除 DeclChecker.cpp L18-19 拦截，编译运行
+        `Variant<Iterator<int>, int>` 用例（plan/联合变体含接口isPtrActive钩子支持.md
+        §7.1 用例 4）；通过则正式放开并更新本条状态，否则保留拦截为退路
+        （保留本条说明原因）
+      - 前置：联合变体含接口（上方 issue）实施完成
+      - 关联：plan/联合变体含接口isPtrActive钩子支持.md §8 步骤 8、
+        change.md §3 步骤 6
+
 ================================================================
 [ 三 ] 跨模块可见性（plan/cross_module_visibility.md）
 ================================================================
@@ -124,34 +168,6 @@
       - 缺：inferCall 中将闭包包装为接口适配器
       - 文件：src/Sema/Checker/ExprInfer.cpp (无相关逻辑)
 
-[x] P1  泛型类型构造函数无法调用  [2026-08-04 提出]
-      - 问题：`type Stack<T>` + `fun (self Stack<T>) Stack()` 声明后，
-        `let stack = Stack()` 报 undefined function 'Stack'；`Stack<int>()`
-        显式泛型调用形式也不支持（expected expression）
-      - 根因（调试确认）：TypeAlias 符号 ctorParams 为空——泛型 receiver 的
-        构造函数参数未注册到类型符号（SymbolTable::define 同名填充未命中）
-      - 影响：READMEs/07-methods-interfaces.md 泛型构造函数示例、
-        READMEs/15-example.md 完整示例均无法编译
-      - 文件：src/Sema/Checker/ExprInfer.cpp:189-248、
-              src/Sema/SymbolTable.cpp、src/Parser/DeclParser.cpp:178
-      - 暂不处理：test.aura 无泛型构造调用，不影响现有功能
-
-[x] P1  返回闭包的工厂函数代码生成有缺陷  [2026-08-04 提出]
-      - 问题：`fun f(n: int) -> fun() -> int { return fun() -> int { return n + 1 } }`
-        这类"工厂函数返回闭包"模式（READMEs/06-generics.md:154、15-example.md 声称支持），
-        生成的 C++ 代码无法编译：
-          * lambda 返回类型被推导为 aura_rt::task<T> 而非 std::function，
-            co_return lambda 实例与函数返回类型 std::function 不匹配
-          * 协程 main 中调用闭包变量 g1() 被错误生成 co_await g1()
-      - 影响：READMEs/15-example.md make_greeter / make_mapper 示例无法编译
-      - 备注：闭包捕获本身 Sema 层正常（生成代码捕获列表 [io] 已正确生成）；
-        15-example 原 make_greeter 还引用未定义的 io（顶层函数无 io 参数），
-        属文档自身错误，与编译器 bug 无关
-      - 文件：src/CodeGen/ExprGen.cpp (genFunExpr / 闭包返回)、
-              src/CodeGen/StmtGen.cpp (闭包调用 co_await 边界)
-      - 暂不处理：test.aura 的闭包均以字面量直接传递（如 Iterator.from(fun ...)），
-        未触发"返回函数类型"路径
-
 [~] P2  字符串遍历 for ch in s
       - READMEs/08-control-flow.md:42-46 承诺
       - 缺：genForStmt 未对 string 做特殊处理，依赖 GcString 是否实现 begin/end
@@ -179,6 +195,93 @@
 ================================================================
 [ 五 ] GC（plan/gc_features_plan.md, plan/gc_promotion_issues.md）
 ================================================================
+
+[x] P0  compact 不重定位堆内 globalRoots rootPtr 地址（闭包捕获 GcRootHandle 悬垂）  [2026-08-06 提出，同日修复完成]
+      - 问题：闭包捕获的 GcRootHandle（ValueGlobal 模式，handles.h:31-41）被存进
+        GC 堆对象（MapIter::fn_ 中 lambda 的值捕获副本），globalRoots_ 的
+        rootPtr = &val_ 指向堆对象内部。compact 只更新 *rootPtr 的值
+        （updateAllReferences 步骤 3，compact.cpp:317-329 / updateMediumPageReferences
+        L652-663），对象搬到新地址后 &val_ 旧地址悬垂；旧页释放复用后
+        下轮 GC 读到垃圾指针 → ASAN access-violation（markPhase，0x1f354d601e0）
+      - 复现：iter_gc_test [2] test_closure_capture（map 闭包捕获 GcString 全局根），
+        gdb 铁证：globalRoots_ root[4] rootPtr=0x1801e0 已落在被回收对象
+        （Array<int32_t> 数据区）内部
+      - 根因：B+W 方案首次把"值持有 GcRootHandle"引入 GC 堆内；此前值持有
+        都在栈/静态区，&val_ 不受 compact 移动影响
+      - 修复：compact 期间用 oldAddr→newAddr 映射（小页 compactEntries_ 按升序二分 /
+        中页 forwardMap），把落在被搬运对象区间 [oldAddr, oldAddr+size) 内的
+        rootPtr 重写为新对象内对应偏移；只做地址运算不 deref，无 strict-aliasing 风险
+      - 方案 P（审查 N1/N2）：同步改写对象内 GcRootHandle::ptr_ref_ 槽位值，
+        保证 ~GcRootHandle 注销 unregisterGlobalRoot（std::find 精确匹配）命中；
+        布局耦合常量 kGcHandlePtrRefValDelta + 注释约束
+      - 大页 sweepLargePages 同路径一并修复（forwardMap 三元组 + relocateRootsInForwardMap）
+      - 验证：iter_gc_test 全 5 用例 + ASAN 通过；test.aura 全量回归通过
+      - 已知限制：threadRootLists_ 的 node（this）指针存在同类缺陷（闭包捕获
+        ThreadLocal 模式 GcRootHandle 进堆时），当前代码路径不触发
+        （仅 ValueGlobal）——已拆独立 issue：下方 [ ] P2 threadRootLists_ node
+      - 文件：runtime/gc/compact.cpp、runtime/gc/gc.h
+      - 详见：plan/compact全局根地址重定位修复.md
+
+[ ] P2  threadRootLists_ node（this）悬垂（闭包捕获 ThreadLocal 模式 GcRootHandle 进堆）  [2026-08-06 提出]
+      - 背景：compact 全局根重定位修复（上方 [x] P0）的已知限制。ValueThreadLocal
+        模式 GcRootHandle 构造时 registerRootThreadLocal(this)，链表节点即句柄
+        自身地址（handles.h:40）；若句柄在 GC 堆对象内部，compact 搬运对象后
+        链表内 this 悬垂，下轮 GC 链表遍历读到被复用内存 → 崩溃（与 globalRoots_
+        rootPtr 悬垂同型）
+      - 现状：不触发——闭包捕获只产生 ValueGlobal 根（genFunExpr init-capture
+        用 GcRootScope::Global，ExprGen.cpp:1615-1620）
+      - 可达性分析（2026-08-06 P1 落码后）：接口视图经 ViewRoot 包裹，ViewRoot
+        内部 GcRootHandle 为 ThreadLocal 模式（iterator.h ViewRoot）；genFunExpr
+        对视图变量（viewRootVarNames_，非 gcRootVarNames_）走按值捕获
+        （ExprGen.cpp:1621-1623）→ 闭包值捕获 ViewRoot 进 GC 堆（如 make_map /
+        XFunc std::function 存 MapIter::fn_ / StringerFunc::func）时，捕获副本的
+        ThreadLocal 句柄新注册根 this 落在堆内 → 触发同类缺陷
+      - 当前 test.aura 无"闭包捕获视图变量"用例，实际不触发
+      - 修复方向（二选一）：
+          * compact 层：与 globalRoots_ 同思路，用 oldAddr→newAddr 映射重写
+            threadRootLists_ node 内 this（GcRootHandleBase 链表 prev/next/this）
+          * CodeGen 层：视图变量按值捕获进堆改 GcSharedRoot 式 init-capture
+            （并入 gcRootVarNames_ 路径，Global 根，避免 ThreadLocal 句柄进堆）
+      - 文件：runtime/gc/handles.h、runtime/gc/compact.cpp、src/CodeGen/ExprGen.cpp
+      - 关联：change.md §4.4（ViewRoot 机制）
+
+[ ] P2  tryAllocSlow 路径未 memset（复用 compact 后旧页时对象内存含脏数据）  [2026-08-07 提出（change.md 第三轮审查发现）]
+      - 问题：TLAB 快路径有 std::memset(mem, 0, size)（alloc.cpp:81，Bug6 修复），
+        但 tryAllocSlow（alloc.cpp:120-174）未 memset。GC sweep 后旧页被复用
+        （rebuildPageList 保留含存活对象的页，其 bumpOffset 后方空间在 GC 前
+        已被分配过对象），bump 出的对象内存含旧对象残留 → 指针字段读脏数据
+        → GcRootHandle 注册后、字段初始化前若 GC 触发，markFields 读到无效指针
+        → SEGV
+      - 影响范围：所有经 tryAllocSlow 分配的对象（首次分配 / TLAB 满 / compact 后
+        / gcPending_ 走慢路径），不限于 Variant
+      - 触发难度：需要"旧页复用 + 字段初始化前 GC"的精确时序；Bug6 修复后 TLAB
+        路径已覆盖大部分分配，当前未观察到实际崩溃
+      - 修复：tryAllocSlow 与 TLAB 对齐补 memset
+      - 文件：runtime/gc/alloc.cpp
+      - 发现来源：change.md（联合变体含接口 + threadRootLists node 重定位）第三轮审查，
+        "make_variant alloc 窗口"限制描述被证伪（TLAB 已 memset）后定位到本真实缺陷
+
+[ ] P2  match 分支 _match_val 跨 GC 保护（Variant 对象指针悬垂）  [2026-08-07 提出]
+      - 背景：change.md（联合变体含接口 + threadRootLists node 重定位）§6 限制 2。
+        genMatchStmt 生成 `auto&& _match_val = expr;`（StmtGen.cpp:1615），是普通
+        右值引用，无 GcRootHandle 保护。分支体内 alloc 触发 compact 时 _match_val
+        悬垂（当它是 Variant<T...>* 堆指针时）
+      - 现状缓解：change.md 步骤 7 的 ViewRoot 绑定保证分支体不再访问 _match_val
+        （binding 拷贝视图值到 ViewRoot，分支体仅用绑定变量），当前不触发
+      - 修复方向：match 语句对 _match_val 生成 GcRootHandle 包裹
+      - 文件：src/CodeGen/StmtGen.cpp
+      - 关联：change.md §6 限制 2、plan/联合变体含接口isPtrActive钩子支持.md §10 限制 4
+
+[ ] P3  方向 A：compact 层重定位 threadRootLists_ 链表 node  [2026-08-07 提出]
+      - 背景：threadRootLists_ 的 node（this）指针在对象进堆后悬垂。当前闭包
+        捕获路径已由 change.md 步骤 9（ViewRoot 转 Global 根）规避，零 compact
+        层改动
+      - 触发场景：若未来出现"无法用 Global 替代的 ThreadLocal 进堆场景"
+        （ThreadLocal 句柄直接存入 GC 堆对象成员，非闭包捕获路径）
+      - 方案：与 globalRoots_ 同思路，用 oldAddr→newAddr 映射重写
+        threadRootLists_ node 内 this（GcRootHandleBase 链表 prev/next/this）
+      - 文件：runtime/gc/compact.cpp、runtime/gc/handles.h
+      - 关联：plan/threadRootLists节点compact重定位.md §10 限制 3
 
 ----------------------------------------------------------------
 GC 其他功能清单（基于 2026-07-19 重新核验）
@@ -303,29 +406,6 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
       - 触发条件（满足任一即可启动）：
           * 优化 1 实施完成，GcRootHandle 构造零开销
           * 出现因裸指针传递导致的 GC 安全 bug（如 compact 期间悬垂）
-
-[ ] P2  协程同步链栈深度保护（长链防栈溢出）  [2026-08-04 提出]
-      - 背景：协程恢复走 final_awaiter::continuation.resume()（runtime/task.h:46-52），
-        非尾调用、逐层压栈；串行同步链 A co_await B co_await C ... 的返回阶段
-        栈深度 = 链长 × 单层帧大小，链长上万时爆掉默认 1MB 线程栈。
-        2026-08-04 排查 test_bug_fixes 崩溃时 gdb 确认了该压栈链；
-        本次崩溃根因虽是 NoneType 闭包缺 return 生成的 ud2，但长链栈溢出
-        是独立真实隐患
-      - 方案（深度阈值 + 超限转调度器清栈，与用户"达到一定深度清空一次"一致）：
-          * detail 命名空间加 thread_local int g_chainDepth + kMaxChainDepth(=512)
-          * final_awaiter::await_suspend 改造：
-            - ++depth < 阈值 → continuation.resume()（短链同步直连，零开销）
-            - ≥ 阈值 → 计数归零 + EventLoop::schedule(continuation)
-              → 当前 resume 返回后整链 C++ 栈逐层解开，EventLoop 从顶层
-              重驱动新链，栈完全清空
-          * task.h 仅声明 detail::scheduleOnEventLoop(coroutine_handle)，
-            task.cpp 实现（避免 task.h ↔ event_loop.h 循环依赖）
-      - 优点：短链性能不变；最坏栈深被钳制在 ~512 层（几十 KB），不会溢出
-      - 代价：计数只增不降，短链累计到阈值会偶发一次调度（无害）
-      - 验证：构造递归长链 chain(n){ n==0 ? return : co_await chain(n-1) }
-        1 万层——修复前栈溢出崩溃、修复后通过
-      - 文件：runtime/task.h、runtime/task.cpp
-      - 暂不处理原因：当前测试链深仅 ~9 层，不阻塞现有功能
 
 ----------------------------------------------------------------
 

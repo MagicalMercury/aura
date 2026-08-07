@@ -1,0 +1,1 @@
+1、Sema 用 resolveNamedType(tp->typeName) 短名解析，泛型类型模式需改 Parser/Sema/CodeGen 三处

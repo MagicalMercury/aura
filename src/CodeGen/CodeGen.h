@@ -262,6 +262,9 @@ private:
     // 判断 C++ 类型字符串是否为 GC 指针类型（如 GcString*, User*, Array<T>*）
     [[nodiscard]] bool isGcPointerType(const std::string& cppType) const;
 
+    // 判定 C++ 类型名是否为接口视图类型（aura_rt::Iterator<T> / 用户接口名[<...>] / 内置接口名[<...>]）
+    [[nodiscard]] bool isIfaceViewTypeName(const std::string& cppType) const;
+
     // 注册一个用户定义的类型名
     void registerTypeName(const std::string& auraName, bool isHeap);
 
@@ -292,6 +295,14 @@ private:
                          const InterfaceDecl& iface);
 
     // --- 函数/方法声明 + 实现 ---
+    // 清理函数级变量跟踪状态（6 处调用点统一；新增跟踪集合时必须同步此处）
+    void clearVarTrackingState();
+    // 参数类型跟踪注册（3 处共有：string / 用户接口 / 值类型 NamedType；不含 _raw 语义）
+    void registerParamTracking(const Param& p);
+    // decl 函数参数特有（签名已生成 varName_raw，函数体入口 GcRootHandle/ViewRoot 包裹）：
+    // 接口视图参数 → viewRootVarNames_ + viewRootTypes_[decltype(_raw)]；
+    // GC 指针参数 → gcRootVarNames_ + gcRootTypes_[decltype(_raw)]
+    void registerRawParamTracking(const Param& p);
     void genFunDecl(std::ostream& h, std::ostream& cpp,
                     const FunDecl& decl, bool declarationsOnly = false);
     void genMethodDecl(std::ostream& h, std::ostream& cpp,
@@ -381,6 +392,11 @@ private:
     [[nodiscard]] std::string genUnionBoxingImpl(const std::vector<std::string>& cppTypes,
                                                  const ASTNode& init,
                                                  bool isCoroutine);
+    // record → 接口视图适配器 view() 预转换 IIFE（提取自 genLetStmt §3.10，供其与 genUnionBoxingImpl 共用）
+    // expr: 已生成的 record 指针表达式字符串；recName: record canonicalName；viewCppType: 视图 C++ 类型
+    [[nodiscard]] std::string genRecordToViewIIFE(const std::string& expr,
+                                                  const std::string& recName,
+                                                  const std::string& viewCppType);
 
     // 为 GC 堆类型参数生成 IIFE + GcRootHandle 包装
     // args: (expr_string, inferredType) 对；callExpr: 包装后的调用表达式
@@ -511,6 +527,16 @@ private:
     // 当前函数内已注册为 GcRootHandle 的变量名集合
     // genIdentifier 遇到这些变量名时生成 .get()
     std::set<std::string> gcRootVarNames_;
+
+    // P1：栈上视图变量名集合（接口视图 / 迭代器视图，经 ViewRoot 包裹）
+    // 视图含 GC 指针 self，compact 不重写栈上裸指针（GC 只重写 GcRootHandle），
+    // 必须用 ViewRoot 注册 self 为 GcRootHandle，GC 后 get() 重建视图取最新 self。
+    // genIdentifier 遇到这些变量名时生成 .get()
+    std::set<std::string> viewRootVarNames_;
+
+    // P2b：视图变量名 → 视图 C++ 类型名（genFunExpr 闭包捕获转 Global ViewRoot 用）
+    // 与 viewRootVarNames_ 一一对应填充；key 与 viewRootVarNames_ 保持一致
+    std::unordered_map<std::string, std::string> viewRootTypes_;
 
     // GC 根变量名 → C++ 类型映射（如 "greeting" → "aura_rt::GcString*"）
     // genFunExpr 的 init-capture 需要类型信息生成 GcSharedRoot<T>

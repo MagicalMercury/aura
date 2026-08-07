@@ -299,6 +299,7 @@ void GcHeap::promoteToOld(GcObject* obj) {
     // 晋升为 old 后这些引用变成 old→young，必须被记忆集追踪，
     // 否则 minor GC 漏标 → young 子对象被 sweep 回收 → 悬垂指针。
     const TypeDescriptor* desc = obj->desc;
+    if (desc && desc->dynamicDesc) desc = desc->dynamicDesc(obj);  // P2b：Variant 按激活变体扫描（与 markFields/updateObjectFields 对齐）
     if (!desc) return;
     char* base = reinterpret_cast<char*>(obj);
 

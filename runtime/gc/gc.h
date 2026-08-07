@@ -33,6 +33,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -380,6 +381,8 @@ public:
     void  updateAllReferences(CompactScope scope);
     void  updateObjectFields(GcObject* obj);
     void  updateInlineArrayElements(GcObject* obj);
+    void  relocateGlobalRootPtrs();      // compact 后重定位堆内 globalRoots rootPtr（方案 P）
+    void  relocateRootsInForwardMap(const std::vector<std::tuple<GcObject*, GcObject*, size_t>>& forwardMap);  // 中页/大页版（线性扫）
 
     // === 阶段 2 新增：中页滑动窗口 compact ===
     bool  shouldCompactMedium();         // 中页碎片率 > 阈值
@@ -398,6 +401,10 @@ public:
     MediumPage* findMediumPage(GcObject* obj) const;
     LargePage*  findLargePage(GcObject* obj) const;
     // 小页反查沿用 compact.cpp 内部 pageByData
+
+    // 判断指针是否落在 GC 管理的任何页数据区内（小/中/大页）
+    // 供迭代器桥接区分"内置迭代器（GcObject 布局）"与"record 适配器（非 GC 对象）"
+    bool isGCAddress(const void* p) const;
 
     // compact 暂停计数控制（供 GcCompactSuspendGuard 使用）
     void incCompactSuspend() { ++compactSuspendedCount_; }

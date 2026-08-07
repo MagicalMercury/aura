@@ -38,6 +38,24 @@ bool CodeGenerator::isGcPointerType(const std::string& cppType) const {
     return true;
 }
 
+// P1：判定 C++ 类型名是否为接口视图类型
+//   - 内置 Iterator<T>（aura_rt::Iterator<...>）
+//   - 用户接口名 / 内置接口名（Stringer / Comparable<...> / Greetable 等）
+// 视图是值类型（{ 方法Fn, self }），非 GC 指针；record 字段含视图时注册 self 子偏移
+bool CodeGenerator::isIfaceViewTypeName(const std::string& cppType) const {
+    if (cppType.rfind("aura_rt::Iterator<", 0) == 0) return true;
+    for (auto& in : interfaceNames_) {
+        if (cppType == in || cppType.rfind(in + "<", 0) == 0) return true;
+    }
+    // 内置接口（interfaces.aurai：Stringer/Comparable）不在 interfaceNames_（仅 program.decls 收集）
+    for (auto& i : BuiltinRegistry::get().auraiInterfaces()) {
+        const std::string& in = i->name;
+        if (in == "Iterator") continue;   // 已在上方处理
+        if (cppType == in || cppType.rfind(in + "<", 0) == 0) return true;
+    }
+    return false;
+}
+
 // ============================================================
 // 类型映射（plan §4.1）
 // ============================================================
@@ -148,6 +166,23 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
                 // 无 SemType（如类型声明处）：按 C++ 名回退判断（指针类型 = 堆）
                 std::string cpp = mapType(*v);
                 heap = !cpp.empty() && cpp.back() == '*';
+                // P2b：接口视图变体（值视图含 GC 指针 self，C++ 名非 * 结尾）→ 需
+                // Variant 堆封装供 descForI 扫描。与 isHeapSemType(InterfaceSemType)=true
+                // 对齐（genUnionBoxing 的 hasHeap 判定）；排除内置 Iterator——其值视图
+                // 由保守栈扫描保护，isHeapSemType 判定其为非堆，此处保持一致。
+                if (!heap && v) {
+                    if (auto* n = dynamic_cast<const NamedType*>(v.get())) {
+                        if (n->name != "Iterator" && n->namespacePrefix.empty()) {
+                            // 用户接口（interfaceNames_）+ 内置接口（auraiInterfaces，
+                            // 如 Stringer/Comparable，与 isIfaceViewTypeName 判定一致）
+                            bool isIface = interfaceNames_.contains(n->name);
+                            if (!isIface)
+                                for (auto& ai : BuiltinRegistry::get().auraiInterfaces())
+                                    if (ai->name == n->name) { isIface = true; break; }
+                            if (isIface) heap = true;
+                        }
+                    }
+                }
             }
             if (heap) { hasHeap = true; break; }
         }
@@ -183,6 +218,10 @@ std::string CodeGenerator::optionalElemOf(const TypeExpr* retType) {
 }
 
 std::string CodeGenerator::mapNamedType(const std::string& name) {
+    // 内置 Iterator：C++ 形态为 16B 值视图（aura_rt::Iterator<T>，无 *）。
+    // 必须在 BuiltinRegistry 命中前特判（registry 存的是旧指针形态 "aura_rt::Iterator*"）
+    if (name == "Iterator") return "aura_rt::Iterator";
+
     // 先查 BuiltinRegistry（内置类型）
     if (auto* ti = Aura::BuiltinRegistry::get().findType(name)) {
         return ti->cppType;
@@ -222,14 +261,9 @@ std::string CodeGenerator::mapValueType(const TypeExpr& type) {
 }
 
 std::string CodeGenerator::mapParamType(const TypeExpr& type) {
-    std::string result = mapType(type);
-    // 接口类型 → const&（抽象类不能按值传递）
-    if (auto* nt = dynamic_cast<const NamedType*>(&type)) {
-        if (interfaceNames_.count(nt->name)) {
-            return "const " + result + "&";
-        }
-    }
-    return result;
+    // P1：接口参数按值传视图（视图 { 方法Fn, self } 是值类型，可拷贝；
+    //     self 指向的堆适配器由保守栈扫描保护，无需 const& 引用形态）
+    return mapType(type);
 }
 
 // ============================================================
@@ -299,8 +333,23 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
         sig += ")>";
         return sig;
     }
+    if (auto* is = dynamic_cast<const InterfaceSemType*>(&semType)) {
+        // P1：接口 → 值视图类型名。泛型接口实例化（Comparable<Point>）时用 typeArgs
+        // 生成完整 C++ 名 Comparable<Point*>（实参经 mapSemType：record → 指针）。
+        if (is->typeArgs.empty()) return is->name;
+        std::string result = is->name + "<";
+        for (size_t i = 0; i < is->typeArgs.size(); ++i) {
+            if (i > 0) result += ", ";
+            result += is->typeArgs[i] ? mapSemType(*is->typeArgs[i]) : "void";
+        }
+        return result + ">";
+    }
     if (auto* gs = dynamic_cast<const GenericSemType*>(&semType)) {
-        if (!gs->resolvedName.empty()) return gs->resolvedName + "*";
+        if (!gs->resolvedName.empty()) {
+            // 内置 Iterator：resolvedName 即值视图类型（aura_rt::Iterator<T>，无 *）
+            if (gs->name == "Iterator") return gs->resolvedName;
+            return gs->resolvedName + "*";
+        }
         // 未实例化的泛型：查 BuiltinRegistry 回退（如 sync.Channel → aura_rt::ThreadChannel*）
         if (auto* ti = BuiltinRegistry::get().findType(gs->name))
             return ti->cppType;
@@ -344,7 +393,15 @@ void CodeGenerator::genTypeDescriptor(std::ostream& cpp,
         cpp << "static const size_t _" << structName << "_ptrs[] = {";
         for (size_t i = 0; i < ptrFieldNames.size(); ++i) {
             if (i > 0) cpp << ", ";
-            cpp << "offsetof(" << fullName << ", " << ptrFieldNames[i] << ")";
+            auto& pf = ptrFieldNames[i];
+            // 视图字段条目格式 "field+ViewType" → offsetof(Self, field) + offsetof(ViewType, self)
+            auto plus = pf.find('+');
+            if (plus != std::string::npos) {
+                cpp << "offsetof(" << fullName << ", " << pf.substr(0, plus)
+                    << ") + offsetof(" << pf.substr(plus + 1) << ", self)";
+            } else {
+                cpp << "offsetof(" << fullName << ", " << pf << ")";
+            }
         }
         cpp << "};\n";
         if (isTemplate) cpp << tprefix;

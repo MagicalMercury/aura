@@ -13,6 +13,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <tuple>
 
 #ifdef _WIN32
   #include <windows.h>
@@ -49,7 +50,10 @@ void GcHeap::compact(CompactScope scope) {
     if (compactEntries_.empty()) return;
 
     updateAllReferences(scope);
-    copyObjectsToNewLocations(scope);
+    copyObjectsToNewLocations(scope);   // 内部不再 clear（compactEntries_ 供 relocateGlobalRootPtrs 做地址映射）
+    relocateGlobalRootPtrs();           // 重定位堆内 globalRoots rootPtr + 对象内 ptr_ref_ 槽位（方案 P）
+    savedDescs_.clear();
+    compactEntries_.clear();
     rebuildPageList(scope);
 }
 
@@ -193,9 +197,8 @@ void GcHeap::copyObjectsToNewLocations(CompactScope /*scope*/) {
         entry.newAddr->flags_ = entry.flags;
         entry.newAddr->setForwarded(false);
     }
-
-    savedDescs_.clear();
-    compactEntries_.clear();
+    // 注：compactEntries_/savedDescs_ 的清理移交 compact() 主流程
+    //（relocateGlobalRootPtrs 需 compactEntries_ 的 oldAddr→newAddr→size 映射）
 }
 
 void GcHeap::rebuildPageList(CompactScope scope) {
@@ -394,6 +397,81 @@ void GcHeap::updateAllReferences(CompactScope scope) {
     }
 }
 
+// ============================================================
+// 全局根地址重定位（方案 P）
+//
+// 背景：闭包捕获的 GcRootHandle（ValueGlobal 模式）被存进 GC 堆对象（如
+// MapIter::fn_ 内 lambda），globalRoots_ 记录的 rootPtr = &val_ 指向堆内。
+// compact 搬运对象后旧 &val_ 地址悬垂，只更新 *rootPtr 值不够，还必须：
+//   1) 重定位 globalRoots_ 容器中的 rootPtr（旧 &val_ → 新 &val_）；
+//   2) 同步改写对象内 GcRootHandle::ptr_ref_ 槽位值——否则对象回收时
+//      ~GcRootHandle 用旧地址 unregisterGlobalRoot（std::find 精确匹配）
+//      失败 → globalRoots_ 残留悬垂 → 下轮 GC 崩溃。
+// 布局依据：GcRootHandleBase{next_(0) prev_(8) ptr_ref_(16)} 24B +
+//           GcRootHandle<T>{union{ptr_,val_}(24) mode_(32)} → ptr_ref_ 槽位
+//           恒在 val_ 槽位前 sizeof(void*) 字节（T 恒为指针类型）。
+// ============================================================
+static constexpr size_t kGcHandlePtrRefValDelta = sizeof(void*);
+
+void GcHeap::relocateGlobalRootPtrs() {
+    if (compactEntries_.empty()) return;
+    std::lock_guard<std::mutex> lk(globalRoots_m_);
+    for (auto*& rootPtr : globalRoots_) {   // 引用形式：直接改写容器元素（元素类型 GcObject**）
+        const char* p = reinterpret_cast<const char*>(rootPtr);
+        // compactEntries_ 按 oldAddr 升序（computeForwardingAddresses 已 sort），二分定位
+        auto it = std::upper_bound(
+            compactEntries_.begin(), compactEntries_.end(), p,
+            [](const char* addr, const CompactEntry& e) {
+                return addr < reinterpret_cast<const char*>(e.oldAddr);
+            });
+        if (it == compactEntries_.begin()) continue;
+        --it;
+        const char* old = reinterpret_cast<const char*>(it->oldAddr);
+        if (p >= old && p < old + it->size) {
+            const size_t off = static_cast<size_t>(p - old);       // val_ 槽位在对象内偏移
+            GcObject** newValPtr = reinterpret_cast<GcObject**>(
+                reinterpret_cast<char*>(it->newAddr) + off);       // 新 val_ 槽位地址
+            rootPtr = newValPtr;                                    // 1) 重定位 globalRoots_ 元素
+            if (off >= kGcHandlePtrRefValDelta) {
+                // 2) 同步对象内 ptr_ref_ 槽位（memcpy 后新对象内 off-8 处仍为旧 &val_，
+                //    改写为 newValPtr，保证 ~GcRootHandle 注销时 std::find 命中）
+                //    槽位内容类型为 GcObject**（GcRootHandleBase::ptr_ref_）
+                *reinterpret_cast<GcObject***>(
+                    reinterpret_cast<char*>(it->newAddr) + off - kGcHandlePtrRefValDelta) =
+                    newValPtr;
+            }
+        }
+    }
+}
+
+// 线性版重定位：用于中页/大页（对象数量少，遍历 forwardMap 足够）。
+// 逻辑与 relocateGlobalRootPtrs 相同（含对象内 ptr_ref_ 槽位同步）。
+void GcHeap::relocateRootsInForwardMap(
+    const std::vector<std::tuple<GcObject*, GcObject*, size_t>>& forwardMap) {
+    std::lock_guard<std::mutex> lk(globalRoots_m_);
+    for (auto*& rootPtr : globalRoots_) {
+        const char* p = reinterpret_cast<const char*>(rootPtr);
+        for (const auto& entry : forwardMap) {
+            const auto& [oldAddr, newAddr, size] = entry;
+            const char* old = reinterpret_cast<const char*>(oldAddr);
+            if (p >= old && p < old + size) {
+                const size_t off = static_cast<size_t>(p - old);       // val_ 槽位在对象内偏移
+                GcObject** newValPtr = reinterpret_cast<GcObject**>(
+                    reinterpret_cast<char*>(newAddr) + off);           // 新 val_ 槽位地址
+                rootPtr = newValPtr;                                    // 1) 重定位 globalRoots_ 元素
+                if (off >= kGcHandlePtrRefValDelta) {
+                    // 2) 同步对象内 ptr_ref_ 槽位（见 relocateGlobalRootPtrs 说明；
+                    //    槽位内容类型为 GcObject**（GcRootHandleBase::ptr_ref_））
+                    *reinterpret_cast<GcObject***>(
+                        reinterpret_cast<char*>(newAddr) + off - kGcHandlePtrRefValDelta) =
+                        newValPtr;
+                }
+                break;
+            }
+        }
+    }
+}
+
 void GcHeap::updateObjectFields(GcObject* obj) {
     // 对象可能已 forwarded（desc 被覆盖为 forwardingPtr），需从 savedDescs_ 获取原始 desc
     const TypeDescriptor* desc;
@@ -477,6 +555,17 @@ PageClass GcHeap::pageClassOf(GcObject* obj) const {
     return PageClass::Small;
 }
 
+bool GcHeap::isGCAddress(const void* p) const {
+    const char* c = static_cast<const char*>(p);
+    for (Page* pg = headPage_; pg; pg = pg->next)
+        if (c >= pg->data && c < pg->data + kPageSize) return true;
+    for (MediumPage* pg = mediumPages_; pg; pg = pg->next)
+        if (c >= pg->data && c < pg->data + MediumPage::kSize) return true;
+    for (LargePage* pg = largePages_; pg; pg = pg->next)
+        if (c >= pg->data && c < pg->data + LargePage::kSize) return true;
+    return false;
+}
+
 // ============================================================
 // 阶段 2：中页滑动窗口多页 compact
 // ============================================================
@@ -529,7 +618,9 @@ void GcHeap::compactMediumPages() {
     std::sort(toCompact.begin(), toCompact.end());
 
     // 滑动窗口搬运：取空闲中页作目标，bump 分配存活对象
-    std::vector<std::pair<GcObject*, GcObject*>> forwardMap;
+    // 三元组 {oldAddr, newAddr, size}：size 供 globalRoots_ 重定位做区间判定
+    //（旧页释放后不能回读 oldAddr->allocSize()，故 push 时记录）
+    std::vector<std::tuple<GcObject*, GcObject*, size_t>> forwardMap;
     MediumPage* newHead = nullptr;
     MediumPage* newTail = nullptr;
     MediumPage* curPage = nullptr;
@@ -574,12 +665,11 @@ void GcHeap::compactMediumPages() {
         GcObject* newAddr = reinterpret_cast<GcObject*>(dest);
         savedDescs_[obj] = obj->desc;
         obj->setForwardingPtr(newAddr);
-        forwardMap.push_back({obj, newAddr});
+        forwardMap.push_back({obj, newAddr, size});
     }
 
     // 拷贝对象到新位置
-    for (auto& [oldAddr, newAddr] : forwardMap) {
-        size_t size = oldAddr->allocSize();
+    for (auto& [oldAddr, newAddr, size] : forwardMap) {
         std::memcpy(newAddr, oldAddr, size);
         newAddr->desc = savedDescs_[oldAddr];
         newAddr->setForwarded(false);
@@ -599,13 +689,17 @@ void GcHeap::compactMediumPages() {
     currentMediumPage_ = newTail;
 
     // 更新 youngObjects_ / oldObjects_ 中的引用
-    for (auto& [oldAddr, newAddr] : forwardMap) {
+    for (auto& [oldAddr, newAddr, size] : forwardMap) {
         for (auto& obj : youngObjects_) if (obj == oldAddr) obj = newAddr;
         for (auto& obj : oldObjects_)   if (obj == oldAddr) obj = newAddr;
     }
 
     // 更新所有对象的字段引用
     updateMediumPageReferences();
+
+    // 重定位位于中页对象内部的 globalRoots_ rootPtr（对象被搬运后 &val_ 悬垂，
+    // 见 relocateGlobalRootPtrs 方案 P 说明；旧中页已进 freeMediumPages_，只做地址运算）
+    relocateRootsInForwardMap(forwardMap);
 
     savedDescs_.clear();
 
@@ -741,7 +835,9 @@ void GcHeap::sweepLargePages() {
     }
     curPage->bumpOffset = 0;
 
-    std::vector<std::pair<GcObject*, GcObject*>> forwardMap;
+    // 三元组 {oldAddr, newAddr, size}：size 供 globalRoots_ 重定位做区间判定
+    //（旧页释放/复用后不能回读 oldAddr->allocSize()，故 push 时记录）
+    std::vector<std::tuple<GcObject*, GcObject*, size_t>> forwardMap;
     savedDescs_.clear();
 
     for (auto* obj : toKeep) {
@@ -767,12 +863,11 @@ void GcHeap::sweepLargePages() {
         GcObject* newAddr = reinterpret_cast<GcObject*>(dest);
         savedDescs_[obj] = obj->desc;
         obj->setForwardingPtr(newAddr);
-        forwardMap.push_back({obj, newAddr});
+        forwardMap.push_back({obj, newAddr, size});
     }
 
     // 拷贝对象
-    for (auto& [oldAddr, newAddr] : forwardMap) {
-        size_t size = oldAddr->allocSize();
+    for (auto& [oldAddr, newAddr, size] : forwardMap) {
         std::memcpy(newAddr, oldAddr, size);
         newAddr->desc = savedDescs_[oldAddr];
         newAddr->setForwarded(false);
@@ -781,8 +876,12 @@ void GcHeap::sweepLargePages() {
     // 更新引用（复用中页的引用更新逻辑）
     updateMediumPageReferences();
 
+    // 重定位位于大页对象内部的 globalRoots_ rootPtr（大页 sweep 同样搬运对象，
+    // 见 relocateGlobalRootPtrs 方案 P 说明；只做地址运算，不 deref 旧地址）
+    relocateRootsInForwardMap(forwardMap);
+
     // 更新 youngObjects_ / oldObjects_ 中的引用
-    for (auto& [oldAddr, newAddr] : forwardMap) {
+    for (auto& [oldAddr, newAddr, size] : forwardMap) {
         for (auto& obj : youngObjects_) if (obj == oldAddr) obj = newAddr;
         for (auto& obj : oldObjects_)   if (obj == oldAddr) obj = newAddr;
     }

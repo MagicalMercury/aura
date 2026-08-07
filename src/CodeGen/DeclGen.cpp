@@ -89,6 +89,11 @@ void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
         // 包括 NamedType（如 User*）、ListType（如 Array<T>*）、GcString* 等
         if (!cppType.empty() && cppType.back() == '*') {
             ptrFields.push_back(safeName(f.name));
+        } else if (isIfaceViewTypeName(cppType)) {
+            // 接口视图字段（值类型，非 * 结尾）：注册 self 子偏移
+            // 格式 "field+ViewType"，genTypeDescriptor 展开为
+            // offsetof(Self, field) + offsetof(ViewType, self)
+            ptrFields.push_back(safeName(f.name) + "+" + cppType);
         }
     }
 
@@ -118,7 +123,7 @@ void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
 }
 
 // ============================================================
-// 接口声明 → 抽象基类 + std::function 包装器
+// 接口声明 → 值视图结构体 + XFunc GC 化（P1 全接口去虚化）
 // ============================================================
 
 void CodeGenerator::genInterfaceDecl(std::ostream& h,
@@ -126,11 +131,11 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
     std::string name = decl.name;
 
     // 内置 Iterator：C++ 形态来自 runtime/builtin/iterator.h（aura_rt::Iterator<T>），
-    // 不在此生成抽象基类（避免与 runtime 的 Iterator<T> 重复/冲突）。
+    // 不在此生成视图（避免与 runtime 的 Iterator<T> 重复/冲突）。
     // interfaces.aurai 中的声明仅供 Sema（方法签名），record impl 适配器走 genIfaceAdapter 特判。
     if (name == "Iterator") return;
 
-    // 泛型接口 → 模板抽象基类（template<typename T> struct Comparable { ... }）
+    // 泛型接口 → 模板视图（template<typename T> struct Comparable { ... }）
     // 方法签名中的泛型引用（GenericTypeRef → "T"）在模板作用域内有效
     std::string tprefix;
     if (!decl.typeParams.empty()) {
@@ -142,70 +147,96 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
         tprefix += ">\n";
     }
 
-    // 1. 抽象基类
+    // 1. 值视图结构体（B+W 统一对象模型）：
+    //    - 每个纯虚方法 → 无捕获函数指针字段（名 = 方法名 + "Fn"，避免与成员函数名冲突）
+    //      + 转发成员函数（内部调用函数指针，首参 self）
+    //    - 默认方法 → 视图内普通成员函数，体内经 currentReceiverName_="self" 映射 this，
+    //      转发调用本视图的纯虚转发成员（完全复用现有 genBlock 翻译）
+    //    - CppBridge（返回类型含未绑定 U，无法在 C++ 表达）→ 不生成
     h << tprefix << "struct " << name << " {\n";
-    h << "  virtual ~" << name << "() = default;\n";
+    // 1a. 函数指针字段（仅纯虚方法；默认方法不占 Fn 字段，由视图内默认方法体承接）
     for (auto& m : decl.methods) {
-        // CppBridge（...）：aura 无实现、c++ 有实现，不生成纯虚/虚成员
-        //（返回类型含未绑定 U 等，无法在 C++ 接口中表达；调用点 CodeGen 直转 runtime）
+        if (m.defaultBody || m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge) continue;
+        std::string retType = m.returnType ? mapType(*m.returnType) : "void";
+        h << "  " << retType << " (*" << m.name << "Fn)(aura_rt::GcObject* self";
+        for (size_t i = 0; i < m.params.size(); ++i) {
+            h << ", " << (m.params[i].type ? mapType(*m.params[i].type) : "auto");
+        }
+        h << ") = nullptr;\n";
+    }
+    h << "  aura_rt::GcObject* self = nullptr;\n";
+    // 1b. 成员函数（纯虚转发 / 默认方法体）
+    for (auto& m : decl.methods) {
         if (m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge) continue;
         std::string retType = m.returnType ? mapType(*m.returnType) : "void";
         if (m.defaultBody) {
-            // 有默认实现 → 非纯虚；体内 self 映射 this（虚调用，尊重派生 override）
-            h << "  virtual " << retType << " " << m.name << "(";
+            // 默认方法：体内 Aura 代码（self.xxx(...)）经 genBlock 翻译为 this->xxx(...)
+            h << "  " << retType << " " << m.name << "(";
             for (size_t i = 0; i < m.params.size(); ++i) {
                 if (i > 0) h << ", ";
                 h << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
                   << " " << safeName(m.params[i].name);
             }
-            h << ") const {\n";
+            h << ") {\n";
             currentReceiverName_ = "self";
             genBlock(h, *m.defaultBody, /*isCoroutine=*/false);
             currentReceiverName_.clear();
             // 清理方法体生成残留的变量跟踪状态（与 genMethodDecl 末尾一致）
-            valueTypeVarNames_.clear();
-            stringVarNames_.clear();
-            gcRootVarNames_.clear();
-            gcRootTypes_.clear();
+            clearVarTrackingState();
             h << "  }\n";
         } else {
-            h << "  virtual " << retType << " " << m.name << "(";
+            // 纯虚方法：转发成员 → 函数指针
+            h << "  " << retType << " " << m.name << "(";
             for (size_t i = 0; i < m.params.size(); ++i) {
                 if (i > 0) h << ", ";
                 h << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
                   << " " << safeName(m.params[i].name);
             }
-            h << ") const = 0;\n";
+            h << ") { return " << m.name << "Fn(self";
+            for (size_t i = 0; i < m.params.size(); ++i) {
+                h << ", " << safeName(m.params[i].name);
+            }
+            h << "); }\n";
         }
     }
     h << "};\n\n";
 
-    // 2. std::function 包装器（闭包适配器）——仅非泛型单方法接口
-    // 泛型接口的闭包适配器 v1 不支持（闭包无类型参数可绑定）
+    // 2. 闭包适配器（XFunc）——仅非泛型单方法接口（泛型接口无类型参数可绑定）
+    //    GC 化：单继承 GcObject，std::function 由 finalizer 显式析构
     if (decl.typeParams.empty() && decl.methods.size() == 1) {
         auto& m = decl.methods[0];
         std::string retType = m.returnType ? mapType(*m.returnType) : "void";
-        std::string params;
+        std::string params, argNames;
         for (size_t i = 0; i < m.params.size(); ++i) {
-            if (i > 0) params += ", ";
+            if (i > 0) { params += ", "; argNames += ", "; }
             params += m.params[i].type ? mapType(*m.params[i].type) : "auto";
+            argNames += safeName(m.params[i].name);
         }
-        h << "struct " << name << "Func : " << name << " {\n";
-        h << "  std::function<" << retType << "(" << params << ")> func;\n";
-        h << "  " << name << "Func(std::function<" << retType << "(" << params
-          << ")> f) : func(std::move(f)) {}\n";
-        h << "  " << retType << " " << m.name << "(";
+        std::string fnType = "std::function<" + retType + "(" + params + ")>";
+        h << "struct " << name << "Func final : aura_rt::GcObject {\n";
+        // FnType 类型别名：C++ 语法不允许 qualified template-id 跟在 ~ 后（~std::function<...> 非法），
+        // 用别名承接析构调用（与 runtime iterator.h 的 MapIter::fn_.~F() 同模式）
+        h << "  using FnType = " << fnType << ";\n";
+        h << "  FnType func;\n";
+        h << "  explicit " << name << "Func(FnType f) : func(std::move(f)) {}\n";
+        h << "  static " << retType << " " << m.name << "Fn(aura_rt::GcObject* self";
         for (size_t i = 0; i < m.params.size(); ++i) {
-            if (i > 0) h << ", ";
-            h << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
+            h << ", " << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
               << " " << safeName(m.params[i].name);
         }
-        h << ") const override { return func(";
-        for (size_t i = 0; i < m.params.size(); ++i) {
-            if (i > 0) h << ", ";
-            h << safeName(m.params[i].name);
-        }
-        h << "); }\n";
+        h << ") {\n";
+        h << "    return static_cast<" << name << "Func*>(self)->func(" << argNames << ");\n";
+        h << "  }\n";
+        h << "  static " << name << " view(" << name << "Func* o) {\n";
+        h << "    return { &" << m.name << "Fn, o };\n";
+        h << "  }\n";
+        h << "  static const aura_rt::TypeDescriptor& desc() {\n";
+        h << "    static const aura_rt::TypeDescriptor d = { sizeof(" << name
+          << "Func), 0, nullptr, 0, nullptr,\n";
+        h << "        [](aura_rt::GcObject* obj) { static_cast<" << name
+          << "Func*>(obj)->func.~FnType(); } };\n";
+        h << "    return d;\n";
+        h << "  }\n";
         h << "};\n\n";
     }
 }
@@ -257,12 +288,8 @@ void CodeGenerator::genIfaceAdapter(std::ostream& h,
         }
         return t ? mapType(*t) : "auto";
     };
-    h << "struct " << adapterName << " final : " << baseType << " {\n";
-    h << "  aura_rt::GcRootHandle<" << recordName << "*> obj;\n";   // 模式 B：值持有 + 线程局部根
-    h << "  explicit " << adapterName << "(" << recordName << "* o)\n";
-    h << "      : obj(o, aura_rt::GcRootScope::ThreadLocal) {}\n";  // 显式 scope（避免匹配模式 A 构造）
-    // 内置 Iterator：C++ 形态来自 runtime/builtin/iterator.h（非 genInterfaceDecl 生成）
-    // 基类为 aura_rt::Iterator<elem>，next() 非 const override 转 obj.get()->next()
+    // 内置 Iterator：适配器 GC 化（单继承 GcObject），owner 裸指针经 desc 扫描；
+    // 视图 {nextFn, self} 分派到 owner->next()（self 恒为适配器对象起始）
     if (iface.name == "Iterator") {
         std::string elem = "int32_t";
         auto recIt = interfaceImplementations_.find(recordName);
@@ -271,30 +298,42 @@ void CodeGenerator::genIfaceAdapter(std::ostream& h,
             if (ifIt != recIt->second.end() && !ifIt->second.empty())
                 elem = ifIt->second[0];
         }
-        h << "  aura_rt::Optional<" << elem << ">* next() override {\n";
-        h << "    return obj.get()->next();\n";
+        h << "struct " << adapterName << " final : aura_rt::GcObject {\n";
+        h << "  " << recordName << "* owner;\n";
+        h << "  explicit " << adapterName << "(" << recordName << "* o) : owner(o) {}\n";
+        h << "  static aura_rt::Optional<" << elem << ">* nextFn(aura_rt::GcObject* self) {\n";
+        h << "    return static_cast<" << adapterName << "*>(self)->owner->next();\n";
+        h << "  }\n";
+        h << "  static aura_rt::Iterator<" << elem << "> view(" << adapterName << "* o) {\n";
+        h << "    return { &nextFn, o };\n";
+        h << "  }\n";
+        h << "  static const aura_rt::TypeDescriptor& desc() {\n";
+        h << "    static const size_t _o[] = { offsetof(" << adapterName << ", owner) };\n";
+        h << "    static const aura_rt::TypeDescriptor d = { sizeof(" << adapterName
+          << "), 1, _o, 0, nullptr, nullptr };\n";
+        h << "    return d;\n";
         h << "  }\n";
         h << "};\n\n";
         return;
     }
+    // 非 Iterator 接口：适配器 GC 化（单继承 GcObject），owner 裸指针经 desc 扫描；
+    // 视图 { 纯虚方法Fn..., self } 分派到 owner->方法(...)
+    // 仅非默认/非 CppBridge 方法生成 static Fn（视图结构体中只有纯虚方法占用 Fn 字段）
+    std::string viewType = baseType;   // 泛型接口已实例化（如 Comparable<Point*>）
+    h << "struct " << adapterName << " final : aura_rt::GcObject {\n";
+    h << "  " << recordName << "* owner;\n";
+    h << "  explicit " << adapterName << "(" << recordName << "* o) : owner(o) {}\n";
     for (auto& m : iface.methods) {
-        // 默认方法 / C++ 桥接且 record 未实现 → 不转发
-        //（继承基类默认实现内部虚调用分发；CppBridge 由调用点直转 runtime，基类也无此虚方法）
-        bool recordHas = false;
-        auto recIt = recordMethods_.find(recordName);
-        if (recIt != recordMethods_.end())
-            recordHas = recIt->second.count(m.name) > 0;
-        if ((m.defaultBody || m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge)
-            && !recordHas) continue;
+        if (m.defaultBody || m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge) continue;
         std::string retType = m.returnType ? mapIfaceType(m.returnType.get()) : "void";
-        h << "  " << retType << " " << m.name << "(";
+        h << "  static " << retType << " " << m.name << "Fn(aura_rt::GcObject* self";
         for (size_t i = 0; i < m.params.size(); ++i) {
-            if (i > 0) h << ", ";
-            h << mapIfaceType(m.params[i].type.get())
+            h << ", " << mapIfaceType(m.params[i].type.get())
               << " " << safeName(m.params[i].name);
         }
-        h << ") const override {\n";
-        h << "    return obj.get()->" << m.name << "(";
+        h << ") {\n";
+        h << "    return static_cast<" << adapterName << "*>(self)->owner->"
+          << m.name << "(";
         for (size_t i = 0; i < m.params.size(); ++i) {
             if (i > 0) h << ", ";
             h << safeName(m.params[i].name);
@@ -302,12 +341,74 @@ void CodeGenerator::genIfaceAdapter(std::ostream& h,
         h << ");\n";
         h << "  }\n";
     }
+    // view()：聚合初始化，字段顺序 = 纯虚方法 Fn 声明序 + self
+    h << "  static " << viewType << " view(" << adapterName << "* o) {\n";
+    h << "    return {";
+    std::string viewFields;
+    for (auto& m : iface.methods) {
+        if (m.defaultBody || m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge) continue;
+        if (!viewFields.empty()) viewFields += ", ";
+        viewFields += "&" + std::string(m.name) + "Fn";
+    }
+    h << viewFields << (viewFields.empty() ? "o" : ", o") << " };\n";
+    h << "  }\n";
+    h << "  static const aura_rt::TypeDescriptor& desc() {\n";
+    h << "    static const size_t _o[] = { offsetof(" << adapterName << ", owner) };\n";
+    h << "    static const aura_rt::TypeDescriptor d = { sizeof(" << adapterName
+      << "), 1, _o, 0, nullptr, nullptr };\n";
+    h << "    return d;\n";
+    h << "  }\n";
     h << "};\n\n";
 }
 
 // ============================================================
 // 函数声明 + 实现（plan §4.6, §4.8）
 // ============================================================
+
+void CodeGenerator::clearVarTrackingState() {
+    valueTypeVarNames_.clear();
+    stringVarNames_.clear();
+    gcRootVarNames_.clear();
+    gcRootTypes_.clear();
+    viewRootVarNames_.clear();
+    viewRootTypes_.clear();
+}
+
+void CodeGenerator::registerParamTracking(const Param& p) {
+    if (!p.type) return;
+    std::string ptype = mapType(*p.type);
+    // string 参数 → stringVarNames_
+    if (ptype.find("aura_rt::GcString*") != std::string::npos)
+        stringVarNames_.insert(p.name);
+    // 接口参数 → valueTypeVarNames_（引用用 . 不是 ->）
+    if (auto* nt = dynamic_cast<const NamedType*>(p.type.get()))
+        if (interfaceNames_.count(nt->name))
+            valueTypeVarNames_.insert(p.name);
+    // 值类型 NamedType → valueTypeVarNames_（registeredTypes_ 非堆 / BuiltinRegistry 非堆）
+    if (auto* nt = dynamic_cast<const NamedType*>(p.type.get()))
+        if ((registeredTypes_.count(nt->name) && !registeredTypes_[nt->name])
+            || (BuiltinRegistry::get().findType(nt->name) != nullptr
+                && !BuiltinRegistry::get().isHeapType(nt->name)))
+            valueTypeVarNames_.insert(p.name);
+}
+
+void CodeGenerator::registerRawParamTracking(const Param& p) {
+    if (!p.type) return;
+    std::string ptype = mapParamType(*p.type);
+    if (isIfaceViewTypeName(ptype)) {
+        valueTypeVarNames_.insert(p.name);
+        viewRootVarNames_.insert(p.name);
+        viewRootTypes_[p.name] = "decltype(" + safeName(p.name) + "_raw)";
+    } else if (auto* nt = dynamic_cast<const NamedType*>(p.type.get())) {
+        if (interfaceNames_.count(nt->name))
+            valueTypeVarNames_.insert(p.name);
+    }
+    if (isGcPointerType(ptype)) {
+        std::string varName = safeName(p.name);
+        gcRootVarNames_.insert(varName);
+        gcRootTypes_[varName] = "decltype(" + varName + "_raw)";
+    }
+}
 
 void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
                                 const FunDecl& decl, bool declarationsOnly) {
@@ -371,38 +472,11 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     stringVarNames_.clear();
     gcRootVarNames_.clear();
     gcRootTypes_.clear();
+    viewRootVarNames_.clear();
+    viewRootTypes_.clear();
     for (auto& p : decl.params) {
-        if (p.type && dynamic_cast<const NamedType*>(p.type.get())) {
-            auto* nt = dynamic_cast<const NamedType*>(p.type.get());
-            if ((registeredTypes_.count(nt->name) && !registeredTypes_[nt->name])
-                || (BuiltinRegistry::get().findType(nt->name) != nullptr
-                    && !BuiltinRegistry::get().isHeapType(nt->name)))
-                valueTypeVarNames_.insert(p.name);
-        }
-        // 跟踪 string 类型参数 → lambda 捕获后 genBinaryExpr 用 concat
-        if (p.type && mapType(*p.type).find("aura_rt::GcString*") != std::string::npos) {
-            stringVarNames_.insert(p.name);
-        }
-        // 接口类型参数 → 值类型追踪（引用用 . 不是 ->）
-        if (p.type) {
-            if (auto* nt = dynamic_cast<const NamedType*>(p.type.get())) {
-                if (interfaceNames_.count(nt->name))
-                    valueTypeVarNames_.insert(p.name);
-            }
-        }
-        // Bug B 修复：堆类型参数注册为 GcRootHandle 变量
-        // 函数签名已生成 varName_raw，函数体入口会包装为同名 GcRootHandle
-        // 这里把 varName 加入 gcRootVarNames_，让 genIdentifier 生成 .get()
-        // gcRootTypes_ 存 decltype(varName_raw)，lambda 捕获时用此类型生成 GcSharedRoot
-        //   （避免源类型含未绑定模板参数 T，如 compose(auto transforms) 的 Array<Transform<T>>*）
-        if (p.type) {
-            std::string ptype = mapParamType(*p.type);
-            if (isGcPointerType(ptype)) {
-                std::string varName = safeName(p.name);
-                gcRootVarNames_.insert(varName);
-                gcRootTypes_[varName] = "decltype(" + varName + "_raw)";
-            }
-        }
+        registerParamTracking(p);
+        registerRawParamTracking(p);
     }
 
     // 模板函数或 auto 返回（泛型闭包）→ 体放入头文件（跨模块可见）
@@ -428,13 +502,18 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     // 签名形如 `Tree<T>* node_raw`，此处生成 `GcRootHandle<decltype(node_raw)> node(node_raw);`
     // 用 decltype 而非显式 ptype，避免泛型闭包（compose(auto transforms)）中
     // 源类型含未绑定模板参数 T 而无法在函数作用域解析的问题
+    // P1：接口视图参数同样处理——ViewRoot 包裹（self 跨 GC 保护）
     for (auto& p : decl.params) {
         if (!p.type) continue;
         std::string ptype = mapParamType(*p.type);
-        if (!isGcPointerType(ptype)) continue;
         std::string varName = safeName(p.name);
-        out << "  aura_rt::GcRootHandle<decltype(" << varName << "_raw)> "
-            << varName << "(" << varName << "_raw);\n";
+        if (isGcPointerType(ptype)) {
+            out << "  aura_rt::GcRootHandle<decltype(" << varName << "_raw)> "
+                << varName << "(" << varName << "_raw);\n";
+        } else if (isIfaceViewTypeName(ptype)) {
+            out << "  aura_rt::ViewRoot<decltype(" << varName << "_raw)> "
+                << varName << "(" << varName << "_raw);\n";
+        }
     }
     if (decl.body) genBlock(out, *decl.body, isCoro);
     bool lastIsReturn = decl.body && !decl.body->stmts.empty()
@@ -451,10 +530,7 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
         out << "  return aura_rt::NoneType{};\n";
     }
     out << "}\n\n";
-    valueTypeVarNames_.clear();
-    stringVarNames_.clear();
-    gcRootVarNames_.clear();
-    gcRootTypes_.clear();
+    clearVarTrackingState();
     currentReturnElem_.clear();
 }
 
@@ -518,9 +594,10 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
 
         // 堆类型参数加 _raw 后缀，函数体开头会用 GcRootHandle 包装为同名变量
         // （防止函数体内 alloc 触发 GC 移动对象后参数悬垂）
+        // P1：接口视图参数同样加 _raw，函数体开头用 ViewRoot 包裹（self 跨 GC 保护）
         if (decl.params[i].type) {
             std::string ptype = mapParamType(*decl.params[i].type);
-            if (isGcPointerType(ptype)) {
+            if (isGcPointerType(ptype) || isIfaceViewTypeName(ptype)) {
                 sig << "_raw";
             }
         }
@@ -593,10 +670,7 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
         recvFullType += ">";
     }
 
-    valueTypeVarNames_.clear();
-    stringVarNames_.clear();
-    gcRootVarNames_.clear();
-    gcRootTypes_.clear();
+    clearVarTrackingState();
 
     // 跟踪方法接收者 self 的类型
     if (!decl.receiverTypeArgs.empty() || !registeredTypes_.count(decl.receiverType) || registeredTypes_[decl.receiverType])
@@ -605,25 +679,8 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
         valueTypeVarNames_.insert(decl.receiverName);
 
     for (auto& p : decl.params) {
-        if (p.type) {
-            auto mt = mapType(*p.type);
-            if (mt.find("aura_rt::GcString*") != std::string::npos)
-                stringVarNames_.insert(p.name);
-            // 接口类型参数 → 值类型追踪（引用用 . 不是 ->）
-            if (auto* nt = dynamic_cast<const NamedType*>(p.type.get())) {
-                if (interfaceNames_.count(nt->name))
-                    valueTypeVarNames_.insert(p.name);
-            }
-            // Bug B 同步修复：堆类型参数注册为 GcRootHandle 变量
-            // 方法签名会生成 varName_raw，方法体入口包装为同名 GcRootHandle
-            // genIdentifier 据此生成 .get()，lambda 捕获用 gcRootTypes_ 生成 GcSharedRoot
-            std::string ptype = mapParamType(*p.type);
-            if (isGcPointerType(ptype)) {
-                std::string varName = safeName(p.name);
-                gcRootVarNames_.insert(varName);
-                gcRootTypes_[varName] = "decltype(" + varName + "_raw)";
-            }
-        }
+        registerParamTracking(p);
+        registerRawParamTracking(p);
     }
 
     std::string retType = decl.returnType ? mapType(*decl.returnType) : "void";
@@ -656,9 +713,10 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
         sig += (decl.params[i].type ? mapParamType(*decl.params[i].type) : "auto")
              + " " + safeName(decl.params[i].name);
         // Bug B 同步修复：堆类型参数加 _raw 后缀，方法体入口用 GcRootHandle 包装
+        // P1：接口视图参数同样加 _raw，方法体入口用 ViewRoot 包裹（self 跨 GC 保护）
         if (decl.params[i].type) {
             std::string ptype = mapParamType(*decl.params[i].type);
-            if (isGcPointerType(ptype)) {
+            if (isGcPointerType(ptype) || isIfaceViewTypeName(ptype)) {
                 sig += "_raw";
             }
         }
@@ -677,21 +735,24 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     // Bug B 同步修复：方法体入口为堆类型参数生成 GcRootHandle 包装
     // 签名形如 `Tree<T>::map(Tree<U>* node_raw)`，此处生成 `GcRootHandle<decltype(node_raw)> node(node_raw);`
     // 用 decltype 避免泛型方法中未绑定模板参数无法解析的问题
+    // P1：接口视图参数 → ViewRoot 包裹（视图含 self 裸指针，compact 不重写栈上指针，
+    //     必须注册 self 为 GcRootHandle，GC 后 get() 重建视图取最新 self）
     for (auto& p : decl.params) {
         if (!p.type) continue;
         std::string ptype = mapParamType(*p.type);
-        if (!isGcPointerType(ptype)) continue;
         std::string varName = safeName(p.name);
-        out << "  aura_rt::GcRootHandle<decltype(" << varName << "_raw)> "
-            << varName << "(" << varName << "_raw);\n";
+        if (isGcPointerType(ptype)) {
+            out << "  aura_rt::GcRootHandle<decltype(" << varName << "_raw)> "
+                << varName << "(" << varName << "_raw);\n";
+        } else if (isIfaceViewTypeName(ptype)) {
+            out << "  aura_rt::ViewRoot<decltype(" << varName << "_raw)> "
+                << varName << "(" << varName << "_raw);\n";
+        }
     }
     if (decl.body) genBlock(out, *decl.body, isCoro);
     currentReceiverName_.clear();
     out << "}\n\n";
-    valueTypeVarNames_.clear();
-    stringVarNames_.clear();
-    gcRootVarNames_.clear();
-    gcRootTypes_.clear();
+    clearVarTrackingState();
     currentReturnElem_.clear();
 }
 
@@ -740,10 +801,7 @@ void CodeGenerator::genConstructor(std::ostream& cpp, const MethodDecl& decl) {
     if (decl.body) genBlock(out, *decl.body, false);
     out << "  return " << safeName(decl.receiverName) << ";\n";
     out << "}\n\n";
-    valueTypeVarNames_.clear();
-    stringVarNames_.clear();
-    gcRootVarNames_.clear();
-    gcRootTypes_.clear();
+    clearVarTrackingState();
     currentTParams_.clear();
 }
 

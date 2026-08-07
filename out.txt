@@ -1,537 +1,258 @@
-# 审查报告
-
-## A. 联合类型GC安全问题.md 审查
-
-### A1. P0 `unionVariantGcUnsafe` 判定与 `isHeapSemType` 口径**不一致**
-
-**位置**：plan §4.1 [L78-97](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L78-L97)
-
-**问题**：
-
-`unionVariantGcUnsafe` 与 [ExprGen.cpp:12-30](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L12-L30) `isHeapSemType` 对相同 SemType 的判断结论**会冲突**：
-
-| 类型 | `isHeapSemType`（CodeGen） | `unionVariantGcUnsafe`（Sema P0） | 冲突 |
-|------|--------------------------|----------------------------------|------|
-| `FuncSemType` | false（[L23](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L23)） | true（[L90](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L90)） | ✓ |
-| `InterfaceSemType` | false（[L22](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L22)） | true（[L91](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L91)） | ✓ |
-
-**后果**：
-- P0 报错"`fun \| int` 不安全" → 用户改用 `Optional`/`Variant`
-- 但 CodeGen `isHeapSemType` 返回 false → 不生成 GcRootHandle
-- 用户若硬绕过 P0（如泛型变体 B3 放行）→ 仍走 std::variant → 内部 GC 指针失根
-
-**风险等级**：P1（重要）。plan §9 风险表已提到"Sema 判定与 CodeGen isHeapSemType 口径漂移"，但只是对照测试，**未要求统一逻辑**。应抽公共函数或 P0 同时修 `isHeapSemType`。
-
-### A2. P0 缺少 `Aura::error` 调用语法核对
-
-**位置**：plan §4.1 [L108-111](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L108-L111)
-
-**问题**：
-
-```cpp
-errorAt(/*v 位置*/,
-    "union type contains GC heap variant '%s' which is not GC-safe yet; "
-    "use Optional<T> for 'T | None' (Variant<T...> coming)",
-    vt->toString().c_str());
-```
-
-而实际源码 [DeclChecker.cpp:326-332](file:///d:/you/Aura/src/Sema/Checker/DeclChecker.cpp#L326-L332) 中 `resolveType` 内部用的是 `SemAnalyzer::error`，签名是 `error(const ASTNode&, const std::string&)`（单消息），不是 C 风格 `printf` 变参。
-
-**修复建议**：
-
-```cpp
-if (vt && unionVariantGcUnsafe(*vt)) {
-    error(*v, "union type contains GC heap variant '" + vt->toString() +
-        "' which is not GC-safe yet; use Optional<T> for 'T | None' "
-        "(Variant<T...> coming)");
-}
-```
-
-**风险等级**：P2（重要，会导致编译失败）。
-
-### A3. P2a `desc->size` 读取点核对**遗漏了 alloc 路径**
-
-**位置**：plan §4.2 [L145](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L145)
-
-**plan 声称**："`desc->size` 唯一读取点 mark_sweep.cpp:102（`== 0` 判定）不受影响；alloc 走显式 size 参数，不依赖 desc->size。"
-
-**实际源码**：
-
-`desc->size` 实际**不止一处**读取：
-- [mark_sweep.cpp:102](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L102)：`== 0` 判定
-- [compact.cpp:188](file:///d:/you/Aura/runtime/gc/compact.cpp#L188)：`std::memcpy(entry.newAddr, entry.oldAddr, entry.size)` — `entry.size` 来自 `entry.allocSize`（uint32_t），**不是** desc->size，✓ 安全
-
-但 plan 没核对 [gc.cpp](file:///d:/you/Aura/runtime/gc.cpp) 中 `alloc` 函数是否真的不读 `desc->size`。GcObject::allocSize_ 是 uint32_t（[types.h:108](file:///d:/you/Aura/runtime/types.h#L108)），但 `setAllocSize(size_t s)` 在 [types.h:144](file:///d:/you/Aura/runtime/types.h#L144) 做 `static_cast<uint32_t>(s)` 截断。如果 size > 4GB 会丢失高位——但实际不会，✓ 安全。
-
-**结论**：plan 描述准确，但核对不彻底（只查了 2 处）。建议 P2a 增加全量 `grep "desc->size"` 步骤。
-
-**风险等级**：P2（次要）。
-
-### A4. P2b `dynamicDesc` 钩子遗漏 `updateInlineArrayElements` 与 `markInlineArrayFields`
-
-**位置**：plan §4.3 [L149-167](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L149-L167)
-
-**问题**：
-
-plan 只在 `markFields`（[mark_sweep.cpp:179](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L179)）和 `updateObjectFields`（[compact.cpp:397](file:///d:/you/Aura/runtime/gc/compact.cpp#L397)）加 `dynamicDesc` 钩子。
-
-但实际 GC 还有两个路径：
-1. **`markInlineArrayFields`**（[mark_sweep.cpp:185](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L185)，被 `markObject` 调用 [L176](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L176)）
-2. **`updateInlineArrayElements`**（[compact.cpp:419](file:///d:/you/Aura/runtime/gc/compact.cpp#L419)，被 [L347-348, L350-351, L655-656](file:///d:/you/Aura/runtime/gc/compact.cpp#L347) 调用）
-
-这两个函数同样读 `desc`。虽然 Variant 设计上**没有 inlineArrayFields**（desc 初始化为 0/nullptr），即使不接钩子也不会扫描错（提前 return）。**但 forwarding 状态下 desc 可能被覆盖为 forwardingPtr**，`updateInlineArrayElements` 走的是 `savedDescs_` 分支（[compact.cpp:422-423](file:///d:/you/Aura/runtime/gc/compact.cpp#L422-L423)），需确认 `dynamicDesc` 钩子也能通过 savedDescs_ 取到的 desc 工作。
-
-**结论**：plan 的钩子接入不完整，但因为 Variant 无 inline array 字段，**不会产生正确性问题**，只是统一性建议。建议 P2b 在两处也加钩子分支保持一致性。
-
-**风险等级**：P2（次要）。
-
-### A5. P1 `Variant::desc()` 缺失且与 `dynamicDesc` 关系不明
-
-**位置**：plan §4.4 [L176-200](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L176-L200)
-
-**问题**：
-
-plan 展示了 `descFor(i)` 和 `dynamicDesc`，但 `make_variant` 调用的是 `Variant<Ts...>::desc()`（[L196](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L196)）：
-
-```cpp
-GcHeap::instance().alloc(sizeof(Variant<Ts...>), &Variant<Ts...>::desc()));
-```
-
-而 `Variant::desc()` **未定义**，只定义了 `descFor(i)`。且 `desc()` 应返回什么？
-
-- 若返回"默认变体的 desc" → 分配时 storage_ 还未初始化，index_=0 → 返回 `kDescs[0]`（即第 0 变体的 desc）
-- 但 `make_variant` 立即设置 index_ 后 `desc()` 仍返回第 0 变体 desc → 与实际变体不符
-
-**正确做法**：alloc 用占位 desc（如 nullptr 或第 0 变体 desc），赋值后由 GC 通过 `dynamicDesc` 钩子读取真实 desc。
-
-plan 没说清这个时序。建议明确：
-- `Variant::desc()` 返回 `kDescs[0]`（占位）
-- `dynamicDesc(obj)` 根据 `obj->index_` 返回对应 desc
-- alloc 时 `desc()` 的作用仅是"占位让 GC 不误判为无 desc 对象"，实际扫描走 `dynamicDesc`
-
-**风险等级**：P1（重要，影响实施）。
-
-### A6. P1 `make_variant` 未指明"对应变体大小"如何获取
-
-**位置**：plan §4.4 [L198](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L198)
-
-```cpp
-std::memcpy(v->storage_, value, /*对应变体大小*/);
-```
-
-**问题**：注释占位"对应变体大小"未给出实现。应为 `std::get<I>(std::make_tuple(sizeof(Ts)...))` 或模板特化 `variantSize<I>()`。
-
-**风险等级**：P2（实现细节）。
-
-### A7. P3a `T | None` 折叠规则未覆盖 `None | T` 顺序
-
-**位置**：plan §4.5 [L211](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L211)
-
-**问题**：plan 说"恰 2 变体、其一为 NoneSemType、另一为堆类型"，但未说明 None 在前（`None | T`）还是后（`T | None`）都折叠。Parser 是否两种顺序都允许？
-
-**建议**：明确两种顺序均折叠为 `Optional<T>`，与 Aura 联合类型无序语义一致（[SemType.cpp:82-90](file:///d:/you/Aura/src/Sema/SemType.cpp#L82-L90) `equals` 按序比较，但语义上 `A|B == B|A` 是否合法需确认）。
-
-**风险等级**：P2（次要）。
-
-### A8. P3b `mapType` 全值联合保留 `std::variant` 与 P5 适配冲突
-
-**位置**：plan §4.6-1 [L215](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L215)
-
-**问题**：
-
-> 全值 → 保留 `std::variant<...>`（避免破坏现有 match/赋值语义，全值 variant 无 GC 问题）
-
-但 P5 [L393](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L393) 又说：
-
-> P3b 后：含堆联合（Variant 路径）常量匹配生成 `is<I> && get<I> == 常量`
-
-**冲突**：全值联合（`int | float`）保留 `std::variant` → P5 常量匹配需走 `holds_alternative + get`（[L388](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L388)）；含堆联合走 `Variant` 指针 → 走 `is<I> + get<I>`。**两套路径并存**，genMatchStmt 需根据目标类型分派。
-
-plan §4.6-3 [L217-221](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L217-L221) 已提到"按目标类型区分"，但 P5 §4.10 [L408](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L408) 实现位置只说"P3b 后适配 Variant 路径"，**未说明 std::variant 路径也要适配**。
-
-**建议**：P5 实施步骤 11 (P5c) 明确"std::variant 路径常量匹配（holds_alternative + get）"和"Variant 路径常量匹配（is + get）"两套都要实现。
-
-**风险等级**：P1（重要）。
-
-### A9. P4 动态分派 `TypeError` 与现有 `Error` 对象语义混淆
-
-**位置**：plan §4.9 [L308](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L308)
-
-**问题**：
-
-> 复用现有 `make_type_error`（runtime/builtin/error.h:23-27，返回 `Error{intern_string("TypeError"), msg}`）。与 Optional.unwrap 抛错同级，**不需显式 throws 标注**（异常可传播，对齐 unwrap 先例）。
-
-但 `Error` 对象的 `kind` 字段是 `GcString*`（[types.h:177](file:///d:/you/Aura/runtime/types.h#L177)），内容为 `"TypeError"`。Aura catch 用 `catch kind == "..."` 匹配，需保证 intern 表中存在 `"TypeError"` 字面量。若动态生成字符串，需 `intern_string("TypeError")`，但 plan 没说明 `make_type_error` 是否走 intern。
-
-**建议**：明确 `make_type_error` 内部用 `intern_string` 保证 `kind` 与用户 catch 的字面量匹配。
-
-**风险等级**：P2（次要）。
-
-### A10. P0 Generic 变体放行 → P3 实例化时二次检查缺失
-
-**位置**：plan §4.1 [L95](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L95)
-
-```cpp
-if (dynamic_cast<const GenericSemType*>(&t)) return false; // 未实例化放行，实例化时二次检查（P3 强化）
-```
-
-**问题**：
-
-P3 步骤 [L505-506](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L505-506) 只提"P3a resolveType 折叠 T|None"，**未提 Generic 实例化时的二次检查**。
-
-例如 `type Tree<T> = { children: [Tree<T> | T] }`，T 未实例化时 P0 放行；实例化为 `Tree<string>` 时，`T` → `string`（堆类型），此时应触发检查。
-
-**建议**：P3 增加步骤"P3c：Generic 实例化时对 UnionSemType 重新调用 `unionVariantGcUnsafe` 检查（substitute 后）"。
-
-**风险等级**：P1（重要，B3 边界未闭环）。
-
-### A11. P5 GroupPattern 与联合类型表达式 `|` 歧义**未充分分析**
-
-**位置**：plan §4.10 [L346](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L346)
-
-**问题**：
-
-> `|` 分组，Rust 风格；case 分隔符已是逗号，逗号分组有歧义，`|` 与联合类型语法精神一致且无歧义
-
-但 Aura 联合类型语法 `A | B` 在**表达式上下文**也用 `|`（如 `let x = a | b` 位或？还是联合？）。虽然 plan §9 风险表 [L528](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L528) 说"分组仅在 parsePattern 内消费"，但需核对 Parser 当前是否在 match 上下文外能识别 `|`。
-
-**实际源码**：[TypeParser.cpp:13-28](file:///d:/you/Aura/src/Parser/TypeParser.cpp#L13-L28) `Bar` token 在类型上下文解析联合类型。parsePattern 在 match 上下文调用，与表达式 `|` 不冲突。✓ 无歧义。
-
-但**嵌套场景**未说明：`match v { User | string => ... }` 中的 `User | string` 是分组还是联合类型模式？plan 说"类型模式分组报错引导分开写"，但 Parser 怎么区分"类型模式 + 类型模式分组"vs"联合类型变量绑定"？
-
-**建议**：P5a 明确 Parser 解析顺序——先尝试 `parsePattern`（单模式），若遇 `|` 且当前模式是 `ConstantPattern` → 收集为 GroupPattern；若是 `TypePattern` → 报错。
-
-**风险等级**：P2（次要）。
-
-### A12. P5b `isMatchExhaustive` 与 GroupPattern 递归未给出具体算法
-
-**位置**：plan §4.10 [L401](file:///d:/you/Aura/plan/联合类型GC安全问题.md#L401)
-
-> 穷尽性不变：常量不覆盖联合变体（值域无限），仍须 TypePattern 或 `_` 补齐（保持 ExprInfer.cpp:554-590 现状，仅 GroupPattern 内 None 参与 None 变体覆盖判定）
-
-**问题**：未说明 GroupPattern 内 None 如何参与穷尽性判定。现有 [ExprInfer.cpp:557](file:///d:/you/Aura/src/Sema/Checker/ExprInfer.cpp#L557) 的逻辑是"每个 variant 必须在 cases 中被覆盖"，GroupPattern 作为单个 case，需递归检查其 alts 是否含 None。
-
-**建议**：P5b 明确算法：
-```
-GroupPattern 被视为一个 case，但穷尽性检查时：
-  若 alts 中含 None 常量 → 视为覆盖 None 变体
-  否则 → 不覆盖任何变体
-```
-
-**风险等级**：P2（次要）。
+# Plan 审查报告：GC稳健性三issue综合修复.md
+
+> 审查对象：`d:\you\Aura\plan\GC稳健性三issue综合修复.md`（详细实施方案，工作流 3）
+> 审查时间：2026-08-07（第三轮，成稿审查）
+> 审查依据：`.trae/rules/plan_review_rule.md`
+> 检索方式：4 个并行 Search Agent + 1 个针对性检索 Agent + 直接 Read 复核（2026-08-07）
 
 ---
 
-## B. 协程同步链栈深度保护.md 审查
+## Search Agent 检索摘要
 
-### B1. `g_chainDepth` 只增不降设计**正确但描述有误导**
+- **检索文件列表**（5 个 Agent 实际检索的文件）：
+  - [runtime/gc/alloc.cpp](file:///d:/you/Aura/runtime/gc/alloc.cpp)（tryAllocSlow 实际 L119-173 / tryAlloc L45-46 对齐 / bumpAlloc L175-189 / allocPage L191-206 / 三处已修 memset L81/L389/L427）
+  - [src/CodeGen/StmtGen.cpp](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp)（genMatchStmt L1655-1852 全量逐行核实 / _match_val 19 处引用全部验证 / L1764-1776 接口视图分支）
+  - [src/CodeGen/CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h)（4 计数器 L492-495 / 6 集合声明 L456/L517/L521/L527/L531/L535 / viewRootTypes_ L531 已存在）
+  - [src/CodeGen/DeclGen.cpp](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp)（6 处成组 clear L183-190/L431-436/L529-535/L674-679/L782-790/L838-844 / genFunDecl L437-476 4 分支 / genMethodDecl L687-713 3 分支缺值类型）
+  - [src/CodeGen/ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp)（genFunExpr L1697-1716 3 分支 + saved/restore L1697-1698 / restore L1798-1799 / genIdentifier L243-245 / 闭包捕获 L1615-1628 / isHeapSemType 定义 L12）
+  - [src/CodeGen/TypeMap.cpp](file:///d:/you/Aura/src/CodeGen/TypeMap.cpp)（isGcPointerType L32-39 / mapSemType L273 / isIfaceViewTypeName L45 / mapParamType L263）
+  - [example/test.aura](file:///d:/you/Aura/example/test.aura)（P2.1 L134-170 含 u1-u4 / P4 L250-302 另一组 u1-u8 / P5 L304-365 含 m1-m9 / gc_force() 用法 / none() 用法 / some() 用法 L219/L377）
+  - [runtime/builtin/optional.h](file:///d:/you/Aura/runtime/builtin/optional.h)（L25 `struct Optional : GcObject` / make_optional L55-62 / is_none L45 / unwrap L47）
+  - [runtime/gc/compact.cpp](file:///d:/you/Aura/runtime/gc/compact.cpp)（updateAllReferences L299-315 / updateMediumPageReferences L720-733 / relocateGlobalRootPtrs L416-445 / 中页调用 L702 / 大页调用 L881）
+  - [src/AST/Stmt.h](file:///d:/you/Aura/src/AST/Stmt.h#L16-L20)（Param 定义 `{name, type, defaultExpr}`）
+  - [src/Sema/BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L335-L337)（some/none 全局函数注册，无 optional）
+  - [src/Sema/Checker/ExprInfer.cpp](file:///d:/you/Aura/src/Sema/Checker/ExprInfer.cpp#L196-L203)（some/none 类型推断特判，无 optional）
+  - [src/CodeGen/ExprGen.cpp L641-644](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L641-L644)（some/none 代码生成特判，无 optional）
+  - [src/CodeGen/DeclGen.cpp L337-359](file:///d:/you/Aura/src/CodeGen/DeclGen.cpp#L337-L359)（let 声明隐式装箱 P3a 折叠）
 
-**位置**：plan §4.3 [L101](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L101)
+- **关键源码定位**：
 
-> 不需要递减：栈解开时若递减会与归零冲突（第 256 层归零后，外层 255 层 resume 返回各自 `--` 会把计数打成负数）
+  | 文件 | 行号区间 | 当前源码片段摘要 |
+  | ---- | -------- | ---------------- |
+  | alloc.cpp | L119-173 | tryAllocSlow 实际函数范围（plan 称 L120-174，⚠️偏移 1 行）；L141-144 OOM 抛出；L146 obj 转型；中间 L145 空行无 memset |
+  | alloc.cpp | L45-46 | `size = (size + 7) & ~size_t(7);` 8 字节对齐 ✅ |
+  | alloc.cpp | L81/L389/L427 | 三处已修 memset 全部准确 ✅ |
+  | StmtGen.cpp | L1655-1852 | genMatchStmt 完整范围 ✅ |
+  | StmtGen.cpp | L1681 | `auto&& _match_val = expr;` 唯一定义 ✅ |
+  | StmtGen.cpp | L1679/L1851 | match 块作用域 `{` / `}` ✅ |
+  | StmtGen.cpp | L1664-1666 | isVariantPtr@L1664 / isOptional@L1665 / **variantCppTypes@L1666**（plan 误称 L1666 是 isOptional 后插入点） |
+  | StmtGen.cpp | L1672-1674 | OptionalSemType 分支（plan 称 L1672-1673，实际含闭合 `}` L1674） |
+  | StmtGen.cpp | L1762-1763 | L1762 `if (!tp->varName.empty())` 守卫 / L1763 varName 声明 |
+  | StmtGen.cpp | L1777-1780 | 非视图堆变体 `} else {` 分支（plan 称 L1777-1779，实际含闭合 `}` L1780） |
+  | StmtGen.cpp | L1785-1788 | Optional binding ✅ |
+  | StmtGen.cpp | L1838-1843 | viewTmpVar 清理（只清 2 集合未清 viewRootTypes_）✅ |
+  | DeclGen.cpp | L183-190/L431-436/L529-535/L674-679/L782-790/L838-844 | 6 处成组 clear 全部准确 ✅ |
+  | CodeGen.h | L492-495 | 4 计数器，unionBoxingCounter_@L495 ✅ |
+  | optional.h | L25 | `struct Optional : GcObject` ✅ |
+  | optional.h | L55-62 | `make_optional<T>(v)` C++ 工厂函数 |
+  | BuiltinRegistry.h | L335-337 | `some`/`none` 全局注册，**无 `optional`** |
+  | ExprGen.cpp | L641-644 | `some(v)` 特判生成 `make_optional(...)`，**无 `optional` 特判** |
+  | DeclGen.cpp | L337-359 | let 声明 OptionalSemType 隐式装箱（P3a 折叠） |
+  | test.aura | L219/L377 | 现有 `some(value)` 用法（int，return 上下文） |
+  | compact.cpp | L702 | 中页 relocateRootsInForwardMap 调用 ✅ |
+  | compact.cpp | L881 | 大页 relocateRootsInForwardMap 调用（plan 称 L880，⚠️偏移 1 行，L880 是注释） |
 
-**实际源码核对**：
-
-[task.h:49-51](file:///d:/you/Aura/runtime/task.h#L49-L51) 现状：
-```cpp
-void await_suspend(std::coroutine_handle<>) noexcept {
-    if (continuation) continuation.resume();
-}
-```
-
-plan 改为：
-```cpp
-if (++g_chainDepth >= kMaxChainDepth) {
-    g_chainDepth = 0;
-    scheduleOnEventLoop(continuation);
-} else {
-    continuation.resume();
-}
-```
-
-**问题分析**：
-
-"第 256 层归零后，外层 255 层 resume 返回各自 `--` 会把计数打成负数"——这个描述**只在采用递减方案时才成立**。plan 选择不递减，所以这个"冲突"本身不存在。描述是"解释为什么不递减"，但读起来像"递减方案有 bug"。
-
-**实际真正的风险**（plan 未提）：只增不降 → **每次 EventLoop 顶层 resume 都从 0 开始**，但如果 EventLoop::processReady 内 batch 循环 resume 多个协程（[task.cpp:103-106](file:///d:/you/Aura/runtime/task.cpp#L103-L106)），每个 resume 是新链，但 `g_chainDepth` 不重置——**只有归零后才重置**。
-
-例如：
-1. processReady resume 协程 A，A final resume B，B final resume C，g_chainDepth=3
-2. C 完成，g_chainDepth 仍为 3
-3. processReady resume 协程 D（新链），D final resume E，g_chainDepth=5
-4. E 完成，g_chainDepth=5
-5. ... 累积到 512 触发 scheduleOnEventLoop
-
-**后果**：多个独立短链被错误视为一个长链，提前触发 scheduleOnEventLoop。plan §4.3 [L101](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L101) 说"无害（多一轮队列，语义等价）"，✓ 正确。但**建议在文档中明确**：g_chainDepth 是"线程级累计 final 恢复次数"，不是"当前链深度"。
-
-**风险等级**：P2（描述清晰度）。
-
-### B2. `scheduleOnEventLoop` 跨命名空间声明/定义分裂
-
-**位置**：plan §4.1 [L61](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L61) + §4.2 [L90-94](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L90-L94)
-
-**问题**：
-
-task.h 中：
-```cpp
-namespace detail {
-void scheduleOnEventLoop(std::coroutine_handle<> h);  // 声明
-}
-```
-
-task.cpp 中：
-```cpp
-namespace detail {
-void scheduleOnEventLoop(std::coroutine_handle<> h) {
-    EventLoop::instance().schedule(h);
-}
-}
-```
-
-但 [task.cpp:16](file:///d:/you/Aura/runtime/task.cpp#L16) 当前是 `namespace aura_rt {`，plan §4.2 说"放在 `namespace aura_rt {` 内、`EventLoop::instance()` 定义之后"，但 `detail` 命名空间是 `aura_rt::detail`（[task.h:37](file:///d:/you/Aura/runtime/task.h#L37) 在 `namespace aura_rt` 内）。
-
-**需确认**：task.cpp 的 `namespace detail { ... }` 实际是 `aura_rt::detail`（因为 task.cpp 已在 `namespace aura_rt {` 内）。✓ 一致。但 plan 未明示这个嵌套关系，实施时可能误写为顶层 `namespace detail`。
-
-**建议**：plan §4.2 明确"在 `namespace aura_rt {` 内、`EventLoop::instance()` 定义之后，开 `namespace detail { ... }` 块"。
-
-**风险等级**：P2（次要）。
-
-### B3. 长链压力测试代码 `aura_rt::run_event_loop(t)` 类型不匹配
-
-**位置**：plan §7.1 [L139](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L139)
-
-```cpp
-aura_rt::task<void> chain(int n) {
-    if (n == 0) co_return;
-    co_await chain(n - 1);
-}
-
-int main() {
-    auto t = chain(20000);
-    aura_rt::run_event_loop(t);
-    ...
-}
-```
-
-**问题**：
-
-[task.h:207](file:///d:/you/Aura/runtime/task.h#L207) 签名是 `void run_event_loop(task<void>& mainTask);`，要求**左值引用**。`auto t = chain(20000)` 是左值，✓ 可绑定。但 `chain` 返回 `task<void>` 是**协程返回对象**，构造时 `task(task&& other)` 移动构造（[task.h:91](file:///d:/you/Aura/runtime/task.h#L91)），移动后原 handle_ 置空。
-
-但 `chain(20000)` 是右值，`auto t = chain(20000)` 触发移动构造，✓ 正常。
-
-**结论**：测试代码正确。无 bug。
-
-**风险等级**：无。
-
-### B4. `final_awaiter::await_suspend` 改造未考虑 `noexcept` 语义
-
-**位置**：plan §4.1 [L71-79](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L71-L79)
-
-**问题**：
-
-```cpp
-void await_suspend(std::coroutine_handle<>) noexcept {
-    if (!continuation) return;
-    if (++g_chainDepth >= kMaxChainDepth) {
-        g_chainDepth = 0;
-        scheduleOnEventLoop(continuation);   // 可能抛？
-    } else {
-        continuation.resume();               // 可能抛？
-    }
-}
-```
-
-现状 [task.h:49-50](file:///d:/you/Aura/runtime/task.h#L49-L50) 标 `noexcept`。`scheduleOnEventLoop` → `EventLoop::schedule` → `std::lock_guard<std::mutex>` + `std::queue::push`，**push 可能抛 `std::bad_alloc`**。在 `noexcept` 函数中抛出 → `std::terminate`。
-
-**建议**：
-- `scheduleOnEventLoop` 内 try/catch 吞掉异常（日志记录，不传播）
-- 或 plan 明确"schedule 失败 = OOM，terminate 可接受"
-
-**风险等级**：P1（重要，OOM 场景崩溃行为变化）。
-
-### B5. `thread_local` 跨静态库/可执行链接**未实际验证**
-
-**位置**：plan §9 [L166](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L166)
-
-> `inline thread_local` 跨静态库/可执行文件单定义合并 | C++17 inline 语义保证；单 TU 内测试先行
-
-**问题**：
-
-Aura runtime 是静态库 `libaura_rt.a`（[AGENTS.md](file:///d:/you/Aura/AGENTS.md) 构建 runtime/build）。`inline thread_local` 在静态库 + 主可执行文件链接时，**MSVC/MinGW 可能产生多个符号副本**（不同编译器对 inline thread_local 的合并行为不一致）。
-
-虽然 plan 说"C++17 inline 语义保证"，但 MinGW (UCRT64 g++) 实际行为需验证。如果 g_chainDepth 在静态库和主可执行中各有一份，则计数分裂，保护失效。
-
-**建议**：plan §7 增加"先在单 TU 内验证计数正确，再全量链接 runtime 验证 g_chainDepth 地址唯一（打印 &g_chainDepth）"。
-
-**风险等级**：P1（重要，平台特定）。
-
-### B6. `when_all` 长列表**未实际触发保护**
-
-**位置**：plan §5 [L107](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L107)
-
-> `when_all`（task.h:190-195）串行 co_await 同样受益。
-
-**问题**：
-
-[task.h:190-195](file:///d:/you/Aura/runtime/task.h#L190-L195) `when_all` 实现：
-```cpp
-inline task<void> when_all(std::vector<task<void>> tasks) {
-    for (auto& t : tasks) {
-        if (t) co_await t;
-    }
-    co_return;
-}
-```
-
-每个 `co_await t` → `t` 的 `final_awaiter::await_suspend` → continuation = when_all 协程 → `continuation.resume()`。
-
-但 `when_all` 协程的 final 又恢复其 continuation（调用者）。**链结构**：
-```
-caller → when_all → t1 → when_all → t2 → when_all → ... 
-```
-
-每两层 `when_all → t_i` 之间，`t_i` final 恢复 `when_all`，`when_all` 恢复 `caller`（如果 when_all 已 co_return）。实际上 when_all 在 for 循环中 co_await，**final 恢复 caller** 只发生在 when_all 完成时。
-
-**深度分析**：每个 `co_await t_i` 是独立链（t_i 的 final 恢复 when_all），不是长链。只有 caller → when_all 是一层。所以 when_all 长列表**不会**触发长链保护，plan 说"同样受益"**不准确**。
-
-**建议**：plan §5 修正描述："when_all 内部每个 `co_await t` 是短链（深度 1），不触发保护；但 when_all 自身的 final 恢复 caller 是一层，无长链风险"。
-
-**风险等级**：P2（描述不准确）。
-
-### B7. 边界 B6"计数漂移"测试"大量短链循环"未给出具体用例
-
-**位置**：plan §6 [L120](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L120)
-
-> B6 | 计数漂移 | — | 超限归零 + 偶发调度 | 大量短链循环
-
-**问题**：§7.2 [L151](file:///d:/you/Aura/plan/协程同步链栈深度保护.md#L151) 说"循环 10 万次 `co_await` 单层任务（链深 1），确认偶发调度不改变输出"，但未给出测试代码。
-
-**建议**：plan §7.2 补充测试代码：
-```cpp
-aura_rt::task<void> noop() { co_return; }
-aura_rt::task<void> loop() {
-    for (int i = 0; i < 100000; ++i) co_await noop();
-}
-```
-
-**风险等级**：P2（次要）。
+- **_match_val 引用全量统计**（Grep 验证）：共 20 行命中，排除 L1681 定义处 = **19 处引用**，plan 列举的 19 个行号（L1690/1693/1697/1719/1720/1727/1728/1735/1736/1740/1741/1761/1768/1778/1786/1788/1791/1794/1799）**全部准确** ✅
 
 ---
 
-## C. 综合审查结论
+## 源码映射审查
 
-### C1. 联合类型GC安全问题.md
+### issue 1（tryAllocSlow memset）
 
-| 严重度 | 数量 | 关键项 |
-|--------|------|--------|
-| P1 | 4 | A1 口径漂移、A5 desc 时序、A8 std::variant/Variant 双路径、A10 Generic 二次检查缺失 |
-| P2 | 8 | A2 error 语法、A3 desc->size 核对不彻底、A4 钩子不完整、A6 变体大小、A7 None 顺序、A9 TypeError intern、A11 GroupPattern 歧义、A12 穷尽性算法 |
+| 步骤 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| §4.1 tryAllocSlow 范围 | [alloc.cpp](file:///d:/you/Aura/runtime/gc/alloc.cpp) | ⚠️ 行号偏移 | plan 称 L120-174，**实际 L119-173**（函数签名 L119，结束 `}` L173，整体前偏 1 行） |
+| §4.1 L146 插入点 | [alloc.cpp L141-146](file:///d:/you/Aura/runtime/gc/alloc.cpp#L141-L146) | ✅ 一致 | L141-144 OOM 抛出，L145 空行，L146 `GcObject* obj = static_cast<GcObject*>(mem);`，中间确实无 memset |
+| §3.1 size 对齐 | [alloc.cpp L45-46](file:///d:/you/Aura/runtime/gc/alloc.cpp#L45-L46) | ✅ 一致 | `size = (size + 7) & ~size_t(7);` |
+| §3.1 三处已修对照 | L81 / L389 / L427 | ✅ 一致 | 三处 memset 行号全部准确，注释详述同类机制 |
+| §3.1 调用汇聚 | L70 / L101 | ✅ 一致 | TLAB 满/gcPending_ → tryAllocSlow；compact 后 TLAB curPage 清空 → 落入 tryAllocSlow |
 
-### C2. 协程同步链栈深度保护.md
+### issue 2（match _match_val 跨 GC 保护）
 
-| 严重度 | 数量 | 关键项 |
-|--------|------|--------|
-| P1 | 2 | B4 noexcept + schedule 可能抛、B5 thread_local 链接验证 |
-| P2 | 5 | B1 描述误导、B2 命名空间嵌套、B6 when_all 不受益、B7 测试代码缺失 |
+| 步骤 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| §4.2.1 计数器 | [CodeGen.h L495](file:///d:/you/Aura/src/CodeGen/CodeGen.h#L495) | ✅ 一致 | unionBoxingCounter_@L495，matchCounter_ 不存在需新增 |
+| §4.2.2 _match_val 定义 | [StmtGen.cpp L1681](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1681) | ✅ 一致 | `auto&& _match_val = expr;`；L1679 `{` / L1851 `}` 块作用域正确；19 处引用全部准确 |
+| §4.2.2 expr | [StmtGen.cpp L1657](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1657) | ✅ 一致 | `genExpr(*stmt.expr, isCoroutine)` |
+| §4.2.3 varName 声明 | [StmtGen.cpp L1762-1763](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1762-L1763) | ⚠️ 行号偏差 | plan 称"L1762 声明"，实际 L1762 是 `if` 守卫，varName 声明在 **L1763** |
+| §4.2.3 `} else {` 分支 | [StmtGen.cpp L1777-1780](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1777-L1780) | ⚠️ 行号偏差 | plan 称 L1777-1779，实际 **L1777-1780**（含闭合 `}` L1780） |
+| §4.2.4 位置 a isOptional 分支 | [StmtGen.cpp L1672-1674](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1672-L1674) | ⚠️ 行号偏差 | plan 称 L1672-1673，实际 **L1672-1674**（含闭合 `}` L1674） |
+| §4.2.4 位置 b 局部变量插入点 | [StmtGen.cpp L1664-1666](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1664-L1666) | ⚠️ 描述误导 | plan 称"L1666（isOptional 声明后）"，但 **L1666 是 `variantCppTypes` 声明**；isVariantPtr@L1664、isOptional@L1665 正确；新变量（elemCppType/elemIsHeap/gcTmpVars）应插入在 **L1666（variantCppTypes）之后、L1667（if 块）之前**；plan "修改前"代码遗漏 `variantCppTypes`，可能导致实施者误判插入位置 |
+| §4.2.4 位置 c Optional binding | [StmtGen.cpp L1785-1788](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1785-L1788) | ✅ 一致 | `auto varName = _match_val->unwrap();` |
+| §4.2.4 isHeapSemType 调用 | [ExprGen.cpp L12](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L12) | ⚠️ 文件标注缺失 | plan §4.2.4 位置 a 修改后代码调用 `isHeapSemType`，plan §3.2/§4.2.3 称其在 TypeMap.cpp —— 实际**定义在 ExprGen.cpp L12**，声明在 CodeGen.h L257（成员函数，跨文件调用无障碍，但 plan 的文件归属描述不准确） |
+| §4.2.5 清理位置 | [StmtGen.cpp L1838-1843](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1838-L1843) | ✅ 一致 | viewTmpVar 清理在 for 循环内 per-case；gcTmpVars 清理插入位置（L1843 之后）合适 |
+| §4.2 判定函数 isGcPointerType | [TypeMap.cpp L32-39](file:///d:/you/Aura/src/CodeGen/TypeMap.cpp#L32-L39) | ✅ 一致 | 以 `*` 结尾排除基本类型裸指针 |
+| §4.2 接口视图分支 L1764-1776 | [StmtGen.cpp L1764-1776](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1764-L1776) | ✅ 一致 | ViewRoot 路径已落地，保持不动 |
 
-### C3. 优先修复建议
+### issue 3（threadRootLists node 重定位方向 A 设计留档）
 
-**联合类型 plan 实施 P0 前必须修**：
-1. A2 `error` 调用语法（否则编译失败）
-2. A1 `unionVariantGcUnsafe` 与 `isHeapSemType` 口径统一
+| 步骤 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| §4.3 快照点 1 | [compact.cpp L308-315](file:///d:/you/Aura/runtime/gc/compact.cpp#L308-L315) | ✅ 一致 | updateAllReferences 步骤 1 遍历 threadRootLists_，仅 `updatePtr(*fieldPtr)` |
+| §4.3 快照点 2 | [compact.cpp L727-733](file:///d:/you/Aura/runtime/gc/compact.cpp#L727-L733) | ✅ 一致 | updateMediumPageReferences 同模式（函数起点 L720） |
+| §4.3 重连点对照 | [compact.cpp L416-445](file:///d:/you/Aura/runtime/gc/compact.cpp#L416-L445) | ✅ 一致 | relocateGlobalRootPtrs 方案 P 作为方向 A 对照 |
+| §4.3 中页调用处 | [compact.cpp L702](file:///d:/you/Aura/runtime/gc/compact.cpp#L702) | ✅ 一致 | relocateRootsInForwardMap(forwardMap) |
+| §4.3 大页调用处 | [compact.cpp L881](file:///d:/you/Aura/runtime/gc/compact.cpp#L881) | ⚠️ 行号偏移 | plan 称 L880，实际调用在 **L881**（L880 是注释行） |
 
-**联合类型 plan 实施 P1 前必须修**：
-1. A5 `Variant::desc()` 时序明确
-2. A10 P3 增加 Generic 实例化二次检查步骤
+### §4.5（整合重构）
 
-**协程链 plan 实施前必须修**：
-1. B4 `scheduleOnEventLoop` 异常处理
-2. B5 thread_local 链接验证步骤
+| 步骤 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| §4.5.1 6 处 clear | DeclGen.cpp L183-190/L431-436/L529-535/L674-679/L782-790/L838-844 | ✅ 一致 | 6 处位置全部准确，每处成组 6 集合 clear 可统一替换 |
+| §4.5.1 特殊字段 | currentReceiverName_/currentReturnElem_/currentTParams_ | ✅ 一致 | 特殊字段不在成组 clear 内，保留原位 |
+| §4.5.2 registerParamTracking | genFunDecl L437-476 / genMethodDecl L687-713 / genFunExpr L1699-1716 | ✅ 一致 | 三处共有逻辑可提取；genMethodDecl 确实缺"值类型 NamedType"分支 |
+| §4.5.2 genFunExpr saved 机制 | [ExprGen.cpp L1697-1698](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L1697-L1698) | ✅ 一致 | saved L1697-1698 / restore L1798-1799；plan 明确保留原位 |
+| §4.5.3 registerRawParamTracking | genFunDecl L452-475 / genMethodDecl L695-711 | ✅ 一致 | 完全相同部分可提取 |
+| §4.5.3 非参数注册点 | StmtGen.cpp L961/L1026/L1050（catch）/ L703（for-in） | ✅ 一致 | 已修正：L961/L1026/L1050 是 try-catch catch 变量；for-in 在 L703 IterVarGuard |
+| §4.5.3 Param 定义 | [Stmt.h L16-20](file:///d:/you/Aura/src/AST/Stmt.h#L16-L20) | ✅ 一致 | `{name, type, defaultExpr}` |
+| §4.5 6 集合声明 | CodeGen.h L456/L517/L521/L527/L531/L535 | ✅ 一致 | viewRootTypes_@L531 已存在 |
 
-审查完毕。
+### §4.4 测试用例（❌ 阻塞性问题）
+
+| 用例 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| u5（非视图堆变体） | test.aura P2.1 区域 L170 后插入 | ✅ 位置可用 | P2.1 现有 u1-u4，u4y@L165，可在 L170 后插入 |
+| m10（Optional<string>） | test.aura P5 区域 L364 后插入 | ❌ API 不存在 | `let m10o: Optional<string> = optional("abc")` —— **`optional(...)` 函数在 Aura 中不存在**，应改为 `some("abc")` 或隐式装箱 `let m10o: Optional<string> = "abc"` |
+| u6（嵌套 match） | test.aura P2.1 区域 | ❌ API 不存在 | `let u6o: Optional<string> = optional(u6t)` —— 同上，应改为 `some(u6t)` 或 `let u6o: Optional<string> = u6t` |
+| m11（Optional<int>） | test.aura P5 区域 | ❌ API 不存在 | `let m11o: Optional<int> = optional(7)` —— 同上，应改为 `some(7)` 或 `let m11o: Optional<int> = 7` |
+| gc_force() 用法 | test.aura 全文 | ✅ 一致 | 大量使用 `gc_force()`（非 `force_gc()`） |
+| io.println 用法 | test.aura 全文 | ✅ 一致 | |
+| Optional< 类型 | test.aura L216/L371 | ✅ 存在 | 作为返回类型使用 |
+
+**阻塞性问题详述**：
+
+经 5 个 Agent 联合检索确认（test.aura 全文 / BuiltinRegistry.h L335-337 / ExprGen.cpp L641-644 / ExprInfer.cpp L196-203 / src/ 全目录 Grep），Aura 语言中**不存在 `optional(...)` 函数**。构造 `Optional<T>` 值的正确方式有三种：
+
+1. **`some(value)`** —— 显式构造 Some 值（BuiltinRegistry.h L335 注册，ExprGen.cpp L641-644 生成 `make_optional(...)`）
+2. **`none()`** —— 构造 None 值（test.aura 已大量使用）
+3. **隐式装箱** —— `let x: Optional<T> = value`（DeclGen.cpp L337-359 P3a 折叠，生成 `make_optional<T>(value)`，类型由左侧注解驱动）
+
+**⚠️ 关于 `some("abc")` 的字符串 CTAD 陷阱**：ExprGen.cpp L643 生成 `aura_rt::make_optional("abc")` 依赖 C++ CTAD，字符串字面量 `"abc"` 退化为 `const char*`，推导出 `Optional<const char*>*`，与目标 `Optional<GcString*>*` 类型不匹配，**m10/u6 若用 `some("abc")`/`some(u6t)` 可能编译失败**。
+
+**推荐修复方案**：m10/m11/u6 改用**隐式装箱**（方案 B，类型安全）：
+```
+let m10o: Optional<string> = "abc"
+let u6o: Optional<string> = u6t
+let m11o: Optional<int> = 7
+```
+DeclGen.cpp L337-359 会从左侧 `OptionalSemType::elementType` 映射 `elemCpp`，生成 `make_optional<GcString*>("abc")` 和 `make_optional<int32_t>(7)`，类型正确无 CTAD 风险。
 
 ---
 
-# D. 迭代器 × GC 交互崩溃发现（issue 记录，待研究）
+## 全链路风险分析
 
-> 提出时间：2026-08-05
-> 状态：**暂停修复**，转为 issue 供用户仔细研究后完成。
-> 相关文件：`example/iter_gc_test.cpp`（手工测试，change.md §6.5）、`runtime/builtin/iterator.h`、
-> `runtime/gc/gc.h`、`runtime/gc/compact.cpp`。
+- **构建系统**：无风险。所有改动均在现有文件内（alloc.cpp / StmtGen.cpp / CodeGen.h / DeclGen.cpp / ExprGen.cpp / test.aura），无 CMakeLists.txt 调整，无新源文件，无新链接库。
 
-## D.1 现象
+- **Runtime 兼容性**：
+  - issue 1：✅ 通过。memset 与 TLAB/Medium/Large 路径对齐（L81/L389/L427），不修改 runtime 接口，size 已对齐。
+  - issue 2：✅ 通过。使用 runtime 已有 `GcRootHandle<T>(T&)` Ref 模式（与 genLetStmt / genUnionBoxingImpl 一致），`decltype(_match_val)` 推导为指针类型匹配 Ref 模式签名。
+  - issue 3：不实施，仅设计留档。
 
-`iter_gc_test.exe` 运行 `test_chain_gc_pressure` 时崩溃（0xC0000005）：
-- 迭代中途触发 `forceGc()`（mark-sweep + compact）后，root 的 `fit`（`FilterIter*`）变量被改写为 **vtable 地址**，
-  下次 `fit->next()` 调用空/错位 vtable → 段错误。
-- 并非偶尔：只要 GC 发生 compact 且迭代器链存活，必然复现。
+- **测试覆盖**：❌ **阻塞**。测试用例 m10/m11/u6 使用不存在的 `optional(...)` 函数，**无法编译**，必须修复。修复后覆盖完整：
+  - u5（非视图堆变体 string 分支 + gc_force + 字符串拼接 alloc）：覆盖 §4.2.3 路径 ✅
+  - m10（Optional<string> 堆元素分支）：覆盖 §4.2.4 路径（修复后）✅
+  - u6（嵌套 match）：覆盖 `_match_rh` 块作用域遮蔽 + `matchCounter_` 唯一性（修复后）✅
+  - m11（Optional<int> 值元素）：覆盖 `elemIsHeap=false` 不包裹路径（修复后）✅
+  - issue 1：无直接触发测试（时序敏感），靠全量回归 + ASAN 压力，合理（§11.1 已声明限制）
+  - §4.5：需 test.cpp diff 验证重构前后等价（§9.5 已提及）
 
-## D.2 根因（已定位）：多继承布局违反 GC 核心假设
+- **异常与回退**：
+  - issue 2：✅ gcTmpVar 清理已明确"成对 erase gcRootVarNames_ 与 gcRootTypes_"（§4.2.5），避免重蹈 viewTmpVar 只清 2 集合未清 viewRootTypes_ 的既有疏漏。
+  - §4.5：genFunExpr saved/restore 机制已明确保留原位（§4.5.2）。
+  - 回滚方案明确（§6）：每步独立可回滚。
 
-**GC 核心假设**：`GcObject*` 地址 == 堆对象起始地址（offset 0）。
-`GcRootHandle` 的 `ptr_ref_` 指向用户变量地址，GC 直接按 `GcObject*` 读写该地址（[gc.h](file:///d:/you/Aura/runtime/gc/gc.h) 中
-`markPhase`/`updateAllReferences` 均如此）。
+---
 
-**C++ 多继承布局**：`struct FilterIter : GcObject, Iterator<T>` 中，
-- `Iterator<T>`（含虚函数 `virtual next()`）成为 **primary base**，排在 **offset 0**（放 vptr）；
-- `GcObject` 子对象被排到 **offset 8**。
+## 已知限制评估
 
-于是：
-1. `fit`（`FilterIter*`）首 8 字节是 **vptr**，不是 `desc`；
-2. GC 按 `GcObject*` 读 `fit` → `obj->desc` 实际读到 **vptr**；
-3. `markObject`/`markFields` 按错误 desc 偏移扫描 → 标记错位；
-4. compact 的 `setForwardingPtr` 把 `fit` 变量更新成 forwardingPtr → `fit` 变成 vtable 地址；
-5. 用户代码再调 `fit->next()` → 0xC0000005。
+- **§11.1 issue 1 无确定性复现测试**：✅ 可接受。缺陷链路在 §3.1 已论证（Bug6 注释 L76-81 描述同类风险，三处已修路径对照），防御性对齐正确。
+- **§11.2 用户手写 C++ 桥接不在语言语义内**：✅ 可接受。与 Aura 语义边界一致。
+- **§11.3 issue 3 本 plan 不实施**：✅ 可接受。当前零触发（方向 B 已闭环），方向 A 设计完整留档（§4.3 含快照点、重连点、中页/大页同路径）。
+- **§11.4 接口视图分支保持 change.md 步骤 7 现状**：✅ 可接受。L1764-1776 ViewRoot 已落地，self 由 ViewRoot 内 GcRootHandle 保护。
+- **§11.5 _match_val 保护不覆盖 branch 条件判定期间**：✅ 可接受。`cond` 表达式在分支体 alloc 之前求值，GC 只在 alloc 时触发，条件求值不 alloc，无跨 GC 窗口。论证正确。
 
-### 插桩证据（已删除，记录如下）
+---
 
-```
-fit dump: 30 f6 ab 3d f7 7f 00 00 | 80 f4 ab 3d f7 7f 00 00
-           └ offset 0-7  = vtable 0x7ff73dabf630
-             offset 8-15 = 真实 desc 0x7ff73dabf480
-[DBG-mark] root %p -> obj=0x...00d0 desc=0x7ff73dabf630   ← GC 把 vptr 当 desc 读
-[DBG-upd]  root %p: 0x...00d0 fwd -> 0x7ff73dabf630        ← fit 被更新成 vtable 地址
-```
+## 上轮审查修改点落实情况
 
-## D.3 影响范围
+上轮审查提出的 5 项修改点已**全部落实** ✅：
 
-- 所有多继承 `GcObject` 派生对象（内置迭代器 `RangeIter/MapIter/FilterIter/FuncIter`）在 GC 下**全部不安全**，
-  不限于 compact，mark-sweep 的字段扫描也已错位。
-- 迭代器链一旦作为 GC 根存活且触发 GC，即崩溃或静默内存损坏。
-- 阻塞 change.md §6.5「迭代器 × GC 交互测试」（0 泄漏 0 悬垂）验收。
+| # | 上轮修改点 | 落实情况 | 证据 |
+| - | ---------- | -------- | ---- |
+| 1 | for-in 注册点描述错误 | ✅ 已修正 | §4.5.3 末尾明确"try-catch catch 变量注册 L961/L1026/L1050"+"真正 for-in 迭代变量注册 genForStmt L703 IterVarGuard" |
+| 2 | L838-843 行号范围未含 L844 | ✅ 已修正 | §4.5.1 表格"L838-844"含 L844 `currentTParams_.clear()` |
+| 3 | genFunExpr saved/restore 机制需明确 | ✅ 已修正 | §4.5.2 明确"保留 L1697-1698 saved/restore 两行，不得放进公共函数" |
+| 4 | gcTmpVar 清理需同步 erase gcRootTypes_ | ✅ 已修正 | §4.2.5 明确"成对 erase 两个集合，防泄漏" |
+| 5 | 测试用例补充（嵌套 match / Optional<int> / 字符串拼接 alloc） | ✅ 已修正 | §4.4 新增 u6（嵌套 match）+ m11（Optional<int>）+ u5/m10 补"字符串拼接 alloc" |
 
-## D.4 当前代码状态（探索性修改，未完成、未验证）
+---
 
-以下修改是为定位/尝试修复而加的，**保留在工作区作为 issue 起点**，不属于本轮提交：
+## 本轮新发现
 
-| 文件 | 修改内容 | 结论 |
-| ---- | ---- | ---- |
-| `runtime/builtin/iterator.h` | `Iterator<T>` 加 `kGcSize=16` + `fromGc/toGc` 布局转换；`MapIter/FilterIter` 加 `srcGc_` 字段，desc 偏移改用 `offsetof(Self, srcGc_)`；`next()` 经 `srcGc_` 恢复接口指针；`make_map/make_filter` 用 `isGCAddress` 判定内置/适配器源；`collect_all` 加 GcRootHandle 保护链顶端 + 结果数组 | **未解决崩溃** |
-| `runtime/gc/gc.h` | `isGCAddress` 声明 | 配套 |
-| `runtime/gc/compact.cpp` | `isGCAddress` 实现（遍历小/中/大页 data 区） | 配套 |
+### ❌ 阻塞性问题（必须修复才能通过）
 
-**失败原因**：根因是 `GcObject` 子对象不在 offset 0（多继承下偏移更深）。
-`toGc(src)` 反推的"对象起始"实际是 vptr 所在地址，`srcGc_` 记录的仍不是对象真实起始；
-GC 对 `srcGc_` 字段的扫描同样错位。即：**只要 `GcObject*` ≠ 对象起始，任何"字段记录 + 扫描"修补都治标不治本**。
+**1. 测试用例 m10/m11/u6 使用不存在的 `optional(...)` 函数**
 
-## D.5 候选修复方案
+- **位置**：plan §4.4 测试用例 m10（L358）/ u6（L377）/ m11（L393）
+- **问题**：`optional(...)` 函数在 Aura 中不存在（经 BuiltinRegistry.h / ExprGen.cpp / ExprInfer.cpp / test.aura 全文 / src/ 全目录 Grep 五重确认）
+- **影响**：测试用例无法编译，阻塞实施
+- **修复建议**：改用隐式装箱（推荐，类型安全）：
+  ```
+  let m10o: Optional<string> = "abc"
+  let u6o: Optional<string> = u6t
+  let m11o: Optional<int> = 7
+  ```
+  或显式 `some(value)`（但字符串字面量有 CTAD 陷阱，需注意）：
+  ```
+  let m10o: Optional<string> = some("abc")   // ⚠️ CTAD 可能推导 Optional<const char*>
+  let u6o: Optional<string> = some(u6t)       // u6t 是 GcString*，CTAD 应正确
+  let m11o: Optional<int> = some(7)           // int CTAD 正确
+  ```
 
-- **方案 A（推荐）**：给 `GcObject` 加 `virtual ~GcObject() = default;`，使 `GcObject` 成为 primary base 回到
-  offset 0，恢复「对象起始 == `GcObject*`」假设，迭代器多继承布局自动正确。
-  代价：所有 GC 对象 +8 字节 vptr（对象头 16 → 24）。
-- **方案 B**：迭代器改为单继承 `GcObject`，内部持有接口指针/纯虚接口拆为单独 vtable 结构；
-  代价：迭代器类层次重写（CodeGen 桥接 `make_range/make_map/make_filter/collect_all` 调用点同步调整）。
-- **方案 C**：GC 支持「对象头偏移」记录（TypeDescriptor 加 headOffset，所有 `obj->desc` 读取点先换算真实头）；
-  代价：GC 全量改造，侵入面最大，不建议优先。
+### ⚠️ 非阻塞性行号偏差（不影响实施方案正确性，实施时可直接修正）
 
-## D.6 复现与验证
+**2. tryAllocSlow 函数行号范围**：plan §3.1/§4.1 称 L120-174，实际 **L119-173**（函数签名 L119，结束 `}` L173，整体前偏 1 行）。修改点 L146 仍准确。
 
-```powershell
-g++ -std=gnu++20 -fcoroutines -w -g -I runtime example/iter_gc_test.cpp runtime/build/libaura_rt.a -o example/iter_gc_test.exe
-.\example\iter_gc_test.exe
-```
+**3. compact.cpp 大页 relocateRootsInForwardMap 调用**：plan §4.3 称 L880，实际调用在 **L881**（L880 是注释行）。
 
-- 复现：`test_chain_gc_pressure`（step % 3 时 forceGc）。
-- 验收：4 个测试全过（0 泄漏 0 悬垂），`ALL ITER-GC TESTS PASSED`。
-- 验证方案 A 前注意：GcObject 加虚析构后，`static_assert(kGcSize == 16)` 与
-  `offsetof` 系断言需同步更新；`gcConstruct` 的 placement-new 路径不受影响。
+**4. §4.2.3 varName 声明行号**：plan 称"L1762 声明"，实际 L1762 是 `if` 守卫，varName 声明在 **L1763**。
+
+**5. §4.2.3 `} else {` 分支范围**：plan 称 L1777-1779，实际 **L1777-1780**（含闭合 `}` L1780）。
+
+**6. §4.2.4 位置 a isOptional 分支范围**：plan 称 L1672-1673，实际 **L1672-1674**（含闭合 `}` L1674）。
+
+**7. §4.2.4 位置 b 插入点描述**：plan 称"L1666（isOptional 声明后）"，但 **L1666 是 `variantCppTypes` 声明**；新变量（elemCppType/elemIsHeap/gcTmpVars）应插入在 **L1666（variantCppTypes）之后、L1667（if 块）之前**；plan "修改前"代码遗漏 `variantCppTypes`，可能导致实施者误判插入位置。
+
+**8. isHeapSemType 文件归属描述不准确**：plan §4.2.4 位置 a 修改后代码调用 `isHeapSemType`，plan 未明确其定义位置 —— 实际**定义在 ExprGen.cpp L12**，声明在 CodeGen.h L257（成员函数，跨文件调用无障碍，但 plan 的文件归属描述应补充）。
+
+### ℹ️ 补充观察（非 plan 错误，仅供参考）
+
+**9. P2.1 区域与 P4 区域 u5 同名**：P2.1（L134-170）现有 u1-u4，plan 新增 u5 在 P2.1；P4 `test_union_dispatch` 函数（L250-302）另有 u1-u8（不同语义）。§9 测试计划称"既有 m1-m9、u5-u8（P4/P5）不回归"中的 u5-u8 指 P4 区域，与新增 u5 同名但不同位置，实施时需注意区分。
+
+**10. genFunExpr 缺 GC 指针分支**：plan 准确指出 genMethodDecl 缺值类型 NamedType 分支，但未提及 genFunExpr 同样缺 GC 指针分支（genFunExpr 只有 string/接口/值类型 3 分支）。闭包参数不注册为 GcRootHandle，因为闭包捕获时已通过 init-capture 单独处理 GC 根。若整合重构旨在统一三处参数注册逻辑，此差异需纳入考量。
+
+---
+
+## 最终裁决
+
+- [ ] 通过（Approve）
+- [x] **需修改（Changes Requested）**
+- [ ] 驳回（Rejected）
+
+**裁决理由**：
+
+本轮审查发现 **1 个阻塞性问题**：测试用例 m10/m11/u6 使用不存在的 `optional(...)` 函数，无法编译。经 5 个 Agent 联合检索五重确认，Aura 中构造 `Optional<T>` Some 值的正确方式是 `some(value)` 或隐式装箱 `let x: Optional<T> = value`。
+
+**必须修复的项**：
+1. plan §4.4 测试用例 m10/u6/m11 的 `optional(...)` 必须替换为隐式装箱（推荐，避免字符串 CTAD 陷阱）或 `some(...)`。
+
+**建议修复的项（非阻塞，实施时可修正）**：
+2. plan §3.1/§4.1 tryAllocSlow 行号范围 L120-174 → L119-173。
+3. plan §4.3 大页调用行号 L880 → L881。
+4. plan §4.2.3 varName 声明行号 L1762 → L1763；`} else {` 分支范围 L1777-1779 → L1777-1780。
+5. plan §4.2.4 位置 a 分支范围 L1672-1673 → L1672-1674。
+6. plan §4.2.4 位置 b 插入点描述"L1666（isOptional 声明后）"应改为"L1666（variantCppTypes）之后"，并在"修改前"代码中补全 `variantCppTypes` 声明。
+7. plan §4.2.4 位置 a 补充说明 `isHeapSemType` 定义在 ExprGen.cpp L12。
+
+**修复后可直接通过**：核心实施方案（issue 1 memset / issue 2 GcRootHandle 包裹 / issue 3 设计留档 / §4.5 整合重构）的源码映射、行号、API 调用全部准确，上轮 5 项修改点已全部落实，已知限制全部可接受。仅测试用例 API 错误阻塞通过，修复后无需再次审查。

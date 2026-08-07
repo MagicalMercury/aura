@@ -144,6 +144,11 @@ GcObject* GcHeap::tryAllocSlow(size_t size, const TypeDescriptor* desc) {
         throwOutOfMemory();
     }
 
+    // 与 TLAB 快路径（L81）/ tryAllocMedium（L389）/ tryAllocLarge（L427）对齐：
+    // GC sweep 后保留旧页被 bumpAlloc 复用（currentPage_ 可能指向保留旧页），
+    // 不清零则新对象指针字段含旧对象残留 → 字段初始化前 GC 触发 → markFields 读无效指针 → SEGV
+    std::memset(mem, 0, size);
+
     GcObject* obj = static_cast<GcObject*>(mem);
     obj->desc = desc;
     obj->setMarked(false);
