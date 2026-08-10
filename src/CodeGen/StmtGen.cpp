@@ -93,7 +93,7 @@ std::string CodeGenerator::genUnionBoxing(const UnionSemType& u,
     bool hasHeap = false;
     for (auto& v : u.variants) {
         cppTypes.push_back(v ? mapSemType(*v) : "void");
-        if (v && isHeapSemType(v.get())) hasHeap = true;
+        if (v && isUnionHeapVariant(v.get())) hasHeap = true;
     }
     if (!hasHeap) return "";  // 全值联合（std::variant 路径）不走装箱
     return genUnionBoxingImpl(cppTypes, init, isCoroutine);
@@ -137,6 +137,13 @@ std::string CodeGenerator::genUnionBoxingImpl(
             if (cppTypes[k] == initCpp) { idx = static_cast<int>(k); break; }
         }
     }
+    // none() 赋给含 None 变体的联合（如 Iterator<int> | None）：初始值推断为
+    // OptionalSemType{Error}（none() 占位），无法按 C++ 类型匹配变体，
+    // 直接定位 NoneType 变体（expr 下方特判为 aura_rt::None）
+    if (idx < 0 && isNoneCallExpr(init)) {
+        for (size_t k = 0; k < cppTypes.size(); ++k)
+            if (cppTypes[k] == "aura_rt::NoneType") { idx = static_cast<int>(k); break; }
+    }
     // 缺口 2 修复：idx 匹配失败但 init 是 record 且某变体是接口视图
     // → record→适配器 view() 预转换后装箱（复用 genRecordToViewIIFE）
     std::string viewCppType;
@@ -154,7 +161,9 @@ std::string CodeGenerator::genUnionBoxingImpl(
 
     std::string expr;
     bool isIfaceViewVariant = isIfaceViewTypeName(cppTypes[idx]);
-    if (!viewCppType.empty()) {
+    if (isNoneCallExpr(init)) {
+        expr = "aura_rt::None";   // none() → NoneType 值（非 make_none<T> 指针）
+    } else if (!viewCppType.empty()) {
         // 缺口 2：record→适配器 view() 预转换（先生成 record 指针表达式，再包 IIFE）
         auto* rt = dynamic_cast<const RecordSemType*>(init.inferredType);
         expr = genRecordToViewIIFE(genExpr(init, isCoroutine), rt->canonicalName, viewCppType);
@@ -163,7 +172,8 @@ std::string CodeGenerator::genUnionBoxingImpl(
     }
 
     int bid = unionBoxingCounter_++;
-    bool initIsHeap = isHeapSemType(init.inferredType);
+    // none() 的 OptionalSemType{Error} 会误判堆；NoneType 是 POD 值，无需 GcRootHandle
+    bool initIsHeap = isHeapSemType(init.inferredType) && !isNoneCallExpr(init);
     std::ostringstream oss;
     oss << "[&]() -> auto {\n";
     oss << "    auto _bx" << bid << " = (" << expr << ");\n";
@@ -208,6 +218,42 @@ std::string CodeGenerator::genUnionBoxingImpl(
 }
 
 void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
+    // 解构 let a, b = f()：临时元组成根后逐字段绑定（三形态分发与单名 let 一致）
+    if (!decl.names.empty()) {
+        auto* rs = dynamic_cast<const RecordSemType*>(decl.inferredType);
+        if (!rs) { /* Sema 已报错，防御返回 */ return; }
+        std::string tvar = "_tup_" + std::to_string(recordAllocCounter_++);
+        writeLine(cpp, "auto " + tvar + "_raw = "
+                  + genExpr(*decl.initializer, currentFunctionIsCoroutine_) + ";");
+        writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + tvar + "_raw)> "
+                  + tvar + "(" + tvar + "_raw);");
+        for (size_t i = 0; i < decl.names.size() && i < rs->fields.size(); ++i) {
+            std::string varName = safeName(decl.names[i]);
+            std::string fldType = rs->fields[i].type ? mapSemType(*rs->fields[i].type) : "auto";
+            std::string getter = tvar + ".get()->_" + std::to_string(i);
+            if (isIfaceViewTypeName(fldType)
+                || fldType.rfind("aura_rt::Iterator", 0) == 0) {
+                writeLine(cpp, fldType + " " + varName + "_raw = " + getter + ";");
+                writeLine(cpp, "aura_rt::ViewRoot<" + fldType + "> " + varName
+                          + "(" + varName + "_raw);");
+                viewRootVarNames_.insert(varName);
+                viewRootTypes_[varName] = fldType;
+                valueTypeVarNames_.insert(varName);
+            } else if (isGcPointerType(fldType)) {
+                writeLine(cpp, fldType + " " + varName + "_raw = " + getter + ";");
+                writeLine(cpp, "aura_rt::GcRootHandle<" + fldType + "> " + varName
+                          + "(" + varName + "_raw);");
+                gcRootVarNames_.insert(varName);
+                gcRootTypes_[varName] = fldType;
+            } else {
+                writeLine(cpp, fldType + " " + varName + " = " + getter + ";");
+            }
+        }
+        currentLetName_.clear();
+        expectedTemplateArgs_.clear();
+        return;
+    }
+
     // P1：非空 = 视图 let（接口视图 / 迭代器视图）→ 值绑定 + ViewRoot 包裹
     // 视图含 GC 指针 self，compact 不重写栈上裸指针，必须注册 self 为 GcRootHandle
     std::string viewRootType;
@@ -324,7 +370,18 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                 if (v && dynamic_cast<const NoneSemType*>(v.get())) { unionHasNone = true; break; }
         }
         if (unionHasNone && decl.initializer && isNoneCallExpr(*decl.initializer)) {
-            init = "aura_rt::None";
+            // 含 None 联合 + none()：全值联合（std::variant 路径）→ NoneType 值直接赋；
+            // 含堆联合（aura_rt::Variant*，如 Iterator<int> | None）→ genUnionBoxing
+            // 装箱为 make_variant<..., NoneType>（NoneType 是 POD，直接 &_bx）
+            std::string boxed;
+            if (auto* u = dynamic_cast<const UnionSemType*>(decl.inferredType)) {
+                bool hasHeap = false;
+                for (auto& v : u->variants)
+                    if (v && isUnionHeapVariant(v.get())) { hasHeap = true; break; }
+                if (hasHeap)
+                    boxed = genUnionBoxing(*u, *decl.initializer, currentFunctionIsCoroutine_);
+            }
+            init = boxed.empty() ? "aura_rt::None" : boxed;
         } else {
             // P3b 隐式装箱：目标为含堆联合（Variant 指针）且初始值为非联合值
             // （int/string/record/list 字面量或表达式）→ 生成 make_variant<I> 装箱
@@ -339,8 +396,21 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                 //   none() → make_none<elem>；普通值 → make_optional<elem>(值)，
                 //   堆值经 GcRootHandle 保护（make_optional 内 alloc 可能触发 GC）
                 std::string elemCpp = os->elementType ? mapSemType(*os->elementType) : "";
+                // 初始值表达式自身产生 Optional<T> 值（变量引用 / 函数或方法调用返回
+                // Optional，如 channel.receive()）→ 直接引用，避免二次装箱；
+                // 字面量 / 数组 / record / none() 会被 Sema 目标类型传播为 OptionalSemType，
+                // 不能当作"已是 Optional"（否则生成裸值，类型不匹配）
+                bool initIsOptionalValue = dynamic_cast<const Identifier*>(decl.initializer.get())
+                    || dynamic_cast<const CallExpr*>(decl.initializer.get())
+                    || dynamic_cast<const MethodCallExpr*>(decl.initializer.get())
+                    || dynamic_cast<const ConditionalExpr*>(decl.initializer.get());
                 if (isNoneCallExpr(*decl.initializer)) {
                     init = "aura_rt::make_none<" + elemCpp + ">()";
+                } else if (initIsOptionalValue
+                           && decl.initializer->inferredType
+                           && dynamic_cast<const OptionalSemType*>(
+                               decl.initializer->inferredType)) {
+                    init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
                 } else if (!elemCpp.empty()) {
                     int oid = unionBoxingCounter_++;
                     std::string ov = "_ox" + std::to_string(oid);
@@ -1669,7 +1739,7 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
     std::vector<std::string> variantCppTypes;  // 各变体 C++ 类型（索引对应；std::variant 与 Variant 路径共用）
     if (auto* u = dynamic_cast<const UnionSemType*>(mt)) {
         for (auto& v : u->variants) {
-            if (v && isHeapSemType(v.get())) isVariantPtr = true;
+            if (v && isUnionHeapVariant(v.get())) isVariantPtr = true;
             variantCppTypes.push_back(v ? mapSemType(*v) : "void");
         }
     } else if (dynamic_cast<const OptionalSemType*>(mt)) {
@@ -1773,10 +1843,18 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
             std::string binding;
             if (isVariantPtr) {
                 // 定位变体索引（TypePattern 类型 == 某变体 C++ 类型）
+                // 前缀匹配：类型模式写裸名（如 Iterator），mapNamedType 返回
+                // aura_rt::Iterator，需匹配实例化变体 aura_rt::Iterator<T>
                 int idx = -1;
                 for (size_t k = 0; k < variantCppTypes.size(); ++k)
-                    if (variantCppTypes[k] == cppType) { idx = static_cast<int>(k); break; }
+                    if (variantCppTypes[k] == cppType ||
+                        (!cppType.empty() && variantCppTypes[k].rfind(cppType + "<", 0) == 0)) {
+                        idx = static_cast<int>(k); break;
+                    }
                 if (idx >= 0) {
+                    // 命中后 cppType 用变体真实 C++ 类型名：
+                    // 视图判定（isIfaceViewTypeName）与 ViewRoot 模板参数依赖完整类型名
+                    cppType = variantCppTypes[idx];
                     cond = "_match_val->is<" + std::to_string(idx) + ">()";
                     if (!tp->varName.empty()) {
                         std::string varName = safeName(tp->varName);

@@ -26,6 +26,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferExpr(const ASTNode& expr) {
     else if (auto* e = dynamic_cast<const AssignExpr*>(&expr))          result = inferAssign(*e);
     else if (auto* e = dynamic_cast<const ErrorPropagationExpr*>(&expr))result = inferErrorPropagation(*e);
     else if (auto* e = dynamic_cast<const PipeExpr*>(&expr))            result = inferPipe(*e);
+    else if (auto* e = dynamic_cast<const ConditionalExpr*>(&expr))     result = inferConditional(*e);
     else if (auto* e = dynamic_cast<const FunExpr*>(&expr))             result = inferFunExpr(*e);
     else {
         error(expr, "internal error: unknown expression node in type inference");
@@ -115,12 +116,28 @@ std::unique_ptr<SemType> SemAnalyzer::inferBinaryExpr(const BinaryExpr& e) {
         return stringType();
     }
 
-    // 算术：int/float
+    // 算术：int/float（字符串拼接已在上面 "+" 分支拦截）
     if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") {
         if (!isAssignable(*lt, *rt) && !isAssignable(*rt, *lt)) {
             error(e, "binary operator '" + op + "' type mismatch: " + lt->toString() + " vs " + rt->toString());
         }
-        return lt->clone();
+        auto* ltp = dynamic_cast<const PrimSemType*>(lt.get());
+        auto* rtp = dynamic_cast<const PrimSemType*>(rt.get());
+        bool lIsNum = ltp && (ltp->kind == PrimSemType::Int || ltp->kind == PrimSemType::Float);
+        bool rIsNum = rtp && (rtp->kind == PrimSemType::Int || rtp->kind == PrimSemType::Float);
+        if (lIsNum && rIsNum) {
+            // % 保持纯整数（用户决策）：浮点取余报错；int % int → int
+            if (op == "%") {
+                if (ltp->kind == PrimSemType::Float || rtp->kind == PrimSemType::Float)
+                    error(e, "operator '%' requires integer operands, got '" +
+                          lt->toString() + "' and '" + rt->toString() + "'");
+                return intType();
+            }
+            // 数值提升：任一操作数为 float → 结果 float；均为 int → int
+            return (ltp->kind == PrimSemType::Float || rtp->kind == PrimSemType::Float)
+                 ? floatType() : intType();
+        }
+        return lt->clone();   // 非数值基元（如 string 参与 -/* 等）：保持现有行为
     }
     // C5b: 比较符号 → Comparable 校验（左右均为 record 时）
     // 同类型 record：要求显式 impl Comparable（recordImplIfaces_ 判定）
@@ -584,6 +601,24 @@ std::unique_ptr<SemType> SemAnalyzer::inferErrorPropagation(const ErrorPropagati
 std::unique_ptr<SemType> SemAnalyzer::inferPipe(const PipeExpr& e) {
     auto _ = inferExpr(*e.left);
     return inferExpr(*e.right);
+}
+
+std::unique_ptr<SemType> SemAnalyzer::inferConditional(const ConditionalExpr& e) {
+    auto condTy = inferExpr(*e.cond);
+    if (!isAssignable(*boolType(), *condTy)) {
+        error(*e.cond, "condition of '?:' must be bool, got '" + condTy->toString() + "'");
+    }
+    auto thenTy = inferExpr(*e.thenBranch);
+    auto elseTy = inferExpr(*e.elseBranch);
+    // 单向兼容（Java JLS 15.25）：else 可赋给 then → 返回 then；否则 then 可赋给 else → 返回 else
+    // bool 两分支互转成立 → 返回 bool（通用逻辑覆盖）
+    // 数值提升自动生效：isAssignable(float, int)=true → `cond ? 1 : 2.0` 经
+    // 第二分支返回 float；`cond ? 2.0 : 1` 经第一分支返回 float（两分支数值混合必走对侧提升）
+    if (isAssignable(*thenTy, *elseTy)) return thenTy->clone();
+    if (isAssignable(*elseTy, *thenTy)) return elseTy->clone();
+    error(*e.thenBranch, "incompatible '?:' branches: '" + thenTy->toString() +
+          "' vs '" + elseTy->toString() + "'");
+    return ErrorSemType::make();
 }
 
 // ============================================================

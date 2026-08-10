@@ -7,7 +7,14 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-08-07（联合变体含接口已放开：Variant::descForI is_iface_view self
+# 最近更新：2026-08-07（GC 稳健性三 issue 综合修复全部落地，详见 plan/GC稳健性三issue综合修复.md
+#            + change.md）：
+#            * tryAllocSlow 补 memset（与 TLAB/medium/large 对齐）
+#            * match 分支 _match_val GcRootHandle Ref 模式包裹 + 堆变体/Optional 堆元素
+#              binding _raw 模式保护（u5/u6/m10/m11 用例通过）
+#            * threadRootLists_ node 悬垂按方向 B 修复（ViewRoot 三参构造 Global +
+#              genFunExpr 视图捕获 init-capture 转 Global，compact 层零改动）
+#            2026-08-07（联合变体含接口已放开：Variant::descForI is_iface_view self
 #            子偏移 + genUnionBoxing ViewRoot 包裹，p2.1 u1-u4 用例通过；
 #            内置 Iterator 变体仍保持拦截，见 [二] P2 评估放开 issue）
 #            2026-08-06（compact 悬垂 rootPtr 地址 issue 已修复并通过 iter_gc_test
@@ -19,12 +26,20 @@
 [ 一 ] 内置 API 与模块（plan/plan11.md）
 ================================================================
 
-[ ] P1  math 内置模块
+[x] P1  math 内置模块  [2026-08-10 完成]
       - plan/plan11.md:54 规划 math.abs / math.sqrt / math.floor 等 8 个函数
       - 缺：builtins/math.aurai 文件 / BuiltinRegistry 加载逻辑
       - 文件：builtins/ (仅 io.aurai, path.aurai)
+      - 完成（change.md：math 内置模块 + 放开 Iterator 变体拦截）：
+          * 新建 builtins/math.aurai（8 函数 float 签名，... 桥接标记）+ runtime/builtin/math.h
+            （aura_rt::math 命名空间，<cmath> 一行映射）+ aura_rt.h 聚合 include
+          * ModuleManager.cpp isKnownBuiltin 白名单加 "math"（L100-102），import math 按需加载
+          * Sema/CodeGen 核心零改动（inferMethodCall Phase B 查表 + importNsNames_ isNs 路径）
+          * int 实参经 C++ 隐式提升（findFunction 仅按参数数量区分重载，float 签名避开冲突）
+          * 验证：test.aura 9 项断言 + 全量回归 ALL TESTS PASSED
+      - 已知限制：仅 float 签名（见 §二 P3 math 函数仅 float 签名条目）
 
-[ ] P1  数组 .iter() 方法
+[x] P1  数组 .iter() 方法
       - plan/range_implementation.md:144 标注"后续单独做"
       - 缺：[T] 方法表加 iter() 项 / IterSemType 元素从 [T] 推导
       - 文件：src/Sema/BuiltinRegistry.h:229-243 (无 iter 项)
@@ -71,44 +86,6 @@
               src/Sema/SemType.cpp、src/CodeGen/TypeMap.cpp、src/CodeGen/DeclGen.cpp、
               src/CodeGen/StmtGen.cpp、src/CodeGen/ExprGen.cpp、src/CodeGen/CodeGen.h
 
-[x] P1  联合类型 GC 安全问题（扩展到所有含堆类型的联合）  [2026-07-31 提出，2026-08-04 扩展]
-      - 问题：Aura 联合类型 `T1 | T2 | ... | Tn` 映射为 `std::variant<...>`
-        （src/CodeGen/TypeMap.cpp:115-123）。只要任一变体是 GC 堆类型
-        （string/Array<T>*/record*/Optional<T>* 等）即存在致命问题：
-          1. variant 是值语义存于栈上，GC 栈扫描无法安全识别内部指针
-             （非激活变体 offset 为垃圾数据，被误当指针 → 崩溃或误标记）
-          2. isGcPointerType 检查类型字符串是否以 `*` 结尾，variant 不符合
-             → 不会被 GcRootHandle 包装 → 内部 GC 指针失去根保护
-          3. TypeDescriptor 静态注册无法表达 variant discriminator 动态语义
-             （同一 offset 当前是指针还是值，取决于运行时 index_）
-      - 受影响场景（不仅限于 `T | None`）：
-          * `Array<int> | string`（双堆类型联合）
-          * `User* | None`（堆 + 非堆）
-          * `Tree<T> | T`（T 实例化为 string 时）
-          * `A* | int`（堆 + 值类型，int 值误判为指针风险最高）
-      - 当前缓解：`Optional<T>` GC 堆类型仅覆盖 `T | None` 双态场景
-        （见 plan/channel_thread_issue.md §三）
-      - 修复方案（对标 C++ 标准库 optional/variant 分工）：
-          * 默认语法糖（Sema 层转换，用户无感）：
-            - `T | None`  → `Optional<T>`（无论 T 是否为泛型）
-            - `A | B | C | ...` → `Variant<A, B, C, ...>`（无论是否有泛型）
-          * 实现 `Variant<T1, ..., Tn>` GC 堆类型（runtime/builtin/variant.h）：
-            - 继承 GcObject，堆分配，存 index_ + aligned storage_
-            - TypeDescriptor 新增 `isPtrActive(obj, offset)` 钩子
-              → GC 扫描时根据运行时 index_ 判断 offset 是否为有效指针
-            - GC 扫描器接入钩子（runtime/gc/mark_sweep.cpp）
-          * Optional 保留：双态场景 API 精简，Variant 也能表达但臃肿
-      - 不采用方案：
-          * 自做 GC-aware variant 但不修 GC（仍依赖栈扫描，治标不治本）
-          * Either<A, B> 嵌套表达多变体（API 丑、与 Aura n 选 1 语义不符）
-          * Sema 层全面禁止含堆类型联合（破坏 Tree<T> | T 等现有用法，无替代）
-      - 实施分阶段：
-          * P0: Sema 层禁止含堆类型联合走 std::variant 路径，报错提示待 Variant 实现
-          * P1: 实现 Variant<T1, ..., Tn> runtime 类型 + isPtrActive 钩子
-          * P2: GC 扫描器接入 isPtrActive 钩子
-          * P3: Sema 层语法糖转换（T | None → Optional<T>，A | B | C → Variant<A, B, C>）
-      - 关联：project_memory 中联合类型相关约束
-
 [x] P2  联合变体含接口（Variant 视图 self 子偏移支持）  [2026-08-06 提出，2026-08-07 完成]
       - 背景：plan/迭代器GC安全修复.md §8 步骤 11（B+W 全接口去虚化后重新评估）。
         接口值是值视图 { 纯虚方法Fn..., self }（self 位于视图内 8~16B 子偏移处），
@@ -127,7 +104,7 @@
       - 依赖：联合类型 GC 安全（上方 [x] P1）的 Variant<T1..Tn> runtime 类型
       - 关联：plan/迭代器GC安全修复.md §10.4、change.md §6 L5、project_memory
 
-[ ] P2  评估放开内置 Iterator 联合变体拦截（Variant<Iterator<T>, X>）  [2026-08-07 提出]
+[x] P2  评估放开内置 Iterator 联合变体拦截（Variant<Iterator<T>, X>）  [2026-08-07 提出，2026-08-10 完成]
       - 背景：change.md（联合变体含接口 + threadRootLists node 重定位）步骤 6
         实施后，用户接口（Stringer/Comparable 等）变体已放开，但内置 Iterator
         （GenericSemType "Iterator"，DeclChecker.cpp:18-19）仍保持 P0.4 拦截
@@ -138,6 +115,74 @@
       - 前置：联合变体含接口（上方 issue）实施完成
       - 关联：plan/联合变体含接口isPtrActive钩子支持.md §8 步骤 8、
         change.md §3 步骤 6
+      - 完成（change.md：math 内置模块 + 放开 Iterator 变体拦截，2026-08-10）：
+          * 运行时机制已完备（is_iface_view_v<Iterator<T>> 自动命中 variant.h:29-38 →
+            descForI 注册 kStorageOffset+offsetof(self)==8 子偏移 variant.h:74-79；
+            装箱 genUnionBoxingImpl StmtGen.cpp:170-186 / match 绑定 L1832-1844 的
+            ViewRoot 包裹已覆盖 aura_rt::Iterator<...>）
+          * 放开需 3 处编译器 gate 同步修复：
+            - DeclChecker.cpp variantStorageUnsafe 移除 Iterator 拦截（L18-19）
+            - TypeMap.cpp mapSemType（L317-319）/ mapType（L168-197）hasHeap 判定
+              改用 isUnionHeapVariant（视图变体含 self 指针必须堆 Variant 封装，
+              否则错误生成 std::variant → GC 不可见）
+            - StmtGen.cpp genUnionBoxing（L94-97）/ genMatchStmt isVariantPtr（L1721）
+              同改；CodeGen.h/ExprGen.cpp 新增 isUnionHeapVariant 成员
+              （isIfaceView 从 file-static 提升为成员，6 处调用点不变）
+          * 实施期补充修复（放开暴露的既有缺口）：
+            - SemAnalyzer.cpp isAssignable L377-383：已解析 GenericSemType source
+              不再被符号表同名 Interface 条目（interfaces.aurai Iterator）误拦截
+              （resolvedName 非空跳过别名解析，继续 UnionSemType 变体匹配/equals）
+            - StmtGen.cpp genMatchStmt L1825-1833：TypePattern 裸名（Iterator）前缀
+              匹配实例化变体（aura_rt::Iterator<T>）+ 命中后 cppType 用变体真实
+              类型名（ViewRoot 模板参数依赖完整名）
+            - StmtGen.cpp genUnionBoxingImpl + genLetStmt unionHasNone：none() 赋给
+              含 None 堆联合（Iterator<T> | None）→ make_variant<...,NoneType> 装箱
+          * 验证：test.aura 5 项用例（视图/值变体装箱 + match + GC 压力 iv3 +
+            Iterator|None 不折叠路径）+ 6.aura 全量回归（u1-u4 接口变体、m1-m11）
+            ALL TESTS PASSED；错误用例（fun 变体/嵌套联合）仍拦截
+      - 已知限制：联合上直接方法调用（v.map(f)）不支持（下方独立 P2 条目）；
+        Optional<Iterator<T>>（some(it)）GC 不安全（下方独立 P2 条目）
+
+[ ] P2  联合上直接调用迭代器方法（v.map(f)，v 为 Iterator<T> | X）  [2026-08-10 提出，本轮不修]
+      - 背景：change.md（math 内置模块 + 放开 Iterator 变体拦截）§6 已知限制 1。
+        放开拦截后 `let v: Iterator<int> | int` 合法，但 v.map(f) / v.collect()
+        仍被 Sema 拦截——inferMethodCallOnVariant 对 GenericSemType Iterator 变体
+        查 BuiltinRegistry.methods_ 无条目（Iterator 方法在 interfaces.aurai 接口
+        声明，非 methods_ 硬编码；ExprInfer.cpp:515-521）
+      - 复用框架：string/[T] 变体直接方法调用已解决（genUnionDispatch +
+        inferMethodCallOnVariant 双查表，ExprInfer.cpp:500-526 / ExprGen.cpp:1179-1271）。
+        Iterator 变体复用需：
+          * Sema：GenericSemType name=="Iterator" 改查 auraiInterfaces() 的 Iterator
+            接口方法集（返回类型带泛型替换，参照 Iterator.from 特判 ExprInfer.cpp:314-335）
+          * CodeGen：genUnionDispatch sups 判定加 Iterator + 对 Iterator case 生成桥接调用
+            （make_map/make_filter/collect_all，参照 objIsIterator 特判 ExprGen.cpp:941-960）
+            + 参数 GC 保护（genGcRootedArgs）；`_dsp_v`（L1228）无 GcRootHandle 的 alloc 窗口分析
+          * 附带验证：genUnionDispatch 对接口视图变体生成 `->` 形态（L1237/L1253），
+            值视图（{fn, self}）需 `.` 访问，该路径无测试覆盖（test_union_dispatch 仅
+            int|[int]、string|[int]）——改造时一并验证/修复
+      - 现状 workaround：match 提取分支后调用
+      - 文件：src/Sema/Checker/ExprInfer.cpp、src/CodeGen/ExprGen.cpp
+
+[ ] P2  Optional<Iterator<T>>（some(it)）GC 安全  [2026-08-10 提出，本轮不修]
+      - 背景：change.md（math 内置模块 + 放开 Iterator 变体拦截）§6 已知限制 2。
+        Optional<T>::desc 仅对 is_pointer_v<T> 注册 value_ 偏移（optional.h:30-43），
+        Iterator<T> 是值视图（非指针）→ value_ 内 self 指针 GC 不可见 → compact 后悬垂
+      - 现状：`Iterator<T> | None` 不折叠为 Optional（unionVariantGcUnsafe(GenericSemType)
+        =false），不受影响；仅显式 some(it) 构造 Optional<Iterator<T>> 触发
+      - 方案：Optional desc 增加 is_iface_view 子偏移注册（仿 variant.h descForI L74-79），
+        或 Sema 拦截 some(迭代器)
+      - 文件：runtime/builtin/optional.h
+
+[ ] P3  math 函数仅 float 签名（联合签名 math.abs(int|float) 推迟）  [2026-08-10 提出]
+      - 背景：change.md（math 内置模块 + 放开 Iterator 变体拦截）§6 已知限制 3。
+        findFunction 仅按参数数量区分重载（BuiltinRegistry.h:163-171），同参数量
+        不同类型重载不可共存；int 实参经 C++ 隐式提升为 double，INT_MIN 无溢出，语义正确
+      - 后续：如需 int 精确语义（如 abs(INT_MIN) 返回 int），需重载机制或 std::variant 签名
+
+[ ] P3  Iterator<int> | int 联合常量模式 match（视图变体无常量判定）  [2026-08-10 提出]
+      - 背景：change.md（math 内置模块 + 放开 Iterator 变体拦截）§6 已知限制 4。
+        genConstCond（StmtGen.cpp:1752-1810）对视图变体无常量比较（视图不可与字面量
+        相等），常量模式仅对值变体有效（与接口变体一致）
 
 ================================================================
 [ 三 ] 跨模块可见性（plan/cross_module_visibility.md）
@@ -222,7 +267,7 @@
       - 文件：runtime/gc/compact.cpp、runtime/gc/gc.h
       - 详见：plan/compact全局根地址重定位修复.md
 
-[ ] P2  threadRootLists_ node（this）悬垂（闭包捕获 ThreadLocal 模式 GcRootHandle 进堆）  [2026-08-06 提出]
+[x] P2  threadRootLists_ node（this）悬垂（闭包捕获 ThreadLocal 模式 GcRootHandle 进堆）  [2026-08-06 提出，2026-08-07 按方向 B 修复完成]
       - 背景：compact 全局根重定位修复（上方 [x] P0）的已知限制。ValueThreadLocal
         模式 GcRootHandle 构造时 registerRootThreadLocal(this)，链表节点即句柄
         自身地址（handles.h:40）；若句柄在 GC 堆对象内部，compact 搬运对象后
@@ -236,16 +281,25 @@
         （ExprGen.cpp:1621-1623）→ 闭包值捕获 ViewRoot 进 GC 堆（如 make_map /
         XFunc std::function 存 MapIter::fn_ / StringerFunc::func）时，捕获副本的
         ThreadLocal 句柄新注册根 this 落在堆内 → 触发同类缺陷
-      - 当前 test.aura 无"闭包捕获视图变量"用例，实际不触发
-      - 修复方向（二选一）：
-          * compact 层：与 globalRoots_ 同思路，用 oldAddr→newAddr 映射重写
-            threadRootLists_ node 内 this（GcRootHandleBase 链表 prev/next/this）
-          * CodeGen 层：视图变量按值捕获进堆改 GcSharedRoot 式 init-capture
-            （并入 gcRootVarNames_ 路径，Global 根，避免 ThreadLocal 句柄进堆）
-      - 文件：runtime/gc/handles.h、runtime/gc/compact.cpp、src/CodeGen/ExprGen.cpp
-      - 关联：change.md §4.4（ViewRoot 机制）
+      - 完成（2026-08-07，方向 B，plan/threadRootLists节点compact重定位.md）：
+          * iterator.h ViewRoot 新增闭包捕获专用三参构造（T, self, GcRootScope），
+            用 other.h.get() 取最新 self + scope 强制 Global（&val_ 注册到
+            globalRoots_，compact 由 relocateGlobalRootPtrs 重定位）
+          * genFunExpr 视图捕获走 init-capture 转 Global ViewRoot
+            （ExprGen.cpp:1621-1628，viewRootVarNames_ 分支，与 gcRootVarNames_
+            同型）→ compact 层零改动，复用已验证机制
+          * CodeGen.h 新增 viewRootTypes_ 映射（视图变量 → 视图 C++ 类型名），
+            3 处填充点（genLetStmt/genFunDecl/genMethodDecl）+ 6 处清理点
+            与 viewRootVarNames_ 同步（含补齐 genFunDecl/genConstructor 末尾
+            状态泄漏）
+          * 测试：test.aura 闭包捕获视图变量路径 + 全量回归通过
+      - 遗留：compact 层重定向方案（方向 A）作为未来预案独立保留（下方
+        [ ] P3 方向 A 条目），当前闭包捕获路径已由方向 B 规避
+      - 文件：runtime/builtin/iterator.h、runtime/gc/handles.h、src/CodeGen/ExprGen.cpp、
+              src/CodeGen/StmtGen.cpp、src/CodeGen/DeclGen.cpp、src/CodeGen/CodeGen.h
+      - 关联：change.md §4.4（ViewRoot 机制）、plan/threadRootLists节点compact重定位.md
 
-[ ] P2  tryAllocSlow 路径未 memset（复用 compact 后旧页时对象内存含脏数据）  [2026-08-07 提出（change.md 第三轮审查发现）]
+[x] P2  tryAllocSlow 路径未 memset（复用 compact 后旧页时对象内存含脏数据）  [2026-08-07 提出（change.md 第三轮审查发现），同日修复完成]
       - 问题：TLAB 快路径有 std::memset(mem, 0, size)（alloc.cpp:81，Bug6 修复），
         但 tryAllocSlow（alloc.cpp:120-174）未 memset。GC sweep 后旧页被复用
         （rebuildPageList 保留含存活对象的页，其 bumpOffset 后方空间在 GC 前
@@ -256,26 +310,40 @@
         / gcPending_ 走慢路径），不限于 Variant
       - 触发难度：需要"旧页复用 + 字段初始化前 GC"的精确时序；Bug6 修复后 TLAB
         路径已覆盖大部分分配，当前未观察到实际崩溃
-      - 修复：tryAllocSlow 与 TLAB 对齐补 memset
+      - 完成（2026-08-07，change.md 工作流 5 落地）：
+          * alloc.cpp tryAllocSlow 在 throwOutOfMemory 检查后、对象头初始化前补
+            std::memset(mem, 0, size)（size 已在 tryAlloc L46 对齐 8 字节），
+            与 TLAB 快路径（L81）/ tryAllocMedium（L389）/ tryAllocLarge（L427）
+            三处已修复模式完全一致
+          * 验证：全量回归 ALL TESTS PASSED，无回归
       - 文件：runtime/gc/alloc.cpp
       - 发现来源：change.md（联合变体含接口 + threadRootLists node 重定位）第三轮审查，
         "make_variant alloc 窗口"限制描述被证伪（TLAB 已 memset）后定位到本真实缺陷
 
-[ ] P2  match 分支 _match_val 跨 GC 保护（Variant 对象指针悬垂）  [2026-08-07 提出]
+[x] P2  match 分支 _match_val 跨 GC 保护（Variant 对象指针悬垂）  [2026-08-07 提出，同日修复完成]
       - 背景：change.md（联合变体含接口 + threadRootLists node 重定位）§6 限制 2。
-        genMatchStmt 生成 `auto&& _match_val = expr;`（StmtGen.cpp:1615），是普通
+        genMatchStmt 生成 `auto&& _match_val = expr;`（StmtGen.cpp:1694），是普通
         右值引用，无 GcRootHandle 保护。分支体内 alloc 触发 compact 时 _match_val
         悬垂（当它是 Variant<T...>* 堆指针时）
       - 现状缓解：change.md 步骤 7 的 ViewRoot 绑定保证分支体不再访问 _match_val
         （binding 拷贝视图值到 ViewRoot，分支体仅用绑定变量），当前不触发
-      - 修复方向：match 语句对 _match_val 生成 GcRootHandle 包裹
+      - 完成（2026-08-07，change.md 工作流 5 落地，plan/GC稳健性三issue综合修复.md）：
+          * 步骤 3：isVariantPtr || isOptional 时生成
+            `auto _match_val = expr;` + `GcRootHandle<decltype(_match_val)> _match_rh(_match_val);`
+            （Ref 模式，compact 经 ptr_ref_ 更新 _match_val 本体）；其余走 auto&&
+          * 步骤 4：非视图堆变体 binding 改 `varName_raw = get<I>()` 独立栈变量 +
+            `GcRootHandle varName(varName_raw)` Ref 模式（与函数参数 _raw 模式一致）
+          * 步骤 5：Optional 堆元素 unwrap 同型保护（elemIsHeap 判定，值元素仅拷贝）
+          * 步骤 6：gcTmpVars 分支体结束成对 erase gcRootVarNames_/gcRootTypes_
+          * 测试：u5/u6/m10/m11 用例（分支内 gc_force + 字符串拼接 alloc 后
+            binding 仍有效，含嵌套 match 内外层均有效）全部通过
       - 文件：src/CodeGen/StmtGen.cpp
       - 关联：change.md §6 限制 2、plan/联合变体含接口isPtrActive钩子支持.md §10 限制 4
 
-[ ] P3  方向 A：compact 层重定位 threadRootLists_ 链表 node  [2026-08-07 提出]
-      - 背景：threadRootLists_ 的 node（this）指针在对象进堆后悬垂。当前闭包
-        捕获路径已由 change.md 步骤 9（ViewRoot 转 Global 根）规避，零 compact
-        层改动
+[-] P3  方向 A：compact 层重定位 threadRootLists_ 链表 node  [2026-08-07 提出]
+      - 背景：threadRootLists_ 的 node（this）指针在对象进堆后悬垂。闭包捕获路径
+        已由上方 [x] threadRootLists_ node 条目的方向 B（ViewRoot 转 Global 根，
+        plan/threadRootLists节点compact重定位.md §4.2-4.4）规避，零 compact 层改动
       - 触发场景：若未来出现"无法用 Global 替代的 ThreadLocal 进堆场景"
         （ThreadLocal 句柄直接存入 GC 堆对象成员，非闭包捕获路径）
       - 方案：与 globalRoots_ 同思路，用 oldAddr→newAddr 映射重写

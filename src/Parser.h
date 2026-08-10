@@ -78,7 +78,17 @@ private:
         std::string errMsg = std::string("expected name after '") + kw + "'";
         auto& nameTok = consume(TokType::Identifier, errMsg);
         decl->name = nameTok.lexeme;
-        if (match(TokType::Colon)) decl->type = parseType();
+        if (match(TokType::Comma)) {
+            // 解构 let a, b = f()：字段类型取自初始值推断，不允许类型注解
+            decl->names.push_back(nameTok.lexeme);
+            do {
+                auto& nTok = consume(TokType::Identifier,
+                    "expected name after ',' in destructuring declaration");
+                decl->names.push_back(nTok.lexeme);
+            } while (match(TokType::Comma));
+        } else {
+            if (match(TokType::Colon)) decl->type = parseType();
+        }
         consume(TokType::Assign, "expected '=' in declaration");
         decl->initializer = parseExpr();
         match(TokType::Semicolon);
@@ -88,6 +98,7 @@ private:
     // --- 解析表达式 ---
     std::unique_ptr<ASTNode> parseExpr();
     std::unique_ptr<ASTNode> parseAssignment();
+    std::unique_ptr<ASTNode> parseConditional();
     std::unique_ptr<ASTNode> parsePipe();
     std::unique_ptr<ASTNode> parseOr();
     std::unique_ptr<ASTNode> parseAnd();

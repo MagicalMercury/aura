@@ -120,6 +120,11 @@ public:
         return (n.left  && self.scanExpr(*n.left)) ||
                (n.right && self.scanExpr(*n.right));
     }
+    bool visit(const ConditionalExpr& n, CoroScanner& self) {
+        if (n.cond       && self.scanExpr(*n.cond)) return true;
+        if (n.thenBranch && self.scanExpr(*n.thenBranch)) return true;
+        return n.elseBranch && self.scanExpr(*n.elseBranch);
+    }
     bool visit(const ListExpr& n, CoroScanner& self) {
         for (auto& el : n.elements)
             if (el && self.scanExpr(*el)) return true;

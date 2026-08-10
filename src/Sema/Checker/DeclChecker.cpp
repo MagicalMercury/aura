@@ -11,12 +11,9 @@ namespace Aura {
 static bool variantStorageUnsafe(const SemType& t) {
     if (dynamic_cast<const FuncSemType*>(&t))     return true;
     if (dynamic_cast<const UnionSemType*>(&t))    return true;
-    // P0.4：内置迭代器（GenericSemType "Iterator"）联合变体编译期拦截。
-    // 视图含 GC 指针 self，Variant storage_ 内 union 无法注册子偏移供 GC 扫描/compact
-    // 更新（B+W 落地前视图实现为值类型，isPtrActive 不支持子偏移）→ 一律拦截。
-    // B+W 落地后重新评估（见 plan 迭代器GC安全修复 §10.4）
-    if (auto* g = dynamic_cast<const GenericSemType*>(&t))
-        if (g->name == "Iterator") return true;
+    // 内置 Iterator（GenericSemType "Iterator"）联合变体：P0.4 起编译期拦截；
+    // B+W 值视图化后 descForI is_iface_view_v 子偏移 + 装箱/match ViewRoot 保护
+    // 已使其 GC 安全（2026-08-10 评估放开，见 plan/评估放开内置Iterator联合变体拦截实施方案.md）。
     return false;
 }
 
@@ -76,6 +73,10 @@ static void forEachGenericRef(const TypeExpr& type,
         for (auto& p : fnT->paramTypes)
             if (p) forEachGenericRef(*p, fn);
         if (fnT->returnType) forEachGenericRef(*fnT->returnType, fn);
+    }
+    if (auto* tp = dynamic_cast<const TupleTypeExpr*>(&type)) {
+        for (auto& e : tp->elementTypes)
+            if (e) forEachGenericRef(*e, fn);
     }
 }
 
@@ -396,6 +397,20 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
         auto t = std::make_unique<RecordSemType>();
         for (auto& f : r->fields) {
             t->fields.push_back({f.name, f.type ? resolveType(*f.type) : ErrorSemType::make()});
+        }
+        return t;
+    }
+    if (auto* tp = dynamic_cast<const TupleTypeExpr*>(&astType)) {
+        // 防御性报错：Tuple2~Tuple8 上限 8（§5 风险表已承诺）
+        if (tp->elementTypes.size() > 8) {
+            error(astType, "tuple type supports at most 8 elements, got " +
+                  std::to_string(tp->elementTypes.size()));
+        }
+        auto t = std::make_unique<RecordSemType>();
+        t->isTuple = true;
+        for (size_t i = 0; i < tp->elementTypes.size(); ++i) {
+            t->fields.push_back({"_" + std::to_string(i),
+                tp->elementTypes[i] ? resolveType(*tp->elementTypes[i]) : ErrorSemType::make()});
         }
         return t;
     }

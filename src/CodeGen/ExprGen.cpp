@@ -40,13 +40,20 @@ bool CodeGenerator::isHeapSemType(const SemType* type) const {
 //   - 接口视图（InterfaceSemType：Stringer/Comparable/用户接口）
 // 视图不能被 GcRootHandle<View> 包裹（视图非指针，模板参数不成立），
 // 传参/包装时按非堆值处理，self 由保守栈扫描 / 视图字段 desc 子偏移保护。
-static bool isIfaceView(const SemType* t) {
+bool CodeGenerator::isIfaceView(const SemType* t) const {
     if (!t) return false;
     if (auto* g = dynamic_cast<const GenericSemType*>(t))
         return g->name == "Iterator";
     if (dynamic_cast<const InterfaceSemType*>(t))
         return true;
     return false;
+}
+
+// 联合变体堆封装判定：isHeapSemType（堆对象）|| isIfaceView（视图含 self GC 指针）。
+// 视图变体必须进 aura_rt::Variant<T...>*（descForI 子偏移扫描），
+// 否则错误生成 std::variant → self 对 GC 不可见 → 悬垂崩溃。
+bool CodeGenerator::isUnionHeapVariant(const SemType* t) const {
+    return isHeapSemType(t) || isIfaceView(t);
 }
 
 // ============================================================
@@ -204,6 +211,8 @@ std::string CodeGenerator::genExpr(const ASTNode& expr, bool isCoroutine) {
         return genErrorPropagation(*e, isCoroutine);
     if (auto* e = dynamic_cast<const PipeExpr*>(&expr))
         return genPipeExpr(*e, isCoroutine);
+    if (auto* e = dynamic_cast<const ConditionalExpr*>(&expr))
+        return genConditionalExpr(*e, isCoroutine);
     if (auto* e = dynamic_cast<const FunExpr*>(&expr))
         return genFunExpr(*e, isCoroutine);
     return "/* ??? */";
@@ -1478,6 +1487,14 @@ std::string CodeGenerator::genPipeExpr(const PipeExpr& e, bool isCoroutine) {
     // 简化：暂不支持，直接展开
     (void)e; (void)isCoroutine;
     return "/* pipe_expr */";
+}
+
+std::string CodeGenerator::genConditionalExpr(const ConditionalExpr& e, bool isCoroutine) {
+    // 直接映射 C++ 三元：只求值选中的分支，整体为单表达式右值。
+    // GC 安全：分配发生在选中分支内，外层由既有 let/实参/赋值上下文成根保护。
+    return "(" + genExpr(*e.cond, isCoroutine) + " ? "
+               + genExpr(*e.thenBranch, isCoroutine) + " : "
+               + genExpr(*e.elseBranch, isCoroutine) + ")";
 }
 
 // ============================================================

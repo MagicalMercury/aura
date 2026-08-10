@@ -67,6 +67,14 @@ void RecordType::print(std::ostream& os, int indent) const {
     }
 }
 
+void TupleTypeExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "TupleTypeExpr" << '\n';
+    for (auto& e : elementTypes) {
+        if (e) e->print(os, indent + 1);
+    }
+}
+
 void UnionType::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << "UnionType" << '\n';
@@ -154,6 +162,20 @@ void UnaryExpr::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << "UnaryExpr: " << op << '\n';
     if (operand) operand->print(os, indent + 1);
+}
+
+void ConditionalExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "ConditionalExpr" << '\n';
+    printIndent(os, indent + 1);
+    os << "cond:" << '\n';
+    if (cond) cond->print(os, indent + 2);
+    printIndent(os, indent + 1);
+    os << "then:" << '\n';
+    if (thenBranch) thenBranch->print(os, indent + 2);
+    printIndent(os, indent + 1);
+    os << "else:" << '\n';
+    if (elseBranch) elseBranch->print(os, indent + 2);
 }
 
 void CallExpr::print(std::ostream& os, int indent) const {
@@ -439,7 +461,13 @@ void FunDecl::print(std::ostream& os, int indent) const {
 
 void LetDecl::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "LetDecl: " << name << '\n';
+    os << "LetDecl: " << name;
+    if (!names.empty()) {
+        os << " <destructure:";
+        for (auto& nm : names) os << " " << nm;
+        os << ">";
+    }
+    os << '\n';
     if (type) {
         printIndent(os, indent + 1);
         os << "type:" << '\n';
@@ -454,7 +482,13 @@ void LetDecl::print(std::ostream& os, int indent) const {
 
 void ConstDecl::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "ConstDecl: " << name << '\n';
+    os << "ConstDecl: " << name;
+    if (!names.empty()) {
+        os << " <destructure:";
+        for (auto& nm : names) os << " " << nm;
+        os << ">";
+    }
+    os << '\n';
     if (type) {
         printIndent(os, indent + 1);
         os << "type:" << '\n';

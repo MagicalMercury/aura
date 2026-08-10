@@ -115,6 +115,8 @@ struct ExprWalker {
             return v.visit(*n, v);
         if (auto* n = dynamic_cast<const PipeExpr*>(&expr))
             return v.visit(*n, v);
+        if (auto* n = dynamic_cast<const ConditionalExpr*>(&expr))
+            return v.visit(*n, v);
         if (auto* n = dynamic_cast<const ListExpr*>(&expr))
             return v.visit(*n, v);
         if (auto* n = dynamic_cast<const RecordExpr*>(&expr))
@@ -275,6 +277,11 @@ public:
     bool visit(const AssignExpr& n, CallTargetScanner& self) { return (n.target && self.scanExpr(*n.target)) || (n.value && self.scanExpr(*n.value)); }
     bool visit(const ErrorPropagationExpr& n, CallTargetScanner& self) { return n.expr && self.scanExpr(*n.expr); }
     bool visit(const PipeExpr& n, CallTargetScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
+    bool visit(const ConditionalExpr& n, CallTargetScanner& self) {
+        if (n.cond && self.scanExpr(*n.cond)) return true;
+        if (n.thenBranch && self.scanExpr(*n.thenBranch)) return true;
+        return n.elseBranch && self.scanExpr(*n.elseBranch);
+    }
     bool visit(const RecordExpr& n, CallTargetScanner& self) { for (auto& f : n.fields) if (f.value && self.scanExpr(*f.value)) return true; return false; }
     bool visit(const ListExpr& n, CallTargetScanner& self) { for (auto& e : n.elements) if (e && self.scanExpr(*e)) return true; return false; }
     bool visit(const FunExpr& n, CallTargetScanner& self) { return n.body && self.scanStmt(*n.body); }
@@ -337,6 +344,11 @@ public:
     bool visit(const AssignExpr& n, CaptureArgScanner& self) { return (n.target && self.scanExpr(*n.target)) || (n.value && self.scanExpr(*n.value)); }
     bool visit(const ErrorPropagationExpr& n, CaptureArgScanner& self) { return n.expr && self.scanExpr(*n.expr); }
     bool visit(const PipeExpr& n, CaptureArgScanner& self) { return (n.left && self.scanExpr(*n.left)) || (n.right && self.scanExpr(*n.right)); }
+    bool visit(const ConditionalExpr& n, CaptureArgScanner& self) {
+        if (n.cond && self.scanExpr(*n.cond)) return true;
+        if (n.thenBranch && self.scanExpr(*n.thenBranch)) return true;
+        return n.elseBranch && self.scanExpr(*n.elseBranch);
+    }
     bool visit(const RecordExpr& n, CaptureArgScanner& self) { for (auto& f : n.fields) if (f.value && self.scanExpr(*f.value)) return true; return false; }
     bool visit(const ListExpr& n, CaptureArgScanner& self) { for (auto& e : n.elements) if (e && self.scanExpr(*e)) return true; return false; }
     bool visit(const FunExpr& n, CaptureArgScanner& self) { return n.body && self.scanStmt(*n.body); }

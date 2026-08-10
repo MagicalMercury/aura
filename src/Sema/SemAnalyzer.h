@@ -187,6 +187,7 @@ private:
     [[nodiscard]] std::unique_ptr<SemType> inferAssign(const AssignExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferErrorPropagation(const ErrorPropagationExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferPipe(const PipeExpr& e);
+    [[nodiscard]] std::unique_ptr<SemType> inferConditional(const ConditionalExpr& e);
 
     // --- 闭包 ---
     [[nodiscard]] std::unique_ptr<SemType> inferFunExpr(const FunExpr& e);

@@ -98,7 +98,8 @@ bool ModuleManager::isKnownBuiltin(const std::string& name) const {
     // 初始内置模块：path（运行时已提供 aura_rt::path）
     // 未来可扩展：json, http, ...
     static const std::unordered_set<std::string> builtins = {
-        "path"
+        "path",
+        "math"
     };
     return builtins.count(name) > 0;
 }

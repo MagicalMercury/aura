@@ -46,6 +46,7 @@ std::unique_ptr<SemType> NoneSemType::clone() const { return make(); }
 bool RecordSemType::equals(const SemType& other) const {
     auto* o = dynamic_cast<const RecordSemType*>(&other);
     if (!o) return false;
+    if (isTuple != o->isTuple) return false;
     if (fields.size() != o->fields.size()) return false;
     // 结构等价：字段名和类型匹配，忽略顺序
     for (auto& f : fields) {
@@ -59,6 +60,16 @@ bool RecordSemType::equals(const SemType& other) const {
 }
 std::string RecordSemType::toString() const {
     std::ostringstream oss;
+    if (isTuple) {
+        // 元组：(t0, t1, ...)（位置字段无字段名）
+        oss << "(";
+        for (size_t i = 0; i < fields.size(); ++i) {
+            if (i > 0) oss << ", ";
+            oss << (fields[i].type ? fields[i].type->toString() : "?");
+        }
+        oss << ")";
+        return oss.str();
+    }
     oss << "{ ";
     for (size_t i = 0; i < fields.size(); ++i) {
         if (i > 0) oss << ", ";
@@ -70,6 +81,7 @@ std::string RecordSemType::toString() const {
 std::unique_ptr<SemType> RecordSemType::clone() const {
     auto n = std::make_unique<RecordSemType>();
     n->canonicalName = canonicalName;
+    n->isTuple = isTuple;
     for (auto& f : fields) {
         n->fields.push_back({f.name, f.type ? f.type->clone() : nullptr});
     }

@@ -159,8 +159,11 @@ std::unique_ptr<TypeExpr> Parser::parsePrimaryType() {
             error("expected type in parentheses");
             return nullptr;
         }
-        error("expected '->' for function type");
-        return nullptr;
+        // 多参数无箭头 → 元组类型 (T1, T2, ...)（匿名 record 语法糖，位置字段 _0/_1/...）
+        auto tp = std::make_unique<TupleTypeExpr>();
+        setNodePos(tp.get(), tok);
+        tp->elementTypes = std::move(paramTypes);
+        return tp;
     }
 
     error("expected type");

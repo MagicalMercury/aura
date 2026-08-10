@@ -85,6 +85,34 @@ void SemAnalyzer::checkSyncMax(const ASTNode& maxExpr, const std::string& kindNa
 }
 
 void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
+    // 解构 let a, b = f()：字段类型取自初始值推断（元组/record 语法糖）
+    if (!decl.names.empty()) {
+        if (rejectStandaloneNone(decl, decl.type.get())) return;
+        auto inferred = decl.initializer ? inferExpr(*decl.initializer) : ErrorSemType::make();
+        auto* rs = dynamic_cast<const RecordSemType*>(inferred.get());
+        if (!rs) {
+            error(decl, "destructuring requires a tuple/record value, got '"
+                  + inferred->toString() + "'");
+            return;
+        }
+        if (rs->fields.size() != decl.names.size()) {
+            error(decl, "destructuring arity mismatch: expected " +
+                  std::to_string(rs->fields.size()) + " names, got " +
+                  std::to_string(decl.names.size()));
+            return;
+        }
+        typeStore_.push_back(inferred->clone());
+        const_cast<LetDecl&>(decl).inferredType = typeStore_.back().get();
+        for (size_t i = 0; i < decl.names.size(); ++i) {
+            Symbol sym;
+            sym.kind = SymKind::Variable;
+            sym.name = decl.names[i];
+            sym.type = rs->fields[i].type ? rs->fields[i].type->clone()
+                                          : ErrorSemType::make();
+            symtab_.define(std::move(sym));
+        }
+        return;
+    }
     // None 不能作为独立变量类型
     if (rejectStandaloneNone(decl, decl.type.get())) return;
 
@@ -122,6 +150,35 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
 }    
 
 void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
+    // 解构 const a, b = f()：与 let 同型（isConst 标志置位）
+    if (!decl.names.empty()) {
+        if (rejectStandaloneNone(decl, decl.type.get())) return;
+        auto inferred = decl.initializer ? inferExpr(*decl.initializer) : ErrorSemType::make();
+        auto* rs = dynamic_cast<const RecordSemType*>(inferred.get());
+        if (!rs) {
+            error(decl, "destructuring requires a tuple/record value, got '"
+                  + inferred->toString() + "'");
+            return;
+        }
+        if (rs->fields.size() != decl.names.size()) {
+            error(decl, "destructuring arity mismatch: expected " +
+                  std::to_string(rs->fields.size()) + " names, got " +
+                  std::to_string(decl.names.size()));
+            return;
+        }
+        typeStore_.push_back(inferred->clone());
+        const_cast<ConstDecl&>(decl).inferredType = typeStore_.back().get();
+        for (size_t i = 0; i < decl.names.size(); ++i) {
+            Symbol sym;
+            sym.kind = SymKind::Variable;
+            sym.isConst = true;
+            sym.name = decl.names[i];
+            sym.type = rs->fields[i].type ? rs->fields[i].type->clone()
+                                          : ErrorSemType::make();
+            symtab_.define(std::move(sym));
+        }
+        return;
+    }
     // None 不能作为独立变量类型
     if (rejectStandaloneNone(decl, decl.type.get())) return;
 

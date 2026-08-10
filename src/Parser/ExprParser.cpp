@@ -11,7 +11,7 @@ std::unique_ptr<ASTNode> Parser::parseExpr() {
 }
 
 std::unique_ptr<ASTNode> Parser::parseAssignment() {
-    auto left = parsePipe();
+    auto left = parseConditional();
 
     if (!left) return nullptr;
 
@@ -24,7 +24,54 @@ std::unique_ptr<ASTNode> Parser::parseAssignment() {
         return assign;
     }
 
+    // 复合赋值脱糖：x += expr ≡ x = x + expr
+    // target 允许 Identifier / obj.f（MemberAccessExpr）/ a[i]（IndexExpr），其他报错
+    const char* compoundOp = nullptr;
+    if (match(TokType::PlusEq))          compoundOp = "+";
+    else if (match(TokType::MinusEq))    compoundOp = "-";
+    else if (match(TokType::StarEq))     compoundOp = "*";
+    else if (match(TokType::SlashEq))    compoundOp = "/";
+    else if (match(TokType::PercentEq))  compoundOp = "%";
+    if (compoundOp) {
+        auto isCompoundTarget = [](const ASTNode* n) {
+            return dynamic_cast<const Identifier*>(n)
+                || dynamic_cast<const MemberAccessExpr*>(n)
+                || dynamic_cast<const IndexExpr*>(n);
+        };
+        if (!isCompoundTarget(left.get())) {
+            error("compound assignment target must be an identifier, member access, or index");
+            return nullptr;
+        }
+        auto bin = std::make_unique<BinaryExpr>();
+        bin->op = compoundOp;
+        bin->left = left->clone();                    // 复用 target 副本作左操作数
+        bin->right = parseAssignment();               // 右结合：x -= a + b ≡ x = x - (a + b)
+        auto assign = std::make_unique<AssignExpr>();
+        setNodePos(assign.get(), peek());
+        assign->target = std::move(left);
+        assign->value = std::move(bin);
+        return assign;
+    }
+
     return left;
+}
+
+std::unique_ptr<ASTNode> Parser::parseConditional() {
+    auto cond = parsePipe();
+    if (!cond) return nullptr;
+    if (!match(TokType::Question)) return cond;
+
+    auto thenBranch = parseExpr();      // then 是完整表达式（含赋值），':' 处自然停止
+    consume(TokType::Colon, "expected ':' in conditional expression");
+    auto elseBranch = parseConditional();   // 右结合
+    if (!elseBranch) return nullptr;
+
+    auto n = std::make_unique<ConditionalExpr>();
+    setNodePos(n.get(), peek());
+    n->cond       = std::move(cond);
+    n->thenBranch = std::move(thenBranch);
+    n->elseBranch = std::move(elseBranch);
+    return n;
 }
 
 std::unique_ptr<ASTNode> Parser::parsePipe() {

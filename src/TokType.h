@@ -52,6 +52,9 @@ enum class TokType {
     Hash,          // #
     Ellipsis,      // ...（C++ 桥接方法声明标记）
 
+    PlusEq, MinusEq, StarEq, SlashEq, PercentEq,   // 复合赋值
+    Question,                                       // 三元 ?
+
     Eof,
     Error,
 };

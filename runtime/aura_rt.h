@@ -9,6 +9,7 @@
 #include "thread_pool.h"   // sync thread 运行时支持
 #include "builtin/string.h"
 #include "builtin/path.h"
+#include "builtin/math.h"
 #include "builtin/io.h"
 #include "builtin/array.h"
 #include "builtin/sync.h"
@@ -18,6 +19,7 @@
 #include "builtin/variant.h"        // Variant<T...>（P1：含堆联合 GC 堆封装）
 #include "builtin/iterator.h"       // Iterator<T> / RangeIter / MapIter / FilterIter / FuncIter
 #include "builtin/thread_channel.h"
+#include "builtin/tuple.h"          // Tuple2~Tuple8（函数多返回值打包；单元素保持分组无 Tuple1）
 
 #include <functional>
 #include <ranges>

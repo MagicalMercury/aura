@@ -165,6 +165,7 @@ public:
         bool visit(const AssignExpr& n, IdRefCollector& self) { self.collectExpr(*n.target); self.collectExpr(*n.value); return false; }
         bool visit(const ErrorPropagationExpr& n, IdRefCollector& self) { self.collectExpr(*n.expr); return false; }
         bool visit(const PipeExpr& n, IdRefCollector& self) { self.collectExpr(*n.left); self.collectExpr(*n.right); return false; }
+        bool visit(const ConditionalExpr& n, IdRefCollector& self) { if (n.cond) self.collectExpr(*n.cond); if (n.thenBranch) self.collectExpr(*n.thenBranch); if (n.elseBranch) self.collectExpr(*n.elseBranch); return false; }
         bool visit(const RecordExpr& n, IdRefCollector& self) { for (auto& f : n.fields) if (f.value) self.collectExpr(*f.value); return false; }
         bool visit(const ListExpr& n, IdRefCollector& self) { for (auto& e : n.elements) if (e) self.collectExpr(*e); return false; }
         bool visit(const IntLiteral&, IdRefCollector&)    { return false; }
@@ -255,6 +256,16 @@ private:
 
     // 判断 SemType 是否对应 GC 堆对象指针（用于 GcRootHandle 包装决策）
     [[nodiscard]] bool isHeapSemType(const SemType* type) const;
+
+    // P1：视图类型判定（值视图 { 函数指针, self }，非 GC 堆对象）
+    //   - 内置 Iterator<T>（GenericSemType "Iterator"）
+    //   - 接口视图（InterfaceSemType：Stringer/Comparable/用户接口）
+    // 视图不能被 GcRootHandle<View> 包裹（视图非指针，模板参数不成立）
+    [[nodiscard]] bool isIfaceView(const SemType* t) const;
+    // 联合变体堆封装判定：堆类型 或 视图类型
+    // （视图含 self GC 指针，放 std::variant 内部 GC 不可见 → 必须 aura_rt::Variant<T...>* 封装，
+    //   descForI 按 self 子偏移扫描；与 isHeapSemType 的"传参包装"语义不同，勿混用）
+    [[nodiscard]] bool isUnionHeapVariant(const SemType* t) const;
 
     // P3b：识别 none() 调用（Optional 占位构造），联合赋值时特判为 NoneType 值
     [[nodiscard]] static bool isNoneCallExpr(const ASTNode& e);
@@ -408,6 +419,7 @@ private:
     [[nodiscard]] std::string genAssignExpr(const AssignExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genErrorPropagation(const ErrorPropagationExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genPipeExpr(const PipeExpr& e, bool isCoroutine);
+    [[nodiscard]] std::string genConditionalExpr(const ConditionalExpr& e, bool isCoroutine);
 
     // --- 闭包 ---
     [[nodiscard]] std::string genFunExpr(const FunExpr& e, bool isCoroutine);

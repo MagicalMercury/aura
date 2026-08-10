@@ -362,12 +362,14 @@ struct FunDecl : Decl {
 
 struct LetDecl : Decl {
     std::string name;
+    std::vector<std::string> names;   // 解构多名字（names.size()>1 时有效；单名保持 name 字段）
     std::unique_ptr<TypeExpr> type;
     std::unique_ptr<ASTNode> initializer;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<LetDecl>();
         n->name = name;
+        n->names = names;
         if (type) n->type.reset(static_cast<TypeExpr*>(type->clone().release()));
         n->initializer = initializer ? initializer->clone() : nullptr;
         n->isPublic = isPublic;
@@ -378,12 +380,14 @@ struct LetDecl : Decl {
 
 struct ConstDecl : Decl {
     std::string name;
+    std::vector<std::string> names;   // 解构多名字（names.size()>1 时有效；单名保持 name 字段）
     std::unique_ptr<TypeExpr> type;
     std::unique_ptr<ASTNode> initializer;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<ConstDecl>();
         n->name = name;
+        n->names = names;
         if (type) n->type.reset(static_cast<TypeExpr*>(type->clone().release()));
         n->initializer = initializer ? initializer->clone() : nullptr;
         n->isPublic = isPublic;

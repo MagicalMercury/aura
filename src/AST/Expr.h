@@ -120,6 +120,21 @@ struct BinaryExpr : ASTNode {
     }
 };
 
+struct ConditionalExpr : ASTNode {
+    std::unique_ptr<ASTNode> cond;
+    std::unique_ptr<ASTNode> thenBranch;
+    std::unique_ptr<ASTNode> elseBranch;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ConditionalExpr>();
+        n->cond       = cond       ? cond->clone()       : nullptr;
+        n->thenBranch = thenBranch ? thenBranch->clone() : nullptr;
+        n->elseBranch = elseBranch ? elseBranch->clone() : nullptr;
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
 struct UnaryExpr : ASTNode {
     std::string op;
     std::unique_ptr<ASTNode> operand;

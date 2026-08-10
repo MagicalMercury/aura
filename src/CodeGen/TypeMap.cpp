@@ -121,6 +121,15 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
         }
         return base;
     }
+    if (auto* tp = dynamic_cast<const TupleTypeExpr*>(&type)) {
+        // 元组类型注解：现场合成 TupleN<elem...>*
+        std::string cn = "aura_rt::Tuple" + std::to_string(tp->elementTypes.size()) + "<";
+        for (size_t i = 0; i < tp->elementTypes.size(); ++i) {
+            if (i > 0) cn += ", ";
+            cn += tp->elementTypes[i] ? mapType(*tp->elementTypes[i]) : "void";
+        }
+        return cn + ">*";
+    }
     if (auto* g = dynamic_cast<const GenericTypeRef*>(&type))
         return mapGenericRef(*g);
     if (auto* l = dynamic_cast<const ListType*>(&type)) {
@@ -161,25 +170,27 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
             if (!v) continue;
             bool heap = false;
             if (v->inferredType) {
-                heap = isHeapSemType(v->inferredType);
+                // 视图变体（Iterator/接口）也需堆 Variant 封装（self 子偏移扫描）
+                heap = isUnionHeapVariant(v->inferredType);
             } else {
                 // 无 SemType（如类型声明处）：按 C++ 名回退判断（指针类型 = 堆）
                 std::string cpp = mapType(*v);
                 heap = !cpp.empty() && cpp.back() == '*';
-                // P2b：接口视图变体（值视图含 GC 指针 self，C++ 名非 * 结尾）→ 需
-                // Variant 堆封装供 descForI 扫描。与 isHeapSemType(InterfaceSemType)=true
-                // 对齐（genUnionBoxing 的 hasHeap 判定）；排除内置 Iterator——其值视图
-                // 由保守栈扫描保护，isHeapSemType 判定其为非堆，此处保持一致。
+                // 接口视图变体（值视图含 GC 指针 self，C++ 名非 * 结尾）→ 需
+                // Variant 堆封装供 descForI 扫描（与 isUnionHeapVariant 对齐）。
+                // 含内置 Iterator：其值视图含 self，B+W 后由 descForI is_iface_view_v
+                // 子偏移 + ViewRoot 保护（2026-08-10 评估放开，见 plan）
                 if (!heap && v) {
                     if (auto* n = dynamic_cast<const NamedType*>(v.get())) {
-                        if (n->name != "Iterator" && n->namespacePrefix.empty()) {
+                        if (n->namespacePrefix.empty()) {
                             // 用户接口（interfaceNames_）+ 内置接口（auraiInterfaces，
                             // 如 Stringer/Comparable，与 isIfaceViewTypeName 判定一致）
                             bool isIface = interfaceNames_.contains(n->name);
                             if (!isIface)
                                 for (auto& ai : BuiltinRegistry::get().auraiInterfaces())
                                     if (ai->name == n->name) { isIface = true; break; }
-                            if (isIface) heap = true;
+                            // 内置 Iterator：NamedType{name="Iterator"}（含 Iterator<int> 带 typeArgs）
+                            if (isIface || n->name == "Iterator") heap = true;
                         }
                     }
                 }
@@ -307,7 +318,7 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
         // P3b：含堆 → Variant 指针；全值 → std::variant
         bool hasHeap = false;
         for (auto& v : u->variants)
-            if (v && isHeapSemType(v.get())) { hasHeap = true; break; }
+            if (v && isUnionHeapVariant(v.get())) { hasHeap = true; break; }
         std::string result = hasHeap ? "aura_rt::Variant<" : "std::variant<";
         for (size_t i = 0; i < u->variants.size(); ++i) {
             if (i > 0) result += ", ";
@@ -317,6 +328,15 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
         return result;
     }
     if (auto* r = dynamic_cast<const RecordSemType*>(&semType)) {
+        if (r->isTuple) {
+            // 元组：现场合成 TupleN<elem...>*（canonicalName 留空，递归映射元素）
+            std::string cn = "aura_rt::Tuple" + std::to_string(r->fields.size()) + "<";
+            for (size_t i = 0; i < r->fields.size(); ++i) {
+                if (i > 0) cn += ", ";
+                cn += r->fields[i].type ? mapSemType(*r->fields[i].type) : "void";
+            }
+            return cn + ">*";
+        }
         if (!r->canonicalName.empty()) {
             return r->canonicalName + "*";
         }

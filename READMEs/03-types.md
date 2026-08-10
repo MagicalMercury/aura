@@ -24,6 +24,22 @@ let maybe: int | None = None     // 初始为空
 // maybe = 42                    // 后续赋值
 ```
 
+**数值类型提升与运算符限制**：
+
+- **`int → float` 单向隐式加宽**：二元算术运算中任一操作数为 `float` 时，`int` 操作数自动提升为 `float`，结果类型为 `float`；两个 `int` 运算结果为 `int`。该加宽同样适用于赋值与三元条件（JLS 5.2 / 5.6.2 单向兼容规则）。
+- **取余 `%` 仅支持整数**：浮点取余编译期报错（`%` 是纯整数运算）。
+- **复合赋值二次求值限制**：`x += v` 脱糖为 `x = x + v`。若 target 的子表达式含副作用（如 `getObj().f += 1`、`a[next()] += 1`），该子表达式会求值两次；target 无副作用场景（普通变量 / 简单字段 / 简单索引）语义正确。
+
+```aura
+let a: int = 3
+let b: float = a * 2.5        // int 提升为 float → 7.5
+let c: float = a + 1          // a + 1 为 int，赋值时加宽为 float
+let d: int = a * 2            // int * int → int
+// let e = 5.0 % 2            // ❌ 错误：% 仅支持整数
+let n = 10
+n += 3                        // n = n + 3 → 13
+```
+
 ### 内置 GC 类型
 
 Aura 提供若干内置的 GC 堆对象类型，由运行时管理生命周期，可直接构造：
@@ -36,7 +52,7 @@ Aura 提供若干内置的 GC 堆对象类型，由运行时管理生命周期�
 | `sync.Mutex` | `sync.Mutex()` | 互斥锁，配合 `lock` 块（见 [§11.6](11-concurrency.md#116-syncmutex-与-lock-块)） |
 | `sync.RWMutex` | `sync.RWMutex()` | 读写锁，`rw.r()` / `rw.w()` 返回读/写视图（见 [§11.6.6](11-concurrency.md#1166-syncrwmutex--读写锁v11)） |
 | `sync.Once` | `sync.Once()` | 一次性执行，`lock (once) { body }` 中 body 仅首次执行（见 [§11.6.7](11-concurrency.md#1167-synconce--一次性执行v11)） |
-| `Optional<T>` | `some(v)` / `none()` | GC 安全可选值封装，规避 `T \| None` 联合的 GC 栈扫描破绽（见 [§7.4](07-methods-interfaces.md#74-内置接口)、[§11.7.3](11-concurrency.md#1173-optionalt--receive-的返回类型)） |
+| `Optional<T>` | `some(v)` / `none()` / 隐式装箱 | GC 安全可选值封装；`T \| None` 联合（T 为堆类型）折叠为 `Optional<T>`（见 [§3.2](#32-复合类型)、[§7.4](07-methods-interfaces.md#74-内置接口)、[§11.7.3](11-concurrency.md#1173-optionalt--receive-的返回类型)） |
 | `Iterator<T>` | `range(n)` / `Iterator.from(f)` / `it.map(f)` / `it.filter(p)` | 惰性迭代器，GC 对象；record `impl Iterator<T>` 实现 `next()` 即可 `for-in`（见 [§7.4](07-methods-interfaces.md#74-内置接口)） |
 
 > `sync.Mutex` / `sync.RWMutex` / `sync.Once` 是 GC 堆对象，生命周期由 GC 管理。`sync` 是伪模块名，用作类型/构造调用的命名空间前缀，运行时等价于裸 `Mutex` / `RWMutex` / `Once` 类型。`RWMutex.r()` / `rw.w()` 返回的 `ReadGuard` / `WriteGuard` 是虚拟视图类型，仅用于 `lock` 块的类型推断，用户不能直接声明。
@@ -84,6 +100,40 @@ type MaybeInt = int | None
 type Result = string | Error
 ```
 
+联合类型把多个候选类型合成一个值类型，配合 `match` 穷尽匹配使用（见 §9）。其运行时表示与 GC 语义由编译器按以下规则决定：
+
+**`T | None` 折叠为 `Optional<T>`**（恰 2 个变体且其一为 `None` 时，顺序无关）：
+
+| 另一变体 | 折叠结果 | 运行时表示 |
+|:---|:---|:---|
+| GC 堆类型（`string` / `[T]` / record / `Optional<T>` / 函数类型等） | ✅ 折叠为 `Optional<T>` | `aura_rt::Optional<T>*`（GC 堆对象） |
+| 全值类型（`int` / `float` / `bool`） | ❌ 不折叠 | `aura_rt::Variant<int, NoneType>*`（GC 封装） |
+
+折叠只发生在"另一变体为 GC 堆类型"时：堆指针（如 `GcString*`）放进裸 `std::variant` 内部会对 GC 不可见，折叠为 `Optional<T>` 直接复用其类型描述符的精确扫描；全值变体无 GC 指针，保留 `std::variant` 表示即可。
+
+**多变体联合 `A | B | C`**：始终编译为 `aura_rt::Variant<A, B, C, ...>*`（GC 堆对象）。`storage_` 按"当前激活变体"精确扫描（TypeDescriptor 动态 desc），接口视图变体（含内置 `Iterator<T>`）额外注册 `self` 子偏移，compact 搬运对象后自动更新；视图变体装箱/提取经 `ViewRoot` 保护，分支体内 GC 安全（2026-08-10 放开内置 Iterator 变体拦截）。
+
+**构造方式**（字面量/表达式赋值自动装箱，无需手动 `some`）：
+
+```aura
+let x: string | None = "abc"        // 自动 make_optional（隐式装箱）
+let n: int | None = None            // None 字面量 → none
+let r: int | string = 42            // 自动按激活变体索引构造 Variant
+let s = some(v)                     // 显式构造 Optional<T>
+```
+
+- initializer 本身已是 `Optional` 值（变量引用 / 函数或方法调用返回 `Optional<T>`，如 `ch.receive()`）→ 直接引用，不重复装箱。
+- 分支体内分配内存触发 GC/compact 时，`match` 分支绑定值由 `GcRootHandle` 保护，始终安全（见 §9）。
+
+**支持范围与限制**（编译期检查，不支持的变体报错）：
+
+- ✅ 接口视图变体：`type R = Stringer | int`（接口变体按 `self` 子偏移 GC 扫描）
+- ✅ 堆类型变体：`string` / `[T]` / record / `Optional<T>`
+- ❌ 函数类型变体 `fun(...)`：`std::function` 捕获的 GC 指针对 GC 不可见
+- ❌ 嵌套联合 `(A | B) | C`：未扁平化，不可入联合
+- ❌ 内置 `Iterator<T>` 变体：迭代器视图含 GC 指针 `self`，暂编译期拦截
+- `None` 不能单独作变量声明类型（联合中除外）
+
 **列表类型**：
 
 ```aura
@@ -122,6 +172,31 @@ let callback: fun() -> None = fun() {
 }
 callback()                       // 调用
 ```
+
+**元组类型**：
+
+`(T1, T2, ..., Tn)`（2 ≤ n ≤ 8）是匿名多值打包类型，映射为运行时 `aura_rt::Tuple2~Tuple8`（GC 堆对象），字段名 `_0` / `_1` / ...。单元素 `(T)` 保持"括号分组"，不构成元组。
+
+```aura
+// --- 返回多个值 ---
+fun divmod(a: int, b: int) -> (int, int) {
+    return a / b, a % b        // 逗号列表打包为元组
+}
+let q, r = divmod(7, 3)        // 解构：q = 2, r = 1
+
+// --- 类型标注与字段访问（元组由多值返回产生）---
+fun pair() -> (int, string) {
+    return 3, "ab"
+}
+let t: (int, string) = pair()
+let x = t._0                   // 3
+let s = t._1                   // "ab"
+```
+
+- **多值返回**：`return a, b` 打包为匿名元组；`-> (T1, T2)` 声明对应返回类型。
+- **解构声明**：`let x, y = f()` 按元组字段顺序逐字段绑定；与 const 声明（`const` 不可变）同样支持。
+- **上限 8 个元素**：超过报编译期错误（暂不支持）。
+- **嵌套元组**：元组字段可为元组/任意 GC 类型，GC 按字段类型精确扫描（指针/接口视图字段注册偏移，值字段过滤）。
 
 **接口类型**：
 

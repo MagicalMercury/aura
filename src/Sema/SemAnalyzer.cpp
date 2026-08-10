@@ -374,12 +374,22 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
 
     // 泛型参数作为 source：查类型别名获取实际类型再做兼容检查
     // 处理递归类型引用（如 Tree<T> 内 children: [Tree<T>]，自引用产生 GenericSemType("Tree")）
+    // 仅未解析的泛型形参（resolvedName 空）走别名解析；
+    // 已解析泛型（如 Iterator<int32_t>，resolvedName 非空）继续向下走
+    // UnionSemType 变体匹配 / equals——否则接口名与泛型同名时（如内置 Iterator
+    // 接口经符号表注册为 Interface 符号）会在下方 UnionSemType 分支前被误拦截
     if (auto* gs = dynamic_cast<const GenericSemType*>(&source)) {
-        auto* sym = symtab_.lookup(gs->name);
-        if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
-            return isAssignable(target, *sym->type);
+        // 仅未解析的泛型形参（resolvedName 空）查类型别名；
+        // 已解析泛型（如 Iterator<int32_t>）不在此 return，继续向下走
+        // UnionSemType 变体匹配 / equals——否则接口名与泛型同名时
+        // （内置 Iterator 接口经符号表注册为 Interface 符号）会在下方被误拦截
+        if (gs->resolvedName.empty()) {
+            auto* sym = symtab_.lookup(gs->name);
+            if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
+                return isAssignable(target, *sym->type);
+            }
+            return false;
         }
-        return false;
     }
 
     // 联合类型：source 匹配任一变体即为可赋值
@@ -472,6 +482,15 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
         return false;
     }
 
+    // 数值提升（Java 赋值转换语义）：float 接受 int（加宽）；int 不接受 float（收窄）
+    // bool/string 基元严格相等（equals），不受影响
+    if (auto* tp = dynamic_cast<const PrimSemType*>(&target)) {
+        if (auto* sp = dynamic_cast<const PrimSemType*>(&source)) {
+            if (tp->kind == PrimSemType::Float && sp->kind == PrimSemType::Int)
+                return true;
+            return target.equals(source);
+        }
+    }
     return target.equals(source);
 }
 
@@ -505,6 +524,7 @@ std::unique_ptr<SemType> SemAnalyzer::substitute(
     }
     if (auto* r = dynamic_cast<const RecordSemType*>(&type)) {
         auto n = std::make_unique<RecordSemType>();
+        n->isTuple = r->isTuple;   // 元组标志随泛型实例化保留（canonicalName 为空，replaceCanonicalArg 空操作）
         // 泛型 record 的 canonicalName（如 "Pair<A, B>"）同步实例化：
         // 将形参名替换为绑定的具体 C++ 类型名（"Pair<int32_t, aura_rt::GcString*>"）
         n->canonicalName = replaceCanonicalArg(r->canonicalName, genericName, semTypeToCppName(concrete));

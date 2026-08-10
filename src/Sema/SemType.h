@@ -56,6 +56,7 @@ struct RecordFieldSem {
 struct RecordSemType : SemType {
     std::vector<RecordFieldSem> fields; // 字段按定义顺序，但等价性检查忽略顺序
     std::string canonicalName;          // 类型别名名（如 "Tree"），用于 CodeGen 映射 C++ 类型
+    bool isTuple = false;               // 元组（匿名 record 语法糖）：位置字段 _0/_1/...；canonicalName 留空，C++ 类型名由 CodeGen 现场合成
     [[nodiscard]] bool equals(const SemType& other) const override;
     [[nodiscard]] std::string toString() const override;
     [[nodiscard]] std::unique_ptr<SemType> clone() const override;

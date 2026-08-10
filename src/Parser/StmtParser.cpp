@@ -146,7 +146,21 @@ std::unique_ptr<Stmt> Parser::parseReturnStmt() {
     setNodePos(stmt.get(), tok);
 
     if (!check(TokType::Semicolon) && !check(TokType::RBrace) && !atEnd()) {
-        stmt->expr = parseExpr();
+        auto first = parseExpr();
+        if (match(TokType::Comma)) {
+            // return v1, v2, ... → RecordExpr{_0, _1, ...}（元组打包，匿名 record）
+            auto rec = std::make_unique<RecordExpr>();
+            setNodePos(rec.get(), tok);
+            size_t idx = 0;
+            rec->fields.push_back({"_" + std::to_string(idx++), std::move(first)});
+            do {
+                auto v = parseExpr();
+                rec->fields.push_back({"_" + std::to_string(idx++), std::move(v)});
+            } while (match(TokType::Comma));
+            stmt->expr = std::move(rec);
+        } else {
+            stmt->expr = std::move(first);
+        }
     }
 
     match(TokType::Semicolon);
