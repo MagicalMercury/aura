@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstddef>
+#include <deque>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -364,6 +365,40 @@ public:
     void  markFields(GcObject* obj);
     void  markInlineArrayFields(GcObject* obj);
 
+    // ---- 并行标记（P1：显式标记栈 + GC 私有线程组）----
+    // 根对象入共享栈（tryMark + push，不递归）
+    void  markRootEnqueue(GcObject* obj);
+    // 非递归字段扫描：子对象 tryMark 后入本地栈
+    void  scanObjectFields(GcObject* obj, std::vector<GcObject*>& local);
+    // 单线程消费共享栈（串行路径，等价原递归 markObject）
+    void  drainMarkStack();
+    // 并行 worker：共享栈批量取 + 本地栈攒批回填（终止检测）
+    void  parallelMarkWorker();
+    // 并行标记入口：对象量 >= 阈值启用线程组，否则单线程消费
+    void  runMarkPhase();
+
+    // ---- 并发标记（P2：SATB，mark 与 mutator 并发）----
+    // 根扫描入栈（markPhase 前半：线程根/协程帧/全局根/记忆集-old 展开/oomError）
+    void  scanRootsOnly(bool youngOnly);
+    // 完整停靠：等所有"有根链表的线程"停止（threadRootLists_ 精确反映需停线程，
+    // 含启动窗口期新注册——registered_threads_ 快照可能落后，循环确认 size 稳定）
+    void  waitForRootThreadsStopped();
+    // 触发：根扫描（线程已停，STW）→ 释放线程 → 并行标记消费（Marking，mutator 并发）
+    //        → 收尾（Finalize，短暂 STW）
+    void  startConcurrentGc();
+    // 阶段 3 收尾：补扫 born-marked + 消费 SATB + drain 标记栈 + sweep + compact
+    void  finalizeMarking();
+    // born-marked 封装（alloc 路径调用，替代直接 setMarked(false)）
+    inline void finishAlloc(GcObject* obj) {
+        if (markingInProgress_.load(std::memory_order_acquire)) {
+            obj->setMarked(true);                       // born-marked：标记期间新分配直接标记
+            std::lock_guard<std::mutex> lk(bornMutex_);
+            bornObjects_.push_back(obj);                // 收尾补扫字段（可能引用旧对象）
+        } else {
+            obj->setMarked(false);
+        }
+    }
+
     // 清除阶段
     void  sweepPhaseYoung();  // 新生代清除 + 晋升
     void  sweepPhaseAll();    // 全量清除 + 页回收
@@ -537,6 +572,33 @@ public:
     // mark 通过正常引用链 + 保守栈扫描 LOS 检查
     // sweep 在 sweepPhaseYoung/sweepPhaseAll 中调用 los_.release()
     LargeObjectSpace            los_;
+
+    // ==================== P1：并行标记 ====================
+    // 共享标记栈（显式 DFS；P2 并发标记复用同一结构）
+    std::deque<GcObject*>      markStack_;      // 共享栈（mutex 保护）
+    std::mutex                 markStackM_;
+    std::atomic<int>           markActive_{0};  // 活跃 worker 计数（终止检测）
+    // 并行阈值与批量
+    static constexpr size_t    kParallelMarkThreshold = 50000;  // 对象数超过才并行
+    static constexpr size_t    kMarkBatchSize          = 32;    // 批量转移粒度
+    std::vector<std::thread>   markThreads_;  // GC 私有线程组（每次 GC 周期创建/回收）
+    static thread_local bool   in_gc_internal_;  // GC 内部线程标志（不参与 STW/alloc）
+
+    // ==================== P2：SATB 并发标记 ====================
+    // 并发阶段：Marking=标记进行中（mutator 自由运行）/ Finalize=收尾（短暂 STW）
+    enum class GcPhase : uint8_t { Idle, Marking, Finalize };
+    std::atomic<GcPhase>      phase_{GcPhase::Idle};
+    std::atomic<bool>         markingInProgress_{false};  // alloc born-marked / 写屏障 SATB 开关
+    // SATB 队列（mutator 写屏障 push / 收尾消费）
+    std::mutex                satbMutex_;
+    std::vector<GcObject*>    satbQueue_;
+    // born-marked 对象（收尾补扫字段）
+    std::mutex                bornMutex_;
+    std::vector<GcObject*>    bornObjects_;
+    // 并发 GC 开关（安全网：false 走 P1 纯 STW 并行标记）
+    bool                      concurrentGcEnabled_ = true;
+    // 并发 GC 启动时判定的级别（收尾执行对应 sweep）：0=Minor 1=Mixed 2=Major 3=SweepLarge
+    int                       pendingGcKind_ = 0;
 };
 
 // ============================================================

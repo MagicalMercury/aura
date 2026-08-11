@@ -61,15 +61,29 @@ void GcHeap::majorGc() {
 // ============================================================
 
 void GcHeap::markPhase(bool youngOnly) {
+    // P1：根扫描只入栈（scanRootsOnly），runMarkPhase 统一并行/串行消费
+    scanRootsOnly(youngOnly);
+    runMarkPhase();
+}
+
+// 根扫描入栈（markPhase 前半；并发标记 startConcurrentGc 在 STW 线程停靠时复用）
+void GcHeap::scanRootsOnly(bool youngOnly) {
     // 1. 从所有线程的 GcRootHandle 链表出发标记
     //    ptr_ref_ 指向用户栈上 GC 指针变量地址，memcpy 读取该地址处的对象指针
     //    （用 memcpy 避免 strict-aliasing：实际指向 GcString* 等派生类型）
-    for (auto* list : threadRootLists_) {
-        for (GcRootHandleBase* node = list->head; node; node = node->next_) {
-            GcObject* obj;
-            std::memcpy(&obj, node->ptr_ref_, sizeof(GcObject*));
-            if (obj) {
-                markObject(obj);
+    //    P1：只入栈不递归（runMarkPhase 统一消费）
+    //    P2：持 threadRootLists_m_ 锁——并发路径的 waitForRootThreadsStopped 二次确认后，
+    //        等待期间新注册线程的 ensureThreadRootList（push_back）可能仍在进行，
+    //        持锁扫描防 vector 并发修改（已停线程的节点遍历不受影响）
+    {
+        std::lock_guard<std::mutex> lk(threadRootLists_m_);
+        for (auto* list : threadRootLists_) {
+            for (GcRootHandleBase* node = list->head; node; node = node->next_) {
+                GcObject* obj;
+                std::memcpy(&obj, node->ptr_ref_, sizeof(GcObject*));
+                if (obj) {
+                    markRootEnqueue(obj);
+                }
             }
         }
     }
@@ -102,8 +116,8 @@ void GcHeap::markPhase(bool youngOnly) {
                     if (!obj->desc) break;
                     if (registeredDescs_.find(obj->desc) == registeredDescs_.end()) break;
                     if (obj->desc->size == 0) break;
-                    // 始终标记：markObject 有 marked 守卫，old 对象不会重复扫描
-                    markObject(obj);
+                    // 始终入栈：markRootEnqueue 有 tryMark 守卫，不会重复入栈
+                    markRootEnqueue(obj);
                     found = true;
                     break;
                 }
@@ -113,7 +127,7 @@ void GcHeap::markPhase(bool youngOnly) {
             // 路径 2：检查是否是中页对象
             if (findMediumPage(obj)) {
                 if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
-                    markObject(obj);
+                    markRootEnqueue(obj);
                 }
                 continue;
             }
@@ -121,7 +135,7 @@ void GcHeap::markPhase(bool youngOnly) {
             // 路径 3：检查是否是大页对象
             if (findLargePage(obj)) {
                 if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
-                    markObject(obj);
+                    markRootEnqueue(obj);
                 }
                 continue;
             }
@@ -129,7 +143,7 @@ void GcHeap::markPhase(bool youngOnly) {
             // 路径 4：检查是否是 LOS 大对象
             if (los_.contains(obj)) {
                 if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
-                    markObject(obj);
+                    markRootEnqueue(obj);
                 }
             }
         }
@@ -140,16 +154,18 @@ void GcHeap::markPhase(bool youngOnly) {
         std::lock_guard<std::mutex> lk(globalRoots_m_);
         for (auto* rootPtr : globalRoots_) {
             if (rootPtr && *rootPtr) {
-                markObject(*rootPtr);
+                markRootEnqueue(*rootPtr);
             }
         }
     }
 
     // 4. 若 youngOnly，从记忆集出发标记 old→young 引用
+    //    P1：已标记对象直接入栈展开字段（不经 tryMark——对象已由根标记置位，
+    //    tryMark 会失败；scanObjectFields 消费时扫描字段，子对象 tryMark 防重复）
     if (youngOnly) {
         for (auto* oldObj : rememberedSet_) {
-            markFields(oldObj);   // 递归标记 old 对象引用的 young 对象
-            markInlineArrayFields(oldObj);
+            std::lock_guard<std::mutex> lk(markStackM_);
+            markStack_.push_back(oldObj);
         }
     }
 
@@ -157,15 +173,15 @@ void GcHeap::markPhase(bool youngOnly) {
     if (!youngOnly) {
         for (auto* obj : oldObjects_) {
             if (obj->marked()) {
-                markFields(obj);
-                markInlineArrayFields(obj);
+                std::lock_guard<std::mutex> lk(markStackM_);
+                markStack_.push_back(obj);
             }
         }
     }
 
     // 5. 始终标记 OOM 错误缓存字符串（确保可随时抛出）
-    if (oomError_.kind) markObject(oomError_.kind);
-    if (oomError_.message) markObject(oomError_.message);
+    if (oomError_.kind) markRootEnqueue(oomError_.kind);
+    if (oomError_.message) markRootEnqueue(oomError_.message);
 }
 
 void GcHeap::markObject(GcObject* obj) {

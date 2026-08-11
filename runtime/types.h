@@ -7,6 +7,7 @@
 // 自动生成对应的 struct 和 TypeDescriptor 实例。
 // ============================================================
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -110,15 +111,41 @@ struct TypeDescriptor {
 struct GcObject {
     const TypeDescriptor* desc = nullptr;  // 8  offset 0
     uint32_t allocSize_ = 0;               // 4  offset 8
-    uint8_t  flags_ = 0;                   // 1  offset 12  bit-packed 标记
-    // padding: 3 bytes                    //    offset 13-15
-    // 总计 16 字节
+    std::atomic<uint8_t> mark_flags_{0};   // 1  offset 12  bit0=marked（并行标记 CAS）
+    uint8_t  flags_ = 0;                   // 1  offset 13  generation/finalized/age/forwarded
+    // padding: 2 bytes                    //    offset 14-15
+    // 总计 16 字节（与拆分前一致）
 
     ~GcObject() = default;  // 非虚：GC 不通过基类 delete，finalizer 走 desc->finalizer
 
-    // ---- marked (bit 0) ----
-    bool marked() const         { return flags_ & kMarkedBit; }
-    void setMarked(bool v)      { flags_ = (flags_ & ~kMarkedBit) | (v ? kMarkedBit : 0); }
+    // atomic 成员使默认拷贝被删除（Error 的 throw 拷贝需要）；
+    // 值语义拷贝：mark_flags_ 按值 load/store（GC 对象拷贝发生在 STW/构造期，无并发）
+    GcObject(const GcObject& o)
+        : desc(o.desc), allocSize_(o.allocSize_),
+          mark_flags_(o.mark_flags_.load(std::memory_order_relaxed)), flags_(o.flags_) {}
+    GcObject& operator=(const GcObject& o) {
+        desc = o.desc;
+        allocSize_ = o.allocSize_;
+        mark_flags_.store(o.mark_flags_.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+        flags_ = o.flags_;
+        return *this;
+    }
+    GcObject() = default;
+
+    // ---- marked (bit 0, 原子字节) ----
+    bool marked() const {
+        return (mark_flags_.load(std::memory_order_acquire) & kMarkedBit) != 0;
+    }
+    void setMarked(bool v) {
+        mark_flags_.store(v ? kMarkedBit : 0, std::memory_order_release);
+    }
+    // 并行标记：未标记→标记，返回是否由本线程完成置位（false=已被其他线程标记）
+    bool tryMark() {
+        uint8_t expected = 0;
+        return mark_flags_.compare_exchange_strong(expected, kMarkedBit,
+                                                   std::memory_order_acq_rel);
+    }
 
     // ---- generation (bit 1) ----
     uint8_t generation() const  { return (flags_ & kGenMask) >> kGenShift; }
@@ -148,7 +175,7 @@ struct GcObject {
     void  setAllocSize(size_t s) { allocSize_ = static_cast<uint32_t>(s); }
 
 private:
-    static constexpr uint8_t kMarkedBit    = 0x01;  // bit 0
+    static constexpr uint8_t kMarkedBit    = 0x01;  // mark_flags_ bit 0
     static constexpr uint8_t kGenMask      = 0x02;  // bit 1
     static constexpr uint8_t kGenShift     = 1;
     static constexpr uint8_t kFinalizedBit = 0x04;  // bit 2
@@ -156,6 +183,8 @@ private:
     static constexpr uint8_t kAgeShift     = 3;
     static constexpr uint8_t kForwardedBit = 0x80;  // bit 7
 };
+// 防布局回归断言（16 字节不变：desc 8B + allocSize 4B + mark_flags 1B + flags 1B + pad 2B）
+static_assert(sizeof(GcObject) == 16, "GcObject layout changed");
 
 // ============================================================
 // GcString — 前向声明，完整定义见 builtin/string.h

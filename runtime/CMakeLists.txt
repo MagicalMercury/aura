@@ -51,6 +51,7 @@ add_library(aura_rt STATIC
     gc/roots.cpp
     gc/safepoint.cpp
     gc/mark_sweep.cpp
+    gc/parallel_mark.cpp
     gc/compact.cpp
     gc/los.cpp
     task.cpp

@@ -16,11 +16,19 @@ namespace aura_rt {
 // ============================================================
 // 写屏障 — 维护记忆集
 // ============================================================
-void GcHeap::writeBarrier(GcObject* parent, void* /*fieldAddr*/, GcObject* newVal) {
-    // 仅当老年代对象写入新生代引用时需要记录
+void GcHeap::writeBarrier(GcObject* parent, void* fieldAddr, GcObject* newVal) {
+    // 分代（不变）：old→young 记记忆集
     if (parent && parent->generation() == 1 && newVal && newVal->generation() == 0) {
         std::lock_guard<std::mutex> lk(rememberedSetM_);
         rememberedSet_.insert(parent);
+    }
+    // P2 SATB（新增）：并发标记期间，记录被覆盖的旧引用（未标记者，收尾补齐）
+    if (markingInProgress_.load(std::memory_order_acquire) && fieldAddr) {
+        GcObject* oldVal = *static_cast<GcObject**>(fieldAddr);
+        if (oldVal && !oldVal->marked()) {
+            std::lock_guard<std::mutex> lk(satbMutex_);
+            satbQueue_.push_back(oldVal);
+        }
     }
 }
 
@@ -28,6 +36,31 @@ void GcHeap::writeBarrier(GcObject* parent, void* /*fieldAddr*/, GcObject* newVa
 // 安全点（多线程 STW）
 // ============================================================
 void GcHeap::safepoint() {
+    if (in_gc_internal_) return;  // P1：GC 内部线程（mark worker）不参与 STW/alloc
+
+    // P2：并发标记协作（phase 分派优先于 gcPending_ 判定）
+    // 两态协作：Marking=标记进行中（mutator 自由运行，不触发新 GC）；
+    //           Finalize=收尾短暂 STW（参与等待，sweep 前暂停）
+    GcPhase ph = phase_.load(std::memory_order_acquire);
+    if (ph == GcPhase::Marking) {
+        return;  // 标记进行中：mutator 自由运行，不触发新 GC
+    }
+    if (ph == GcPhase::Finalize) {
+        // 收尾 STW：非 initiator 参与等待（gc_epoch_ 变化后恢复）
+        std::unique_lock<std::mutex> lk(all_stopped_m_);
+        uint64_t my_epoch = gc_epoch_.load();
+        stopped_threads_++;
+        all_stopped_cv_.notify_all();
+        while (gc_epoch_.load() == my_epoch &&
+               phase_.load(std::memory_order_acquire) == GcPhase::Finalize) {
+            lk.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            lk.lock();
+        }
+        return;
+    }
+
+    // Idle：现有逻辑
     if (!gcPending_.load()) return;
 
     // 关键：flush 本线程 TLAB 到全局
@@ -61,10 +94,14 @@ void GcHeap::safepoint() {
             // 正常 GC 路径：minorGc 内 shouldCompact 会处理 compact
             // 注：needCompactOnly 已被 exchange 消费，若 minorGc 内 compact 被延迟
             //     会重新 store(true)，下次 tryAlloc 再次走 safepoint
-            if (youngBytes_ >= kYoungThreshold / 2) minorGc();
-            if (shouldCompactMedium() && !compactSuspendedCount_.load()) mixedGc();
-            if (oldBytes_ >= kOldThreshold) majorGc();
-            if (shouldSweepLargePages() && !compactSuspendedCount_.load()) sweepLargePages();
+            if (concurrentGcEnabled_) {
+                startConcurrentGc();  // P2：SATB 并发标记（单线程：快照+标记+收尾）
+            } else {
+                if (youngBytes_ >= kYoungThreshold / 2) minorGc();
+                if (shouldCompactMedium() && !compactSuspendedCount_.load()) mixedGc();
+                if (oldBytes_ >= kOldThreshold) majorGc();
+                if (shouldSweepLargePages() && !compactSuspendedCount_.load()) sweepLargePages();
+            }
         } else if (needCompactOnly) {
             // A+C 路径：只 compact，跳过 mark-sweep
             // compact 不依赖 marked 标志，可独立执行（搬运已死对象浪费空间，下次 GC 回收）
@@ -112,10 +149,14 @@ void GcHeap::safepoint() {
                           (shouldCompactMedium() && !compactSuspendedCount_.load()) ||
                           (shouldSweepLargePages() && !compactSuspendedCount_.load());
         if (needFullGc) {
-            if (youngBytes_ >= kYoungThreshold / 2) minorGc();
-            if (shouldCompactMedium() && !compactSuspendedCount_.load()) mixedGc();
-            if (oldBytes_ >= kOldThreshold) majorGc();
-            if (shouldSweepLargePages() && !compactSuspendedCount_.load()) sweepLargePages();
+            if (concurrentGcEnabled_) {
+                startConcurrentGc();  // P2：SATB 并发标记（含收尾；唤醒由下方统一执行）
+            } else {
+                if (youngBytes_ >= kYoungThreshold / 2) minorGc();
+                if (shouldCompactMedium() && !compactSuspendedCount_.load()) mixedGc();
+                if (oldBytes_ >= kOldThreshold) majorGc();
+                if (shouldSweepLargePages() && !compactSuspendedCount_.load()) sweepLargePages();
+            }
         } else if (needCompactOnly) {
             if (compactSuspendedCount_.load() > 0) {
                 compactPending_.store(true, std::memory_order_release);
@@ -246,6 +287,114 @@ GcString* gc_stats_string() {
         s.mediumPages, s.largePages, s.freeMediumPages,
         s.losObjects, fmtBytes(s.losBytes, lbuf, sizeof(lbuf)));
     return make_string(buf);
+}
+
+// ============================================================
+// P2：SATB 并发标记 — 触发流程（根快照 → 释放线程 → 并发标记 → 收尾）
+// ============================================================
+// 调用点（两类，线程均已处于 STW 停止状态）：
+//   - 单线程分支（threadCount<=1）：无其他线程，直接快照 → 标记 → 收尾
+//   - 多线程 initiator（抢 gc_in_progress_ 成功、所有线程已停在现有 STW 等待）：
+//     快照（链表稳定）→ 释放线程（epoch++ 唤醒，Marking 期自由运行 = mutator 并发）
+//     → 并发标记 → Finalize（线程再次停于 safepoint）→ 收尾 → 唤醒
+// 正确性：根快照在 STW 完成（无并发）；标记期间 mutator 新根指向的对象 ∈
+//          {已标记字段值, born-marked}（SATB + born-marked 闭合，见 plan §2）。
+void GcHeap::startConcurrentGc() {
+    // ---- 级别判定（优先级：Minor > Mixed > Major > SweepLarge，与现有顺序一致）----
+    if (youngBytes_ >= kYoungThreshold / 2) {
+        pendingGcKind_ = 0;
+    } else if (shouldCompactMedium() && !compactSuspendedCount_.load()) {
+        pendingGcKind_ = 1;
+    } else if (oldBytes_ >= kOldThreshold) {
+        pendingGcKind_ = 2;
+    } else {
+        pendingGcKind_ = 3;
+    }
+
+    // ---- 根扫描（完整停靠：所有有根链表的线程确认停止，含启动窗口期新注册）----
+    waitForRootThreadsStopped();
+    // 复用 markPhase 的根扫描（与 STW GC 完全一致，无自定义快照遍历）
+    scanRootsOnly(false);
+
+    // ---- 释放其他线程（多线程场景：从现有 STW 等待唤醒，Marking 期自由运行）----
+    int threadCount;
+    {
+        std::lock_guard<std::mutex> lk(threads_m_);
+        threadCount = static_cast<int>(registered_threads_.size());
+    }
+    if (threadCount <= 0) threadCount = 1;
+    phase_.store(GcPhase::Marking, std::memory_order_release);
+    markingInProgress_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(all_stopped_m_);
+        stopped_threads_.store(0);
+        gc_epoch_.fetch_add(1);       // 唤醒现有 STW 等待者（线程恢复运行）
+        all_stopped_cv_.notify_all();
+    }
+    // 线程恢复后：下次 safepoint 看到 phase==Marking → 直接返回（mutator 并发运行）
+    // initiator 本线程继续执行标记协调（阻塞在此，等价现有 STW initiator 语义）
+
+    // ---- 阶段 2：并发标记（GC 线程组消费标记栈；mutator 产生的 SATB/born 由收尾统一处理）----
+    runMarkPhase();
+
+    // ---- 阶段 3：收尾（短暂 STW：线程在 safepoint 的 Finalize 分支停止）----
+    stopped_threads_.store(0);
+    phase_.store(GcPhase::Finalize, std::memory_order_release);
+    gcPending_.store(true, std::memory_order_release);
+    // 等所有线程停止（含 Marking 期新注册根链表的线程——与根扫描同一完整停靠协议）
+    waitForRootThreadsStopped();
+    finalizeMarking();
+    // 清标志 + 唤醒（Finalize 等待者恢复；gc_in_progress_ 重置供下次 GC 抢权）
+    {
+        std::lock_guard<std::mutex> lk(all_stopped_m_);
+        stopped_threads_.store(0);
+        gc_in_progress_.store(false);
+        gc_epoch_.fetch_add(1);
+        all_stopped_cv_.notify_all();
+    }
+    phase_.store(GcPhase::Idle, std::memory_order_release);
+    gcPending_.store(false);
+}
+
+// 完整停靠：等所有"有根链表的线程"停止。
+// 背景：registered_threads_（STW 名单）在 initiator 进入 safepoint 时快照，可能落后于
+//       启动窗口期新注册的线程（worker 启动：registerThread → ensureThreadRootList →
+//       创建 handle）。这些线程不在 threadCount 内，但它们的根链表在 threadRootLists_，
+//       根扫描会遍历 → 若活跃则并发增删节点 → use-after-free。
+// 方案：以 threadRootLists_ 为准（精确反映"需停线程"），等 stopped 到位后二次确认
+//       size 稳定（等待期间新线程注册会 push_back → 重新等）。
+void GcHeap::waitForRootThreadsStopped() {
+    for (;;) {
+        int target;
+        {
+            std::lock_guard<std::mutex> lk(threadRootLists_m_);
+            target = static_cast<int>(threadRootLists_.size());
+        }
+        if (target <= 1) return;  // 仅 initiator（或无线程）——无其他线程需停
+        {
+            std::unique_lock<std::mutex> lk(all_stopped_m_);
+            int stalls = 0;
+            while (stopped_threads_.load() < target - 1) {
+                lk.unlock();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                lk.lock();
+                if (stopped_threads_.load() < target - 1) {
+                    if (++stalls >= 2000) {  // 2s 超时（1ms × 2000）
+                        int stopped = stopped_threads_.load();
+                        std::fprintf(stderr, "[GC] *** ROOT STOP TIMEOUT *** stopped=%d target=%d\n",
+                                     stopped, target - 1);
+                        std::abort();
+                    }
+                }
+            }
+        }
+        // 二次确认：等待期间新线程可能注册根链表（ensureThreadRootList push_back）
+        {
+            std::lock_guard<std::mutex> lk(threadRootLists_m_);
+            if (static_cast<int>(threadRootLists_.size()) <= target) return;  // 稳定
+            // size 增长 → 新线程已注册根链表 → 重新等待其停止
+        }
+    }
 }
 
 } // namespace aura_rt

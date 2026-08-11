@@ -204,8 +204,11 @@ static GcString* concat_multi_flat_range(const std::vector<const GcString*>& par
                                           size_t start, size_t end) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 parts 及其 data()
     // 额外用 GcRootHandle 保护 parts 中的对象，防止 alloc 触发 GC 时对象被回收
+    // P2 修复：reserve 预分配——见 concat_multi 注释（_objs realloc → ptr_ref_ 悬垂）
     std::vector<GcObject*> _objs;
     std::vector<GcRootHandle<GcObject*>> _guards;
+    _objs.reserve(end - start);
+    _guards.reserve(end - start);
     for (size_t i = start; i < end; ++i) {
         _objs.push_back(const_cast<GcObject*>(static_cast<const GcObject*>(parts[i])));
         _guards.emplace_back(_objs.back());
@@ -233,8 +236,11 @@ static GcString* build_balanced_rope(const std::vector<const GcString*>& parts,
                                       size_t start, size_t end) {
     GcCompactSuspendGuard _compactGuard;  // 递归 alloc，保护 parts
     // 额外用 GcRootHandle 保护 parts 中的对象，防止递归 alloc 触发 GC 时 sweep 回收
+    // P2 修复：reserve 预分配——见 concat_multi 注释（_objs realloc → ptr_ref_ 悬垂）
     std::vector<GcObject*> _objs;
     std::vector<GcRootHandle<GcObject*>> _guards;
+    _objs.reserve(end - start);
+    _guards.reserve(end - start);
     for (size_t i = start; i < end; ++i) {
         _objs.push_back(const_cast<GcObject*>(static_cast<const GcObject*>(parts[i])));
         _guards.emplace_back(_objs.back());
@@ -293,8 +299,12 @@ GcString* GcString::concat(const GcString& other) const {
 GcString* concat_multi(std::initializer_list<const GcString*> parts) {
     GcCompactSuspendGuard _compactGuard;  // 禁 compact，保护 parts 中的裸指针值拷贝
     // 额外用 GcRootHandle 保护 parts 中的对象，防止 alloc 触发 GC 时对象被回收
+    // P2 修复：reserve 预分配——GcRootHandle 以 Ref 模式绑定 _objs 元素（ptr_ref_=&_objs[i]），
+    //          _objs 若 realloc 则旧缓冲区释放 → ptr_ref_ 悬垂（并发 GC 扫描暴露）
     std::vector<GcObject*> _objs;
     std::vector<GcRootHandle<GcObject*>> _guards;
+    _objs.reserve(parts.size());
+    _guards.reserve(parts.size());
     for (auto* p : parts) {
         if (p) {
             _objs.push_back(const_cast<GcObject*>(static_cast<const GcObject*>(p)));

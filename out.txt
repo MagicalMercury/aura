@@ -1,123 +1,177 @@
-# Plan 审查报告：change.md（math 内置模块 + 放开 Iterator 联合变体拦截）
+# Plan 审查报告：change.md（并发 GC：P1 并行 STW 标记 + P2 SATB 并发标记）
+
+> 审查对象：`d:\you\Aura\change.md`（工作流 4 合并实施文档）
+> 审查时间：2026-08-11
+> 审查依据：`.trae/rules/plan_review_rule.md`
+> 检索方式：3 个并行 Search Agent + 直接 Read 复核（2026-08-11，全部行号为当前磁盘实际行号）
+
+---
 
 ## Search Agent 检索摘要
 
-- **检索文件列表**（3 个并行 Search Agent 实际检索，行号均为当前磁盘实际）：
-  - [ModuleManager.cpp](file:///d:/you/Aura/src/Module/ModuleManager.cpp)、[runtime/aura_rt.h](file:///d:/you/Aura/runtime/aura_rt.h)、[builtins/path.aurai](file:///d:/you/Aura/builtins/path.aurai)、[runtime/builtin/path.h](file:///d:/you/Aura/runtime/builtin/path.h)、[BuiltinRegistry.h](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h)、[Checker/ExprInfer.cpp](file:///d:/you/Aura/src/Sema/Checker/ExprInfer.cpp)、[READMEs/14-path-module.md](file:///d:/you/Aura/READMEs/14-path-module.md)
-  - [CodeGen.h](file:///d:/you/Aura/src/CodeGen/CodeGen.h)、[ExprGen.cpp](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp)、[TypeMap.cpp](file:///d:/you/Aura/src/CodeGen/TypeMap.cpp)、[StmtGen.cpp](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp)、[Checker/DeclChecker.cpp](file:///d:/you/Aura/src/Sema/Checker/DeclChecker.cpp)、[runtime/builtin/variant.h](file:///d:/you/Aura/runtime/builtin/variant.h)、[runtime/builtin/iterator.h](file:///d:/you/Aura/runtime/builtin/iterator.h)
-  - [example/test.aura](file:///d:/you/Aura/example/test.aura)、[TODO.txt](file:///d:/you/Aura/TODO.txt)、[runtime/builtin/optional.h](file:///d:/you/Aura/runtime/builtin/optional.h)、[example/used/6.aura](file:///d:/you/Aura/example/used/6.aura)、[runtime/builtin/array.h](file:///d:/you/Aura/runtime/builtin/array.h)
+- **检索文件列表**（3 个并行 Search Agent 实际检索）：
+  - [runtime/types.h](file:///d:/you/Aura/runtime/types.h)（GcObject L110-158）
+  - [runtime/gc/mark_sweep.cpp](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp)（markPhase L63-169 / markObject L171-179 / markFields L181-196 / markInlineArrayFields L198-222）
+  - [runtime/gc/gc.h](file:///d:/you/Aura/runtime/gc/gc.h)（GcRootHandleBase L65-72 / threadRootLists_ L452 / youngObjects_/oldObjects_ L485-486 / gc_in_progress_ L525 / gc_epoch_ L527 / tl_roots_ L455 / 多线程 STW 协调 L522-529）
+  - [runtime/gc/safepoint.cpp](file:///d:/you/Aura/runtime/gc/safepoint.cpp)（safepoint L30-157 / writeBarrier L19-25）
+  - [runtime/gc/alloc.cpp](file:///d:/you/Aura/runtime/gc/alloc.cpp)（5 处 setMarked(false) L85/L154/L398/L436/L467）
+  - [runtime/gc/compact.cpp](file:///d:/you/Aura/runtime/gc/compact.cpp)（L336 注释 / shouldCompact L30-46 / shouldCompactMedium L573-591 / updateAllReferences L340-355）
+  - [runtime/gc/roots.cpp](file:///d:/you/Aura/runtime/gc/roots.cpp) + [runtime/gc/tlab.cpp](file:///d:/you/Aura/runtime/gc/tlab.cpp)（registerThread / ensureThreadRootList / tl_roots_ 机制）
+  - [TODO.txt](file:///d:/you/Aura/TODO.txt) §五 L372-375
+  - [example/test.aura](file:///d:/you/Aura/example/test.aura)（132 行，无并发 GC 用例）
+  - [plan/并发GC分析plan.md](file:///d:/you/Aura/plan/并发GC分析plan.md)（来源方案存在）
+  - [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) L110（clear_intern_cache 声明）
 
 - **关键源码定位**：
 
   | 文件 | 行号区间 | 当前源码片段摘要 |
   | ---- | -------- | ---------------- |
-  | ModuleManager.cpp | L97-104 | isKnownBuiltin，L100-102 白名单当前只含 `"path"` ✅ |
-  | aura_rt.h | L1-25 | L11 `#include "builtin/path.h"`，无 math.h ✅；L21 已有 tuple.h ✅ |
-  | builtins/path.aurai | L1-22 | L7 注释 `... = C++ 桥接标记`；L13-15 `fun path.xxx(...) -> Ret ...` ✅ |
-  | runtime/builtin/path.h | L25/L86/L129/L136 | `namespace aura_rt { namespace path {} }` + inline 函数 ✅ |
-  | BuiltinRegistry.h | L163-171 | findFunction 仅按 name + argCount 区分，不查参数类型 ✅；L332-334 range 3 重载均返回 Iterator<int> ✅ |
-  | ExprInfer.cpp | L270-310 | inferMethodCall Phase A L271-295（Symbol::belongsToModule）+ Phase B L297-310（BuiltinRegistry 查表）✅ |
-  | ExprGen.cpp | L12-36 | isHeapSemType，L28-29 Iterator 恒 false ✅ |
-  | ExprGen.cpp | L43-50 | isIfaceView file-static 定义 ✅ |
-  | ExprGen.cpp | L73/L102/L119/L131/L149/L151 | isIfaceView **6 处**调用点（change.md 漏列 L73）❌ |
-  | TypeMap.cpp | L44-53 | isIfaceViewTypeName 定义起点 L44（非 L46），L45 覆盖 `aura_rt::Iterator<` ⚠️ |
-  | TypeMap.cpp | L167-197 | mapType UnionType hasHeap，L184 `n->name != "Iterator"` 排除 ✅ |
-  | TypeMap.cpp | L316-326 | mapSemType UnionSemType hasHeap L317-319 ✅ |
-  | StmtGen.cpp | L88-100 | genUnionBoxing hasHeap L94-97 ✅ |
-  | StmtGen.cpp | L1719-1723 | genMatchStmt isVariantPtr L1721 ✅ |
-  | StmtGen.cpp | L1741-1749 | `_match_val` GcRootHandle Ref 保护 ✅ |
-  | StmtGen.cpp | L1832-1844 | match binding isIfaceViewTypeName ViewRoot 包裹 ✅ |
-  | DeclChecker.cpp | L11-21 | variantStorageUnsafe，L18-19 Iterator 拦截（L14-17 注释）✅ |
-  | DeclChecker.cpp | L32-47 | unionVariantGcUnsafe L45 GenericSemType 返回 false ✅ |
-  | variant.h | L29-38/L74-79 | is_iface_view trait + descForI `kStorageOffset + offsetof(T, self)` ✅ |
-  | iterator.h | L58-64 | Iterator 结构体，L61 `GcObject* self` ✅；**无 collect 成员方法**（L239-251 自由函数 collect_all）❌ |
-  | optional.h | L24-62 | Optional::desc L30-43 仅对 `is_pointer_v<T>` 注册偏移；make_optional L55-62 ✅ |
-  | array.h | L96-214 | Array<T> L98 `int32_t length` 字段 ✅ |
-  | test.aura | 79 行 | 当前为 2026-08-08 版本，**无 import math/Iterator/range/collect**（change.md 未实施）✅ |
-  | TODO.txt | L29-32/L99-109 | P1 math `[ ]` / P2 评估放开 Iterator `[ ]` 均未完成 ✅ |
+  | types.h | L110-158 | GcObject 16 字节（desc 8B + allocSize_ 4B + flags_ 1B + padding 3B，非虚无 vptr）✅ |
+  | types.h | L151-157 | kMarkedBit=0x01 / kGenMask=0x02 / kFinalizedBit=0x04 / kAgeMask=0x78 / kForwardedBit=0x80 ✅ |
+  | mark_sweep.cpp | L63-169 | markPhase 4 类根扫描：①threadRootLists_ L67-75 ②协程帧 L78-136 ③全局根 L139-146 ④记忆集/old L149-164 ✅ |
+  | mark_sweep.cpp | L171-179 | markObject 递归（→markFields→markObject / →markInlineArrayFields→markObject）✅ |
+  | safepoint.cpp | L19-25 | writeBarrier 仅分代 rememberedSet，无 SATB ✅ |
+  | safepoint.cpp | L30-157 | safepoint 含 gc_in_progress_ 抢权（L83）+ gc_epoch_ 唤醒（L134/L151）✅ |
+  | alloc.cpp | L85/L154/L398/L436/L467 | 5 处 setMarked(false) 模式一致（desc/setMarked/setGeneration/setFinalized/setAllocSize）✅ |
+  | compact.cpp | L336 | flatten flat_cache_ 注释路径 ✅ |
+  | compact.cpp | L30-46 | shouldCompact（小页版）⚠️ change.md 误指 L573-591 |
+  | compact.cpp | L573-591 | shouldCompactMedium（中页版）⚠️ |
+  | compact.cpp | L340-355 | updateAllReferences 全量扫描 old 对象（Bug 3 修复）❌ change.md 误指 L157-164 |
+  | gc.h | L65-72 | GcRootHandleBase 双向链表（next_ + prev_ + ptr_ref_）⚠️ change.md 漏列 prev_ |
+  | gc.h | L520 | oomInit_ 行；实际插入点 L539 与 L540（`};`）之间 ⚠️ |
+  | gc.h | L525/L527 | gc_in_progress_ / gc_epoch_ 多线程 STW 协调 ✅ |
 
 ## 源码映射审查
 
-### 方案一（math 内置模块）
+### P1.1 flags_ 拆分（marked 位原子化）
 
 | 步骤 | 文件 | 比对结果 | 备注 |
 | ---- | ---- | -------- | ---- |
-| 步骤 1 math.h | runtime/builtin/math.h（新增） | ✅ 设计可行 | 仿 path.h 的 `namespace aura_rt { namespace math {} }` + inline 模式 |
-| 步骤 2 aura_rt.h include | [runtime/aura_rt.h L11](file:///d:/you/Aura/runtime/aura_rt.h#L11) | ✅ 一致 | path.h 在 L11，math.h 追加在其后 |
-| 步骤 3 math.aurai | builtins/math.aurai（新增） | ✅ 设计可行 | 仿 path.aurai 的 `fun math.xxx(...) -> Ret ...` 桥接语法 |
-| 步骤 4 白名单 | [ModuleManager.cpp L100-102](file:///d:/you/Aura/src/Module/ModuleManager.cpp#L100-L102) | ✅ 一致 | 当前只含 `"path"`，加 `"math"` |
-| §1.1 通用支持引用 | [ExprInfer.cpp L271-310](file:///d:/you/Aura/src/Sema/Checker/ExprInfer.cpp#L271-L310) | ⚠️ 术语错误 | change.md 称"importNsNames_ isNs 路径"，**实际变量名不存在**；真实机制是 `Symbol::belongsToModule` 字段（Symbol.h:57）+ Phase A L271-295 + Phase B L297-310。机制结论成立，术语需更正 |
-| §1.1 findFunction 限制 | [BuiltinRegistry.h L163-171](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L163-L171) | ✅ 一致 | 仅按 name + argCount 区分；math 8 函数全 float 签名避开重载冲突 ✅ |
-| 步骤 11 READMEs/15-math-module.md | [READMEs/](file:///d:/you/Aura/READMEs/) | ⚠️ 编号冲突 | 当前已有 `15-example.md`，新增 `15-math-module.md` 编号冲突，需重排或用其他编号 |
+| GcObject 定义行号 | [types.h L110-158](file:///d:/you/Aura/runtime/types.h#L110-L158) | ✅ 一致 | |
+| 字段布局 desc/allocSize_/flags_ | [types.h L111-115](file:///d:/you/Aura/runtime/types.h#L111-L115) | ✅ 一致 | 8B+4B+1B+3B padding=16B，非虚无 vptr |
+| bit-packed 常量 | [types.h L151-157](file:///d:/you/Aura/runtime/types.h#L151-L157) | ✅ 一致 | kMarkedBit=0x01/kGenMask=0x02/kFinalizedBit=0x04/kAgeMask=0x78/kForwardedBit=0x80 |
+| 访问方法 | [types.h L120-148](file:///d:/you/Aura/runtime/types.h#L120-L148) | ✅ 一致 | marked/setMarked/generation/finalized/age/forwarded/forwardingPtr 全部存在 |
+| compact 转发机制 | [types.h L138-144](file:///d:/you/Aura/runtime/types.h#L138-L144) | ✅ 一致 | desc 槽转发 + bit7 标记，P1.1 不影响 |
+| GcObject 16 字节保持 | types.h | ✅ 可行 | 3 字节 padding 可容纳新增 mark_flags_ 1B；但源码无 `static_assert(sizeof(GcObject)==16)`，建议补断言 |
 
-### 方案二（放开 Iterator 联合变体拦截）
+### P1.2 显式标记栈 + GC 私有标记线程组
 
 | 步骤 | 文件 | 比对结果 | 备注 |
 | ---- | ---- | -------- | ---- |
-| 步骤 5 CodeGen.h 声明 | [CodeGen.h L257-258](file:///d:/you/Aura/src/CodeGen/CodeGen.h#L257-L258) | ✅ 一致 | isHeapSemType 声明处；当前无 isIfaceView/isUnionHeapVariant 声明 |
-| 步骤 6 isIfaceView 提升 | [ExprGen.cpp L43-50](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L43-L50) | ✅ 一致 | file-static 定义行号准确 |
-| 步骤 6 调用点清单 | [ExprGen.cpp L73/L102/L119/L131/L149/L151](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L73) | ❌ **漏列 L73** | change.md 称"5 处 L102/L119/L131/L149/L151"，**实际 6 处**，漏列 L73（genGcRootedArgs hasHeap 循环） |
-| 步骤 7① mapSemType hasHeap | [TypeMap.cpp L317-319](file:///d:/you/Aura/src/CodeGen/TypeMap.cpp#L317-L319) | ✅ 一致 | |
-| 步骤 7② mapType hasHeap | [TypeMap.cpp L167-197](file:///d:/you/Aura/src/CodeGen/TypeMap.cpp#L167-L197) | ✅ 一致 | L184 `n->name != "Iterator"` 排除存在；修改后去掉排除让 Iterator 走视图分支 |
-| §1.2 isIfaceViewTypeName 引用 | [TypeMap.cpp L44-53](file:///d:/you/Aura/src/CodeGen/TypeMap.cpp#L44-L53) | ⚠️ 行号偏移 | change.md 称 L46，实际定义起点 L44、Iterator 覆盖判定 L45 |
-| 步骤 8① genUnionBoxing | [StmtGen.cpp L94-97](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L94-L97) | ✅ 一致 | |
-| 步骤 8② genMatchStmt | [StmtGen.cpp L1721](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1721) | ✅ 一致 | |
-| 步骤 8 Ref 保护引用 | [StmtGen.cpp L1741-1745](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1741-L1745) | ✅ 一致 | |
-| 步骤 8 ViewRoot 引用 | [StmtGen.cpp L1832-1844](file:///d:/you/Aura/src/CodeGen/StmtGen.cpp#L1832-L1844) | ✅ 一致 | |
-| 步骤 9 variantStorageUnsafe | [DeclChecker.cpp L11-21](file:///d:/you/Aura/src/Sema/Checker/DeclChecker.cpp#L11-L21) | ✅ 一致 | L18-19 拦截代码（L14-17 注释），移除后保留 Func/Union 拦截 |
-| unionVariantGcUnsafe | [DeclChecker.cpp L32-47](file:///d:/you/Aura/src/Sema/Checker/DeclChecker.cpp#L32-L47) | ✅ 一致 | L45 GenericSemType 返回 false（不折叠），放开后无需改 |
-| runtime is_iface_view | [variant.h L29-38](file:///d:/you/Aura/runtime/builtin/variant.h#L29-L38) | ✅ 一致 | trait 检测 self 成员，Iterator<T> 自动命中 |
-| runtime descForI | [variant.h L74-79](file:///d:/you/Aura/runtime/builtin/variant.h#L74-L79) | ✅ 一致 | L77 `kStorageOffset + offsetof(T, self)` 子偏移注册 |
-| Iterator self 成员 | [iterator.h L61](file:///d:/you/Aura/runtime/builtin/iterator.h#L61) | ✅ 一致 | `GcObject* self = nullptr;` |
+| gc.h L520 插入点 | [gc.h L514-540](file:///d:/you/Aura/runtime/gc/gc.h#L514-L540) | ⚠️ 行号偏移 | L520 实为 `oomInit_` 行；实际插入点 L539（los_）与 L540（`};`）之间，语义指向成员区尾部可接受 |
+| 依赖成员 youngObjects_/oldObjects_ | [gc.h L485-486](file:///d:/you/Aura/runtime/gc/gc.h#L485-L486) | ✅ 一致 | runMarkPhase 阈值判断可用 |
+| 依赖成员 threadRootLists_ | [gc.h L452-453](file:///d:/you/Aura/runtime/gc/gc.h#L452-L453) | ✅ 一致 | |
+| 依赖成员 tl_roots_ | [gc.h L455](file:///d:/you/Aura/runtime/gc/gc.h#L455) | ✅ 一致 | static thread_local |
+| 新增成员全部不存在 | gc.h | ✅ 确认 | markStack_/markStackM_/markActive_/kParallelMarkThreshold/kMarkBatchSize/markThreads_/in_gc_internal_ 全部未命中 |
+| parallel_mark.cpp 新增 | runtime/gc/ | ✅ 确认 | 目录无此文件，待新增 |
+| scanObjectFields 前提 | [mark_sweep.cpp L171-222](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L171-L222) | ✅ 一致 | markObject 经 markFields+markInlineArrayFields 间接递归，合并为非递归版本结构可行 |
 
-### 测试用例（步骤 10）
+### P1.3 markPhase 改造（根扫描只入栈）
+
+| 步骤 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| markPhase 行号 | [mark_sweep.cpp L63-169](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L63-L169) | ✅ 一致 | |
+| ① 线程 GcRootHandle 链表 | [mark_sweep.cpp L67-75](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L67-L75) | ✅ 一致 | |
+| ② 协程帧保守扫描 | [mark_sweep.cpp L78-136](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L78-L136) | ✅ 行号一致 | |
+| ② 协程帧 markObject 调用数 | mark_sweep.cpp | ❌ **不符** | change.md 称"3 处"，**实际 4 处**（L106 小页 / L116 中页 / L123 大页 / L132 LOS） |
+| ③ 全局根 | [mark_sweep.cpp L139-146](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L139-L146) | ✅ 一致 | |
+| ④ 记忆集 + old 对象 | [mark_sweep.cpp L149-164](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L149-L164) | ✅ 一致 | |
+| oomError | [mark_sweep.cpp L167-168](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L167-L168) | ✅ 一致 | |
+| GcRootHandleBase 字段 | [gc.h L65-72](file:///d:/you/Aura/runtime/gc/gc.h#L65-L72) | ⚠️ 漏列 | 双向链表（next_ + **prev_** + ptr_ref_），change.md 只提 next_/ptr_ref_，若涉及链表切分须处理 prev_ |
+
+### P1.4 safepoint 重入防护
+
+| 步骤 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| safepoint 行号 | [safepoint.cpp L30](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L30) | ✅ 一致 | L30 函数起点，L157 闭合 |
+| gcPending_ 判定 | [safepoint.cpp L31](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L31) | ✅ 一致 | |
+| flushTlab/clear_intern_cache | [safepoint.cpp L38-39](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L38-L39) | ✅ 一致 | clear_intern_cache 是自由函数（string.h L110），非 GcHeap 成员 |
+
+### P1.5 compact 降频调优（可选）
+
+| 步骤 | 文件 | 比对结果 | 备注 |
+| | ---- | -------- | ---- |
+| shouldCompact 行号 | [compact.cpp](file:///d:/you/Aura/runtime/gc/compact.cpp) | ⚠️ 函数名混淆 | change.md 称 L573-591，实际 L573-591 是 `shouldCompactMedium`（中页版）；`shouldCompact`（小页版）在 L30-46。需明确指代 |
+
+### P2.1 safepoint 状态机（GcPhase）
+
+| 步骤 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| gc_in_progress_ 机制 | [gc.h L525](file:///d:/you/Aura/runtime/gc/gc.h#L525) / [safepoint.cpp L83](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L83) | ✅ 一致 | 抢权协调机制存在 |
+| gc_epoch_ 机制 | [gc.h L527](file:///d:/you/Aura/runtime/gc/gc.h#L527) / [safepoint.cpp L134/L151](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L134) | ✅ 一致 | 代次唤醒机制存在，P2.5 收尾 STW 可复用 |
+| 新增成员全部不存在 | gc.h | ✅ 确认 | GcPhase/phase_/markingInProgress_/handshakeArrived_/handshakeTarget_/rootSnapshot_/satbMutex_/satbQueue_/bornMutex_/bornObjects_/concurrentGcEnabled_ 全部未命中 |
+| registered_threads_/threads_m_ | [gc.h L523-524](file:///d:/you/Aura/runtime/gc/gc.h#L523-L524) | ✅ 一致 | handshakeTarget_ 取数可用 |
+| safepoint 现有 STW 执行体 | [safepoint.cpp L41-156](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L41-L156) | ✅ 一致 | 单线程 L41-80 / 多线程 L82-156 |
+
+### P2.2 根快照（handshake 内拷贝值）
+
+| 步骤 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| tl_roots_ 机制 | [roots.cpp L23/L59-68](file:///d:/you/Aura/runtime/gc/roots.cpp#L59) | ✅ 一致 | thread_local，懒分配，push 到 threadRootLists_ |
+| registerThread | [tlab.cpp L62-71](file:///d:/you/Aura/runtime/gc/tlab.cpp#L62-L71) | ✅ 一致 | 新线程注册 ThreadRootList |
+| snapshotThreadRoots 可行性 | gc.h / roots.cpp | ✅ 可行 | STW 期间遍历 threadRootLists_ 无需锁 |
+
+### P2.3 写屏障 SATB 扩展
+
+| 步骤 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| writeBarrier 行号 | [safepoint.cpp L19-25](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L19-L25) | ✅ 一致 | 当前仅分代 rememberedSet，无 SATB |
+| compact.cpp L336 注释 | [compact.cpp L336](file:///d:/you/Aura/runtime/gc/compact.cpp#L336) | ✅ 一致 | flatten flat_cache_ 遗漏路径注释存在 |
+| compact.cpp L157-164 引用 | compact.cpp | ❌ **不符** | change.md 称"L157-164 全量 old 对象扫描"，实际 L157-164 是 computeForwardingAddresses 内 OOM 释放新页代码；真正全量扫描在 **L340-355**（updateAllReferences 步骤 4/5，Bug 3 修复结果） |
+
+### P2.4 born-marked（标记期间新分配）
+
+| 步骤 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| 5 处 setMarked(false) | [alloc.cpp L85/L154/L398/L436/L467](file:///d:/you/Aura/runtime/gc/alloc.cpp#L85) | ✅ 全部一致 | 行号精确命中，模式一致 |
+| tryAllocLOS 差异 | [alloc.cpp L466-470](file:///d:/you/Aura/runtime/gc/alloc.cpp#L466) | ⚠️ 注意 | tryAllocLOS 前无 memset 清零，与其他 4 处不同；finishAlloc 封装时需注意 |
+
+### P2.5 并发标记流程
+
+| 步骤 | 文件 | 比对结果 | 备注 |
+| ---- | ---- | -------- | ---- |
+| 复用 gc_in_progress_/gc_epoch_ | safepoint.cpp | ✅ 一致 | 收尾 STW 协调机制成熟 |
+| sleep_for 轮询模式 | [safepoint.cpp L86-87/L143-145](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L86) | ✅ 一致 | 现有代码用 unlock+sleep_for+lock 轮询（GCC 11 TSan bug），P2.5 应保持 |
+
+### 测试与 TODO
 
 | 核对项 | 文件 | 比对结果 | 备注 |
 | ---- | ---- | -------- | ---- |
-| test.aura 当前状态 | [example/test.aura](file:///d:/you/Aura/example/test.aura) | ✅ 一致 | 79 行，change.md 未实施 |
-| `import math` 写入 | test.aura（待写入） | ✅ 设计可行 | |
-| `range(0, 10)` 语法 | [BuiltinRegistry.h L332-334](file:///d:/you/Aura/src/Sema/BuiltinRegistry.h#L332-L334) | ✅ 支持 | 3 重载返回 Iterator<int> |
-| `i.collect().length` 语法 | [iterator.h L58-64](file:///d:/you/Aura/runtime/builtin/iterator.h#L58-L64) | ❌ **存疑** | Iterator **无 collect 成员方法**，仅有自由函数 `collect_all`（L240）；但 6.aura 历史用例 L235/249/254/256 使用了 `.collect()` 成员语法，可能 Sema/CodeGen 有语法糖映射，需确认 |
-| Array.length 字段 | [array.h L98](file:///d:/you/Aura/runtime/builtin/array.h#L98) | ✅ 存在 | `int32_t length`；6.aura 历史用 `.len()`（L149 方法），风格不一致但均合法 |
-| `let mut` 语法 | test.aura | ✅ 不存在 | 上一版审查问题已不复现 |
-| TODO.txt P1 条目 | [TODO.txt L29-32](file:///d:/you/Aura/TODO.txt#L29-L32) | ✅ 一致 | `[ ]` 未完成 |
-| TODO.txt P2 条目 | [TODO.txt L99-109](file:///d:/you/Aura/TODO.txt#L99-L109) | ✅ 一致 | `[ ]` 未完成 |
-
-### §6 已知限制核对
-
-| 限制项 | 文件 | 比对结果 | 备注 |
-| ---- | ---- | -------- | ---- |
-| 限制 2：Optional<Iterator> GC 不安全 | [optional.h L30-43](file:///d:/you/Aura/runtime/builtin/optional.h#L30-L43) | ✅ 描述准确 | L31 `if constexpr (std::is_pointer_v<T>)` 才注册偏移；Iterator<T> 非指针 → 走 else 分支（L37-42，ptrCount=0）→ GC 不扫描 value_.self → compact 后 self 悬垂 |
+| TODO §五 L372-375 | [TODO.txt L372-375](file:///d:/you/Aura/TODO.txt#L372-L375) | ✅ 一致 | `[ ] P3 并发 GC`，内容与 change.md 背景一致 |
+| test.aura 当前状态 | [example/test.aura](file:///d:/you/Aura/example/test.aura) | ✅ 一致 | 132 行，无并发 GC 用例，待新增 |
+| plan 来源 | [plan/并发GC分析plan.md](file:///d:/you/Aura/plan/并发GC分析plan.md) | ✅ 存在 | 工作流 3 产物，与 change.md 背景一致 |
 
 ## 全链路风险分析
 
-- **构建系统**：无风险。math.h header-only，CMake 无需改（runtime/CMakeLists.txt 仅列 .cpp）。
-- **Runtime 兼容性**：通过。variant.h L29-38 is_iface_view trait + L74-79 descForI 子偏移已完备；iterator.h L61 Iterator 含 `GcObject* self`；runtime 侧无需改动。
-- **测试覆盖**：**阻塞**——`i.collect().length` 语法存疑（Iterator 无 collect 成员方法）；其余覆盖完整（math 8 函数、视图变体装箱+GC、值变体、GC 压力 compact、Iterator|None 不折叠）。
-- **异常与回退**：可接受。§5 风险表"失败即回退"（git checkout DeclChecker.cpp 恢复拦截）具体可操作；isUnionHeapVariant 统一判定修复 4 个 gate 点（mapSemType/mapType/genUnionBoxing/genMatchStmt）全链路闭合。
-- **回归**：§4.3 接口变体回归（u1-u4）+ match GC 保护回归（m1-m11）+ 全量既有用例 + 生成产物人工检查（grep 无 `std::variant<aura_rt::Iterator`）覆盖完整。
+- **构建系统**：无风险。新增 parallel_mark.cpp 需加入 runtime/CMakeLists.txt（change.md 未明确提及，建议补充）。
+- **Runtime 兼容性**：通过。GcObject 16 字节布局保持（3B padding 足够）；compact 转发机制（desc 槽 + bit7）不受影响；gc_in_progress_/gc_epoch_ 协调机制成熟可复用。
+- **测试覆盖**：基本完整。P1.6 覆盖全量回归 + 大图 + 一致性对照 + ASAN；P2.6 覆盖行为等价 + 并发正确性 + SATB/born 专项 + 死锁压力 + 一致性对照 + ASAN + 暂停基准。但 **test.aura 具体用例代码缺失**（change.md 仅描述测试方案，未给出具体 test.aura 代码）。
+- **异常与回退**：可接受。`concurrentGcEnabled_=false` 回退 P1；`kParallelMarkThreshold` 调大强制单线程回退旧版；P1.1 独立合入先验证布局。三级回退策略具体可操作。
+- **并发正确性**：理论可行。SATB（写屏障记录旧引用）+ born-marked（新分配直接标记 + 收尾补扫）+ 根快照（标记线程只扫快照）三机制闭合；但 **compact.cpp L340-355 全量扫描 old 对象**（Bug 3 修复结果）在 SATB 引入后需重新评估——SATB 若能覆盖 flatten/promoteToOld 等内部路径可优化为仅扫 rememberedSet_，否则保留全量扫描兜底。
 
 ## 已知限制评估
 
-1. **联合上直接调用迭代器方法**（`v.map(f)` / `v.collect()`）：可接受。Sema 报错，用户需先 match 提取。
-2. **Optional<Iterator<T>>**（`some(it)`）：可接受。§6 已知限制 2 描述准确（optional.h L30-43 仅 is_pointer_v 注册偏移），独立 issue 记入 TODO。
-3. **math 函数仅 float 签名**：可接受。int 实参隐式提升，`math::abs(INT_MIN)` 走 double 版本无溢出。
-4. **`Iterator<int> | int` 联合的常量模式 match**：可接受。视图变体无常量判定，与接口变体一致。
+1. **不做并发 compact/sweep**：可接受。读屏障基础设施独立远期路线。
+2. **compact.cpp 内部直写缺口**（flatten flat_cache_ 等）：可接受。P2.3 采用保守方案（收尾全量扫描兜底），后续专项补屏障。
+3. **P2.5 收尾 STW 复用现有协调**：可接受。gc_in_progress_ 抢权 + gc_epoch_ 唤醒模式成熟，但 sleep_for 轮询（GCC 11 TSan bug）需保持。
+4. **concurrentGcEnabled_ 安全网**：可接受。并发标记出问题时一键回退 P1 纯 STW。
 
 ## 最终裁决
 
-- [ ] **需修改（Changes Requested）** —— 2 项阻塞 + 3 项非阻塞：
+- [ ] **需修改（Changes Requested）** —— 3 项阻塞 + 3 项非阻塞：
 
   **阻塞（必须修正）**：
-  1. **步骤 6 isIfaceView 调用点漏列 L73**：[ExprGen.cpp L73](file:///d:/you/Aura/src/CodeGen/ExprGen.cpp#L73) `if (isHeapSemType(type) && !isIfaceView(type)) hasHeap = true;` 位于 genGcRootedArgs 开头 hasHeap 判定循环。change.md 步骤 6 称"原 5 处调用点 L102/L119/L131/L149/L151 均为成员函数内调用，无需改动"——**实际 6 处**，漏列 L73。影响评估：isIfaceView 从 file-static 提升为成员函数后，L73 同文件内调用形式不变（同名同参数），**功能不受影响**，但 change.md 的调用点清单不准确，应更正为"L73/L102/L119/L131/L149/L151 共 6 处"。
+  1. **P1.3 协程帧保守扫描 markObject 调用数错误**：[mark_sweep.cpp L78-136](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L78-L136) 协程帧保守扫描内 markObject 调用**实际 4 处**（L106 小页 / L116 中页 / L123 大页 / L132 LOS），change.md P1.3 称"3 处 markObject"不符。P1.3 改造若按 3 处插入 markRootEnqueue 会漏 LOS 路径，导致 LOS 对象在并行标记下漏标。**需更正为 4 处**。
 
-  2. **步骤 10 测试用例 `i.collect().length` 语法存疑**：[iterator.h L58-64](file:///d:/you/Aura/runtime/builtin/iterator.h#L58-L64) Iterator<T> 结构体**无 collect 成员方法**，仅有自由函数 `collect_all(Iterator<T> it)`（L239-251）。change.md 测试用例 L342/358/371 的 `i.collect().length` 可能无法编译。但 [6.aura L235/249/254/256](file:///d:/you/Aura/example/used/6.aura#L235) 历史用例确实使用了 `.collect()` 成员方法语法，暗示 Sema/CodeGen 可能有 `it.collect()` → `collect_all(it)` 的语法糖映射。**需确认**：若 Sema/CodeGen 无此映射，测试用例需改为 `collect_all(i).length`；若有映射，change.md 应注明依赖该语法糖。建议 change.md 补充说明 `.collect()` 的编译路径（是 Sema 语法糖还是需改为自由函数调用形式）。
+  2. **P2.3 compact.cpp L157-164 引用错误**：change.md P2.3 称"compact.cpp L157-164 已有此逻辑（全量扫描 old 对象兜底）"，**实际 L157-164 是 computeForwardingAddresses 内 OOM 释放新页代码**。真正的全量扫描 old 对象逻辑在 **[compact.cpp L340-355](file:///d:/you/Aura/runtime/gc/compact.cpp#L340-L355)**（updateAllReferences 步骤 4/5，Bug 3 修复结果，All/Young 两分支均扫所有 old 对象）。P2.3 SATB 引入后此段逻辑需重新评估，引用错误会导致实施者定位失败。**需更正为 L340-355**。
+
+  3. **test.aura 具体用例代码缺失**：change.md P1.6/P2.6 仅描述测试方案（大图/并发压力/SATB/born 专项等），未给出具体 test.aura 代码。对比之前审查的 change.md（math/Iterator 方案有完整测试用例代码），本 change.md 测试用例缺失无法验证编译/运行。**需补充具体 test.aura 代码**（至少含 P1 大图触发并行阈值 + P2 并发 alloc/改写字段/SATB 覆写/born-marked 用例）。
 
   **非阻塞（建议更新）**：
-  3. §1.1 "importNsNames_ isNs 路径"术语更正为 `Symbol::belongsToModule` 字段判断路径（Symbol.h:57 + ExprInfer.cpp L271-295 Phase A + L297-310 Phase B）。
-  4. §1.2 / 步骤 7② isIfaceViewTypeName 行号从 L46 更正为 L44（定义起点）/ L45（Iterator 覆盖判定）。
-  5. 步骤 11 READMEs/15-math-module.md 编号冲突：当前已有 `15-example.md`，需重排编号或改用其他编号（如 16）。
+  4. **P1.5 shouldCompact 函数名混淆**：change.md 称 L573-591，实际 L573-591 是 `shouldCompactMedium`（中页版）；`shouldCompact`（小页版）在 L30-46。需明确指代哪个函数。
+  5. **GcRootHandleBase 漏列 prev_**：[gc.h L65-72](file:///d:/you/Aura/runtime/gc/gc.h#L65-L72) GcRootHandleBase 是双向链表（next_ + **prev_** + ptr_ref_），change.md P1.2/P1.3 只提 next_/ptr_ref_。若 P1.3 并行化涉及根链表切分/合并须处理 prev_，建议补充说明。
+  6. **gc.h L520 插入点行号偏移**：L520 实为 `oomInit_` 行，实际插入点 L539（los_）与 L540（`};`）之间。语义指向成员区尾部可接受，但行号建议更正。另建议 P1.1 补 `static_assert(sizeof(GcObject)==16)` 防回归。
 
 ---
 
-**总结**：change.md 源码映射准确度较高——方案一 6 项断言 5 项完全一致（仅术语 `importNsNames_` 错误，机制结论成立）；方案二 17 个核对点 15 项完全一致、1 项行号偏移（isIfaceViewTypeName L46→L44）、1 项漏列调用点（L73）。runtime 侧（variant.h is_iface_view + descForI + iterator.h self 成员）已完全具备支持能力，无需改动。§6 已知限制 2（Optional<Iterator> GC 不安全）描述准确。两处阻塞：isIfaceView 调用点清单漏列 L73（功能不受影响但描述不准）、`i.collect().length` 语法存疑（Iterator 无 collect 成员方法，需确认 Sema/CodeGen 是否有语法糖映射）。修正后即可进入实施。
+**总结**：change.md 源码映射准确度较高——P1.1 GcObject 布局、P1.2 依赖成员、P1.4 safepoint、P2.1 状态机、P2.2 根快照、P2.3 writeBarrier、P2.4 5 处 setMarked(false)、P2.5 协调机制等核心核对点全部一致或可行。三处阻塞：P1.3 协程帧 markObject 调用数（3→4 处，漏 LOS）、P2.3 compact.cpp L157-164 引用错误（应为 L340-355）、test.aura 具体用例代码缺失。修正后即可进入实施。P1 可独立合入验证（STW 语义不变），P2 在 P1 基础上叠加（concurrentGcEnabled_ 开关兜底）。

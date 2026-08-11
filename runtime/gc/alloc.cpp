@@ -82,7 +82,7 @@ GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
 
         GcObject* obj = static_cast<GcObject*>(mem);
         obj->desc = desc;
-        obj->setMarked(false);
+        finishAlloc(obj);   // P2：标记期间新分配 born-marked
         obj->setGeneration(0);  // 新生代
         obj->setFinalized(false);
         obj->setAllocSize(size);
@@ -151,7 +151,7 @@ GcObject* GcHeap::tryAllocSlow(size_t size, const TypeDescriptor* desc) {
 
     GcObject* obj = static_cast<GcObject*>(mem);
     obj->desc = desc;
-    obj->setMarked(false);
+    finishAlloc(obj);   // P2：标记期间新分配 born-marked
     obj->setGeneration(0);  // 新生代
     obj->setFinalized(false);
     obj->setAllocSize(size);
@@ -395,7 +395,7 @@ GcObject* GcHeap::tryAllocMedium(size_t size, const TypeDescriptor* desc) {
 
     GcObject* obj = static_cast<GcObject*>(mem);
     obj->desc = desc;
-    obj->setMarked(false);
+    finishAlloc(obj);   // P2：标记期间新分配 born-marked
     obj->setGeneration(0);
     obj->setFinalized(false);
     obj->setAllocSize(size);
@@ -433,7 +433,7 @@ GcObject* GcHeap::tryAllocLarge(size_t size, const TypeDescriptor* desc) {
 
     GcObject* obj = static_cast<GcObject*>(mem);
     obj->desc = desc;
-    obj->setMarked(false);
+    finishAlloc(obj);   // P2：标记期间新分配 born-marked
     obj->setGeneration(0);
     obj->setFinalized(false);
     obj->setAllocSize(size);
@@ -464,7 +464,7 @@ GcObject* GcHeap::tryAllocLOS(size_t size, const TypeDescriptor* desc) {
     }
 
     obj->desc = desc;
-    obj->setMarked(false);
+    finishAlloc(obj);   // P2：标记期间新分配 born-marked
     obj->setGeneration(0);
     obj->setFinalized(false);
     obj->setAllocSize(size);
