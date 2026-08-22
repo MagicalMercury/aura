@@ -645,3 +645,46 @@ sync thread(max = 2) {
 - ❌ `Optional<T>` 暂无 `map` / `and_then` / `or_else` 链式操作（v1.3 远期）
 - ❌ `cv.notify_all` 唤醒后仍走 1ms `sleep_for` 轮询，延迟较高（v1.1 优化为 `try_lock` 快速重获）
 - ❌ 与协程 `channel<T>` 不可互操作（独立类型，跨场景需显式转换）
+
+## 11.8 GC 运行时与调试日志（v0.8+）
+
+Aura 运行时 GC 支持**事件级日志**：设置环境变量 `AURA_GC_LOG` 后，每次 GC 在 **stderr** 输出触发时机、分阶段耗时与回收量（默认关闭，零开销）。
+
+### 11.8.1 环境变量语法
+
+```
+AURA_GC_LOG=gc=info                  # 输出 gc 标签 info 及以上级别
+AURA_GC_LOG=gc*=trace                # 通配 gc*：gc 子树全部标签
+AURA_GC_LOG=gc=info,gc/phase=debug   # 多标签逗号分隔
+```
+
+| 标签 | 内容 |
+| ---- | ---- |
+| `gc` | 每次 GC 主行（触发时机/耗时/内存变化） |
+| `gc/phase` | 分阶段耗时明细（根扫描/标记/收尾） |
+| `gc/memory` | 对象数/字节数变化明细（预留） |
+| `gc/trigger` | 触发原因（阈值/碎片率/forceGc） |
+
+**级别**：`trace < debug < info < warning < error`。默认全 Off（零开销）；仅设置子标签时 `gc` 自动默认 `info`（对标 Java `-Xlog` 语义）。环境变量值允许首尾空白（自动 trim）。
+
+### 11.8.2 输出格式（Go `gctrace` 风格）
+
+```
+[GC][info] concurrent #7 @0.010s: 0.75+0.51+0.69 ms clock, live 38542->20266 (2.0MB->1.2MB), freed 824.8KB
+[GC][debug][phase] concurrent: roots=0.75ms mark=0.51ms finalize=0.69ms (wait=..ms work=..ms)
+[GC][debug][trigger] concurrent #7: youngBytes>=threshold
+```
+
+- **并发路径三阶段 `a+b+c ms clock`**：STW 根扫描 + 并发标记 + STW 收尾；收尾内部再拆分 `wait`（STW 停靠等待）与 `work`（补扫/SATB/回收）——用于诊断收尾耗时构成
+- `live A->B (X->Y MB)`：存活对象数 + 活跃字节变化；`freed`：本次回收量
+- STW 路径（minor/mixed/major/sweepLarge）为单值耗时
+
+### 11.8.3 `gc_stats()` 内置函数
+
+`gc_stats()` 返回聚合统计字符串（含**最近一次 GC 耗时** `last=` 字段）：
+
+```
+GC: alloc=11.0MB young=56B old=3.4MB gc=7 minor=9 mixed=2 live=62139 pages=2739 medium=5 large=44 freeMed=1 los=1/302.6KB last=49.08ms
+```
+
+配合 `gc_force()`（强制触发一次完整 GC）可测量任意时点的 GC 行为。`gc_force` 路径同样产生事件日志（`trigger=forceGc`）。

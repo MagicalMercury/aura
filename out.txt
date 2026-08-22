@@ -1,177 +1,79 @@
-# Plan 审查报告：change.md（并发 GC：P1 并行 STW 标记 + P2 SATB 并发标记）
-
-> 审查对象：`d:\you\Aura\change.md`（工作流 4 合并实施文档）
-> 审查时间：2026-08-11
-> 审查依据：`.trae/rules/plan_review_rule.md`
-> 检索方式：3 个并行 Search Agent + 直接 Read 复核（2026-08-11，全部行号为当前磁盘实际行号）
-
----
+# Plan 审查报告：P2_signal_driven_safepoint_plan.md
 
 ## Search Agent 检索摘要
 
-- **检索文件列表**（3 个并行 Search Agent 实际检索）：
-  - [runtime/types.h](file:///d:/you/Aura/runtime/types.h)（GcObject L110-158）
-  - [runtime/gc/mark_sweep.cpp](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp)（markPhase L63-169 / markObject L171-179 / markFields L181-196 / markInlineArrayFields L198-222）
-  - [runtime/gc/gc.h](file:///d:/you/Aura/runtime/gc/gc.h)（GcRootHandleBase L65-72 / threadRootLists_ L452 / youngObjects_/oldObjects_ L485-486 / gc_in_progress_ L525 / gc_epoch_ L527 / tl_roots_ L455 / 多线程 STW 协调 L522-529）
-  - [runtime/gc/safepoint.cpp](file:///d:/you/Aura/runtime/gc/safepoint.cpp)（safepoint L30-157 / writeBarrier L19-25）
-  - [runtime/gc/alloc.cpp](file:///d:/you/Aura/runtime/gc/alloc.cpp)（5 处 setMarked(false) L85/L154/L398/L436/L467）
-  - [runtime/gc/compact.cpp](file:///d:/you/Aura/runtime/gc/compact.cpp)（L336 注释 / shouldCompact L30-46 / shouldCompactMedium L573-591 / updateAllReferences L340-355）
-  - [runtime/gc/roots.cpp](file:///d:/you/Aura/runtime/gc/roots.cpp) + [runtime/gc/tlab.cpp](file:///d:/you/Aura/runtime/gc/tlab.cpp)（registerThread / ensureThreadRootList / tl_roots_ 机制）
-  - [TODO.txt](file:///d:/you/Aura/TODO.txt) §五 L372-375
-  - [example/test.aura](file:///d:/you/Aura/example/test.aura)（132 行，无并发 GC 用例）
-  - [plan/并发GC分析plan.md](file:///d:/you/Aura/plan/并发GC分析plan.md)（来源方案存在）
-  - [runtime/builtin/string.h](file:///d:/you/Aura/runtime/builtin/string.h) L110（clear_intern_cache 声明）
-
-- **关键源码定位**：
-
-  | 文件 | 行号区间 | 当前源码片段摘要 |
-  | ---- | -------- | ---------------- |
-  | types.h | L110-158 | GcObject 16 字节（desc 8B + allocSize_ 4B + flags_ 1B + padding 3B，非虚无 vptr）✅ |
-  | types.h | L151-157 | kMarkedBit=0x01 / kGenMask=0x02 / kFinalizedBit=0x04 / kAgeMask=0x78 / kForwardedBit=0x80 ✅ |
-  | mark_sweep.cpp | L63-169 | markPhase 4 类根扫描：①threadRootLists_ L67-75 ②协程帧 L78-136 ③全局根 L139-146 ④记忆集/old L149-164 ✅ |
-  | mark_sweep.cpp | L171-179 | markObject 递归（→markFields→markObject / →markInlineArrayFields→markObject）✅ |
-  | safepoint.cpp | L19-25 | writeBarrier 仅分代 rememberedSet，无 SATB ✅ |
-  | safepoint.cpp | L30-157 | safepoint 含 gc_in_progress_ 抢权（L83）+ gc_epoch_ 唤醒（L134/L151）✅ |
-  | alloc.cpp | L85/L154/L398/L436/L467 | 5 处 setMarked(false) 模式一致（desc/setMarked/setGeneration/setFinalized/setAllocSize）✅ |
-  | compact.cpp | L336 | flatten flat_cache_ 注释路径 ✅ |
-  | compact.cpp | L30-46 | shouldCompact（小页版）⚠️ change.md 误指 L573-591 |
-  | compact.cpp | L573-591 | shouldCompactMedium（中页版）⚠️ |
-  | compact.cpp | L340-355 | updateAllReferences 全量扫描 old 对象（Bug 3 修复）❌ change.md 误指 L157-164 |
-  | gc.h | L65-72 | GcRootHandleBase 双向链表（next_ + prev_ + ptr_ref_）⚠️ change.md 漏列 prev_ |
-  | gc.h | L520 | oomInit_ 行；实际插入点 L539 与 L540（`};`）之间 ⚠️ |
-  | gc.h | L525/L527 | gc_in_progress_ / gc_epoch_ 多线程 STW 协调 ✅ |
+- **检索文件**：`runtime/gc/safepoint.cpp`（584 行）、`runtime/gc/gc.h`、`runtime/gc/gc.cpp`、`runtime/gc/tlab.cpp`、`runtime/gc/roots.cpp`、`runtime/gc/alloc.cpp`、`runtime/thread_pool.cpp`、`runtime/builtin/mutex.h`、`runtime/builtin/thread_channel.h`
+- **关键发现（决定性）**：当前磁盘代码**已落地 cv 化方案**——safepoint.cpp 全部等待点已是 `cv_.wait_for(50ms)`（[L66](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L66)、[L153](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L153)、[L575](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L575)），`notifyIdleWakeups()` 已存在（gc.cpp L41-44），空闲 worker 由 `gcWakeupGen_` 代次 + `cv.notify_all` 广播唤醒（thread_pool.cpp L32-35）。**`broadcastInterrupt` / `ThreadHandle` / `threadHandles_` 全库不存在**。
 
 ## 源码映射审查
 
-### P1.1 flags_ 拆分（marked 位原子化）
+| plan 引用 | 实际源码 | 比对结果 | 备注 |
+| ---- | ---- | ---- | ---- |
+| §2.1 Finalize 分支 L66 sleep 轮询 | safepoint.cpp L51-69 已 `cv.wait_for(50ms)` | ❌ 过时 | L66 恰好是 wait_for 行，歪打正着 |
+| §2.1 initiator L153 sleep(10ms) | safepoint.cpp L149-164 已 `cv.wait_for(50ms)` | ❌ 过时 | L153 恰为 wait_for 行 |
+| §2.1 waitForRootThreadsStopped L564 | 实际 L547-582，已 cv 化 + 二次确认 | ❌ 行号错 | plan 行号超旧版范围 |
+| §2.1 空闲 worker cv.wait_for(50ms) + gcWakeupGen 谓词 | thread_pool.cpp L135 一致 | ✅ | 谓词含 gcWakeupGen |
+| §8.2 workerLoop 50ms→5ms | thread_pool.cpp L135 `wait_for(50ms)` | ✅ 修改目标成立 | — |
+| §8.3 waitGroup sleep_for(1ms) | thread_pool.cpp L97 一致 | ✅ | — |
+| §8.4 submit try_acquire_for(1ms) | thread_pool.cpp L225 一致 | ✅ | — |
+| §8.5 mutex.h 4 处 L81/L187/L245/L324 | 逐行一致 | ✅ | — |
+| §8.6 thread_channel.h L57/L76 | 一致 | ✅ | — |
+| §8.7 alloc.cpp L148 | 一致 | ✅ | — |
+| §8.8 safepoint 3 处 50ms→5ms | 3 处 wait_for(50ms) 存在 | ⚠️ 行号错（L564），修改目标成立 | abort 计数需同步改（当前 `40×50ms=2s`，plan 写 400×5ms ✅ 正确） |
+| §9 STW DEADLOCK L154 | 实际 L156-159 | ⚠️ 行号偏移 | — |
+| ROOT STOP TIMEOUT L530 | 实际 L576 附近 | ❌ 行号错 | — |
+| notifyIdleWakeups 链路 | gc.cpp L41-44 已存在（gc.h L299 声明） | ⚠️ plan 未指出其已落地 | — |
 
-| 步骤 | 文件 | 比对结果 | 备注 |
-| ---- | ---- | -------- | ---- |
-| GcObject 定义行号 | [types.h L110-158](file:///d:/you/Aura/runtime/types.h#L110-L158) | ✅ 一致 | |
-| 字段布局 desc/allocSize_/flags_ | [types.h L111-115](file:///d:/you/Aura/runtime/types.h#L111-L115) | ✅ 一致 | 8B+4B+1B+3B padding=16B，非虚无 vptr |
-| bit-packed 常量 | [types.h L151-157](file:///d:/you/Aura/runtime/types.h#L151-L157) | ✅ 一致 | kMarkedBit=0x01/kGenMask=0x02/kFinalizedBit=0x04/kAgeMask=0x78/kForwardedBit=0x80 |
-| 访问方法 | [types.h L120-148](file:///d:/you/Aura/runtime/types.h#L120-L148) | ✅ 一致 | marked/setMarked/generation/finalized/age/forwarded/forwardingPtr 全部存在 |
-| compact 转发机制 | [types.h L138-144](file:///d:/you/Aura/runtime/types.h#L138-L144) | ✅ 一致 | desc 槽转发 + bit7 标记，P1.1 不影响 |
-| GcObject 16 字节保持 | types.h | ✅ 可行 | 3 字节 padding 可容纳新增 mark_flags_ 1B；但源码无 `static_assert(sizeof(GcObject)==16)`，建议补断言 |
+**结论**：plan 基于 cv 化前的旧版代码编写。§8 的 sleep_for 替换点（mutex/channel/alloc/waitGroup/submit）仍准确有效，但 §8.8 行号、§2 现状描述已过时，需按当前版本重写。
 
-### P1.2 显式标记栈 + GC 私有标记线程组
+## Go 语言使用 APC 的对比（核心问题）
 
-| 步骤 | 文件 | 比对结果 | 备注 |
-| ---- | ---- | -------- | ---- |
-| gc.h L520 插入点 | [gc.h L514-540](file:///d:/you/Aura/runtime/gc/gc.h#L514-L540) | ⚠️ 行号偏移 | L520 实为 `oomInit_` 行；实际插入点 L539（los_）与 L540（`};`）之间，语义指向成员区尾部可接受 |
-| 依赖成员 youngObjects_/oldObjects_ | [gc.h L485-486](file:///d:/you/Aura/runtime/gc/gc.h#L485-L486) | ✅ 一致 | runMarkPhase 阈值判断可用 |
-| 依赖成员 threadRootLists_ | [gc.h L452-453](file:///d:/you/Aura/runtime/gc/gc.h#L452-L453) | ✅ 一致 | |
-| 依赖成员 tl_roots_ | [gc.h L455](file:///d:/you/Aura/runtime/gc/gc.h#L455) | ✅ 一致 | static thread_local |
-| 新增成员全部不存在 | gc.h | ✅ 确认 | markStack_/markStackM_/markActive_/kParallelMarkThreshold/kMarkBatchSize/markThreads_/in_gc_internal_ 全部未命中 |
-| parallel_mark.cpp 新增 | runtime/gc/ | ✅ 确认 | 目录无此文件，待新增 |
-| scanObjectFields 前提 | [mark_sweep.cpp L171-222](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L171-L222) | ✅ 一致 | markObject 经 markFields+markInlineArrayFields 间接递归，合并为非递归版本结构可行 |
+**答案是：是。Go 在 Windows 上正是用 `QueueUserAPC` 做线程异步抢占**，Unix 上用信号（`tgkill` + SIGURG）。但 Go 的用法与本 plan 有**四个本质差异**：
 
-### P1.3 markPhase 改造（根扫描只入栈）
+| 维度 | Go（1.14+ 异步抢占） | 本 plan |
+| ---- | ---- | ---- |
+| **Windows 中断** | `preemptM` → `QueueUserAPC(apc_preempt, mp.thread, 0)`，callback 执行**实际抢占** | `QueueUserAPC(空操作)` 仅打断 alertable wait |
+| **Unix 中断** | `signalM` → `tgkill(getpid(), tid, SIGURG)` | `pthread_kill(SIGUSR1)` |
+| **handler 行为** | `doSigPreempt`：检查安全点 → **改写信号上下文 PC/SP** → 重定向到 `asyncPreempt`（保存寄存器、进入调度器） | 空 handler，只靠 EINTR 打断阻塞 |
+| **能否中断 CPU 密集** | ✅ 能（`asyncPreempt` 由编译器在函数序言/回边注入，信号把执行流硬切到安全点） | ❌ 明确放弃（plan §1.4 承认需 P3+ 编译器支持） |
+| **信号选择** | SIGURG——**特意避开 SIGUSR1/SIGUSR2**（用户库常用，避免冲突） | SIGUSR1，未讨论与用户信号冲突 |
+| **信号风暴防护** | `atomic.Cas(&mp.signalPending, 0, 1)` 合并——同线程只发一次信号 | 每 20ms 无合并重发 |
 
-| 步骤 | 文件 | 比对结果 | 备注 |
-| ---- | ---- | -------- | ---- |
-| markPhase 行号 | [mark_sweep.cpp L63-169](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L63-L169) | ✅ 一致 | |
-| ① 线程 GcRootHandle 链表 | [mark_sweep.cpp L67-75](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L67-L75) | ✅ 一致 | |
-| ② 协程帧保守扫描 | [mark_sweep.cpp L78-136](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L78-L136) | ✅ 行号一致 | |
-| ② 协程帧 markObject 调用数 | mark_sweep.cpp | ❌ **不符** | change.md 称"3 处"，**实际 4 处**（L106 小页 / L116 中页 / L123 大页 / L132 LOS） |
-| ③ 全局根 | [mark_sweep.cpp L139-146](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L139-L146) | ✅ 一致 | |
-| ④ 记忆集 + old 对象 | [mark_sweep.cpp L149-164](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L149-L164) | ✅ 一致 | |
-| oomError | [mark_sweep.cpp L167-168](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L167-L168) | ✅ 一致 | |
-| GcRootHandleBase 字段 | [gc.h L65-72](file:///d:/you/Aura/runtime/gc/gc.h#L65-L72) | ⚠️ 漏列 | 双向链表（next_ + **prev_** + ptr_ref_），change.md 只提 next_/ptr_ref_，若涉及链表切分须处理 prev_ |
-
-### P1.4 safepoint 重入防护
-
-| 步骤 | 文件 | 比对结果 | 备注 |
-| ---- | ---- | -------- | ---- |
-| safepoint 行号 | [safepoint.cpp L30](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L30) | ✅ 一致 | L30 函数起点，L157 闭合 |
-| gcPending_ 判定 | [safepoint.cpp L31](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L31) | ✅ 一致 | |
-| flushTlab/clear_intern_cache | [safepoint.cpp L38-39](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L38-L39) | ✅ 一致 | clear_intern_cache 是自由函数（string.h L110），非 GcHeap 成员 |
-
-### P1.5 compact 降频调优（可选）
-
-| 步骤 | 文件 | 比对结果 | 备注 |
-| | ---- | -------- | ---- |
-| shouldCompact 行号 | [compact.cpp](file:///d:/you/Aura/runtime/gc/compact.cpp) | ⚠️ 函数名混淆 | change.md 称 L573-591，实际 L573-591 是 `shouldCompactMedium`（中页版）；`shouldCompact`（小页版）在 L30-46。需明确指代 |
-
-### P2.1 safepoint 状态机（GcPhase）
-
-| 步骤 | 文件 | 比对结果 | 备注 |
-| ---- | ---- | -------- | ---- |
-| gc_in_progress_ 机制 | [gc.h L525](file:///d:/you/Aura/runtime/gc/gc.h#L525) / [safepoint.cpp L83](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L83) | ✅ 一致 | 抢权协调机制存在 |
-| gc_epoch_ 机制 | [gc.h L527](file:///d:/you/Aura/runtime/gc/gc.h#L527) / [safepoint.cpp L134/L151](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L134) | ✅ 一致 | 代次唤醒机制存在，P2.5 收尾 STW 可复用 |
-| 新增成员全部不存在 | gc.h | ✅ 确认 | GcPhase/phase_/markingInProgress_/handshakeArrived_/handshakeTarget_/rootSnapshot_/satbMutex_/satbQueue_/bornMutex_/bornObjects_/concurrentGcEnabled_ 全部未命中 |
-| registered_threads_/threads_m_ | [gc.h L523-524](file:///d:/you/Aura/runtime/gc/gc.h#L523-L524) | ✅ 一致 | handshakeTarget_ 取数可用 |
-| safepoint 现有 STW 执行体 | [safepoint.cpp L41-156](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L41-L156) | ✅ 一致 | 单线程 L41-80 / 多线程 L82-156 |
-
-### P2.2 根快照（handshake 内拷贝值）
-
-| 步骤 | 文件 | 比对结果 | 备注 |
-| ---- | ---- | -------- | ---- |
-| tl_roots_ 机制 | [roots.cpp L23/L59-68](file:///d:/you/Aura/runtime/gc/roots.cpp#L59) | ✅ 一致 | thread_local，懒分配，push 到 threadRootLists_ |
-| registerThread | [tlab.cpp L62-71](file:///d:/you/Aura/runtime/gc/tlab.cpp#L62-L71) | ✅ 一致 | 新线程注册 ThreadRootList |
-| snapshotThreadRoots 可行性 | gc.h / roots.cpp | ✅ 可行 | STW 期间遍历 threadRootLists_ 无需锁 |
-
-### P2.3 写屏障 SATB 扩展
-
-| 步骤 | 文件 | 比对结果 | 备注 |
-| ---- | ---- | -------- | ---- |
-| writeBarrier 行号 | [safepoint.cpp L19-25](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L19-L25) | ✅ 一致 | 当前仅分代 rememberedSet，无 SATB |
-| compact.cpp L336 注释 | [compact.cpp L336](file:///d:/you/Aura/runtime/gc/compact.cpp#L336) | ✅ 一致 | flatten flat_cache_ 遗漏路径注释存在 |
-| compact.cpp L157-164 引用 | compact.cpp | ❌ **不符** | change.md 称"L157-164 全量 old 对象扫描"，实际 L157-164 是 computeForwardingAddresses 内 OOM 释放新页代码；真正全量扫描在 **L340-355**（updateAllReferences 步骤 4/5，Bug 3 修复结果） |
-
-### P2.4 born-marked（标记期间新分配）
-
-| 步骤 | 文件 | 比对结果 | 备注 |
-| ---- | ---- | -------- | ---- |
-| 5 处 setMarked(false) | [alloc.cpp L85/L154/L398/L436/L467](file:///d:/you/Aura/runtime/gc/alloc.cpp#L85) | ✅ 全部一致 | 行号精确命中，模式一致 |
-| tryAllocLOS 差异 | [alloc.cpp L466-470](file:///d:/you/Aura/runtime/gc/alloc.cpp#L466) | ⚠️ 注意 | tryAllocLOS 前无 memset 清零，与其他 4 处不同；finishAlloc 封装时需注意 |
-
-### P2.5 并发标记流程
-
-| 步骤 | 文件 | 比对结果 | 备注 |
-| ---- | ---- | -------- | ---- |
-| 复用 gc_in_progress_/gc_epoch_ | safepoint.cpp | ✅ 一致 | 收尾 STW 协调机制成熟 |
-| sleep_for 轮询模式 | [safepoint.cpp L86-87/L143-145](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L86) | ✅ 一致 | 现有代码用 unlock+sleep_for+lock 轮询（GCC 11 TSan bug），P2.5 应保持 |
-
-### 测试与 TODO
-
-| 核对项 | 文件 | 比对结果 | 备注 |
-| ---- | ---- | -------- | ---- |
-| TODO §五 L372-375 | [TODO.txt L372-375](file:///d:/you/Aura/TODO.txt#L372-L375) | ✅ 一致 | `[ ] P3 并发 GC`，内容与 change.md 背景一致 |
-| test.aura 当前状态 | [example/test.aura](file:///d:/you/Aura/example/test.aura) | ✅ 一致 | 132 行，无并发 GC 用例，待新增 |
-| plan 来源 | [plan/并发GC分析plan.md](file:///d:/you/Aura/plan/并发GC分析plan.md) | ✅ 存在 | 工作流 3 产物，与 change.md 背景一致 |
+**结论**：方向一致（用 OS 原语打断线程缩短 STW 等待），但 Go 的机制更完整——空操作 handler 只能打断"阻塞等待中的线程"，Go 能打断"运行中的 goroutine"。plan 的 P3+ 规划（编译器注入 poll 点）正是 Go 的 `asyncPreempt` 路线，两者可衔接。
 
 ## 全链路风险分析
 
-- **构建系统**：无风险。新增 parallel_mark.cpp 需加入 runtime/CMakeLists.txt（change.md 未明确提及，建议补充）。
-- **Runtime 兼容性**：通过。GcObject 16 字节布局保持（3B padding 足够）；compact 转发机制（desc 槽 + bit7）不受影响；gc_in_progress_/gc_epoch_ 协调机制成熟可复用。
-- **测试覆盖**：基本完整。P1.6 覆盖全量回归 + 大图 + 一致性对照 + ASAN；P2.6 覆盖行为等价 + 并发正确性 + SATB/born 专项 + 死锁压力 + 一致性对照 + ASAN + 暂停基准。但 **test.aura 具体用例代码缺失**（change.md 仅描述测试方案，未给出具体 test.aura 代码）。
-- **异常与回退**：可接受。`concurrentGcEnabled_=false` 回退 P1；`kParallelMarkThreshold` 调大强制单线程回退旧版；P1.1 独立合入先验证布局。三级回退策略具体可操作。
-- **并发正确性**：理论可行。SATB（写屏障记录旧引用）+ born-marked（新分配直接标记 + 收尾补扫）+ 根快照（标记线程只扫快照）三机制闭合；但 **compact.cpp L340-355 全量扫描 old 对象**（Bug 3 修复结果）在 SATB 引入后需重新评估——SATB 若能覆盖 flatten/promoteToOld 等内部路径可优化为仅扫 rememberedSet_，否则保留全量扫描兜底。
+- **构建系统**：需新增 2 个源文件 + 2 个平台文件进 CMakeLists（plan §13 Step 6 已给出，✅ 正确），无其他问题。
+- **Runtime 兼容性**：⚠️ 有细节问题，需修正后再合入：
+  1. **无谓词 wait_for 下信号收益被高估**（plan §4.3）：当前 `all_stopped_cv_.wait_for(lk, 50ms)` 是**无谓词版**——被 EINTR 打断后 glibc/libstdc++ 内部重试**继续等**，外层 while 才查 `stopped_threads_`。信号对 cv wait 实际无帮助（真正唤醒靠 notify_all）。plan 表格"✅ EINTR → 重检查谓词"不成立。
+  2. **SIGUSR1 冲突**：用户代码/库可能占用 SIGUSR1。建议改用 SIGURG（Go 同款选择）。
+  3. **alloc.cpp L148 Marking 期等待**：该处等待的是"Marking 结束"，非"STW 通知"——中断后立即重试仍 Marking，无意义，还增加忙轮询。建议排除在替换清单外。
+  4. **Windows 上收益主要来自 100μs 轮询而非 APC**（plan §11 自己承认）——需明确定位：APC 只解决 sleep 类阻塞，cv/sem 仍靠轮询。
+  5. **EventLoop 缺口未覆盖**：plan 未提 task.cpp 主线程 10ms IOCP 轮询不响应 STW（cv 化 plan 阶段 2.2 内容）。
+  6. 线程句柄生命周期（§6.3/§10.3）：ESRCH/无效句柄忽略处理 ✅ 正确。
+- **测试覆盖**：§15 覆盖功能/性能/安全三类，但测试路径为外部 Linux 环境（§13 Step 7），需改写为本仓库流程（compile.cmd + test.aura + verify_gc_log.ps1），并补充"中断风暴"（高频 broadcastInterrupt）与"信号与用户 SIGUSR1 共存"用例。
+- **异常与回退**：`AURA_INTERRUPT_SAFEPOINT` 编译宏回退 ✅ 合理，但建议改为运行时开关（编译宏需重编）。
 
 ## 已知限制评估
 
-1. **不做并发 compact/sweep**：可接受。读屏障基础设施独立远期路线。
-2. **compact.cpp 内部直写缺口**（flatten flat_cache_ 等）：可接受。P2.3 采用保守方案（收尾全量扫描兜底），后续专项补屏障。
-3. **P2.5 收尾 STW 复用现有协调**：可接受。gc_in_progress_ 抢权 + gc_epoch_ 唤醒模式成熟，但 sleep_for 轮询（GCC 11 TSan bug）需保持。
-4. **concurrentGcEnabled_ 安全网**：可接受。并发标记出问题时一键回退 P1 纯 STW。
+1. CPU 密集不可中断（P3+ 编译器 poll 点）→ **可接受**，但需明确该 plan 定位为"缩短阻塞线程停靠延迟"，性能预期（§12.1 表格"1 线程 CPU 密集 10ms → ~10ms"）已如实标注 ✅。
+2. Windows cv/sem 不可打断 → **可接受**，plan 如实标注 ✅。
 
 ## 最终裁决
 
-- [ ] **需修改（Changes Requested）** —— 3 项阻塞 + 3 项非阻塞：
+- [ ] 通过（Approve）
+- [x] **需修改（Changes Requested）** — 具体修改点：
+  1. **以当前版本为基础重写 §2 现状**（cv 化已落地）：3 处 wait_for(50ms) 现状 + 行号修正（waitForRootThreadsStopped L547-582、DEADLOCK L156-159、TIMEOUT L576 附近）；`notifyIdleWakeups` 已存在需注明。
+  2. **修正 §4.3 对无谓词 wait_for 的 EINTR 分析**——信号对 cv wait 无实际收益，删除该行"✅ 重检查谓词"或改为有谓词版后重新评估。
+  3. **信号改用 SIGURG**（对齐 Go 选择，避免用户信号冲突）；如坚持 SIGUSR1，需补充冲突评估。
+  4. **alloc.cpp L148 移出替换清单**（Marking 等待语义不符）。
+  5. **补 EventLoop 停靠缺口**（task.cpp）。
+  6. **测试路径改写为本仓库流程** + 中断风暴用例。
+  7. 说明 Windows 端主要收益来自 100μs 轮询缩短（APC 为辅助），并给出二者解耦的回退方案。
 
-  **阻塞（必须修正）**：
-  1. **P1.3 协程帧保守扫描 markObject 调用数错误**：[mark_sweep.cpp L78-136](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L78-L136) 协程帧保守扫描内 markObject 调用**实际 4 处**（L106 小页 / L116 中页 / L123 大页 / L132 LOS），change.md P1.3 称"3 处 markObject"不符。P1.3 改造若按 3 处插入 markRootEnqueue 会漏 LOS 路径，导致 LOS 对象在并行标记下漏标。**需更正为 4 处**。
-
-  2. **P2.3 compact.cpp L157-164 引用错误**：change.md P2.3 称"compact.cpp L157-164 已有此逻辑（全量扫描 old 对象兜底）"，**实际 L157-164 是 computeForwardingAddresses 内 OOM 释放新页代码**。真正的全量扫描 old 对象逻辑在 **[compact.cpp L340-355](file:///d:/you/Aura/runtime/gc/compact.cpp#L340-L355)**（updateAllReferences 步骤 4/5，Bug 3 修复结果，All/Young 两分支均扫所有 old 对象）。P2.3 SATB 引入后此段逻辑需重新评估，引用错误会导致实施者定位失败。**需更正为 L340-355**。
-
-  3. **test.aura 具体用例代码缺失**：change.md P1.6/P2.6 仅描述测试方案（大图/并发压力/SATB/born 专项等），未给出具体 test.aura 代码。对比之前审查的 change.md（math/Iterator 方案有完整测试用例代码），本 change.md 测试用例缺失无法验证编译/运行。**需补充具体 test.aura 代码**（至少含 P1 大图触发并行阈值 + P2 并发 alloc/改写字段/SATB 覆写/born-marked 用例）。
-
-  **非阻塞（建议更新）**：
-  4. **P1.5 shouldCompact 函数名混淆**：change.md 称 L573-591，实际 L573-591 是 `shouldCompactMedium`（中页版）；`shouldCompact`（小页版）在 L30-46。需明确指代哪个函数。
-  5. **GcRootHandleBase 漏列 prev_**：[gc.h L65-72](file:///d:/you/Aura/runtime/gc/gc.h#L65-L72) GcRootHandleBase 是双向链表（next_ + **prev_** + ptr_ref_），change.md P1.2/P1.3 只提 next_/ptr_ref_。若 P1.3 并行化涉及根链表切分/合并须处理 prev_，建议补充说明。
-  6. **gc.h L520 插入点行号偏移**：L520 实为 `oomInit_` 行，实际插入点 L539（los_）与 L540（`};`）之间。语义指向成员区尾部可接受，但行号建议更正。另建议 P1.1 补 `static_assert(sizeof(GcObject)==16)` 防回归。
-
----
-
-**总结**：change.md 源码映射准确度较高——P1.1 GcObject 布局、P1.2 依赖成员、P1.4 safepoint、P2.1 状态机、P2.2 根快照、P2.3 writeBarrier、P2.4 5 处 setMarked(false)、P2.5 协调机制等核心核对点全部一致或可行。三处阻塞：P1.3 协程帧 markObject 调用数（3→4 处，漏 LOS）、P2.3 compact.cpp L157-164 引用错误（应为 L340-355）、test.aura 具体用例代码缺失。修正后即可进入实施。P1 可独立合入验证（STW 语义不变），P2 在 P1 基础上叠加（concurrentGcEnabled_ 开关兜底）。
+Sources:
+- [Go async preemption (preempt.go)](https://go.dev/src/runtime/preempt.go)
+- [Go runtime os_windows.go (preemptM → QueueUserAPC)](https://github.com/golang/go/blob/master/src/runtime/os_windows.go)
+- [Go 语言实现——异步抢占调度](https://chanfung032.github.io/go/asynchronous-preemption.html)
+- [Go 是如何做抢占式调度的？](https://blog.csdn.net/Guzarish/article/details/157868118)
+- [Preemption in Go: an introduction](https://www.recentic.net/introduction-to-golang-preemption-mechanisms/)

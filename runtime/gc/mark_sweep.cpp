@@ -75,78 +75,49 @@ void GcHeap::scanRootsOnly(bool youngOnly) {
     //    P2：持 threadRootLists_m_ 锁——并发路径的 waitForRootThreadsStopped 二次确认后，
     //        等待期间新注册线程的 ensureThreadRootList（push_back）可能仍在进行，
     //        持锁扫描防 vector 并发修改（已停线程的节点遍历不受影响）
+    //    P0-B：threadRootLists_ 分片并行扫描（markRootEnqueue 已有 markStackM_ 互斥；
+    //        持锁状态下 parallelFor——worker 只读遍历，不再获取 threadRootLists_m_，无死锁）
     {
         std::lock_guard<std::mutex> lk(threadRootLists_m_);
-        for (auto* list : threadRootLists_) {
-            for (GcRootHandleBase* node = list->head; node; node = node->next_) {
-                GcObject* obj;
-                std::memcpy(&obj, node->ptr_ref_, sizeof(GcObject*));
-                if (obj) {
-                    markRootEnqueue(obj);
+        size_t total = threadRootLists_.size();
+        parallelFor(total, kParallelRootScanThreshold,
+            [this](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; ++i) {
+                    for (GcRootHandleBase* node = threadRootLists_[i]->head;
+                         node; node = node->next_) {
+                        GcObject* obj;
+                        std::memcpy(&obj, node->ptr_ref_, sizeof(GcObject*));
+                        if (obj) markRootEnqueue(obj);
+                    }
                 }
-            }
-        }
+            });
     }
 
     // 2. 从栈帧根出发标记（保守扫描栈中的指针）
-    for (auto& [begin, end] : stackRoots_) {
-        char* start2 = static_cast<char*>(begin);
-        char* stop2  = static_cast<char*>(end);
-        // 优先使用实际协程帧大小（避免越过帧边界 → ASAN 报错 / 读到未映射内存）
-        // 找不到时回退到 end 指针（向后兼容）
-        size_t actualSize = getFrameSize(begin);
-        if (actualSize > 0) {
-            char* frameEnd = start2 + actualSize;
-            if (frameEnd < stop2) stop2 = frameEnd;
-        }
-        for (char* p = start2; p + sizeof(void*) <= stop2; p += sizeof(void*)) {
-            void* candidate = *reinterpret_cast<void**>(p);
-            if (!candidate) continue;
-            GcObject* obj = static_cast<GcObject*>(candidate);
-
-            // 路径 1：保守检查候选指针是否在小页范围内
-            bool found = false;
-            for (Page* page = headPage_; page; page = page->next) {
-                if (candidate >= static_cast<void*>(page->data) &&
-                    candidate < static_cast<void*>(page->data + kPageSize)) {
-                    // 验证是否为有效的 GC 对象再读取字段
-                    // 关键：candidate 可能落在 GcString 等对象的 inline 数据区域中间
-                    // 此时 obj->desc 会被误读为 length/capacity 等数值（如 0x38）
-                    // 用 registeredDescs_ 查表验证 desc 是否为已注册的合法 TypeDescriptor
-                    if (!obj->desc) break;
-                    if (registeredDescs_.find(obj->desc) == registeredDescs_.end()) break;
-                    if (obj->desc->size == 0) break;
-                    // 始终入栈：markRootEnqueue 有 tryMark 守卫，不会重复入栈
-                    markRootEnqueue(obj);
-                    found = true;
-                    break;
+    //    P0-B：按 stackRoots_ 条目分片并行扫描（各 worker 访问不同栈区间，无竞争；
+    //    STW 期间 stackRoots_ 只读，findMediumPage/findLargePage/los_.contains 均为只读）
+    {
+        size_t total = stackRoots_.size();
+        parallelFor(total, kParallelRootScanThreshold,
+            [this](size_t begin, size_t end) {
+                for (size_t idx = begin; idx < end; ++idx) {
+                    auto& [beginPtr, endPtr] = stackRoots_[idx];
+                    char* start2 = static_cast<char*>(beginPtr);
+                    char* stop2  = static_cast<char*>(endPtr);
+                    // 优先使用实际协程帧大小（避免越过帧边界 → ASAN 报错 / 读到未映射内存）
+                    // 找不到时回退到 end 指针（向后兼容）
+                    size_t actualSize = getFrameSize(beginPtr);
+                    if (actualSize > 0) {
+                        char* frameEnd = start2 + actualSize;
+                        if (frameEnd < stop2) stop2 = frameEnd;
+                    }
+                    for (char* p = start2; p + sizeof(void*) <= stop2; p += sizeof(void*)) {
+                        void* candidate = *reinterpret_cast<void**>(p);
+                        if (!candidate) continue;
+                        scanStackCandidate(static_cast<GcObject*>(candidate));
+                    }
                 }
-            }
-            if (found) continue;
-
-            // 路径 2：检查是否是中页对象
-            if (findMediumPage(obj)) {
-                if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
-                    markRootEnqueue(obj);
-                }
-                continue;
-            }
-
-            // 路径 3：检查是否是大页对象
-            if (findLargePage(obj)) {
-                if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
-                    markRootEnqueue(obj);
-                }
-                continue;
-            }
-
-            // 路径 4：检查是否是 LOS 大对象
-            if (los_.contains(obj)) {
-                if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
-                    markRootEnqueue(obj);
-                }
-            }
-        }
+            });
     }
 
     // 3. 从全局根出发标记（运行时缓存 / interned 字符串）
@@ -182,6 +153,54 @@ void GcHeap::scanRootsOnly(bool youngOnly) {
     // 5. 始终标记 OOM 错误缓存字符串（确保可随时抛出）
     if (oomError_.kind) markRootEnqueue(oomError_.kind);
     if (oomError_.message) markRootEnqueue(oomError_.message);
+}
+
+// P0-B：单个栈候选指针的保守扫描（从 scanRootsOnly 提取）。
+// 并行 worker 直接调用，减少 lambda 嵌套深度；语义与原内联四路校验逐条一致
+void GcHeap::scanStackCandidate(GcObject* obj) {
+    // 路径 1：保守检查候选指针是否在小页范围内
+    bool found = false;
+    for (Page* page = headPage_; page; page = page->next) {
+        void* candidate = static_cast<void*>(obj);
+        if (candidate >= static_cast<void*>(page->data) &&
+            candidate < static_cast<void*>(page->data + kPageSize)) {
+            // 验证是否为有效的 GC 对象再读取字段
+            // 关键：candidate 可能落在 GcString 等对象的 inline 数据区域中间
+            // 此时 obj->desc 会被误读为 length/capacity 等数值（如 0x38）
+            // 用 registeredDescs_ 查表验证 desc 是否为已注册的合法 TypeDescriptor
+            if (!obj->desc) break;
+            if (registeredDescs_.find(obj->desc) == registeredDescs_.end()) break;
+            if (obj->desc->size == 0) break;
+            // 始终入栈：markRootEnqueue 有 tryMark 守卫，不会重复入栈
+            markRootEnqueue(obj);
+            found = true;
+            break;
+        }
+    }
+    if (found) return;
+
+    // 路径 2：检查是否是中页对象
+    if (findMediumPage(obj)) {
+        if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
+            markRootEnqueue(obj);
+        }
+        return;
+    }
+
+    // 路径 3：检查是否是大页对象
+    if (findLargePage(obj)) {
+        if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
+            markRootEnqueue(obj);
+        }
+        return;
+    }
+
+    // 路径 4：检查是否是 LOS 大对象
+    if (los_.contains(obj)) {
+        if (obj->desc && registeredDescs_.find(obj->desc) != registeredDescs_.end()) {
+            markRootEnqueue(obj);
+        }
+    }
 }
 
 void GcHeap::markObject(GcObject* obj) {
@@ -358,29 +377,54 @@ void GcHeap::promoteToOld(GcObject* obj) {
 // ============================================================
 
 void GcHeap::sweepPhaseAll() {
-    // 1. 统计存活对象（不清除 marked 标志，留给 finalizer 检查用）
+    // 1. 统计存活对象（并行分区）+ 收集死亡对象（finalizer/LOS 串行处理用）
+    //    不清除 marked 标志，留给 finalizer/弱引用检查用
     std::vector<GcObject*> liveYoung;
     std::vector<GcObject*> liveOld;
+    std::vector<GcObject*> deadYoung;
+    std::vector<GcObject*> deadOld;
     size_t liveYoungBytes = 0;
     size_t liveOldBytes = 0;
-
-    for (auto* obj : youngObjects_) {
-        if (obj->marked()) {
-            liveYoung.push_back(obj);
-            liveYoungBytes += obj->allocSize();
-        }
+    {
+        size_t youngTotal = youngObjects_.size();
+        size_t total = youngTotal + oldObjects_.size();
+        std::mutex mergeM;
+        // 合并容器（主线程在锁下拼接各 worker 局部结果）
+        std::vector<GcObject*> mergedLiveY, mergedLiveO, mergedDeadY, mergedDeadO;
+        size_t mergedYBytes = 0, mergedOBytes = 0;
+        parallelFor(total, kParallelSweepThreshold,
+            [&](size_t begin, size_t end) {
+                // 每 worker 局部收集（避免锁竞争；临时 vector 走 C++ 堆）
+                std::vector<GcObject*> lLiveY, lLiveO, lDeadY, lDeadO;
+                size_t lYBytes = 0, lOBytes = 0;
+                for (size_t i = begin; i < end; ++i) {
+                    GcObject* obj = (i < youngTotal) ? youngObjects_[i]
+                                                     : oldObjects_[i - youngTotal];
+                    if (obj->marked()) {
+                        if (i < youngTotal) { lLiveY.push_back(obj); lYBytes += obj->allocSize(); }
+                        else                { lLiveO.push_back(obj); lOBytes += obj->allocSize(); }
+                    } else {
+                        if (i < youngTotal) lDeadY.push_back(obj);
+                        else                lDeadO.push_back(obj);
+                    }
+                }
+                std::lock_guard<std::mutex> lk(mergeM);
+                mergedLiveY.insert(mergedLiveY.end(), lLiveY.begin(), lLiveY.end());
+                mergedLiveO.insert(mergedLiveO.end(), lLiveO.begin(), lLiveO.end());
+                mergedDeadY.insert(mergedDeadY.end(), lDeadY.begin(), lDeadY.end());
+                mergedDeadO.insert(mergedDeadO.end(), lDeadO.begin(), lDeadO.end());
+                mergedYBytes += lYBytes;
+                mergedOBytes += lOBytes;
+            });
+        liveYoung = std::move(mergedLiveY);
+        liveOld   = std::move(mergedLiveO);
+        deadYoung = std::move(mergedDeadY);
+        deadOld   = std::move(mergedDeadO);
+        liveYoungBytes = mergedYBytes;
+        liveOldBytes   = mergedOBytes;
     }
 
-    for (auto* obj : oldObjects_) {
-        if (obj->marked()) {
-            // sweepePhaseYoung 已将晋升对象的 generation 设为 1，
-            // 此处的 gen==0 分支不再需要（且 promoteToOld 在迭代 oldObjects_ 时调用会 UB）
-            liveOld.push_back(obj);
-            liveOldBytes += obj->allocSize();
-        }
-    }
-
-    // 2. 清空指向死亡对象的弱引用
+    // 2. 清空指向死亡对象的弱引用（串行，持锁——量小）
     {
         std::lock_guard<std::mutex> lk(weakHandles_m_);
         for (auto* wh : weakHandles_) {
@@ -391,43 +435,48 @@ void GcHeap::sweepPhaseAll() {
         }
     }
 
-    // 3. 调用 finalizer（对未标记且未 finalize 的对象）
+    // 3. 调用 finalizer（死对象列表）
+    //    P0-C：finalizer 对象间互不干扰（当前全部为 delete 内部指针），并行调用
     //    注意：此时 marked 标志尚未清除，finalizer 通过 marked 区分存活/死亡
-    for (auto* obj : youngObjects_) {
-        if (!obj->marked() && !obj->finalized()) {
-            if (obj->desc && obj->desc->finalizer) {
-                obj->desc->finalizer(obj);
-                obj->setFinalized(true);
-            }
-        }
-    }
-    for (auto* obj : oldObjects_) {
-        if (!obj->marked() && !obj->finalized()) {
-            if (obj->desc && obj->desc->finalizer) {
-                obj->desc->finalizer(obj);
-                obj->setFinalized(true);
-            }
-        }
+    //    未来若引入非线程安全 finalizer 需加 finalizer_thread_safe 标志回退串行
+    {
+        // 合并 deadYoung + deadOld 单次 parallelFor（减少线程创建开销）
+        std::vector<GcObject*> allDead;
+        allDead.reserve(deadYoung.size() + deadOld.size());
+        allDead.insert(allDead.end(), deadYoung.begin(), deadYoung.end());
+        allDead.insert(allDead.end(), deadOld.begin(), deadOld.end());
+        parallelFor(allDead.size(), kParallelSweepThreshold,
+            [this, &allDead](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; ++i) {
+                    GcObject* obj = allDead[i];
+                    if (!obj->finalized() && obj->desc && obj->desc->finalizer) {
+                        obj->desc->finalizer(obj);
+                        obj->setFinalized(true);
+                    }
+                }
+            });
     }
 
-    // 3.5 释放未标记的 LOS 对象
+    // 3.5 释放未标记的 LOS 对象（串行——los_.release 线程安全未确认，保守）
     //     必须在 finalizer 之后（finalizer 可能访问对象字段）
     //     必须在清除 marked 标志之前（用 marked 区分存活/死亡）
     //     LOS 对象内存独立，不随页释放，需显式 release
-    for (auto* obj : youngObjects_) {
-        if (!obj->marked() && los_.contains(obj)) {
-            los_.release(obj);
-        }
+    for (auto* obj : deadYoung) {
+        if (los_.contains(obj)) los_.release(obj);
     }
-    for (auto* obj : oldObjects_) {
-        if (!obj->marked() && los_.contains(obj)) {
-            los_.release(obj);
-        }
+    for (auto* obj : deadOld) {
+        if (los_.contains(obj)) los_.release(obj);
     }
 
-    // 4. 清除存活对象的 marked 标志（为下次 GC 准备）
-    for (auto* obj : liveYoung) obj->setMarked(false);
-    for (auto* obj : liveOld)   obj->setMarked(false);
+    // 4. 清除存活对象的 marked 标志（并行分片；为下次 GC 准备）
+    parallelFor(liveYoung.size() + liveOld.size(), kParallelSweepThreshold,
+        [this, &liveYoung, &liveOld](size_t begin, size_t end) {
+            size_t youngTotal = liveYoung.size();
+            for (size_t i = begin; i < end; ++i) {
+                GcObject* obj = (i < youngTotal) ? liveYoung[i] : liveOld[i - youngTotal];
+                obj->setMarked(false);
+            }
+        });
 
     youngObjects_ = std::move(liveYoung);
     oldObjects_   = std::move(liveOld);
@@ -446,12 +495,20 @@ void GcHeap::sweepPhaseAll() {
             compactAndReclaim();
         }
         // 阶段 2：中页 compact（滑动窗口搬运）
-        if (shouldCompactMedium()) {
-            compactMediumPages();
-        }
+        bool mediumMoved = shouldCompactMedium();
+        if (mediumMoved) compactMediumPages();
         // 阶段 2：大页 mark-sweep（分配失败率触发）
-        if (shouldSweepLargePages()) {
-            sweepLargePages();
+        bool largeMoved = shouldSweepLargePages();
+        if (largeMoved) sweepLargePages();
+
+        // 统一引用更新：原先 compactMediumPages/sweepLargePages 各自内部调用
+        // updateMediumPageReferences（各 4 趟全量遍历），两者同时执行时重复遍历
+        // ——合并为一次。安全性：两函数返回前已将 youngObjects_/oldObjects_
+        // vector 元素更新为新地址（forwarded=false），不依赖 savedDescs_
+        if (mediumMoved || largeMoved) {
+            updateMediumPageReferences();
+            // 高水位归还：须在引用更新之后（旧中页数据区仍存有 forwardingPtr）
+            if (mediumMoved) reclaimExcessMediumPages();
         }
     }
 
@@ -540,6 +597,10 @@ void GcHeap::mixedGc() {
             compactPending_.store(true, std::memory_order_release);
         } else {
             compactMediumPages();
+            // 引用更新已从 compactMediumPages 内部移出（避免与 sweepPhaseAll
+            // 重复遍历）——独立调用路径必须在此补上，否则悬垂指针
+            updateMediumPageReferences();
+            reclaimExcessMediumPages();
         }
     }
 }

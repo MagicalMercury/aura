@@ -32,9 +32,24 @@ bool GcHeap::shouldCompact(CompactScope scope) {
     for (Page* p = headPage_; p; p = p->next) pageCount++;
 
     size_t totalPageBytes = pageCount * kPageSize;
-    size_t usedBytes = youngBytes_ + oldBytes_;
-    size_t fragmentation = (totalPageBytes > usedBytes)
-                          ? (totalPageBytes - usedBytes) * 100 / totalPageBytes
+    // 碎片率口径修正：分子分母必须同口径——只统计小页对象的字节。
+    // 原实现用 youngBytes_ + oldBytes_（含中页/大页/LOS 对象），当这些对象
+    // 存在时 usedBytes 恒 > totalPageBytes → fragmentation 恒 0 → compact 永不触发
+    size_t smallPageBytes = 0;
+    for (auto* obj : youngObjects_) {
+        if (los_.contains(obj)) continue;       // LOS 对象跳过
+        if (findMediumPage(obj)) continue;       // 中页对象跳过
+        if (findLargePage(obj)) continue;        // 大页对象跳过
+        smallPageBytes += obj->allocSize();
+    }
+    for (auto* obj : oldObjects_) {
+        if (los_.contains(obj)) continue;
+        if (findMediumPage(obj)) continue;
+        if (findLargePage(obj)) continue;
+        smallPageBytes += obj->allocSize();
+    }
+    size_t fragmentation = (totalPageBytes > smallPageBytes)
+                          ? (totalPageBytes - smallPageBytes) * 100 / totalPageBytes
                           : 0;
 
     if (scope == CompactScope::Young) {
@@ -188,15 +203,21 @@ void GcHeap::computeForwardingAddresses(CompactScope scope) {
 
 void GcHeap::copyObjectsToNewLocations(CompactScope /*scope*/) {
     // 拷贝式压缩：从旧地址 memcpy 到新地址（新页与旧页不重叠，无覆盖风险）
-    for (const auto& entry : compactEntries_) {
-        std::memcpy(entry.newAddr, entry.oldAddr, entry.size);
+    // 并行化：compactEntries_ 每条 entry 独立（不同 entry 写不同 newAddr），只读遍历安全
+    size_t total = compactEntries_.size();
+    parallelFor(total, kParallelCopyThreshold,
+        [this](size_t begin, size_t end) {
+            for (size_t i = begin; i < end; ++i) {
+                const auto& entry = compactEntries_[i];
+                std::memcpy(entry.newAddr, entry.oldAddr, entry.size);
 
-        // 恢复完整头部（从备份，不依赖可能已被 overwrite 的源内存）
-        entry.newAddr->desc = entry.desc;
-        entry.newAddr->allocSize_ = entry.allocSize;
-        entry.newAddr->flags_ = entry.flags;
-        entry.newAddr->setForwarded(false);
-    }
+                // 恢复完整头部（从备份，不依赖可能已被 overwrite 的源内存）
+                entry.newAddr->desc = entry.desc;
+                entry.newAddr->allocSize_ = entry.allocSize;
+                entry.newAddr->flags_ = entry.flags;
+                entry.newAddr->setForwarded(false);
+            }
+        });
     // 注：compactEntries_/savedDescs_ 的清理移交 compact() 主流程
     //（relocateGlobalRootPtrs 需 compactEntries_ 的 oldAddr→newAddr→size 映射）
 }
@@ -331,27 +352,22 @@ void GcHeap::updateAllReferences(CompactScope scope) {
         }
     }
 
-    // 4. 更新对象字段
-    // Bug 3 修复：Young 模式也扫描所有 oldObjects_，而非仅 rememberedSet_。
+    // 4+5. 更新对象字段 + 内联数组元素（合并单次遍历 + 分片并行）
+    // Bug 3 修复语义保持：统一扫描所有 young + old 对象，而非仅 rememberedSet_。
     // 写屏障仅覆盖显式 gc_write_barrier 调用，存在遗漏路径（如 flatten 设置 flat_cache_
     // 在 Bug 4 修复前无写屏障；promoteToOld 晋升时未扫描字段在 Bug 5 修复前未扫描）。
     // 遗漏的 old→young 引用若仅扫 rememberedSet_，young 对象移动后不会被更新 → 悬垂指针。
-    // 改为统一扫描所有 old 对象，性能损失可接受（minor GC 频率高但 old 对象数量有限）。
-    if (scope == CompactScope::All) {
-        for (auto* obj : youngObjects_) updateObjectFields(obj);
-        for (auto* obj : oldObjects_)   updateObjectFields(obj);
-    } else {
-        for (auto* obj : youngObjects_) updateObjectFields(obj);
-        for (auto* obj : oldObjects_)   updateObjectFields(obj);
-    }
-
-    // 5. 更新数组元素（同理）
-    if (scope == CompactScope::All) {
-        for (auto* obj : youngObjects_) updateInlineArrayElements(obj);
-        for (auto* obj : oldObjects_)   updateInlineArrayElements(obj);
-    } else {
-        for (auto* obj : youngObjects_) updateInlineArrayElements(obj);
-        for (auto* obj : oldObjects_)   updateInlineArrayElements(obj);
+    {
+        size_t youngTotal = youngObjects_.size();
+        size_t total = youngTotal + oldObjects_.size();
+        parallelFor(total, kParallelUpdateThreshold,
+            [this, youngTotal](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; ++i) {
+                    GcObject* obj = (i < youngTotal) ? youngObjects_[i]
+                                                     : oldObjects_[i - youngTotal];
+                    updateObjectAllFields(obj);
+                }
+            });
     }
 
     // 6. 更新 weakHandles_
@@ -520,6 +536,47 @@ void GcHeap::updateInlineArrayElements(GcObject* obj) {
         for (int32_t j = 0; j < count; ++j) {
             if (elems[j] && elems[j]->forwarded()) {
                 elems[j] = elems[j]->forwardingPtr();
+            }
+        }
+    }
+}
+
+// 合并的字段 + 内联数组更新（单次遍历，desc 解析一次——缓存友好）。
+// updateAllReferences 并行分片路径使用；中页/大页路径（updateMediumPageReferences）
+// 仍用上面两个分立函数。
+void GcHeap::updateObjectAllFields(GcObject* obj) {
+    // 对象可能已 forwarded（desc 被覆盖为 forwardingPtr），需从 savedDescs_ 获取原始 desc
+    const TypeDescriptor* desc;
+    if (obj->forwarded()) {
+        auto it = savedDescs_.find(obj);
+        if (it == savedDescs_.end()) return;
+        desc = it->second;
+    } else {
+        desc = obj->desc;
+    }
+    // P2b：动态 desc 钩子应用在 desc 恢复之后（dynamicDesc 依赖运行时字段如 index_）
+    if (desc && desc->dynamicDesc) desc = desc->dynamicDesc(obj);
+    if (!desc) return;
+
+    char* base = reinterpret_cast<char*>(obj);
+    // 指针字段
+    for (size_t i = 0; i < desc->ptrFieldCount; ++i) {
+        GcObject** fieldPtr = reinterpret_cast<GcObject**>(base + desc->ptrFieldOffsets[i]);
+        if (*fieldPtr && (*fieldPtr)->forwarded()) {
+            *fieldPtr = (*fieldPtr)->forwardingPtr();
+        }
+    }
+    // 内联数组元素
+    if (desc->inlineArrayFieldCount && desc->inlineArrayFields) {
+        for (size_t i = 0; i < desc->inlineArrayFieldCount; ++i) {
+            const InlineArrayField& iaf = desc->inlineArrayFields[i];
+            if (!iaf.isPtrArray) continue;
+            int32_t count = *reinterpret_cast<int32_t*>(base + iaf.lengthOffset);
+            GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
+            for (int32_t j = 0; j < count; ++j) {
+                if (elems[j] && elems[j]->forwarded()) {
+                    elems[j] = elems[j]->forwardingPtr();
+                }
             }
         }
     }
@@ -694,27 +751,16 @@ void GcHeap::compactMediumPages() {
         for (auto& obj : oldObjects_)   if (obj == oldAddr) obj = newAddr;
     }
 
-    // 更新所有对象的字段引用
-    updateMediumPageReferences();
+    // 注：字段引用更新（updateMediumPageReferences）与高水位归还
+    // 已移至调用方统一执行（sweepPhaseAll/mixedGc 等）——中页 compact 与
+    // 大页 sweep 同时执行时避免重复全量遍历；高水位归还必须在引用更新之后
+    //（旧中页数据区仍存有 forwardingPtr，先 munmap 再读会段错误）
 
     // 重定位位于中页对象内部的 globalRoots_ rootPtr（对象被搬运后 &val_ 悬垂，
     // 见 relocateGlobalRootPtrs 方案 P 说明；旧中页已进 freeMediumPages_，只做地址运算）
     relocateRootsInForwardMap(forwardMap);
 
     savedDescs_.clear();
-
-    // 高水位归还：若 freeMediumPages_ > usedMediumPages_ / 4，归还多余页给 OS
-    size_t usedCount = 0;
-    for (MediumPage* p = mediumPages_; p; p = p->next) usedCount++;
-    size_t freeCount = freeMediumPages_.size();
-    if (freeCount * kFreeMediumHighWatermarkRatio > usedCount) {
-        size_t keepCount = usedCount / kFreeMediumHighWatermarkRatio;
-        while (freeMediumPages_.size() > keepCount) {
-            MediumPage* p = freeMediumPages_.back();
-            freeMediumPages_.pop_back();
-            freeMediumPage(p);
-        }
-    }
 }
 
 void GcHeap::updateMediumPageReferences() {
@@ -745,13 +791,20 @@ void GcHeap::updateMediumPageReferences() {
         }
     }
 
-    // 更新对象字段
-    for (auto* obj : youngObjects_) updateObjectFields(obj);
-    for (auto* obj : oldObjects_)   updateObjectFields(obj);
-
-    // 更新数组元素
-    for (auto* obj : youngObjects_) updateInlineArrayElements(obj);
-    for (auto* obj : oldObjects_)   updateInlineArrayElements(obj);
+    // 更新对象字段 + 内联数组元素（原 4 趟串行合并为 1 趟并行，
+    // 复用 updateObjectAllFields：desc 只解析一次，缓存友好）
+    {
+        size_t youngTotal = youngObjects_.size();
+        size_t total = youngTotal + oldObjects_.size();
+        parallelFor(total, kParallelUpdateThreshold,
+            [this, youngTotal](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; ++i) {
+                    GcObject* obj = (i < youngTotal) ? youngObjects_[i]
+                                                     : oldObjects_[i - youngTotal];
+                    updateObjectAllFields(obj);
+                }
+            });
+    }
 
     // 更新 weakHandles_
     {
@@ -782,6 +835,24 @@ void GcHeap::updateMediumPageReferences() {
             }
         }
         rememberedSet_ = std::move(newRemembered);
+    }
+}
+
+// 中页高水位归还：若 freeMediumPages_ > usedMediumPages_ / 4，归还多余页给 OS。
+// 时序约束：必须在 updateMediumPageReferences() 之后调用——旧中页数据区仍存有
+// 对象的 forwardingPtr（字段引用更新需读取），先 munmap 再读会段错误。
+// （原位于 compactMediumPages 末尾；引用更新移至调用方后一并迁出）
+void GcHeap::reclaimExcessMediumPages() {
+    size_t usedCount = 0;
+    for (MediumPage* p = mediumPages_; p; p = p->next) usedCount++;
+    size_t freeCount = freeMediumPages_.size();
+    if (freeCount * kFreeMediumHighWatermarkRatio > usedCount) {
+        size_t keepCount = usedCount / kFreeMediumHighWatermarkRatio;
+        while (freeMediumPages_.size() > keepCount) {
+            MediumPage* p = freeMediumPages_.back();
+            freeMediumPages_.pop_back();
+            freeMediumPage(p);
+        }
     }
 }
 
@@ -873,8 +944,8 @@ void GcHeap::sweepLargePages() {
         newAddr->setForwarded(false);
     }
 
-    // 更新引用（复用中页的引用更新逻辑）
-    updateMediumPageReferences();
+    // 注：字段引用更新（updateMediumPageReferences）已移至调用方统一执行
+    //（sweepPhaseAll/mixedGc 等）——中页 compact 与大页 sweep 同时执行时避免重复全量遍历
 
     // 重定位位于大页对象内部的 globalRoots_ rootPtr（大页 sweep 同样搬运对象，
     // 见 relocateGlobalRootPtrs 方案 P 说明；只做地址运算，不 deref 旧地址）

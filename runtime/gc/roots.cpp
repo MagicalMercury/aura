@@ -9,6 +9,11 @@
 
 #include "gc.h"
 #include <algorithm>
+#ifdef _WIN32
+#include <windows.h>   // OpenThread/CloseHandle（P2 中断句柄）
+#else
+#include <pthread.h>   // pthread_self（P2 中断句柄）
+#endif
 
 namespace aura_rt {
 
@@ -64,6 +69,22 @@ GcHeap::ThreadRootList* GcHeap::ensureThreadRootList() {
         std::lock_guard<std::mutex> lk(threadRootLists_m_);
         threadRootLists_.push_back(list);
     }
+    // P2：懒注册中断句柄。此处覆盖所有产生根链表的路径：
+    //   worker（registerThread→本函数）/ EventLoop 主线程（同）/ 任意线程
+    //   首建 GcRootHandle（懒调用）。入口 tl_roots_ 早退保证每线程仅注册一次。
+    //   句柄生命周期与 tl_roots_ 绑定（releaseThreadRootList 同步移除）。
+    {
+        auto tid = std::this_thread::get_id();
+        std::lock_guard<std::mutex> lk(threadHandlesM_);
+#ifdef _WIN32
+        // THREAD_SET_CONTEXT 是 QueueUserAPC 的必需权限（自身线程，OpenThread 不会失败；
+        // 防御：失败得 NULL 入表，投递时 QueueUserAPC 返回 0 静默忽略）
+        HANDLE h = OpenThread(THREAD_SET_CONTEXT, FALSE, GetCurrentThreadId());
+        threadHandles_.push_back({tid, h});
+#else
+        threadHandles_.push_back({tid, static_cast<unsigned long>(pthread_self())});
+#endif
+    }
     return list;
 }
 
@@ -74,6 +95,21 @@ void GcHeap::releaseThreadRootList() {
         std::lock_guard<std::mutex> lk(threadRootLists_m_);
         auto it = std::find(threadRootLists_.begin(), threadRootLists_.end(), tl_roots_);
         if (it != threadRootLists_.end()) threadRootLists_.erase(it);
+    }
+    // P2：同步移除中断句柄（与根链表生命周期对齐）。
+    // 竞态说明：broadcastInterrupt 可能已快照到本句柄——Linux pthread_kill 得
+    // ESRCH、Win QueueUserAPC 得失效句柄返回 0，均静默忽略，停靠靠轮询兜底
+    {
+        auto tid = std::this_thread::get_id();
+        std::lock_guard<std::mutex> lk(threadHandlesM_);
+        auto it = std::find_if(threadHandles_.begin(), threadHandles_.end(),
+            [tid](const ThreadHandle& th) { return th.id == tid; });
+        if (it != threadHandles_.end()) {
+#ifdef _WIN32
+            if (it->native) CloseHandle(static_cast<HANDLE>(it->native));
+#endif
+            threadHandles_.erase(it);
+        }
     }
     delete tl_roots_;
     tl_roots_ = nullptr;

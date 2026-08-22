@@ -72,6 +72,9 @@ void EventLoop::run(task<void>& mainTask) {
         // 2. 主协程完成 → 退出
         if (handle.done()) break;
 
+        // 2.5 阶段 2.2：响应 GC STW（协程全挂起时主线程在 IOCP 轮询不响应——停靠缺口）
+        gc.safepoint();
+
         // 3. 无就绪协程 + 有待处理 I/O → 轮询 IOCP
         if (ready_.empty()) {
 #ifdef _WIN32
@@ -122,8 +125,13 @@ void EventLoop::processReady() {
 
 #ifdef _WIN32
 void EventLoop::processIocp() {
-    auto result = IoCompletionPort::instance().getCompletion(10);  // 10ms 超时
+    // P2：10ms→1ms——GC 发起 Finalize 后主线程最坏阻塞从 10ms 降到 1ms；
+    //     broadcastInterrupt 的伪完成包（kGcWakeupKey）可进一步强制立即返回
+    auto result = IoCompletionPort::instance().getCompletion(1);
     if (result.valid) {
+        // P2：GC 唤醒伪完成包——不回调、不减 pending，直接返回；
+        //     外层循环的 gc.safepoint() 立即执行 → Finalize 分支停靠
+        if (result.key == IoCompletionPort::kGcWakeupKey) return;
         IoCompletionPort::instance().invokeCallback(result.bytes, result.ov);
         decPending();
     }

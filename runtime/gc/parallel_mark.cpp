@@ -186,6 +186,9 @@ void GcHeap::finalizeMarking() {
             ++mixedGcCount_;
             sweepPhaseYoung();
             compactMediumPages();
+            // 引用更新已从 compactMediumPages 内部移出——独立调用路径必须补上
+            updateMediumPageReferences();
+            reclaimExcessMediumPages();
             break;
         case 2:  // Major
             ++gcCount_;
@@ -194,6 +197,8 @@ void GcHeap::finalizeMarking() {
             break;
         default:  // 3: SweepLarge
             sweepLargePages();
+            // 引用更新已从 sweepLargePages 内部移出——独立调用路径必须补上
+            updateMediumPageReferences();
             break;
     }
     // 5. 清标志（phase_=Idle 由 startConcurrentGc 与唤醒一起做）

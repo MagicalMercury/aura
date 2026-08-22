@@ -22,6 +22,7 @@
 // ============================================================
 
 #include "../gc.h"
+#include "../gc/gc_interrupt.h"  // gc_interruptible_sleep（P2 可中断 sleep）
 #include "../types.h"        // Error
 #include "error.h"           // make_runtime_error
 #include "string.h"          // make_string
@@ -78,7 +79,7 @@ struct Mutex : GcObject {
                 // 或 GC 正在请求 STW。主动响应 safepoint，避免本线程成为
                 // 无法到达 safepoint 的"卡死"线程。
                 gc_safepoint();
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                gc_interruptible_sleep(std::chrono::microseconds(100));  // P2：1ms→100μs 可中断
             }
             // 获取锁成功，记录持有者
             m_->inner_->owner.store(cur, std::memory_order_release);
@@ -183,8 +184,8 @@ struct RWMutex : GcObject {
                     if (rw_->inner_->generation.load(std::memory_order_acquire) != gen) break;
                     std::this_thread::yield();
                 }
-                // 仍无变化则 sleep 1ms 重试
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                // 仍无变化则 sleep 重试（P2：1ms→100μs 可中断）
+                gc_interruptible_sleep(std::chrono::microseconds(100));
             }
         }
         ~ReadGuard() {
@@ -242,7 +243,7 @@ struct RWMutex : GcObject {
                     rw_->inner_->m.unlock();
                 }
                 gc_safepoint();
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                gc_interruptible_sleep(std::chrono::microseconds(100));  // P2：1ms→100μs 可中断
             }
         }
         ~WriteGuard() {
@@ -321,7 +322,7 @@ struct Once : GcObject {
         while (!self->m_->try_lock()) {
             if (self->done_->load(std::memory_order_acquire)) return;
             gc_safepoint();   // GC compact 后 self 会被 GcRootHandle 更新
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            gc_interruptible_sleep(std::chrono::microseconds(100));  // P2：1ms→100μs 可中断
         }
         // RAII 守卫：异常安全，确保 f() 抛异常时 m_ 也能 unlock
         // 否则 m_ 永久持锁 → 其他线程死锁在 try_lock 轮询

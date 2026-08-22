@@ -66,7 +66,12 @@ GcObject* GcHeap::tryAlloc(size_t size, const TypeDescriptor* desc) {
         tlab->bumpOffset + size <= kPageSize) {
         // L1 safepoint：内存分配点检查 GC 暂停请求
         // 若 gcPending_，走慢路径进入 safepoint（避免在 TLAB 快路径中错过 STW）
-        if (gcPending_.load()) {
+        // 🔴 阶段1+2 实测修复（wait=54ms 根因）：Marking 期 gcPending_ 已被 initiator 消费（false），
+        //    执行任务的 worker 在 TLAB 快路径无 safepoint → 不响应 Finalize/Handshake 停靠（等任务结束才停）。
+        //    补充 phase 检查：Finalize/Handshake 时走慢路径（safepoint 停靠）；
+        //    Idle/Marking 期保持快路径（无额外开销）。
+        GcPhase ph = phase_.load(std::memory_order_acquire);
+        if (gcPending_.load() || ph == GcPhase::Finalize) {  // 阶段3 加 || ph == GcPhase::Handshake
             return tryAllocSlow(size, desc);
         }
 
@@ -135,6 +140,13 @@ GcObject* GcHeap::tryAllocSlow(size_t size, const TypeDescriptor* desc) {
         lk.unlock();
         gcPending_.store(true);
         safepoint();
+        // 🔴 二次审查修正（Marking 期 OOM）：safepoint 在 Marking 期穿透（sweep 未执行），
+        // 若 GC 仍在进行，等当前周期结束再重试
+        // ⚠️ 不能持 all_stopped_m_ 等待（gcThreadMain 的 Finalize 停靠需要该锁 → 死锁）；
+        //    低频失败路径用不持锁轮询（粒度可接受）；阶段 3 升级为 gcDoneCv_ 精确等待
+        while (phase_.load(std::memory_order_acquire) == GcPhase::Marking) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
         lk.lock();
         mem = bumpAlloc(size);
     }

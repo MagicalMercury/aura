@@ -374,13 +374,16 @@ GC 其他功能清单（基于 2026-07-19 重新核验）
       - 缺：mark 阶段并发执行，仅 sweep 阶段暂停
       - 风险：需要读屏障/写屏障配合，极复杂
 
-[~] P3  GC 日志与统计  [部分完成]
+[x] P3  GC 日志与统计  [2026-08-11 完成]
       - ✅ 已完成：gc_stats_string() 返回格式化字符串 + Aura gc_stats() 内置函数
-        （runtime/gc.cpp:301-309, BuiltinRegistry 注册）
-      - ❌ 未实施：verbose_ 开关 + logGcEvent 事件级日志
-        （每次 GC 触发时机、耗时、回收字节数）
-      - 剩余工作：通过 #gc.verbose = true 配置开启事件日志
-      - 对应：plan/gc_features_plan.md §十七 ⚠️ 部分完成
+        （runtime/gc/safepoint.cpp gc_stats_string + builtins/builtin.aurai 注册）
+      - ✅ 已完成：单次 GC 事件日志——AURA_GC_LOG 环境变量（标签+级别细粒度）
+        （runtime/gc/gc.cpp parseGcLogEnv + safepoint.cpp recordGcEvent/logGcEvent；
+         标签：gc/gc/phase/gc/memory/gc/trigger；级别：trace<debug<info<warning<error；
+         输出 gctrace 风格三阶段耗时 roots+mark+finalize；gc_stats 补 last= 字段）
+      - 用法示例：AURA_GC_LOG=gc=info test.exe（stderr 每次 GC 一行）；
+        AURA_GC_LOG=gc/phase=debug / gc*=trace
+      - 对应：plan/GC事件日志与单次耗时测量plan.md（工作流 4 已实施）
 
 ================================================================
 [ 六 ] 运行时库改进（plan/gcstring_optimization.md, plan/plan13.md）

@@ -46,6 +46,7 @@ endif()
 add_library(aura_rt STATIC
     types.cpp
     gc/gc.cpp
+    gc/gc_interrupt.cpp   # P2：跨平台中断抽象（gc_interruptible_sleep）
     gc/alloc.cpp
     gc/tlab.cpp
     gc/roots.cpp
@@ -61,6 +62,13 @@ add_library(aura_rt STATIC
     builtin/mutex.cpp
     win_iocp.cpp
 )
+
+# P2：平台专用中断原语（Linux SIGURG / Windows APC + IOCP 伪完成包）
+if(WIN32)
+    target_sources(aura_rt PRIVATE gc/safepoint_interrupt_win.cpp)
+else()
+    target_sources(aura_rt PRIVATE gc/safepoint_signal_linux.cpp)
+endif()
 
 target_include_directories(aura_rt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aura_rt PUBLIC stdc++exp)   # <filesystem> (某些 GCC 版本需要)
