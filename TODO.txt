@@ -7,7 +7,42 @@
 #   - 优先级 P0=必须 / P1=重要 / P2=可改进 / P3=远期
 #
 # 数据来源：READMEs/ + plan/ + src/ 实际代码三方对照
-# 最近更新：2026-08-07（GC 稳健性三 issue 综合修复全部落地，详见 plan/GC稳健性三issue综合修复.md
+# 最近更新：2026-08-22（第二轮：Optional<Iterator> GC 安全 + 嵌套泛型物化 +
+#            unwrap 推断修复）
+#            * 完成：[二] P2 Optional<Iterator<T>>（some(it)）GC 安全——optional.h
+#              desc() 插入 is_iface_view_v<T> 分支（value_+self 复合子偏移），
+#              test.aura U1-U5 全过（117 次 GC 含 compact 无悬垂）；同步更新
+#              READMEs/03-types.md 新增「Optional<T> 创建详解」小节（三种创建方式 /
+#              none() 元素类型上下文推导 / GC 语义表）+ 修正 Iterator 变体过时的
+#              "暂拦截"描述（见 [二] 对应 [x] 条目）
+#            * 附带修复（实施中发现，后补完整）：SemAnalyzer.cpp 嵌套泛型物化——
+#              新增 cppNameOfTypeExpr 递归函数（L62-95），materializeCanonicalName
+#              两分支统一改用：任意深度嵌套 / ListType / namespacePrefix 全限定 /
+#              用户泛型实例补 * 全覆盖（原 cppNameOf 只取顶层名：丢 <int> 多旧 *）
+#            * 完成：[二] P2 unwrap() 返回类型推断（同日发现同日修）——typeKey
+#              提取加 OptionalSemType 分支（ExprInfer.cpp:443-446，+4 行），
+#              命中 registry "T" 路径走 elemTypeOf 闭环；test.aura U1 删标注、
+#              U5 链式调用 o5.unwrap().collect().length 均通过
+#            2026-08-22（TODO 全面核账：修正滞后标记 + 补记 2026-08-07 后完成工作）
+#            * 修正：[五] P3 并发 GC 实际早已完成（SATB + Marking/Finalize 状态机 +
+#              startConcurrentGc + bornObjects_ + concurrentGcEnabled_ 全套落地），
+#              改标 [x]
+#            * 补记 2026-08-11 完成：GC 异步日志（GcLogWriter 后台线程 + gcLogEnqueue，
+#              解决 gcLogFputs 全局锁串行化瓶颈；见 [五] GC 日志与统计条目）
+#            * 补记 2026-08-22 完成：P0 STW 优化三项（notifyIdleWakeups 前移到
+#              phase_=Finalize 之前消除 50ms 空转 / scanRootsOnly 并行化（阈值 8，
+#              scanStackCandidate 提取）/ finalizer 并行化（deadYoung+deadOld 合并
+#              allDead 单 parallelFor，LOS 串行保守），见 plan/p0_optimization_report.md）
+#            * 补记 2026-08-22 完成：P2 中断驱动 safepoint（Linux SIGURG 空信号 +
+#              Windows QueueUserAPC/SleepEx(alertable) + IOCP 伪完成包 postWakeup +
+#              EventLoop 停靠缺口封堵；cv 兜底 50→5ms、sleep 1ms→100μs 可中断、
+#              GQCS 10→1ms；stalls 20→200/40→400 保持 abort 语义；两级回退开关
+#              AURA_INTERRUPT_SAFEPOINT + g_disableInterrupt；见
+#              plan/P2_signal_driven_safepoint_plan.md + change.md）
+#            * 补记 2026-08-07 完成（漏记）：match 分支 _match_val 跨 GC 保护 +
+#              tryAllocSlow memset + threadRootLists_ node 方向 B（ViewRoot 转 Global）
+#              已在下方 [五] 各条目记录，此处补日期戳
+#            2026-08-07（GC 稳健性三 issue 综合修复全部落地，详见 plan/GC稳健性三issue综合修复.md
 #            + change.md）：
 #            * tryAllocSlow 补 memset（与 TLAB/medium/large 对齐）
 #            * match 分支 _match_val GcRootHandle Ref 模式包裹 + 堆变体/Optional 堆元素
@@ -16,7 +51,7 @@
 #              genFunExpr 视图捕获 init-capture 转 Global，compact 层零改动）
 #            2026-08-07（联合变体含接口已放开：Variant::descForI is_iface_view self
 #            子偏移 + genUnionBoxing ViewRoot 包裹，p2.1 u1-u4 用例通过；
-#            内置 Iterator 变体仍保持拦截，见 [二] P2 评估放开 issue）
+#            内置 Iterator 变体 2026-08-10 亦已放开，见 [二] [x] 条目）
 #            2026-08-06（compact 悬垂 rootPtr 地址 issue 已修复并通过 iter_gc_test
 #            全 5 用例 + ASAN 验证：compact 期间用 oldAddr→newAddr 映射重定位堆内
 #            globalRoots rootPtr + 同步改写对象内 GcRootHandle::ptr_ref_ 槽位；
@@ -141,7 +176,7 @@
             Iterator|None 不折叠路径）+ 6.aura 全量回归（u1-u4 接口变体、m1-m11）
             ALL TESTS PASSED；错误用例（fun 变体/嵌套联合）仍拦截
       - 已知限制：联合上直接方法调用（v.map(f)）不支持（下方独立 P2 条目）；
-        Optional<Iterator<T>>（some(it)）GC 不安全（下方独立 P2 条目）
+        Optional<Iterator<T>>（some(it)）GC 安全已修复（2026-08-22，下方 [x] 条目）
 
 [ ] P2  联合上直接调用迭代器方法（v.map(f)，v 为 Iterator<T> | X）  [2026-08-10 提出，本轮不修]
       - 背景：change.md（math 内置模块 + 放开 Iterator 变体拦截）§6 已知限制 1。
@@ -163,15 +198,45 @@
       - 现状 workaround：match 提取分支后调用
       - 文件：src/Sema/Checker/ExprInfer.cpp、src/CodeGen/ExprGen.cpp
 
-[ ] P2  Optional<Iterator<T>>（some(it)）GC 安全  [2026-08-10 提出，本轮不修]
+[x] P2  Optional<Iterator<T>>（some(it)）GC 安全  [2026-08-22 完成]
       - 背景：change.md（math 内置模块 + 放开 Iterator 变体拦截）§6 已知限制 2。
         Optional<T>::desc 仅对 is_pointer_v<T> 注册 value_ 偏移（optional.h:30-43），
         Iterator<T> 是值视图（非指针）→ value_ 内 self 指针 GC 不可见 → compact 后悬垂
-      - 现状：`Iterator<T> | None` 不折叠为 Optional（unionVariantGcUnsafe(GenericSemType)
-        =false），不受影响；仅显式 some(it) 构造 Optional<Iterator<T>> 触发
-      - 方案：Optional desc 增加 is_iface_view 子偏移注册（仿 variant.h descForI L74-79），
-        或 Sema 拦截 some(迭代器)
-      - 文件：runtime/builtin/optional.h
+      - ✅ 已完成（方案 A：desc 增加 is_iface_view 子偏移注册）：optional.h desc()
+        插入 is_iface_view_v<T> 分支（复 include variant.h 复用 trait），复合偏移
+        offsetof(value_) + offsetof(T, self)——与 Variant::descForI 同型已验证模式；
+        否决方案 B（Sema 拦截 some(迭代器)）：只堵不修且覆盖面窄
+      - ✅ 测试：example/test.aura U1-U5（悬垂/none 安全/指针回归/值回归/百轮压力）
+        全过，117 次 GC 无崩溃无回归；详见 plan/Optional迭代器GC安全修复.md + change.md
+      - 附带修复（实施中发现的编译器缺陷，2026-08-22 第二轮补完整）：
+        materializeCanonicalName 嵌套泛型参数递归展开——新增匿名 namespace
+        cppNameOfTypeExpr（SemAnalyzer.cpp:62-95，递归拼接 TypeExpr 完整 C++
+        模板参数形态），RecordSemType / GenericSemType 两分支统一改用；
+        覆盖任意深度嵌套 NamedType（修复原 cppNameOf 只取顶层名：丢 <int>
+        多旧指针 *）/ ListType（Optional<[int]> → aura_rt::Array<E>*，与
+        mapType 一致）/ namespacePrefix 全限定查表（sync.Channel<int>）/
+        用户泛型实例补 *（Tree<int> → Tree<int32_t>*，堆指针语义）；
+        泛型形参保留裸名；Tuple/Union/Function/未注册全限定名返回空（维持
+        旧路径行为，本应被上游拦截）
+      - 遗留（Sema 既有缺陷）：unwrap() 返回类型推断——已修复（下方 [x] 条目）
+
+[x] P2  Optional.unwrap() 返回类型推断（receiver 为 OptionalSemType 时静默放行）  [2026-08-22 发现，同日修复]
+      - 现象：`let it = opt.unwrap()` 推断结果为 ErrorSemType → it 的
+        inferredType 非 Iterator → CodeGen objIsIterator 判定失败 → 生成
+        `it->collect()`（值类型用 -> 编译错误）
+      - 根因：inferMethodCall 的 typeKey 提取（ExprInfer.cpp:438-451）只处理
+        Prim（string）/ List / Generic 三类 receiver，不含 OptionalSemType →
+        typeKey 为空 → 查表路径直接跳到「不在表中 → 放行」返回
+        ErrorSemType（静默，无诊断）
+      - 修复（ExprInfer.cpp:443-446，+4 行）：typeKey 提取加 OptionalSemType
+        分支（typeKey = "Optional"）→ 命中 registry unwrap 条目
+        （Generic(0,"T")）→ semTypeFromBuiltinReturn "T" 分支（SemAnalyzer.cpp
+        L340-342）走 elemTypeOf(objType) 提取元素类型（elemTypeOf 已支持
+        Optional）→ 闭环。TODO 原方案担心的 "'T' 只对 List 生效" 不成立：
+        "T" 分支实现就是 elemTypeOf(objType)，Optional 直接复用
+      - 验证：test.aura U1 删显式标注（let it1 = opt1.unwrap()）、U5 直接
+        链式调用（o5.unwrap().collect().length）均通过；全量回归
+        ALL TESTS PASSED；READMEs/03-types.md 同步删除"需显式标注"注意事项
 
 [ ] P3  math 函数仅 float 签名（联合签名 math.abs(int|float) 推迟）  [2026-08-10 提出]
       - 背景：change.md（math 内置模块 + 放开 Iterator 变体拦截）§6 已知限制 3。
@@ -369,10 +434,20 @@ GC 其他功能清单（基于 2026-07-19 重新核验）
       - 暂不实施原因：当前无配置系统（ConfigDecl 未实现）
       - 远期改进：待 Aura 配置系统完善后再做
 
-[ ] P3  并发 GC（concurrent marking）
-      - 现状：GC 全程 stop-the-world
-      - 缺：mark 阶段并发执行，仅 sweep 阶段暂停
-      - 风险：需要读屏障/写屏障配合，极复杂
+[x] P3  并发 GC（concurrent marking）  [实际早已完成，2026-08-22 核账改标]
+      - ✅ 已完成：SATB 写屏障（safepoint.cpp:29-36，markingInProgress_ 时旧引用
+        入 satbQueue_）+ GcPhase::Marking/Finalize 状态机（Marking 期 mutator 自由
+        运行，仅 Finalize STW，safepoint.cpp:45-70）+ startConcurrentGc 入口
+        （safepoint.cpp:463-507，concurrentGcEnabled_ 开关控制）+ 分配路径
+        born-marked（gc.h:440-443，markingInProgress_ 时新对象入 bornObjects_）
+        + 收尾补扫（parallel_mark.cpp:150-170，bornObjects_ + satbQueue_ + drain）
+      - 相关状态成员：gc.h:664-672（markingInProgress_/satbQueue_/bornObjects_/
+        concurrentGcEnabled_）
+      - 后续完善（均已落地）：cv 化（阶段 1）、空闲唤醒广播（阶段 2.1）、
+        P0 STW 优化三项（2026-08-22，plan/p0_optimization_report.md）、
+        P2 中断驱动 safepoint（2026-08-22，plan/P2_signal_driven_safepoint_plan.md）
+      - 原 TODO 描述"GC 全程 stop-the-world"已过时——当前架构为
+        mark 并发 + finalize STW（gctrace 风格三阶段）
 
 [x] P3  GC 日志与统计  [2026-08-11 完成]
       - ✅ 已完成：gc_stats_string() 返回格式化字符串 + Aura gc_stats() 内置函数
@@ -381,9 +456,45 @@ GC 其他功能清单（基于 2026-07-19 重新核验）
         （runtime/gc/gc.cpp parseGcLogEnv + safepoint.cpp recordGcEvent/logGcEvent；
          标签：gc/gc/phase/gc/memory/gc/trigger；级别：trace<debug<info<warning<error；
          输出 gctrace 风格三阶段耗时 roots+mark+finalize；gc_stats 补 last= 字段）
+      - ✅ 已完成（2026-08-11 补充）：异步日志输出——GcLogWriter 后台线程 +
+        gcLogEnqueue 无锁队列（gc_log_queue.h / gc_log_writer.h），替代
+        gcLogFputs 直接 fwrite 的全局锁串行化瓶颈；日志生命周期嵌套于
+        GcHeap（gcLogStart/gcLogShutdown 自由函数 + 静态指针，规避静态析构
+        顺序问题，GcHeap 构造 L130 起启动）；kEntrySize=512 防截断 +
+        appendFmt clamp 防溢出（P1-P3 修复，plan/gc_log_async_plan.md）
       - 用法示例：AURA_GC_LOG=gc=info test.exe（stderr 每次 GC 一行）；
         AURA_GC_LOG=gc/phase=debug / gc*=trace
-      - 对应：plan/GC事件日志与单次耗时测量plan.md（工作流 4 已实施）
+      - 对应：plan/GC事件日志与单次耗时测量plan.md + plan/gc_log_async_plan.md
+        （均已实施）
+
+[x] P2  中断驱动 safepoint（Finalize STW 停靠加速）  [2026-08-22 完成]
+      - 背景：Finalize STW 停靠延迟主要来自 OS 调度 + 阻塞 syscall 轮询粒度
+        （sleep 1ms / cv 兜底 50ms / IOCP 10ms）
+      - 完成（change.md 工作流 4 落地，plan/P2_signal_driven_safepoint_plan.md）：
+          * 新增跨平台中断抽象 runtime/gc/gc_interrupt.h/.cpp：
+            gc_interruptible_sleep（Linux sleep_for 遇 SIGURG EINTR 即返 /
+            Win SleepEx(alertable) 被 APC 打断）+ AURA_INTERRUPT_SAFEPOINT
+            编译宏 + g_disableInterrupt 运行时开关（两级回退）
+          * Linux SIGURG 空信号 handler（safepoint_signal_linux.cpp，对齐
+            Go 1.14+ 选型，避开 SIGUSR1 冲突；GcHeap 构造安装）
+          * Windows APC（safepoint_interrupt_win.cpp）：QueueUserAPC 空 callback
+            + IOCP 伪完成包 postWakeup（kGcWakeupKey=~0，task.cpp processIocp
+            过滤，封堵 EventLoop GQCS 停靠缺口）
+          * broadcastInterrupt（safepoint.cpp）：句柄快照遍历投递（不含自身），
+            waitForRootThreadsStopped / 传统 STW initiator 等待入口 + 每 20ms
+            （4×5ms）重发
+          * 句柄注册收敛到 ensure/releaseThreadRootList（roots.cpp，与
+            tl_roots_ 生命周期绑定，tlab.cpp 零改动）
+          * 轮询缩短：safepoint.cpp 4 处 cv 50→5ms（stalls 20→200/40→400
+            保持 1s/2s abort 语义）+ workerLoop cv 50→5ms + waitGroup/mutex/
+            channel sleep 1ms→100μs + submit acquire 1ms→100μs + GQCS 10→1ms
+      - 已知限制：CPU 密集任务不可中断（需编译器 poll 点，P3+）；Windows
+        cv/sem 非 alertable 靠轮询兜底（Windows 主收益来自轮询缩短）
+      - 测试：已通过（用户确认，2026-08-22）
+      - 文件：runtime/gc/gc_interrupt.h/.cpp、safepoint_signal_linux.cpp、
+        safepoint_interrupt_win.cpp、gc.h、gc.cpp、roots.cpp、safepoint.cpp、
+        thread_pool.cpp、builtin/mutex.h、builtin/thread_channel.h、
+        win_iocp.h/.cpp、task.cpp、CMakeLists.txt
 
 ================================================================
 [ 六 ] 运行时库改进（plan/gcstring_optimization.md, plan/plan13.md）
@@ -456,8 +567,10 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
           * src/Sema/BuiltinRegistry.h（函数签名表更新）
           * src/CodeGen/ExprGen.cpp（生成 GcRootHandle 传递而非裸指针）
       - 前置依赖：
-          * 优化 1（GcRootHandle 线程局部链表）应先实施，否则签名统一后
-            调用频次不变，mutex 开销反而增加（每次调用都构造 GcRootHandle）
+          * ✅ 优化 1（GcRootHandle 线程局部链表）已完成（2026-08-22 核账确认：
+            handles.h ValueThreadLocal 模式走 registerRootThreadLocal 线程局部
+            链表，仅 ValueGlobal 走全局容器；根注册无全局 mutex）——本条目
+            触发条件"优化 1 实施完成"已满足
           * GcRootHandle::rebind 语义明确（append 返回值赋回场景）
       - 优点：
           * 职责清晰：调用方负责 root，被调用方直接使用

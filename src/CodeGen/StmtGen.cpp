@@ -653,9 +653,11 @@ void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
             isPtr = true;
         }
         // 如果是 aura_rt::task<T>，提取 T
-        if (recType.find("aura_rt::task<") == 0) {
-            recType = recType.substr(15, recType.size() - 16);
-            if (recType.back() == '*') { recType.pop_back(); isPtr = true; }
+        // "aura_rt::task<" 长度为 14：内层 T 起始于下标 14，止于末尾 '>' 前（substr 长度 = size - 15）
+        // 原 substr(15, size-16) 偏移 1，会漏掉首字符且多截末尾，此处修正
+        if (recType.find("aura_rt::task<") == 0 && recType.size() > 15) {
+            recType = recType.substr(14, recType.size() - 15);
+            if (!recType.empty() && recType.back() == '*') { recType.pop_back(); isPtr = true; }
         }
 
         if (isPtr) {

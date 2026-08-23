@@ -48,6 +48,56 @@ std::string cppNameOf(const std::string& auraName) {
     return auraName;
 }
 
+// 递归拼接 TypeExpr 的完整 C++ 模板参数形态（materializeCanonicalName 用），
+// 修复嵌套泛型参数丢失（原 cppNameOf 只取顶层名，如 Optional<Iterator<int>>
+// 物化为 Optional<Iterator*>——丢 <int> 且多出旧指针形态 * 后缀）：
+//   - NamedType：registry 查表（namespacePrefix 拼全限定名优先）；有 typeArgs 时
+//     逐层递归展开。registry 命中的 cppType * 后缀按"嵌套元素"语义剥除
+//     （aura_rt::Iterator* → aura_rt::Iterator<int>）；未命中的用户泛型实例
+//     拼完补 *（用户泛型 record/接口实例均为堆指针）
+//   - ListType：aura_rt::Array<E>*（与 mapType L135-138 一致）
+//   - GenericTypeRef：泛型形参保留裸名
+//   - Tuple/Union/Function/Record 内联形态及未注册全限定名：返回空串，
+//     调用方拼接空参数，维持旧路径行为（这些形态本应被上游拦截）
+std::string cppNameOfTypeExpr(const TypeExpr* te) {
+    if (!te) return "";
+    if (auto* nt = dynamic_cast<const NamedType*>(te)) {
+        std::string name;
+        if (!nt->namespacePrefix.empty()) {
+            std::string fq;
+            // 预估容量：各命名空间段 + 分隔点 + 末段名，减少循环内重分配
+            fq.reserve(nt->name.size() + nt->namespacePrefix.size() * 16);
+            for (const auto& ns : nt->namespacePrefix) fq += ns + ".";
+            fq += nt->name;
+            name = cppNameOf(fq);
+            if (name == fq) return "";  // 未注册的全限定名（跨模块用户类型），无法可靠映射
+        } else {
+            name = cppNameOf(nt->name);
+        }
+        if (nt->typeArgs.empty()) return name;
+        bool userGeneric = (name == nt->name);  // registry 未命中 → 用户泛型实例
+        if (!name.empty() && name.back() == '*') name.pop_back();
+        name += "<";
+        // 预估模板参数拼接容量，减少循环内多次重分配
+        name.reserve(name.size() + nt->typeArgs.size() * 16);
+        for (size_t j = 0; j < nt->typeArgs.size(); ++j) {
+            if (j > 0) name += ", ";
+            name += cppNameOfTypeExpr(nt->typeArgs[j].get());
+        }
+        name += ">";
+        if (userGeneric) name += "*";  // 用户泛型实例是堆指针
+        return name;
+    }
+    if (auto* lt = dynamic_cast<const ListType*>(te)) {
+        std::string elem = cppNameOfTypeExpr(lt->elementType.get());
+        if (elem.empty()) return "";
+        return "aura_rt::Array<" + elem + ">*";
+    }
+    if (auto* gtr = dynamic_cast<const GenericTypeRef*>(te))
+        return cppNameOf(gtr->name);
+    return "";
+}
+
 // 将 canonicalName（如 "Pair<A, B>"）模板参数列表中名为 name 的形参替换为 cppName
 std::string replaceCanonicalArg(const std::string& canonicalName,
                                 const std::string& name,
@@ -75,6 +125,8 @@ std::string replaceCanonicalArg(const std::string& canonicalName,
     }
     parts.push_back(cur);
     std::string joined;
+    // joined 约等于 args 的字符总量，预留容量避免循环内多次重分配
+    joined.reserve(args.size());
     for (size_t i = 0; i < parts.size(); ++i) {
         if (i > 0) joined += ", ";
         auto b = parts[i].find_first_not_of(" \t");
@@ -479,6 +531,21 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
             }
             return true;
         }
+        // 泛型 record 自引用（Tree<T> 定义内 children 元素为 GenericSemType("Tree", "Tree<T>")）：
+        // source 指回类型别名原始定义 → 解析别名做结构比较，否则 Record target 对
+        // Generic source 一律拒绝——泛型函数体内递归传参（for child in node.children
+        // 再传回 Tree<T> 形参）会误报 type mismatch。
+        // 仅 TypeAlias→RecordSemType 生效（用户泛型 record）；Interface 符号（如内置
+        // Iterator）不受影响，维持原有 Union 变体匹配路径。
+        if (auto* gs = dynamic_cast<const GenericSemType*>(&source)) {
+            if (!gs->resolvedName.empty()) {
+                auto* sym = symtab_.lookup(gs->name);
+                if (sym && sym->kind == SymKind::TypeAlias && sym->type
+                    && dynamic_cast<const RecordSemType*>(sym->type.get())) {
+                    return isAssignable(target, *sym->type);
+                }
+            }
+        }
         return false;
     }
 
@@ -710,15 +777,14 @@ void SemAnalyzer::materializeCanonicalName(
         if (n.typeArgs.empty()) return;
         bool allConcrete = true;
         std::string fullName = rec->canonicalName + "<";
+        fullName.reserve(fullName.size() + n.typeArgs.size() * 16);
         for (size_t i = 0; i < n.typeArgs.size(); ++i) {
             if (i > 0) fullName += ", ";
-            std::string auraName;
-            if (auto* argNt = dynamic_cast<const NamedType*>(n.typeArgs[i].get()))
-                auraName = argNt->name;
-            else if (dynamic_cast<const GenericTypeRef*>(n.typeArgs[i].get())) {
+            if (dynamic_cast<const GenericTypeRef*>(n.typeArgs[i].get())) {
                 allConcrete = false; break;
             }
-            fullName += cppNameOf(auraName);
+            // 嵌套泛型参数递归展开（Tree<Tree<int>> 内层也完整拼接，修复丢 <int>）
+            fullName += cppNameOfTypeExpr(n.typeArgs[i].get());
         }
         fullName += ">";
         if (allConcrete) {
@@ -742,17 +808,15 @@ void SemAnalyzer::materializeCanonicalName(
         base = ti->cppType;
         if (!base.empty() && base.back() == '*') base.pop_back();
     }
+    // 模板参数统一走 cppNameOfTypeExpr 递归展开：
+    //   - 嵌套泛型（Optional<Iterator<int>>）逐层拼接，修复丢内层参数 + 旧 * 后缀
+    //   - ListType（Optional<[int]>）→ aura_rt::Array<E>*
+    //   - 泛型形参（T）保留裸名
     std::string fullName = base + "<";
+    fullName.reserve(fullName.size() + n.typeArgs.size() * 16);
     for (size_t i = 0; i < n.typeArgs.size(); ++i) {
         if (i > 0) fullName += ", ";
-        std::string auraName;
-        if (auto* argNt = dynamic_cast<const NamedType*>(n.typeArgs[i].get())) {
-            auraName = argNt->name;
-        } else if (dynamic_cast<const GenericTypeRef*>(n.typeArgs[i].get())) {
-            // 泛型形参（如 T），保留原样
-            auraName = dynamic_cast<const GenericTypeRef*>(n.typeArgs[i].get())->name;
-        }
-        fullName += cppNameOf(auraName);
+        fullName += cppNameOfTypeExpr(n.typeArgs[i].get());
     }
     fullName += ">";
     gs->resolvedName = fullName;

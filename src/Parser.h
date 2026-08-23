@@ -96,6 +96,8 @@ private:
     }
 
     // --- 解析表达式 ---
+    using ParseFn = std::unique_ptr<ASTNode> (Parser::*)();
+    std::unique_ptr<ASTNode> parseBinaryLevel(ParseFn next, const TokType* ops, size_t opCount);
     std::unique_ptr<ASTNode> parseExpr();
     std::unique_ptr<ASTNode> parseAssignment();
     std::unique_ptr<ASTNode> parseConditional();

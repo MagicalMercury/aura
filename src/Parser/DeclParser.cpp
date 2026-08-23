@@ -128,6 +128,15 @@ std::unique_ptr<InterfaceDecl> Parser::parseInterfaceDecl() {
     consume(TokType::LBrace, "expected '{' after interface name");
 
     while (!check(TokType::RBrace) && !atEnd()) {
+        // 错误恢复：当前 token 不是方法名（Identifier）时，跳过到下一个方法名或 '}'，
+        // 避免 consume 报错不前进导致的死循环
+        if (!check(TokType::Identifier)) {
+            error("expected method name in interface");
+            while (!atEnd() && !check(TokType::RBrace) && !check(TokType::Identifier)) {
+                advance();
+            }
+            continue;
+        }
         decl->methods.push_back(parseInterfaceMethodSig());
     }
 

@@ -7,6 +7,26 @@
 namespace Aura {
 
 // ============================================================
+// escapeStringLiteral — 转义字符串字面量内容，使其可安全嵌入生成的 C++ 源码
+// 不转义则源串中的 "、\、\n、\t、\r 会破坏生成的 C++ 字符串字面量或被解释为控制字符
+// ============================================================
+static std::string escapeStringLiteral(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\t': out += "\\t"; break;
+            case '\r': out += "\\r"; break;
+            default:   out += c;
+        }
+    }
+    return out;
+}
+
+// ============================================================
 // isHeapSemType — 成员方法实现（原 file-static，提升为成员供 StmtGen 使用）
 // ============================================================
 bool CodeGenerator::isHeapSemType(const SemType* type) const {
@@ -231,7 +251,7 @@ std::string CodeGenerator::genFloatLiteral(const FloatLiteral& e) {
 }
 
 std::string CodeGenerator::genStringLiteral(const StringLiteral& e) {
-    return "aura_rt::intern_string(\"" + e.value + "\")";
+    return "aura_rt::intern_string(\"" + escapeStringLiteral(e.value) + "\")";
 }
 
 std::string CodeGenerator::genBoolLiteral(const BoolLiteral& e) {

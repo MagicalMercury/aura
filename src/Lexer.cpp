@@ -1,4 +1,5 @@
 #include "Lexer.h"
+#include <cerrno>
 #include <cstdlib>
 
 namespace Aura {
@@ -227,12 +228,20 @@ Token Lexer::scanNumber() {
     Token tok{{}, lexeme, 0, 0};
     if (isFloat) {
         char* end = nullptr;
+        errno = 0;
         double val = std::strtod(lexeme.c_str(), &end);
+        if (errno == ERANGE) {
+            return makeError("floating point literal out of range");
+        }
         tok.type = TokType::FloatLiteral;
         tok.literal = val;
     } else {
         char* end = nullptr;
+        errno = 0;
         int64_t val = std::strtoll(lexeme.c_str(), &end, base);
+        if (errno == ERANGE) {
+            return makeError("integer literal too large");
+        }
         tok.type = TokType::IntLiteral;
         tok.literal = val;
     }

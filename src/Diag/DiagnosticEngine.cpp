@@ -57,22 +57,36 @@ void DiagnosticEngine::note(int line, int col, const std::string& msg) {
 }
 
 // ============================================================
+// buildLineOffsets — 构建每行起始偏移缓存（惰性、只构建一次）
+// lineOffsets_[k] = 第 k+1 行（1-based）在 source_ 中的起始下标
+// ============================================================
+void DiagnosticEngine::buildLineOffsets() const {
+    if (lineOffsetsBuilt_) return;
+    lineOffsets_.clear();
+    lineOffsets_.push_back(0);
+    for (size_t i = 0; i < source_.size(); ++i) {
+        if (source_[i] == '\n' && i + 1 < source_.size()) {
+            lineOffsets_.push_back(i + 1);
+        }
+    }
+    lineOffsetsBuilt_ = true;
+}
+
+// ============================================================
 // getSourceLine — 从 source_ 视图提取第 N 行
+// 利用行偏移缓存 O(1) 定位，避免每次线性扫描源码
 // ============================================================
 std::string DiagnosticEngine::getSourceLine(int line) const {
     if (source_.empty() || line < 1) return {};
-    int current = 1;
-    size_t start = 0;
-    for (size_t i = 0; i < source_.size(); ++i) {
-        if (current == line) {
-            start = i;
-            while (i < source_.size() && source_[i] != '\n') ++i;
-            auto sv = std::string_view(source_).substr(start, i - start);
-            // 去尾 \r
-            if (!sv.empty() && sv.back() == '\r') sv.remove_suffix(1);
-            return std::string(sv);
-        }
-        if (source_[i] == '\n') ++current;
+    buildLineOffsets();
+    if (line >= 1 && line <= (int)lineOffsets_.size()) {
+        size_t start = lineOffsets_[line - 1];
+        size_t end = (line < (int)lineOffsets_.size()) ? lineOffsets_[line] - 1
+                                                        : source_.size();
+        auto sv = std::string_view(source_).substr(start, end - start);
+        // 去尾 \r
+        if (!sv.empty() && sv.back() == '\r') sv.remove_suffix(1);
+        return std::string(sv);
     }
     return {};
 }

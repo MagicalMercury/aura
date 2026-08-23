@@ -30,7 +30,8 @@ public:
     [[nodiscard]] const std::vector<std::string>& errorMessages() const { return errorMessages_; }
 
     void setMaxErrors(int n) { maxErrors_ = n; }
-    void setSourceView(std::string_view source) { source_ = source; }
+    // source_ 变更后需失效行偏移缓存，下次 getSourceLine 重建
+    void setSourceView(std::string_view source) { source_ = source; lineOffsetsBuilt_ = false; }
     void setFileName(const std::string& name) { fileName_ = name; }
 
     void print(std::ostream& os) const;
@@ -46,6 +47,12 @@ private:
     int maxErrors_   = 20;
     int errorCount_  = 0;
     int warningCount_ = 0;
+
+    // 行偏移缓存：避免 getSourceLine 每次线性扫描整个源码
+    // （mutable：在 const 的 getSourceLine 内惰性构建）
+    mutable std::vector<size_t> lineOffsets_;
+    mutable bool lineOffsetsBuilt_ = false;
+    void buildLineOffsets() const;
 
     // 获取源码第 N 行（1-based）
     std::string getSourceLine(int line) const;

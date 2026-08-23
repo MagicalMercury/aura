@@ -92,12 +92,14 @@ public:
     // --- Expr visit ---
     bool visit(const CallExpr& n, CoroScanner& self) {
         if (isSuspending(n)) return true;
+        if (n.callee && self.scanExpr(*n.callee)) return true;
         for (auto& a : n.args)
             if (a && self.scanExpr(*a)) return true;
         return false;
     }
     bool visit(const MethodCallExpr& n, CoroScanner& self) {
         if (isSuspending(n)) return true;
+        if (n.object && self.scanExpr(*n.object)) return true;
         for (auto& a : n.args)
             if (a && self.scanExpr(*a)) return true;
         return false;

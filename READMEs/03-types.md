@@ -125,13 +125,73 @@ let s = some(v)                     // 显式构造 Optional<T>
 - initializer 本身已是 `Optional` 值（变量引用 / 函数或方法调用返回 `Optional<T>`，如 `ch.receive()`）→ 直接引用，不重复装箱。
 - 分支体内分配内存触发 GC/compact 时，`match` 分支绑定值由 `GcRootHandle` 保护，始终安全（见 §9）。
 
+### Optional<T> 创建详解（2026-08-22）
+
+`Optional<T>` 是 GC 堆上的可选值封装（运行时 `aura_rt::Optional<T>*`），共有三种创建方式：
+
+**方式一：显式构造 `some(v)` / `none()`**
+
+```aura
+let a = some(42)                    // Optional<int>（T 从实参推导）
+let b = some("hello")               // Optional<string>
+let c = some(range(0, 5))           // Optional<Iterator<int>>（接口视图元素也 GC 安全，见下）
+```
+
+`some(v)` 的元素类型 `T` 由实参推导。`none()` 无实参，元素类型依赖上下文推导：
+
+```aura
+let d = none()                      // ❌ 无上下文，T 推不出（error_type），后续使用报错
+let e = cond ? some(1) : none()     // ✅ 三元另一分支统一为 Optional<int>
+fun find(k: string) -> Optional<int> {
+    if k == "x" { return some(1) }
+    return none()                   // ✅ 函数返回类型标注推导（生成 make_none<int>）
+}
+```
+
+**方式二：`T | None` 隐式装箱**（`T` 为 GC 堆类型时联合折叠）
+
+```aura
+let x: string | None = "abc"        // 自动装箱，等价 some("abc")
+let y: string | None = None         // 等价 none()
+```
+
+全值类型（`int` / `float` / `bool`）不折叠，走 `Variant<T, NoneType>*` 封装（见上表）。
+
+**方式三：函数 / 方法返回**（如 `sync.Channel<T>.receive()`，见 [§11.7.3](11-concurrency.md#1173-optionalt--receive-的返回类型)）
+
+```aura
+let m = ch.receive()                // Optional<T>：空时阻塞；关闭且空时返回 None
+```
+
+**消费：`is_none()` / `unwrap()`**
+
+```aura
+if opt.is_none() == false {
+    let v = opt.unwrap()            // 取值（None 状态下 unwrap 抛运行时错误）
+}
+```
+
+`unwrap()` 返回值类型推断（2026-08-22 修复）支持直接链式调用：
+
+```aura
+let n = opt.unwrap().collect().length   // Optional<Iterator<int>> → Iterator → 列表长度
+```
+
+**GC 语义**（2026-08-22 修复接口视图元素）：
+
+| 元素类型 `T` | GC 扫描的指针字段 | 说明 |
+|:---|:---|:---|
+| 指针（`string` / `[T]` / record 等） | `value_` 偏移 | 基础路径 |
+| 接口视图（`Iterator<T>` / `Stringer` 等含 `self` 的值视图） | `value_ + self` 复合子偏移 | compact 搬运对象后 `self` 自动更新（此前 `self` 对 GC 不可见 → 悬垂，已修复） |
+| `none()` 状态 | 无（`self` 为 null，扫描自动跳过） | 安全 |
+
 **支持范围与限制**（编译期检查，不支持的变体报错）：
 
 - ✅ 接口视图变体：`type R = Stringer | int`（接口变体按 `self` 子偏移 GC 扫描）
 - ✅ 堆类型变体：`string` / `[T]` / record / `Optional<T>`
 - ❌ 函数类型变体 `fun(...)`：`std::function` 捕获的 GC 指针对 GC 不可见
 - ❌ 嵌套联合 `(A | B) | C`：未扁平化，不可入联合
-- ❌ 内置 `Iterator<T>` 变体：迭代器视图含 GC 指针 `self`，暂编译期拦截
+- ✅ 内置 `Iterator<T>` 变体（2026-08-10 放开）：按 `self` 子偏移 GC 扫描，compact 后自动更新
 - `None` 不能单独作变量声明类型（联合中除外）
 
 **列表类型**：

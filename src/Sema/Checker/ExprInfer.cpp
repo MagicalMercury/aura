@@ -78,8 +78,9 @@ std::unique_ptr<SemType> SemAnalyzer::inferListExpr(const ListExpr& e) {
         const_cast<ListExpr&>(e).inferredType = typeStore_.back().get();
         return typeStore_.back()->clone();
     }
-    auto elemType = inferExpr(*e.elements[0]);
+    auto elemType = e.elements[0] ? inferExpr(*e.elements[0]) : ErrorSemType::make();
     for (size_t i = 1; i < e.elements.size(); ++i) {
+        if (!e.elements[i]) continue;
         auto ti = inferExpr(*e.elements[i]);
         if (!isAssignable(*elemType, *ti)) {
             error(*e.elements[i], "list element type mismatch: expected '" + elemType->toString() + "', got '" + ti->toString() + "'");
@@ -121,8 +122,9 @@ std::unique_ptr<SemType> SemAnalyzer::inferBinaryExpr(const BinaryExpr& e) {
         if (!isAssignable(*lt, *rt) && !isAssignable(*rt, *lt)) {
             error(e, "binary operator '" + op + "' type mismatch: " + lt->toString() + " vs " + rt->toString());
         }
-        auto* ltp = dynamic_cast<const PrimSemType*>(lt.get());
-        auto* rtp = dynamic_cast<const PrimSemType*>(rt.get());
+        // 复用上方非 const dynamic_cast 结果（ltPrim/rtPrim），避免对同一对象重复 RTTI 查找
+        PrimSemType* ltp = ltPrim;
+        PrimSemType* rtp = rtPrim;
         bool lIsNum = ltp && (ltp->kind == PrimSemType::Int || ltp->kind == PrimSemType::Float);
         bool rIsNum = rtp && (rtp->kind == PrimSemType::Int || rtp->kind == PrimSemType::Float);
         if (lIsNum && rIsNum) {
@@ -314,15 +316,18 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
         if (id->name == "Iterator" && e.method == "from") {
             for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
-            if (!e.args.empty() && e.args[0]->inferredType) {
+            if (!e.args.empty() && e.args[0] && e.args[0]->inferredType) {
                 if (auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType)) {
                     if (auto* os = dynamic_cast<const OptionalSemType*>(ft->returnType.get())) {
-                        auto g = std::make_unique<GenericSemType>();
-                        g->name = "Iterator";
-                        g->resolvedName = "aura_rt::Iterator<"
-                            + semTypeToCppName(*os->elementType) + ">";
-                        typeStore_.push_back(std::move(g));
-                        return typeStore_.back()->clone();
+                        // os->elementType 可能为 null（none()/未知类型），须判空再解引用
+                        if (os->elementType) {
+                            auto g = std::make_unique<GenericSemType>();
+                            g->name = "Iterator";
+                            g->resolvedName = "aura_rt::Iterator<"
+                                + semTypeToCppName(*os->elementType) + ">";
+                            typeStore_.push_back(std::move(g));
+                            return typeStore_.back()->clone();
+                        }
                     }
                 }
             }
@@ -399,7 +404,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
             typeStore_.push_back(std::move(lt));
             return typeStore_.back()->clone();
         }
-        if (e.method == "map" && !e.args.empty() && e.args[0]->inferredType) {
+        if (e.method == "map" && !e.args.empty() && e.args[0] && e.args[0]->inferredType) {
             auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType);
             if (ft && ft->returnType && !dynamic_cast<const ErrorSemType*>(ft->returnType.get())) {
                 auto g = std::make_unique<GenericSemType>();
@@ -440,6 +445,10 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
         if (p->kind == PrimSemType::String) typeKey = "string";
     } else if (dynamic_cast<const ListSemType*>(objType.get())) {
         typeKey = "[T]";
+    } else if (dynamic_cast<const OptionalSemType*>(objType.get())) {
+        // Optional<T> 方法表（unwrap / is_none）：返回 Generic(0,"T") 走
+        // semTypeFromBuiltinReturn "T" 分支 → elemTypeOf(objType) 提取元素类型
+        typeKey = "Optional";
     } else if (auto* g = dynamic_cast<const GenericSemType*>(objType.get())) {
         // Io / Path 等内置非基础类型（Phase 4）
         if (BuiltinRegistry::get().findType(g->name))
