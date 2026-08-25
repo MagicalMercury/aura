@@ -74,6 +74,16 @@ bool CodeGenerator::isNoneCallExpr(const ASTNode& e) {
     return false;
 }
 
+// 从 "aura_rt::Optional<X>*" 提取 X（X 可能含嵌套尖括号，如 Optional<Optional<int>*>*）；
+// 供 genUnionBoxingImpl 对 Optional 变体的 none() 生成 make_none<X>()
+static std::string optionalElemCpp(const std::string& cppType) {
+    static const std::string prefix = "aura_rt::Optional<";
+    size_t p = cppType.find(prefix);
+    if (p == std::string::npos || cppType.size() < prefix.size() + 2) return "";
+    // 尾部固定为 ">*"，去掉后剩余 "aura_rt::Optional<X"
+    return cppType.substr(p + prefix.size(), cppType.size() - (p + prefix.size()) - 2);
+}
+
 // ============================================================
 // P3b 隐式装箱（genUnionBoxing）
 // 目标为含堆联合（aura_rt::Variant<T...>*）且初始值为非联合值时，
@@ -125,6 +135,125 @@ std::string CodeGenerator::genRecordToViewIIFE(const std::string& expr,
            "  }()";
 }
 
+std::string CodeGenerator::genOptionalBoxIIFE(const std::string& elemCpp,
+                                               const ASTNode& initExpr,
+                                               bool isCoroutine) {
+    if (elemCpp.empty()) return "";
+    int oid = unionBoxingCounter_++;
+    std::string ov = "_ox" + std::to_string(oid);
+    std::string oh = "_ohx" + std::to_string(oid);
+    bool heap = isHeapSemType(initExpr.inferredType);
+    std::ostringstream oss;
+    oss << "[&]() -> auto {\n";
+    oss << "    auto " << ov << " = (" << genExpr(initExpr, isCoroutine) << ");\n";
+    if (heap)
+        oss << "    aura_rt::GcRootHandle<decltype(" << ov << ")> " << oh
+            << "(" << ov << ");\n";
+    oss << "    return aura_rt::make_optional<" << elemCpp << ">("
+        << (heap ? oh + ".get()" : ov) << ");\n";
+    oss << "  }()";
+    return oss.str();
+}
+
+// #1：接口视图元素装箱 IIFE——ViewRoot 保护视图 self 后 make_optional<elemCpp>(视图值)。
+// 与 genUnionBoxingImpl 的视图变体 ViewRoot 模式一致（viewExpr 已含 self 的 GcObject*，
+// compact 会重写 GcRootHandle 取最新地址，get() 重建视图）。不能复用 genOptionalBoxIIFE：
+// isHeapSemType(InterfaceSemType)=true 会生成 GcRootHandle<视图>（视图非指针）→ 编译失败。
+std::string CodeGenerator::genOptionalViewValueBox(const std::string& elemCpp,
+                                                    const std::string& viewExpr) {
+    int oid = unionBoxingCounter_++;
+    std::string vv = "_ov" + std::to_string(oid);
+    std::string vr = "_ovr" + std::to_string(oid);
+    std::ostringstream oss;
+    oss << "[&]() -> auto {\n";
+    oss << "    auto " << vv << " = (" << viewExpr << ");\n";
+    oss << "    aura_rt::ViewRoot<decltype(" << vv << ")> " << vr << "(" << vv << ");\n";
+    oss << "    return aura_rt::make_optional<" << elemCpp << ">(" << vr << ".get());\n";
+    oss << "  }()";
+    return oss.str();
+}
+
+// #1：按元素 C++ 类型与值形态生成 make_optional<elemCpp>(值)：
+//   - 元素为接口视图（Stringer/Comparable<...>/Iterator<...>）且值为 record →
+//     record→view 预转换（genRecordToViewIIFE）后装箱
+//   - 元素为接口视图且值已是视图 → ViewRoot 保护后装箱
+//   - 其余（普通堆 record / 值类型 / std::function / list 等）→ 显式模板参数
+//     make_optional<elemCpp>(值)，堆值经 GcRootHandle 保护
+std::string CodeGenerator::genOptionalBoxByElem(const std::string& elemCpp,
+                                                 const ASTNode& val,
+                                                 bool isCoroutine) {
+    if (elemCpp.empty()) return "";
+    if (isIfaceViewTypeName(elemCpp)) {
+        if (auto* rt = dynamic_cast<const RecordSemType*>(val.inferredType);
+            rt && !rt->canonicalName.empty()) {
+            return genOptionalViewValueBox(
+                elemCpp,
+                genRecordToViewIIFE(genExpr(val, isCoroutine), rt->canonicalName, elemCpp));
+        }
+        if (val.inferredType && isIfaceView(val.inferredType))
+            return genOptionalViewValueBox(elemCpp, genExpr(val, isCoroutine));
+    }
+    return genOptionalBoxIIFE(elemCpp, val, isCoroutine);
+}
+
+// #1：判定初始化器是否"已是 Optional 值"（防二次装箱）：
+// Identifier（Optional 变量）/ CallExpr（函数调用返回 Optional）/ MethodCallExpr
+// （如 channel.receive()）/ ConditionalExpr 且其 inferredType 为 Optional
+// （OptionalSemType 或 GenericSemType{name=="Optional"}）。与 genLetStmt OptionalSemType
+// 分支的 initIsOptionalValue 判定（L465-475）保持一致；some()/none() 由
+// genOptionalTargetInit 在调用前单独处理（不落入本判定）。
+static bool isAlreadyOptionalValue(const ASTNode& init) {
+    bool structural = dynamic_cast<const Identifier*>(&init)
+        || dynamic_cast<const CallExpr*>(&init)
+        || dynamic_cast<const MethodCallExpr*>(&init)
+        || dynamic_cast<const ConditionalExpr*>(&init);
+    if (!structural || !init.inferredType) return false;
+    if (dynamic_cast<const OptionalSemType*>(init.inferredType)) return true;
+    if (auto* gs = dynamic_cast<const GenericSemType*>(init.inferredType))
+        return gs->name == "Optional";
+    return false;
+}
+
+// #1：显式 Optional<X> 目标的初始化器装箱（genLetStmt else 兜底 / genReturnStmt 共用）。
+// 按初始化器形态分发：
+//   - some(arg)：对 arg 装箱（元素为接口视图 → record→view；元素为 std::function →
+//     显式模板参数；record 字面量 → make_optional<elem>(record)；普通值 → 显式模板参数）
+//   - none()：make_none<elem>（P1-1 已修路径，保持）
+//   - 已是 Optional 值（Optional 变量 / 调用返回 Optional / 条件表达式）：不装箱
+//     （防二次装箱），返回其裸表达式；复合表达式（条件等）内的 some() 经
+//     optionalTargetElem_ 感知目标元素（genCallExpr some() 分支消费）
+//   - 其余（裸值 / record 字面量）：genOptionalBoxByElem 装箱
+std::string CodeGenerator::genOptionalTargetInit(const ASTNode& init,
+                                                  const std::string& elemCpp,
+                                                  bool isCoroutine) {
+    if (elemCpp.empty()) return "";
+    std::string savedElem = optionalTargetElem_;
+    optionalTargetElem_ = elemCpp;   // 复合初始化器内嵌 some() 感知目标元素
+
+    std::string result;
+    // some(arg)：提取实参装箱（arg 内嵌套 some() 需 CTAD → 临时清空目标元素）
+    const ASTNode* someArg = nullptr;
+    if (auto* call = dynamic_cast<const CallExpr*>(&init)) {
+        if (auto* id = dynamic_cast<const Identifier*>(call->callee.get());
+            id && id->name == "some" && call->args.size() == 1)
+            someArg = call->args[0].get();
+    }
+    if (someArg) {
+        optionalTargetElem_.clear();
+        result = genOptionalBoxByElem(elemCpp, *someArg, isCoroutine);
+    } else if (isNoneCallExpr(init)) {
+        result = "aura_rt::make_none<" + elemCpp + ">()";
+    } else if (isAlreadyOptionalValue(init)) {
+        // 已是 Optional 值 → 直接裸引用（不装箱）
+        result = genExpr(init, isCoroutine);
+    } else {
+        result = genOptionalBoxByElem(elemCpp, init, isCoroutine);
+    }
+
+    optionalTargetElem_ = savedElem;
+    return result;
+}
+
 std::string CodeGenerator::genUnionBoxingImpl(
     const std::vector<std::string>& cppTypes,
     const ASTNode& init, bool isCoroutine) {
@@ -138,11 +267,19 @@ std::string CodeGenerator::genUnionBoxingImpl(
         }
     }
     // none() 赋给含 None 变体的联合（如 Iterator<int> | None）：初始值推断为
-    // OptionalSemType{Error}（none() 占位），无法按 C++ 类型匹配变体，
-    // 直接定位 NoneType 变体（expr 下方特判为 aura_rt::None）
+    // NoneSemType，直接定位 NoneType 变体（expr 下方特判为 aura_rt::None）
     if (idx < 0 && isNoneCallExpr(init)) {
         for (size_t k = 0; k < cppTypes.size(); ++k)
             if (cppTypes[k] == "aura_rt::NoneType") { idx = static_cast<int>(k); break; }
+        // none() → 联合含 Optional<X> 变体（如 u63: int | Optional<string>）：
+        // Optional 变体的 None 值 = make_none<X>()（Optional<X>* 堆指针），
+        // 与 NoneType 变体（aura_rt::None 值）区分开
+        if (idx < 0) {
+            for (size_t k = 0; k < cppTypes.size(); ++k)
+                if (cppTypes[k].rfind("aura_rt::Optional<", 0) == 0) {
+                    idx = static_cast<int>(k); break;
+                }
+        }
     }
     // 缺口 2 修复：idx 匹配失败但 init 是 record 且某变体是接口视图
     // → record→适配器 view() 预转换后装箱（复用 genRecordToViewIIFE）
@@ -162,7 +299,12 @@ std::string CodeGenerator::genUnionBoxingImpl(
     std::string expr;
     bool isIfaceViewVariant = isIfaceViewTypeName(cppTypes[idx]);
     if (isNoneCallExpr(init)) {
-        expr = "aura_rt::None";   // none() → NoneType 值（非 make_none<T> 指针）
+        if (cppTypes[idx] == "aura_rt::NoneType") {
+            expr = "aura_rt::None";   // NoneType 变体：none() → NoneType 值
+        } else {
+            // Optional<X>* 变体（u63: int | Optional<string>）：none() → make_none<X>()
+            expr = "aura_rt::make_none<" + optionalElemCpp(cppTypes[idx]) + ">()";
+        }
     } else if (!viewCppType.empty()) {
         // 缺口 2：record→适配器 view() 预转换（先生成 record 指针表达式，再包 IIFE）
         auto* rt = dynamic_cast<const RecordSemType*>(init.inferredType);
@@ -172,8 +314,11 @@ std::string CodeGenerator::genUnionBoxingImpl(
     }
 
     int bid = unionBoxingCounter_++;
-    // none() 的 OptionalSemType{Error} 会误判堆；NoneType 是 POD 值，无需 GcRootHandle
+    // none() 的推断类型（NoneSemType）会误判堆；NoneType 是 POD 值，无需 GcRootHandle
     bool initIsHeap = isHeapSemType(init.inferredType) && !isNoneCallExpr(init);
+    // make_none<X>() 返回 Optional<X>* 堆指针（make_variant 内 alloc 可能触发 GC），需保护
+    if (isNoneCallExpr(init) && idx >= 0 && cppTypes[idx] != "aura_rt::NoneType")
+        initIsHeap = true;
     std::ostringstream oss;
     oss << "[&]() -> auto {\n";
     oss << "    auto _bx" << bid << " = (" << expr << ");\n";
@@ -311,16 +456,32 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
 
         // RecordExpr 作为 let 初始值 → gc_alloc + 字段赋值
         if (auto* rec = dynamic_cast<const RecordExpr*>(decl.initializer.get())) {
+            // #2：判断目标是否为 Optional（折叠 union Point|None → OptionalSemType /
+            // 显式 Optional<X> 注解 → GenericSemType{name=="Optional"} / C++ 类型前缀
+            // aura_rt::Optional<）。目标为 Optional 时 record 字面量不应走 record 构造
+            // （gc_alloc<Optional<...>> + ->field 非法），应作为 Optional 元素装箱：
+            //   - OptionalSemType 目标 → 下方 OptionalSemType 分支的 make_optional IIFE
+            //   - GenericSemType{name=="Optional"} 目标 → else 兜底前的显式装箱分支
+            bool targetIsOptional = false;
+            if (auto* os = dynamic_cast<const OptionalSemType*>(decl.inferredType)) {
+                targetIsOptional = os->elementType != nullptr;
+            } else if (auto* gs = dynamic_cast<const GenericSemType*>(decl.inferredType)) {
+                targetIsOptional = gs->name == "Optional";
+            }
+            if (!targetIsOptional && decl.type
+                && mapType(*decl.type).find("aura_rt::Optional<") == 0) {
+                targetIsOptional = true;
+            }
             // 检查是否有可用的记录类型名（含 decl.type 或 inferredType 中的 canonicalName）
             bool hasRecordType = false;
             std::string recType;
             // P3b：目标为联合（decl.inferredType 是 UnionSemType）时不走 record 构造，
             // record 字面量应作为联合变体装箱（make_variant），由下方隐式装箱逻辑处理
             bool targetIsUnion = dynamic_cast<const UnionSemType*>(decl.inferredType) != nullptr;
-            if (!targetIsUnion && decl.type) {
+            if (!targetIsUnion && !targetIsOptional && decl.type) {
                 recType = mapType(*decl.type);
                 hasRecordType = true;
-            } else if (!targetIsUnion) {
+            } else if (!targetIsUnion && !targetIsOptional) {
                 if (auto* rs = dynamic_cast<const RecordSemType*>(decl.inferredType)) {
                     if (!rs->canonicalName.empty()) {
                         recType = rs->canonicalName + "*";
@@ -412,26 +573,40 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                                decl.initializer->inferredType)) {
                     init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
                 } else if (!elemCpp.empty()) {
-                    int oid = unionBoxingCounter_++;
-                    std::string ov = "_ox" + std::to_string(oid);
-                    std::string oh = "_ohx" + std::to_string(oid);
-                    bool heap = isHeapSemType(decl.initializer->inferredType);
-                    std::ostringstream oss;
-                    oss << "[&]() -> auto {\n";
-                    oss << "    auto " << ov << " = ("
-                        << genExpr(*decl.initializer, currentFunctionIsCoroutine_) << ");\n";
-                    if (heap)
-                        oss << "    aura_rt::GcRootHandle<decltype(" << ov << ")> " << oh
-                            << "(" << ov << ");\n";
-                    oss << "    return aura_rt::make_optional<" << elemCpp << ">("
-                        << (heap ? oh + ".get()" : ov) << ");\n";
-                    oss << "  }()";
-                    init = oss.str();
+                    init = genOptionalBoxIIFE(elemCpp, *decl.initializer, currentFunctionIsCoroutine_);
                 } else {
                     init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
                 }
             } else {
-                init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
+                // #1/#2：显式 Optional<X> 注解（GenericSemType{name=="Optional"} /
+                // NamedType Optional）→ 按初始化器形态装箱：
+                //   some(arg) / 裸值直赋 / record 字面量（make_optional<elem>(record)）
+                //   / none()（make_none<elem>）；元素为接口视图 → record→view，
+                //   元素为 std::function → 显式模板参数；已是 Optional 值不装箱
+                std::string optElem;
+                bool targetIsOptional = false;
+                // 优先 decl.type 的 mapType（与声明 C++ 类型一致，接口元素不误加 *；
+                //   optionalElemCppName 从 resolvedName 提取接口元素可能带错星号，
+                //   如 Comparable<Point> → "Comparable<Point>*" 而非 "Comparable<Point*>"）
+                if (decl.type) {
+                    if (auto* nt = dynamic_cast<const NamedType*>(decl.type.get());
+                        nt && nt->name == "Optional" && nt->typeArgs.size() == 1) {
+                        targetIsOptional = true;
+                        optElem = mapType(*nt->typeArgs[0]);
+                    }
+                }
+                if (!targetIsOptional) {
+                    if (auto* gs = dynamic_cast<const GenericSemType*>(decl.inferredType);
+                        gs && gs->name == "Optional") {
+                        targetIsOptional = true;
+                        optElem = optionalElemCppName(decl.inferredType);
+                    }
+                }
+                if (targetIsOptional && !optElem.empty())
+                    init = genOptionalTargetInit(*decl.initializer, optElem,
+                                                 currentFunctionIsCoroutine_);
+                else
+                    init = genExpr(*decl.initializer, currentFunctionIsCoroutine_);
             }
         }
         if (lastClosureIsCoro_) {
@@ -636,13 +811,54 @@ void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
         }
     }
 
+    // P1-2：函数返回"含 None 变体的全值联合"（std::variant<T..., NoneType>）且
+    // return none() → 生成 None 变体值 aura_rt::None（std::variant 由 NoneType 直接
+    // 构造），而非 make_none<...>（Optional 指针，类型不匹配）。含堆联合（Variant*）
+    // 已由上方 currentReturnVariantCppTypes_ 装箱处理；`-> Point|None` 折叠为
+    // Optional 的返回由 none() inferredType/currentReturnElem_ 路径（make_none<elem>）处理。
+    if (stmt.expr && isNoneCallExpr(*stmt.expr) && currentReturnHasNoneVariant_
+        && currentReturnVariantCppTypes_.empty()) {
+        writeLine(cpp, prefix + " aura_rt::None;");
+        return;
+    }
+
+    // #1：显式 Optional<X> / 折叠 Point|None 返回类型 + 非 record 返回值 → 装箱。
+    //   some(p)（元素接口视图 → record→view）、some(lambda)（→ 显式模板参数）、
+    //   裸值 p/7（→ make_optional<X>）、已是 Optional 值（→ 裸返回不装箱）。
+    //   record 字面量由下方 RecordExpr 分支处理（其 recType 取自 optElem 更直接）；
+    //   none() 已由上方处理；`-> int|None` 全值 variant（非 Optional）不落入。
+    if (stmt.expr && !dynamic_cast<const RecordExpr*>(stmt.expr.get())
+        && currentReturnCppType_.rfind("aura_rt::Optional<", 0) == 0) {
+        std::string optElem = optionalElemCpp(currentReturnCppType_);
+        if (!optElem.empty()) {
+            std::string boxed = genOptionalTargetInit(*stmt.expr, optElem, isCoroutine);
+            writeLine(cpp, prefix + " " + boxed + ";");
+            return;
+        }
+    }
+
     // RecordExpr 在 return 语句中 → 生成 gc_alloc + 字段赋值
     if (stmt.expr && dynamic_cast<const RecordExpr*>(stmt.expr.get())) {
         auto* rec = static_cast<const RecordExpr*>(stmt.expr.get());
+        // #2：函数返回 Optional（Point|None 折叠 / 显式 Optional<T> 标注，
+        // currentReturnCppType_ = aura_rt::Optional<elem>）且返回 record 字面量
+        // → 构造 record 后 make_optional<elem>(record) 装箱返回（否则裸返回 T*
+        // 与 Optional<T> 返回类型不匹配，C++ 编译失败）
+        bool returnIsOptional = currentReturnCppType_.find("aura_rt::Optional<") == 0;
+        std::string optElem;
+        if (returnIsOptional) {
+            auto lt = currentReturnCppType_.find('<');
+            auto rt = currentReturnCppType_.rfind('>');
+            if (lt != std::string::npos && rt != std::string::npos && rt > lt)
+                optElem = currentReturnCppType_.substr(lt + 1, rt - lt - 1);
+            if (optElem.empty()) returnIsOptional = false;  // 提取失败回退原逻辑
+        }
         // 优先从表达式 inferredType 取类型，其次从当前函数返回类型
         std::string recType;
         const RecordSemType* rs = dynamic_cast<const RecordSemType*>(stmt.expr->inferredType);
-        if (rs && !rs->canonicalName.empty()) {
+        if (returnIsOptional) {
+            recType = optElem;
+        } else if (rs && !rs->canonicalName.empty()) {
             recType = rs->canonicalName + "*";
         } else {
             recType = currentReturnCppType_;
@@ -680,7 +896,11 @@ void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
                     writeLine(cpp, var + ".get()->" + safeName(f.name) + " = " + fval + ";");
                 }
             }
-            writeLine(cpp, prefix + " " + var + ".get();");
+            writeLine(cpp, prefix + " "
+                + (returnIsOptional
+                   ? "aura_rt::make_optional<" + optElem + ">(" + var + ".get())"
+                   : var + ".get()")
+                + ";");
             return;
         }
     }

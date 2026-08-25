@@ -107,6 +107,29 @@ TEST(SemaRecord, PositionalLiteralNotSupported) {
 }
 
 // ============================================================
+// record 列表字面量（A3：无标注时按字段匹配解析元素类型）
+// ============================================================
+TEST(SemaRecord, RecordListNoAnnotationResolved) {
+    // A3：无标注记录列表 + 全局存在匹配 record 声明 → 元素类型解析成功（无 error）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let e = [{ x = 1, y = 2 }, { x = 3, y = 4 }] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaRecord, RecordListAnnotated) {
+    // A3 回归：有标注 [Point] 的记录列表正常（不误报）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let e: [Point] = [{ x = 1, y = 2 }, { x = 3, y = 4 }] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
 // 构造函数后字面量（实现宽松：仍允许）
 // ============================================================
 TEST(SemaRecord, LiteralAfterCtorAllowed) {

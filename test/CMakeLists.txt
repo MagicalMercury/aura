@@ -17,7 +17,7 @@
 #
 # 用法：
 #   ctest --test-dir build            # 运行全部测试
-#   ./build/test/aura_tests --filter=Lexer   # 运行指定套件（精确匹配套件名）
+#   ./build/aura_tests.exe --filter=Lexer   # 运行指定套件（精确匹配套件名）
 # ============================================================
 cmake_minimum_required(VERSION 4.1)
 project(AuraTests)

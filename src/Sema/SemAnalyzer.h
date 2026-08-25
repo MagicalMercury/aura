@@ -163,24 +163,34 @@ private:
     void checkLockStmt(const LockStmt& stmt);   // lock (m) { } 块语句
     void checkExprStmt(const ExprStmt& stmt);
 
+    // 漏 return 检查辅助：语句/语句块是否在所有路径上以 return/throw 终结
+    // （checkFunBody / checkMethodBody / inferFunExpr 共用；防止 CodeGen 生成
+    //  no-return 函数/lambda → g++ 插 ud2 运行时崩溃）
+    static bool blockAllPathsReturn(const BlockStmt& block);
+    static bool stmtAllPathsReturn(const Stmt& stmt);
+
     // None 不能作为独立类型标注（E017）
     bool rejectStandaloneNone(const Decl& decl, const TypeExpr* type);
     // sync 系 max 表达式类型检查（"sync" / "sync thread" / "sync for"）
     void checkSyncMax(const ASTNode& maxExpr, const std::string& kindName);
 
     // ============ 表达式类型推断 ============
-    [[nodiscard]] std::unique_ptr<SemType> inferExpr(const ASTNode& expr);
+    // expected: 期望类型（借用指针，仅同步透传不存储；nullptr = 纯自底向上）
+    [[nodiscard]] std::unique_ptr<SemType> inferExpr(const ASTNode& expr,
+                                                     const SemType* expected = nullptr);
     [[nodiscard]] std::unique_ptr<SemType> inferIntLiteral(const IntLiteral& e);
     [[nodiscard]] std::unique_ptr<SemType> inferFloatLiteral(const FloatLiteral& e);
     [[nodiscard]] std::unique_ptr<SemType> inferStringLiteral(const StringLiteral& e);
     [[nodiscard]] std::unique_ptr<SemType> inferBoolLiteral(const BoolLiteral& e);
     [[nodiscard]] std::unique_ptr<SemType> inferNoneLiteral();
     [[nodiscard]] std::unique_ptr<SemType> inferIdentifier(const Identifier& e);
-    [[nodiscard]] std::unique_ptr<SemType> inferListExpr(const ListExpr& e);
+    [[nodiscard]] std::unique_ptr<SemType> inferListExpr(const ListExpr& e,
+                                                         const SemType* expected = nullptr);
     [[nodiscard]] std::unique_ptr<SemType> inferRecordExpr(const RecordExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferBinaryExpr(const BinaryExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferUnaryExpr(const UnaryExpr& e);
-    [[nodiscard]] std::unique_ptr<SemType> inferCall(const CallExpr& e);
+    [[nodiscard]] std::unique_ptr<SemType> inferCall(const CallExpr& e,
+                                                     const SemType* expected = nullptr);
     [[nodiscard]] std::unique_ptr<SemType> inferMethodCall(const MethodCallExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferMemberAccess(const MemberAccessExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferIndexExpr(const IndexExpr& e);
@@ -190,7 +200,8 @@ private:
     [[nodiscard]] std::unique_ptr<SemType> inferConditional(const ConditionalExpr& e);
 
     // --- 闭包 ---
-    [[nodiscard]] std::unique_ptr<SemType> inferFunExpr(const FunExpr& e);
+    [[nodiscard]] std::unique_ptr<SemType> inferFunExpr(const FunExpr& e,
+                                                        const SemType* expected = nullptr);
 
     // ============ match 穷尽性检查 ============
     bool isMatchExhaustive(const SemType& matchedType,
@@ -268,6 +279,17 @@ private:
 
     // ============ 递归类型解析 ============
     void propagateCanonicalName(const ASTNode& expr, const SemType* type);
+    // A3：匿名 record 字面量按字段结构匹配全局 record 类型声明，返回 canonicalName。
+    // 仅匹配非泛型 record（typeParams 为空）——泛型 record 的实例化参数不可知时不能
+    // 误报匹配；无匹配返回空串（元素真未知由调用点报干净错误）
+    [[nodiscard]] std::string resolveAnonymousRecordName(const RecordSemType& rec) const;
+    // 递归检测类型中是否含"不可解析"的 error 元素（[] / none() 无上下文 → 元素类型不可知），
+    // 用于在 let/const/return/赋值提交点拦截，避免 error_type 泄漏到 CodeGen
+    static bool containsErrorElement(const SemType* t);
+    // 递归检测类型中是否含"未绑定泛型变量"（调用点未能把 <T> 绑定到具体类型）。
+    // 当前作用域内已注册的泛型参数（泛型函数体内的 T）视为可引用，不视为未绑定；
+    // 用于拦截未绑定 T 泄漏到 CodeGen 产生 std::function<T(...)> / auto 等 C++ 错误
+    [[nodiscard]] bool containsUnresolvedGeneric(const SemType* t) const;
     // seal self-referencing GenericSemType to RecordSemType with full canonicalName
     void sealSelfRefs(std::unique_ptr<SemType>& node,
                       const std::string& bareName,

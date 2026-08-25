@@ -76,6 +76,28 @@ bool CodeGenerator::isUnionHeapVariant(const SemType* t) const {
     return isHeapSemType(t) || isIfaceView(t);
 }
 
+// 回调包装辅助：SemType 是否"完全具体"（可安全映射为 C++ 类型，无未解析泛型/错误）。
+// 泛型函数调用点（fnCallbackParams_ 仅对模板函数注册）的 ftStr 形如 std::function<T(T)>，
+// 含未绑定泛型变量，在非泛型调用点无 T 作用域 → 生成代码编译失败；
+// 实参推断的 FuncSemType（双向推断已将 T 代换为具体类型）可给出 std::function<int(int)>。
+static bool semTypeIsConcrete(const SemType* t) {
+    if (!t) return false;
+    if (dynamic_cast<const ErrorSemType*>(t)) return false;
+    if (auto* g = dynamic_cast<const GenericSemType*>(t))
+        return !g->resolvedName.empty();   // 已实例化泛型（如 Iterator<int32_t>）视为具体
+    if (auto* l = dynamic_cast<const ListSemType*>(t))
+        return semTypeIsConcrete(l->elementType.get());
+    if (auto* o = dynamic_cast<const OptionalSemType*>(t))
+        return semTypeIsConcrete(o->elementType.get());
+    if (auto* f = dynamic_cast<const FuncSemType*>(t)) {
+        if (!semTypeIsConcrete(f->returnType.get())) return false;
+        for (auto& p : f->paramTypes)
+            if (!semTypeIsConcrete(p.get())) return false;
+        return true;
+    }
+    return true;   // Prim/None/Record/Union/Interface → 具体
+}
+
 // ============================================================
 // genGcRootedArgs — 为 GC 堆类型参数生成 IIFE + GcRootHandle 包装
 // 所有参数都不是堆类型时，直接返回 callExpr（避免无意义 IIFE）
@@ -328,8 +350,15 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
             }
             if (semElemType.find("GcObject") == std::string::npos
                 && semElemType.find("/*") == std::string::npos
-                && semElemType != "auto")
+                && semElemType != "auto") {
                 elemType = semElemType;
+            } else if (e.elements.size() > 0 && e.elements[0]
+                       && dynamic_cast<const RecordExpr*>(e.elements[0].get())) {
+                // A3：record 元素类型不可知（Sema 未解析出 record 类型名，即列表元素
+                // 是匿名 record 且无匹配声明）→ 报干净错误而非静默退化为 int32_t/GcObject
+                // （否则在 C++ 侧产生 Array<int32_t> 与 record 构造之间的模板类型错误）
+                error(e, "cannot infer element type of list literal; add an explicit type annotation (e.g. let e: [Point] = [...])");
+            }
         }
     }
 
@@ -406,7 +435,22 @@ std::string CodeGenerator::genRecordExpr(const RecordExpr& e, bool isCoroutine) 
             if (!rs->canonicalName.empty()) return rs->canonicalName;
         }
         if (auto* gs = dynamic_cast<const GenericSemType*>(e.inferredType)) {
-            if (!gs->resolvedName.empty()) return gs->resolvedName;
+            if (!gs->resolvedName.empty()) {
+                // #2：显式 Optional<X> 上下文（GenericSemType{name=="Optional"}）下
+                // 的 record 字面量：propagateCanonicalName 的 GenericSemType 分支把
+                // inferredType 物化为 Optional 包裹，需从 resolvedName 提取元素
+                // C++ 名作为记录类型（如 "aura_rt::Optional<Point>" → "Point"）
+                if (gs->name == "Optional") {
+                    size_t lt = gs->resolvedName.find('<');
+                    size_t rt = gs->resolvedName.rfind('>');
+                    if (lt != std::string::npos && rt != std::string::npos && rt > lt) {
+                        std::string elem = gs->resolvedName.substr(lt + 1, rt - lt - 1);
+                        if (elem.size() > 1 && elem.back() == '*') elem.pop_back();
+                        return elem;
+                    }
+                }
+                return gs->resolvedName;
+            }
         }
         return "";
     };
@@ -669,12 +713,35 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
 
     // some(v)/none()：Optional 构造（C++ CTAD 推导 T）
     if (calleeName == "some" && e.args.size() == 1) {
+        // #1：显式 Optional<X> 目标下的 some()（genOptionalTargetInit 设置
+        // optionalTargetElem_，覆盖条件表达式/传参等非 let 形态）→ 按目标元素
+        // 装箱（接口视图+record → record→view；其余显式模板参数）；
+        // 无目标元素 → 保持 CTAD（普通 some() 行为不变）。嵌套 some() 时
+        // optionalTargetElem_ 已被调用方临时清空（防二次装箱）。
+        if (!optionalTargetElem_.empty()) {
+            std::string elem = optionalTargetElem_;
+            optionalTargetElem_.clear();   // 实参内再嵌套 some() → 恢复 CTAD
+            std::string result = genOptionalBoxByElem(elem, *e.args[0], isCoroutine);
+            optionalTargetElem_ = elem;
+            return result;
+        }
         return "aura_rt::make_optional(" + genExpr(*e.args[0], isCoroutine) + ")";
     }
     if (calleeName == "none" && e.args.empty()) {
-        // T 从当前函数返回类型（Optional<T>）提取；缺省兜底 int32_t
-        return "aura_rt::make_none<" + (currentReturnElem_.empty()
-                                        ? std::string("int32_t") : currentReturnElem_) + ">()";
+        // none() 元素类型取用优先级（P1-1/A1）：
+        //   1. none() 调用自身的 inferredType —— Sema 在期望上下文（let 注解 / 赋值目标 /
+        //      传参形参）已把正确元素反推并挂上（见 ExprInfer none() 分支），覆盖
+        //      `let x: Optional<T> = none()` 等形态；元素为 Error（真未知）时不取
+        //   2. currentReturnElem_ —— 函数/闭包返回 Optional<T> 上下文填充（return 形态）
+        //   3. 都不可得 → 防御性报错（真未知已被 Sema containsErrorElement 拦截，
+        //      若仍可达说明回归，报干净错误而非静默伪装成 int32_t）
+        std::string elem = optionalElemCppName(e.inferredType);
+        if (elem.empty()) elem = currentReturnElem_;
+        if (elem.empty()) {
+            error(e, "cannot infer element type for none(); add an explicit type annotation");
+            elem = "int32_t";  // 占位；driver 检测到 codegen 错误后不会调用 g++
+        }
+        return "aura_rt::make_none<" + elem + ">()";
     }
 
     // range(...) → make_range（iota_view）；for-in 的 range 仍走 iota 特判（性能路径）
@@ -826,7 +893,16 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
         if (cbIt != fnCallbackParams_.end()) {
             for (auto& [idx, ftStr] : cbIt->second) {
                 if (idx == i) {
-                    arg = ftStr + "(" + arg + ")";
+                    // 泛型函数调用点：ftStr 含未绑定泛型变量（如 std::function<T(T)>），
+                    // 非泛型调用点无 T 作用域 → 编译失败。改用实参推断的具体 FuncSemType
+                    // 生成 std::function 类型（双向推断已将 T 代换为具体类型）；
+                    // 实参仍含泛型（调用点在泛型作用域内，T 在作用域）时保持原 ftStr。
+                    std::string wrapType = ftStr;
+                    if (auto* fst = dynamic_cast<const FuncSemType*>(e.args[i]->inferredType);
+                        fst && semTypeIsConcrete(fst)) {
+                        wrapType = mapSemType(*fst);
+                    }
+                    arg = wrapType + "(" + arg + ")";
                     break;
                 }
             }
@@ -958,11 +1034,28 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         for (size_t i = 0; i < e.args.size(); ++i)
             iArgs.push_back(genExpr(*e.args[i], isCoroutine));
         if (e.method == "from" && iArgs.size() == 1) {
-            // FuncIter 无自动推导（T 与 F 无关联）：T 从闭包返回类型 Optional<T> 显式提取
-            std::string elem = "int32_t";
-            if (auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType))
-                if (auto* os = dynamic_cast<const OptionalSemType*>(ft->returnType.get()))
-                    elem = mapSemType(*os->elementType);
+            // FuncIter 无自动推导（T 与 F 无关联）：T 从闭包返回类型 Optional<T> 显式提取。
+            // A2：显式 `-> Optional<string>` 注解物化为 GenericSemType{name=="Optional"}，
+            // 与 OptionalSemType 统一经 optionalElemCppName 提取；真未知（确为 Optional
+            // 但元素推不出）→ 防御性报错（不静默退 int32_t）。
+            // 非 Optional 返回类型（如 `fun()->int`）保持既有 int32_t 兜底（Sema 侧同样
+            // 落 int32_t、不报错），避免 CodeGen 与 Sema 判定不一致。
+            std::string elem;
+            bool retIsOptional = false;
+            if (auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType)) {
+                auto* rt = ft->returnType.get();
+                retIsOptional = dynamic_cast<const OptionalSemType*>(rt)
+                    || (dynamic_cast<const GenericSemType*>(rt)
+                        && static_cast<const GenericSemType*>(rt)->name == "Optional");
+                if (retIsOptional) elem = optionalElemCppName(rt);
+            }
+            if (retIsOptional && elem.empty()) {
+                error(e, "cannot infer element type of closure return for 'Iterator.from'; "
+                         "annotate the return type (e.g. fun () -> Optional<string>)");
+                elem = "int32_t";  // 占位；driver 检测到 codegen 错误后不会调用 g++
+            } else if (elem.empty()) {
+                elem = "int32_t";  // 非 Optional 返回：既有兜底（与 Sema 一致）
+            }
             return "aura_rt::make_iterator_from<" + elem + ">(" + iArgs[0] + ")";
         }
         if (e.method == "map" && iArgs.size() == 1) {
@@ -1512,9 +1605,24 @@ std::string CodeGenerator::genPipeExpr(const PipeExpr& e, bool isCoroutine) {
 std::string CodeGenerator::genConditionalExpr(const ConditionalExpr& e, bool isCoroutine) {
     // 直接映射 C++ 三元：只求值选中的分支，整体为单表达式右值。
     // GC 安全：分配发生在选中分支内，外层由既有 let/实参/赋值上下文成根保护。
-    return "(" + genExpr(*e.cond, isCoroutine) + " ? "
+    //
+    // P1-1 回归：三元内单分支 none() 的 inferredType 为 Optional<error>（无期望，
+    // 元素推不出），其元素由另一分支统一（如 `true ? some(7) : none()` → Optional<int>，
+    // Sema 经 isAssignable 兼容放行、不报错）。生成时用另一分支的 Optional 元素
+    // 填充 currentReturnElem_，供 none() 分支回退取用，避免防御性报错误触发。
+    std::string savedReturnElem = currentReturnElem_;
+    const ASTNode* other = nullptr;
+    if (isNoneCallExpr(*e.thenBranch)) other = e.elseBranch.get();
+    else if (isNoneCallExpr(*e.elseBranch)) other = e.thenBranch.get();
+    if (other && other->inferredType) {
+        std::string elem = optionalElemCppName(other->inferredType);
+        if (!elem.empty()) currentReturnElem_ = elem;
+    }
+    std::string result = "(" + genExpr(*e.cond, isCoroutine) + " ? "
                + genExpr(*e.thenBranch, isCoroutine) + " : "
                + genExpr(*e.elseBranch, isCoroutine) + ")";
+    currentReturnElem_ = savedReturnElem;
+    return result;
 }
 
 // ============================================================
@@ -1700,7 +1808,15 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
         if (isCallable) {
             oss << "F" << callableIdx << "&& " << safeName(e.params[i].name);
         } else {
-            std::string paramType = e.params[i].type ? mapType(*e.params[i].type) : "auto";
+            // 参数类型：有显式标注用 mapType（多态闭包 [T] 正确映射 C++ 模板参数）；
+            // 无标注用 Sema 反推结果（双向推断：闭包参数从期望类型推断）
+            std::string paramType = "auto";
+            if (e.params[i].type) {
+                paramType = mapType(*e.params[i].type);
+            } else if (auto* fst = dynamic_cast<const FuncSemType*>(e.inferredType);
+                       fst && i < fst->paramTypes.size() && fst->paramTypes[i]) {
+                paramType = mapSemType(*fst->paramTypes[i]);
+            }
             oss << paramType << " " << safeName(e.params[i].name);
         }
     }
@@ -1710,18 +1826,25 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     if (needsMutable && !captures.empty())
         oss << " mutable";
 
-    // 返回类型：协程闭包 → task<...>；有 callable 推导 → auto
+    // 返回类型：协程闭包 → task<...>；多态闭包（调用点才确定）→ auto；
+    // 无返回标注的闭包优先读 Sema 推断的返回类型（期望反推）；
+    // 其余按显式标注映射；无标注且推断为 None/Error 保持 auto
     if (closureIsCoro) {
         if (e.returnType)
             oss << " -> aura_rt::task<" << mapType(*e.returnType) << ">";
         else
             oss << " -> aura_rt::task<void>";
     } else if (e.returnType && (!callableParamIndices.empty() || !returnOnlyGenerics.empty())) {
-        oss << " -> auto";
+        oss << " -> auto";        // 多态闭包兜底（invoke_result_t 机制）
     } else if (e.returnType) {
         oss << " -> " << mapType(*e.returnType);
+    } else if (auto* fst = dynamic_cast<const FuncSemType*>(e.inferredType);
+               fst && fst->returnType
+               && !dynamic_cast<const NoneSemType*>(fst->returnType.get())
+               && !dynamic_cast<const ErrorSemType*>(fst->returnType.get())) {
+        oss << " -> " << mapSemType(*fst->returnType);   // Sema 推断的返回类型（如期望反推 int）
     } else {
-        oss << " -> auto";
+        oss << " -> auto";        // 兜底（无标注无推断，如 void 闭包）
     }
 
     // === 函数体 ===
@@ -1794,8 +1917,27 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     }
 
     // C3.2: 闭包返回 Optional<T> 时跟踪元素类型（none() 直转 make_none<T> 用）
+    // P1-2：闭包返回含 None 联合 / 含堆联合时同样填充 union 装箱状态（供 genReturnStmt
+    // return none()/record→view 装箱），并保存/恢复外层函数状态防污染
     auto savedReturnElem = currentReturnElem_;
+    auto savedRetVariantTypes = std::move(currentReturnVariantCppTypes_);
+    auto savedHasNoneVariant = currentReturnHasNoneVariant_;
+    currentReturnVariantCppTypes_.clear();
+    currentReturnHasNoneVariant_ = false;
     currentReturnElem_ = optionalElemOf(e.returnType.get());
+    if (e.returnType && e.returnType->inferredType) {
+        if (auto* u = dynamic_cast<const UnionSemType*>(e.returnType->inferredType)) {
+            std::vector<std::string> cppTypes;
+            bool hasHeap = false;
+            for (auto& v : u->variants) {
+                cppTypes.push_back(v ? mapSemType(*v) : "void");
+                if (v && isUnionHeapVariant(v.get())) hasHeap = true;
+                if (v && dynamic_cast<const NoneSemType*>(v.get()))
+                    currentReturnHasNoneVariant_ = true;
+            }
+            if (hasHeap) currentReturnVariantCppTypes_ = std::move(cppTypes);
+        }
+    }
     for (auto& s : e.body->stmts) {
         if (s) genStmt(oss, *s, closureIsCoro);
     }
@@ -1812,6 +1954,16 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
         // （Bug 2-A 修复前该闭包是协程、会补 co_return，故此前未暴露）
         // → 补 return aura_rt::NoneType{}; 使函数体合法
         oss << indentStr() << "return aura_rt::NoneType{};\n";
+    } else if (!lastIsReturn && e.returnType
+               && callableParamIndices.empty() && returnOnlyGenerics.empty()) {
+        // 防御（#4）：非 None/void 返回类型闭包体末尾无 return（缺显式 return）时
+        // 补 `return {};` 兜底，杜绝产出 no-return lambda（g++ 插 ud2 → 运行时崩溃）。
+        // Sema inferFunExpr 已拦截非法程序，此处防 match 表达式体等漏网路径。
+        // 多态闭包（-> auto，经 returnOnlyGenerics 推导返回类型）补 {} 无法推导故排除；
+        // `-> void` 闭包自然走到末尾合法，不补。
+        std::string cppRet = mapType(*e.returnType);
+        if (cppRet != "void")
+            oss << indentStr() << "return {};\n";
     }
     indentLevel_--;
     oss << indentStr() << "}";
@@ -1820,6 +1972,8 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     stringVarNames_ = savedStringVars;
     valueTypeVarNames_ = savedValueVars;
     currentReturnElem_ = savedReturnElem;
+    currentReturnVariantCppTypes_ = std::move(savedRetVariantTypes);
+    currentReturnHasNoneVariant_ = savedHasNoneVariant;
 
     lastClosureIsCoro_ = closureIsCoro;
     return oss.str();

@@ -295,3 +295,53 @@ let s: Stack<int> = { items = [], top = -1 }  // 实例化 T = int
 | `TypeName(val1, val2, ...)` | 构造函数调用，按参数顺序 | **是**（见 §7.2） | `User(1, "Alice")` |
 
 > **说明**：`TypeName(...)` 是构造函数调用语法，仅在定义了构造函数（`fun (self T) T(...)`）后可用。其余三种是记录字面量语法。
+
+## 3.5 类型标注要求（推荐全标注，可选择性省略）
+
+Aura **推荐全部显式标注**——可读性、可维护性与静态检查强度最佳。但类型推断（含双向推断）允许"具备可反推期望类型"的标注省略。
+
+**核心判据**：能否省略标注 ⟺ 该位置是否存在可反推的期望类型（声明类型 / 形参类型 / 返回类型 / 已确定的泛型映射）。无来源的标注依旧必须。
+
+### 3.5.1 必须标注
+
+| 场景 | 示例 | 原因 |
+| --- | --- | --- |
+| 普通函数 / 方法参数 | `fun add(a: int, b: int) -> int` | 定义时无调用点上下文；无标注 → 参数类型为 error_type（CodeGen 兜底 `auto`），静态检查失效（[§5.1](05-functions.md#51-基本函数)） |
+| 泛型函数类型中的 `<T>` 引入点 | `fun(<T>) -> <T>` 的 `<T>` | 泛型必须通过参数类型引入（[§6.2](06-generics.md#62-泛型函数) 规则一） |
+| 泛型类型别名实参 | `Pair<int, string>` | 禁止裸写 `Pair`；缺省/多余实参均报错（[§6.1](06-generics.md#61-泛型类型别名) / [§3.3](#33-类型别名)） |
+| 返回类型中未引入的泛型 | `fun foo() -> T` | 普通函数不允许返回未引入的泛型（[§6.2](06-generics.md#62-泛型函数)） |
+| 无期望类型的闭包参数 | `let f = fun(a) { return a }` | 无声明/形参/返回类型可反推 → 报 `requires an explicit type annotation` |
+| 无期望类型的空列表元素类型 | `let e = []` | 元素类型无法推断（`const e = []` 直接报错；`let e = []` 产生 error_type 导致 C++ 编译失败）；`let xs: [int] = []` 的 `[int]` 本身即期望来源，不可省（[§4](04-variables.md)） |
+| `none()` 的元素类型（无期望） | `let d = none()` | `T` 推不出 → error_type（见 [§3.2](#32-复合类型)） |
+| `channel<T>` 的元素类型 | `let ch: channel<int> = channel(10)` | 编译器不做从 `send()` 反推（[§11.2](11-concurrency.md#112-协程间通信-channelt)） |
+| `throws` 标注 | `fun divide(...) throws -> float` | 与类型推断无关；函数/闭包体可能抛异常时必须显式标注（[§5.2](05-functions.md#52-异常标记-throws)） |
+| 自定义命名 record 的外部类型名 | `let tree: Tree<int> = { value = 1, children = [] }` | 无标注按匿名 record 处理（见 [§3.2](#32-复合类型)） |
+
+### 3.5.2 可省略（偷懒）标注
+
+| 场景 | 示例 | 反推来源 |
+| --- | --- | --- |
+| 变量 / 常量声明类型（有初始值） | `let price = 9.99` | 初始值表达式（见 [§3.1](#31-基础类型)） |
+| 闭包参数（有期望类型） | `let op: fun(int, int) -> int = fun(a, b) { return a + b }` | 声明类型 / 形参类型 / 返回类型 |
+| 闭包实参的参数（泛型映射已定） | `apply(fun(n) { return n * 2 }, 5)` → `n: int` | 其他实参先绑定 `T`，再反推闭包参数（[§6.2](06-generics.md#62-泛型函数)） |
+| 闭包返回类型（有期望返回类型） | `return fun(msg) { return msg }` | 函数返回类型 `fun(string) -> string` |
+| 空列表 `[]` 元素类型（有期望列表类型） | `count([])`（形参 `[int]`）；`fun f() -> [string] { return [] }` | 形参 / 返回列表类型的元素类型 |
+| 泛型函数实参的 `T` | `apply(..., 5)` → `T = int` | 调用点由其他实参推导（[§6.2](06-generics.md#62-泛型函数)） |
+| `some(v)` 元素类型 | `let a = some(42)` | 实参推导（见 [§3.2](#32-复合类型)） |
+| 函数 / 闭包返回类型（无返回语句） | `fun f() { ... }` | 省略默认 `None`（[§5.1](05-functions.md#51-基本函数) / [§5.3](05-functions.md#53-闭包匿名函数)） |
+
+### 3.5.3 对照示例
+
+```aura
+// --- 必须标注 ---
+fun add(a: int, b: int) -> int { return a + b }   // 普通函数参数
+let op2: fun(int) -> int = ...                     // 泛型别名/函数类型实参不能裸写
+
+// --- 可省略（偷懒）标注 ---
+let price = 9.99                    // 变量类型从初始值推断
+let op: fun(int, int) -> int = fun(a, b) {   // a, b 从声明类型反推
+    return a + b
+}
+let r = apply(fun(n) { return n * 2 }, 5)   // n 从泛型映射反推为 int
+let n = count([])                   // 空列表元素类型从形参 [int] 反推
+```

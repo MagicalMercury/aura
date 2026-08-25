@@ -1,1 +1,3 @@
-1、Sema 用 resolveNamedType(tp->typeName) 短名解析，泛型类型模式需改 Parser/Sema/CodeGen 三处
+Optional<Stringer> = some(p) —— [x] 已修（2026-08-25，plan/issue_遗留三项问题修复规划.md §#1）：显式 Optional<X> 装箱（record→view / lambda→std::function / 裸值 / some(record)）
+let r: Point|None = {x=1,y=2} —— [x] 已修（2026-08-25，§#2）：propagateCanonicalName Optional 下钻 + 目标识别；遗留 [~] #13 列表元素 / #10 record 字段的 Optional 装箱
+range(5).map(fun(x:int)->int{x*2}).collect() 运行时崩溃 —— [x] 已修（2026-08-25，§#4）：非 runtime 问题，闭包缺 return 的 Sema 漏检 + CodeGen 不补 → 已编译期拦截；新发现 [ ] `let x = opt.unwrap()` 对接口/list 元素的推断缺口

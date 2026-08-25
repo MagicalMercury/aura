@@ -64,6 +64,30 @@ TEST(SemaIterator, FromFunctionGenerator) {
     EXPECT_FALSE(diag.hasErrors());
 }
 
+TEST(SemaIterator, FromFunctionGeneratorStringElem) {
+    // P1-1/A2：显式 `-> Optional<string>` 注解物化为 GenericSemType{name=="Optional"}
+    // （非 OptionalSemType），Sema 经 elemTypeOf 提取 string 元素，不再静默退 int32_t
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let git = Iterator.from(fun () -> Optional<string> { return none() });"
+        " for v in git { io.println(v) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaIterator, FromFunctionGeneratorUnknownElemRejected) {
+    // A2：闭包返回 `-> Optional`（无元素标注）→ 元素推不出 → 干净报错（不静默 int32_t）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let git = Iterator.from(fun () -> Optional { return none() });"
+        " for v in git { io.println(v) } }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot infer element type of closure return"));
+}
+
 // ============================================================
 // range 1/2/3 参数
 // ============================================================
@@ -127,6 +151,17 @@ TEST(SemaIterator, ArbitraryChain) {
         " fun main(io: Io) { let r = range(10).filter(odd).map(process) }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaIterator, FilterBareIteratorErrors) {
+    // A5：裸 Iterator（无类型实参，元素不可知）上 filter → 报错引导显式标注
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let it: Iterator = Iterator.from(fun() -> int { return 1 });"
+        " let f = it.filter(fun(x: int) -> bool { return x > 0 }) }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
 }
 
 // ============================================================

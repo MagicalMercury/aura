@@ -177,6 +177,20 @@ TEST(CodeGen, ClosureMapsToStdFunction) {
     EXPECT_CONTAINS(unit.impl, "std::function<int32_t(int32_t)>");
 }
 
+TEST(CodeGen, GenericClosureArgConcreteWrapper) {
+    // 泛型函数 + 闭包实参：调用点必须用实参推断的具体 FuncSemType 生成 std::function，
+    // 不能用含未绑定泛型变量的 std::function<T(T)>（非泛型调用点无 T 作用域 → 编译失败）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun apply(f: fun(<T>) -> <T>, v: <T>) -> T { return f(v) }"
+        " fun main(io: Io) { let r = apply(fun(n) { return n * 2 }, 5) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 双向推断将 T 代换为 int32_t，闭包实参包装为具体 std::function<int32_t(int32_t)>
+    EXPECT_CONTAINS(unit.impl, "std::function<int32_t(int32_t)>([");
+    EXPECT_NOT_CONTAINS(unit.impl, "std::function<T(T)>(");
+}
+
 // ============================================================
 // 元组
 // ============================================================

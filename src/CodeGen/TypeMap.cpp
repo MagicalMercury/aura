@@ -154,8 +154,22 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
                 // 堆判定与 Sema unionVariantGcUnsafe 对齐：类型标注处无 SemType
                 // （如 [int] | None 的 [int] 是 ListType），按 C++ 名回退（指针 = 堆）
                 bool otherHeap = false;
+                // 内置泛型模板（Optional/Iterator/channel 等，BuiltinPrim::Other）：
+                // Sema 将它们物化为 GenericSemType，unionVariantGcUnsafe 恒 false →
+                // resolveType 不折叠，保持 UnionSemType（Variant 路径）。CodeGen mapType
+                // 必须一致，否则声明类型与 genUnionBoxing 初始化类型不匹配（u5/u12/u62）
+                auto isBuiltinGenericNamed = [](const TypeExpr* t) {
+                    if (auto* n = dynamic_cast<const NamedType*>(t)) {
+                        auto* ti = BuiltinRegistry::get().findType(n->name);
+                        return ti && ti->primKind == BuiltinPrim::Other;
+                    }
+                    return false;
+                };
                 if (other && other->inferredType) {
-                    otherHeap = isHeapSemType(other->inferredType);
+                    otherHeap = !dynamic_cast<const GenericSemType*>(other->inferredType)
+                             && isHeapSemType(other->inferredType);
+                } else if (other && isBuiltinGenericNamed(other.get())) {
+                    otherHeap = false;   // 内置泛型变体不折叠
                 } else if (other) {
                     std::string cpp = mapType(*other);
                     otherHeap = !cpp.empty() && cpp.back() == '*';
@@ -228,6 +242,47 @@ std::string CodeGenerator::optionalElemOf(const TypeExpr* retType) {
     return "";
 }
 
+std::string CodeGenerator::optionalElemCppName(const SemType* optType) {
+    // P1-1/A1/A2：从"Optional 语义类型"提取元素 C++ 名。
+    // 显式 `Optional<T>` 注解经 DeclChecker 物化为 GenericSemType{name=="Optional",
+    // resolvedName="aura_rt::Optional<T>"}（非 OptionalSemType）；mapSemType 对
+    // GenericSemType 会追加 * 尾缀（Iterator 特判外），故 Generic 形态从 resolvedName
+    // 直接取 <...> 内元素 C++ 名（含嵌套尖括号用末个 '>' 定位）。
+    //
+    // 元素 C++ 名可能缺失堆 record 的 *（Sema 的 resolvedName/cppNameOfTypeExpr 对
+    // record 不加 *，而声明侧 mapType 对 record 追加 *）→ 统一补 * 与声明侧一致，
+    // 否则 `let x: Optional<Point> = none()` 生成 Optional<Point>*（元素无 *）与
+    // 声明 Optional<Point*>* 不匹配。
+    auto finalizeElem = [this](std::string elem) -> std::string {
+        if (elem.empty() || elem.back() == '*') return elem;
+        if (isIfaceViewTypeName(elem)) return elem;   // 值视图（Iterator<...>/接口）无 *
+        auto it = registeredTypes_.find(elem);
+        if (it != registeredTypes_.end() && it->second) return elem + "*";  // 堆 record → 补 *
+        return elem;
+    };
+
+    if (auto* os = dynamic_cast<const OptionalSemType*>(optType)) {
+        if (os->elementType
+            && !dynamic_cast<const ErrorSemType*>(os->elementType.get())) {
+            // 元素 GenericSemType（Sema elemTypeOf 经 semTypeFromCppName 还原）：
+            //   resolvedName 即元素 C++ 名（可能缺 record 的 *）；其余走 mapSemType
+            if (auto* ge = dynamic_cast<const GenericSemType*>(os->elementType.get()))
+                return finalizeElem(ge->resolvedName);
+            return mapSemType(*os->elementType);
+        }
+        return "";
+    }
+    if (auto* gs = dynamic_cast<const GenericSemType*>(optType)) {
+        if (gs->name == "Optional" && !gs->resolvedName.empty()) {
+            auto lt = gs->resolvedName.find('<');
+            auto rt = gs->resolvedName.rfind('>');
+            if (lt != std::string::npos && rt != std::string::npos && rt > lt)
+                return finalizeElem(gs->resolvedName.substr(lt + 1, rt - lt - 1));
+        }
+    }
+    return "";
+}
+
 std::string CodeGenerator::mapNamedType(const std::string& name) {
     // 内置 Iterator：C++ 形态为 16B 值视图（aura_rt::Iterator<T>，无 *）。
     // 必须在 BuiltinRegistry 命中前特判（registry 存的是旧指针形态 "aura_rt::Iterator*"）
@@ -292,8 +347,16 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
     }
     if (dynamic_cast<const NoneSemType*>(&semType))
         return "aura_rt::NoneType";
-    if (dynamic_cast<const ErrorSemType*>(&semType))
-        return "/* error_type */";
+    if (dynamic_cast<const ErrorSemType*>(&semType)) {
+        // 兜底：error_type 泄漏到 CodeGen 会生成无效模板参数（如 Array</* error_type */>）→ C++ 错误。
+        // 正常应被 Sema 的 containsErrorElement 拦截；此处报一次干净错误并返回安全占位，
+        // 使 CodeGen 自身不崩溃、且 driver 检测到错误后不会调用 g++。
+        if (!reportedErrorType_) {
+            reportedErrorType_ = true;
+            diag_.error(0, 0, "codegen: unresolved 'error_type' reached code generation (missing Sema check); add an explicit type annotation");
+        }
+        return "int32_t";
+    }
     if (auto* l = dynamic_cast<const ListSemType*>(&semType)) {
         return "aura_rt::Array<" + mapSemType(*l->elementType) + ">*";
     }
@@ -312,7 +375,15 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
                 if (dynamic_cast<const NoneSemType*>(v.get())) noneV = v.get();
                 else otherV = v.get();
             }
-            if (noneV && otherV && isHeapSemType(otherV))
+            // 与 resolveType 的 unionVariantGcUnsafe 对齐：GenericSemType（内置泛型
+            // 物化）与 InterfaceSemType（接口视图，P1-2 Option B）不折叠——Sema 对
+            // `Optional<int>|None` / `Stringer|None` 保持 UnionSemType，mapSemType 须
+            // 一致（Variant 路径），否则与 mapType 声明类型不匹配
+            bool otherFold = otherV
+                && !dynamic_cast<const GenericSemType*>(otherV)
+                && !dynamic_cast<const InterfaceSemType*>(otherV)
+                && isHeapSemType(otherV);
+            if (noneV && otherFold)
                 return "aura_rt::Optional<" + mapSemType(*otherV) + ">*";
         }
         // P3b：含堆 → Variant 指针；全值 → std::variant

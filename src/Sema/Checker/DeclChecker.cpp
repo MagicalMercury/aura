@@ -35,7 +35,10 @@ bool SemAnalyzer::unionVariantGcUnsafe(const SemType& t) {
     if (dynamic_cast<const OptionalSemType*>(&t)) return true; // Optional<T>* 堆
     if (dynamic_cast<const RecordSemType*>(&t))   return true; // 用户 record → Name* 堆对象
     if (dynamic_cast<const FuncSemType*>(&t))     return true; // std::function 捕获 GC 指针，GC 不可见
-    if (dynamic_cast<const InterfaceSemType*>(&t)) return true;// 抽象类值无法入 variant
+    // 接口视图（值视图 { 方法Fn, self }）：P1-2 Option B 不折叠，走 Variant 路径
+    // （与 Iterator<T>|None 一致）。Variant 对接口视图变体由 descForI is_iface_view_v
+    // 子偏移（storage_ + offsetof(T,self)）+ ViewRoot 保护，GC 安全（见 variant.h:74-78）。
+    if (dynamic_cast<const InterfaceSemType*>(&t)) return false;
     if (auto* u = dynamic_cast<const UnionSemType*>(&t))
         for (auto& v : u->variants)
             if (v && unionVariantGcUnsafe(*v)) return true;
@@ -122,6 +125,9 @@ void SemAnalyzer::buildTypeMethods(const Program& program) {
             }
             if (m->returnType) sig.returnType = resolveType(*m->returnType);
             sig.throws = m->throws;
+            // 尾部默认参数个数（checkCallArgs 参数数量检查用，C3.1 保证连续）
+            for (auto& p : m->params)
+                if (p.defaultExpr) ++sig.defaultCount;
             typeMethods_[key].push_back(std::move(sig));
         }
     }
@@ -529,14 +535,17 @@ void SemAnalyzer::checkDefaultArgRules(const ASTNode& declNode,
             error(declNode, "parameter '" + p.name
                   + "': default argument not supported on generic parameter");
         }
-        // 默认值表达式声明处求值检查（inferExpr 写入 defaultExpr->inferredType，C5 复用）
-        auto dt = inferExpr(*p.defaultExpr);
+        // 默认值表达式声明处求值检查（inferExpr 写入 defaultExpr->inferredType，C5 复用）。
+        // 带参数类型作为期望（P1-1）：`x: Optional<float> = none()` 的默认 none() 需形参
+        // Optional<float> 反推元素，否则推断为 Optional<error> → CodeGen none() 分支报错
+        std::unique_ptr<SemType> pt;
+        if (p.type) pt = resolveType(*p.type);
+        auto dt = inferExpr(*p.defaultExpr, pt ? pt.get() : nullptr);
         if (dynamic_cast<const ErrorSemType*>(dt.get())) {
             error(*p.defaultExpr, "invalid default argument for parameter '" + p.name + "'");
             continue;
         }
         if (p.type) {
-            auto pt = resolveType(*p.type);
             if (!isAssignable(*pt, *dt))
                 error(*p.defaultExpr, "default argument type mismatch for parameter '"
                       + p.name + "': expected '" + pt->toString() + "', got '"
@@ -549,9 +558,7 @@ void SemAnalyzer::checkDefaultArgRules(const ASTNode& declNode,
 // 辅助：漏 return 检查（非 None 返回类型函数必须所有路径显式 return）
 // 递归判断语句是否在所有路径上以 return/throw 终结（终结后语句不可达）
 // ============================================================
-static bool stmtAllPathsReturn(const Stmt& stmt);
-
-static bool blockAllPathsReturn(const BlockStmt& block) {
+bool SemAnalyzer::blockAllPathsReturn(const BlockStmt& block) {
     for (auto& s : block.stmts) {
         if (!s) continue;
         // 一旦遇到终结语句（return/throw），其后的语句不可达
@@ -560,7 +567,7 @@ static bool blockAllPathsReturn(const BlockStmt& block) {
     return false;
 }
 
-static bool stmtAllPathsReturn(const Stmt& stmt) {
+bool SemAnalyzer::stmtAllPathsReturn(const Stmt& stmt) {
     // return / throw 均为终结语句
     if (dynamic_cast<const ReturnStmt*>(&stmt)) return true;
     if (dynamic_cast<const ThrowStmt*>(&stmt)) return true;
@@ -622,6 +629,12 @@ void SemAnalyzer::checkFunBody(const FunDecl& decl) {
     // 3. 解析返回类型（泛型已注册，T 可正确解析为 GenericSemType）
     //    用 FnCtxGuard 保存/恢复外层上下文（支持闭包体嵌套检查）
     auto retType = decl.returnType ? resolveType(*decl.returnType) : nullptr;
+    // P1-2：保存解析后的返回类型到 returnType->inferredType（typeStore_ 保活），
+    // 供 CodeGen funSignature 读取（currentReturnVariantCppTypes_ / HasNoneVariant_ 装箱）
+    if (retType && decl.returnType) {
+        typeStore_.push_back(retType->clone());
+        const_cast<TypeExpr*>(decl.returnType.get())->inferredType = typeStore_.back().get();
+    }
     FnCtxGuard fc(*this, retType ? retType->clone() : nullptr, decl.throws);
 
     // 默认参数声明规则检查（尾部连续、类型可赋值、泛型参数拒绝）
@@ -681,6 +694,12 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
 
     // 5. 解析返回类型（用 FnCtxGuard 保存/恢复外层上下文）
     auto retType = decl.returnType ? resolveType(*decl.returnType) : nullptr;
+    // P1-2：保存解析后的返回类型到 returnType->inferredType（typeStore_ 保活），
+    // 供 CodeGen methodSignature 读取（currentReturnVariantCppTypes_ / HasNoneVariant_ 装箱）
+    if (retType && decl.returnType) {
+        typeStore_.push_back(retType->clone());
+        const_cast<TypeExpr*>(decl.returnType.get())->inferredType = typeStore_.back().get();
+    }
     FnCtxGuard fc(*this, retType ? retType->clone() : nullptr, decl.throws);
 
     // 默认参数声明规则检查（尾部连续、类型可赋值、泛型参数拒绝）

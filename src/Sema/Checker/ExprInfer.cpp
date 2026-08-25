@@ -7,7 +7,8 @@ namespace Aura {
 // 表达式类型推断
 // ============================================================
 
-std::unique_ptr<SemType> SemAnalyzer::inferExpr(const ASTNode& expr) {
+std::unique_ptr<SemType> SemAnalyzer::inferExpr(const ASTNode& expr,
+                                                const SemType* expected) {
     std::unique_ptr<SemType> result;
     if (auto* e = dynamic_cast<const IntLiteral*>(&expr))          result = inferIntLiteral(*e);
     else if (auto* e = dynamic_cast<const FloatLiteral*>(&expr))        result = inferFloatLiteral(*e);
@@ -15,11 +16,11 @@ std::unique_ptr<SemType> SemAnalyzer::inferExpr(const ASTNode& expr) {
     else if (auto* e = dynamic_cast<const BoolLiteral*>(&expr))         result = inferBoolLiteral(*e);
     else if (dynamic_cast<const NoneLiteral*>(&expr))                     result = NoneSemType::make();
     else if (auto* e = dynamic_cast<const Identifier*>(&expr))          result = inferIdentifier(*e);
-    else if (auto* e = dynamic_cast<const ListExpr*>(&expr))            result = inferListExpr(*e);
+    else if (auto* e = dynamic_cast<const ListExpr*>(&expr))            result = inferListExpr(*e, expected);
     else if (auto* e = dynamic_cast<const RecordExpr*>(&expr))          result = inferRecordExpr(*e);
     else if (auto* e = dynamic_cast<const BinaryExpr*>(&expr))          result = inferBinaryExpr(*e);
     else if (auto* e = dynamic_cast<const UnaryExpr*>(&expr))           result = inferUnaryExpr(*e);
-    else if (auto* e = dynamic_cast<const CallExpr*>(&expr))            result = inferCall(*e);
+    else if (auto* e = dynamic_cast<const CallExpr*>(&expr))            result = inferCall(*e, expected);
     else if (auto* e = dynamic_cast<const MethodCallExpr*>(&expr))      result = inferMethodCall(*e);
     else if (auto* e = dynamic_cast<const MemberAccessExpr*>(&expr))    result = inferMemberAccess(*e);
     else if (auto* e = dynamic_cast<const IndexExpr*>(&expr))           result = inferIndexExpr(*e);
@@ -27,7 +28,7 @@ std::unique_ptr<SemType> SemAnalyzer::inferExpr(const ASTNode& expr) {
     else if (auto* e = dynamic_cast<const ErrorPropagationExpr*>(&expr))result = inferErrorPropagation(*e);
     else if (auto* e = dynamic_cast<const PipeExpr*>(&expr))            result = inferPipe(*e);
     else if (auto* e = dynamic_cast<const ConditionalExpr*>(&expr))     result = inferConditional(*e);
-    else if (auto* e = dynamic_cast<const FunExpr*>(&expr))             result = inferFunExpr(*e);
+    else if (auto* e = dynamic_cast<const FunExpr*>(&expr))             result = inferFunExpr(*e, expected);
     else {
         error(expr, "internal error: unknown expression node in type inference");
         return ErrorSemType::make();
@@ -70,15 +71,71 @@ std::unique_ptr<SemType> SemAnalyzer::inferIdentifier(const Identifier& e) {
     return sym->type ? sym->type->clone() : ErrorSemType::make();
 }
 
-std::unique_ptr<SemType> SemAnalyzer::inferListExpr(const ListExpr& e) {
+std::unique_ptr<SemType> SemAnalyzer::inferListExpr(const ListExpr& e,
+                                                    const SemType* expected) {
     if (e.elements.empty()) {
+        // 空列表：从期望 ListSemType / 含 List 变体的 UnionSemType 反推元素（缺口 3）；
+        // 无期望 → List<error>，交由 let/const/return/赋值提交点拦截
+        const SemType* elemExpected = nullptr;
+        if (auto* el = dynamic_cast<const ListSemType*>(expected); el && el->elementType) {
+            elemExpected = el->elementType.get();
+        } else if (auto* u = dynamic_cast<const UnionSemType*>(expected)) {
+            // `T | [E] | None` 联合期望：从 ListSemType 变体反推元素类型
+            for (auto& v : u->variants) {
+                if (auto* lv = dynamic_cast<const ListSemType*>(v.get());
+                    lv && lv->elementType) {
+                    elemExpected = lv->elementType.get();
+                    break;
+                }
+            }
+            if (!elemExpected) {
+                // 联合无 List 变体（如 Iterator<int> | None / Optional<int> | None）：
+                // `[]` 语义非法 → 干净报类型不匹配（不让 List<error> 绕过 isAssignable）
+                error(e, "type mismatch: cannot assign empty list '[]' to '"
+                         + expected->toString() + "'");
+            }
+        }
         auto t = std::make_unique<ListSemType>();
-        t->elementType = ErrorSemType::make();
+        t->elementType = elemExpected ? elemExpected->clone() : ErrorSemType::make();
         typeStore_.push_back(std::move(t));
         const_cast<ListExpr&>(e).inferredType = typeStore_.back().get();
         return typeStore_.back()->clone();
     }
-    auto elemType = e.elements[0] ? inferExpr(*e.elements[0]) : ErrorSemType::make();
+    // 非空列表：首元素可透传期望元素类型（f([fun(n){...}]) 场景）
+    const SemType* firstExpected = nullptr;
+    if (auto* el = dynamic_cast<const ListSemType*>(expected); el && el->elementType)
+        firstExpected = el->elementType.get();
+    auto elemType = e.elements[0] ? inferExpr(*e.elements[0], firstExpected) : ErrorSemType::make();
+    // A3：无标注记录列表字面量（let e = [{x=1,y=2},{x=3,y=4}]）——首元素是匿名
+    // RecordExpr 且 canonicalName 为空时，按字段结构匹配全局 record 类型声明，使
+    // CodeGen 生成 Array<Point*>（而非静默退化为 GcObject*/int32_t）。有期望类型
+    //（如 [Point] 标注）时由 checkLetDecl 的 propagateCanonicalName 传播，此处跳过。
+    if (!firstExpected && !e.elements.empty() && e.elements[0]) {
+        if (auto* rec = dynamic_cast<const RecordExpr*>(e.elements[0].get())) {
+            if (const auto* rs = dynamic_cast<const RecordSemType*>(rec->inferredType)) {
+                if (rs->canonicalName.empty()) {
+                    std::string recName = resolveAnonymousRecordName(*rs);
+                    if (!recName.empty()) {
+                        // 同步填充所有 RecordExpr 元素的 inferredType（CodeGen genRecordExpr 依赖）
+                        for (auto& el : e.elements) {
+                            if (!el) continue;
+                            auto* recEl = dynamic_cast<const RecordExpr*>(el.get());
+                            if (!recEl) continue;
+                            const auto* rsEl = dynamic_cast<const RecordSemType*>(recEl->inferredType);
+                            if (!rsEl || !rsEl->canonicalName.empty()) continue;
+                            auto named = rsEl->clone();
+                            dynamic_cast<RecordSemType*>(named.get())->canonicalName = recName;
+                            typeStore_.push_back(std::move(named));
+                            const_cast<RecordExpr*>(recEl)->inferredType = typeStore_.back().get();
+                        }
+                        if (auto* rsE = const_cast<RecordSemType*>(
+                                dynamic_cast<const RecordSemType*>(elemType.get())))
+                            rsE->canonicalName = recName;
+                    }
+                }
+            }
+        }
+    }
     for (size_t i = 1; i < e.elements.size(); ++i) {
         if (!e.elements[i]) continue;
         auto ti = inferExpr(*e.elements[i]);
@@ -193,7 +250,45 @@ std::unique_ptr<SemType> SemAnalyzer::inferUnaryExpr(const UnaryExpr& e) {
     return ErrorSemType::make();
 }
 
-std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
+// ============================================================
+// containsUnresolvedGeneric — 类型中是否含"未绑定泛型变量"
+// ============================================================
+// 泛型函数调用点若未能把 <T> 绑定到具体类型（如 head(fun(xs){...}) 只从闭包自身
+// 推导 T），未绑定 T 会泄漏到 CodeGen 生成 std::function<T(...)> / auto → C++ 编译错误。
+// 当前作用域内已注册的泛型参数（泛型函数体内的 T）视为可引用，不视为未绑定。
+bool SemAnalyzer::containsUnresolvedGeneric(const SemType* t) const {
+    if (!t) return false;
+    if (auto* g = dynamic_cast<const GenericSemType*>(t)) {
+        if (!g->resolvedName.empty()) return false;   // 已实例化（Iterator<int32_t>）→ 具体
+        auto* s = symtab_.lookup(g->name);            // 作用域内泛型参数 → 可引用
+        if (s && s->kind == SymKind::GenericParam) return false;
+        return true;
+    }
+    if (auto* l = dynamic_cast<const ListSemType*>(t))
+        return containsUnresolvedGeneric(l->elementType.get());
+    if (auto* o = dynamic_cast<const OptionalSemType*>(t))
+        return containsUnresolvedGeneric(o->elementType.get());
+    if (auto* u = dynamic_cast<const UnionSemType*>(t)) {
+        for (auto& v : u->variants)
+            if (containsUnresolvedGeneric(v.get())) return true;
+        return false;
+    }
+    if (auto* f = dynamic_cast<const FuncSemType*>(t)) {
+        if (containsUnresolvedGeneric(f->returnType.get())) return true;
+        for (auto& p : f->paramTypes)
+            if (containsUnresolvedGeneric(p.get())) return true;
+        return false;
+    }
+    if (auto* r = dynamic_cast<const RecordSemType*>(t)) {
+        for (auto& fld : r->fields)
+            if (containsUnresolvedGeneric(fld.type.get())) return true;
+        return false;
+    }
+    return false;
+}
+
+std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e,
+                                                const SemType* expected) {
     auto* callee = dynamic_cast<const Identifier*>(e.callee.get());
     if (!callee) {
         // 非标识符调用（如闭包调用）— 推断 callee 类型
@@ -221,7 +316,30 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
                 return typeStore_.back()->clone();
             }
             if (fn->name == "none") {
-                auto ot = OptionalSemType::make(ErrorSemType::make());
+                // none()：元素类型可从期望 Optional 反推（如 let x: Optional<int> = none()）；
+                // 无期望 → Optional<error>，交由 let/const/return/赋值提交点拦截
+                const SemType* elemTy = nullptr;
+                std::unique_ptr<SemType> genericElem;  // 保活 elemTypeOf 返回的临时对象
+                if (auto* oe = dynamic_cast<const OptionalSemType*>(expected))
+                    elemTy = oe->elementType.get();
+                else if (auto* g = dynamic_cast<const GenericSemType*>(expected)) {
+                    // `-> Optional<int>` 等注解物化为 GenericSemType{name="Optional",
+                    // resolvedName="aura_rt::Optional<int32_t>"}：经 elemTypeOf 从
+                    // resolvedName 提取 `<...>` 内元素类型，避免 containsErrorElement 误报
+                    if (g->name == "Optional") {
+                        genericElem = elemTypeOf(expected);
+                        if (!dynamic_cast<const ErrorSemType*>(genericElem.get()))
+                            elemTy = genericElem.get();
+                    }
+                }
+                // `T | None` 联合期望：none() 代表联合的 None 值，返回 NoneSemType
+                // （不再生成 Optional<error> 泄漏）。isAssignable(Union, None) 由联合的
+                // None 变体（u4 等）或 Optional 变体（u63: int | Optional<string>）判定；
+                // 联合不含 None/Optional 变体（如 int|string）时由 isAssignable 报类型不匹配。
+                if (dynamic_cast<const UnionSemType*>(expected))
+                    return NoneSemType::make();
+                auto ot = OptionalSemType::make(
+                    elemTy ? elemTy->clone() : ErrorSemType::make());
                 typeStore_.push_back(std::move(ot));
                 return typeStore_.back()->clone();
             }
@@ -241,7 +359,12 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
         for (auto it = sym->params.rbegin(); it != sym->params.rend() && it->hasDefault; ++it) ++dc;
         checkCallArgs(e, callee->name, "function", formalTypes, e.args, genericMap, dc);
         auto result = sym->type ? sym->type->clone() : ErrorSemType::make();
-        return applyGenericMap(std::move(result), genericMap);
+        auto applied = applyGenericMap(std::move(result), genericMap);
+        if (containsUnresolvedGeneric(applied.get())) {
+            error(e, "cannot infer type parameter(s) in call to '" + callee->name
+                  + "'; bind them via concrete arguments or explicit type arguments");
+        }
+        return applied;
     }
     // TypeAlias 有显式构造函数（fun (self T) T(...)）→ 作为构造函数调用
     // 用 ctorDeclared 判断（ctorParams 为空 = 无参构造函数，!empty() 会误判）
@@ -261,7 +384,12 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e) {
             for (auto& pt : fst->paramTypes) formalTypes.push_back(pt.get());
             checkCallArgs(e, callee->name, "function", formalTypes, e.args, genericMap);
             auto result = fst->returnType ? fst->returnType->clone() : NoneSemType::make();
-            return applyGenericMap(std::move(result), genericMap);
+            auto applied = applyGenericMap(std::move(result), genericMap);
+            if (containsUnresolvedGeneric(applied.get())) {
+                error(e, "cannot infer type parameter(s) in call to '" + callee->name
+                      + "'; bind them via concrete arguments or explicit type arguments");
+            }
+            return applied;
         }
     }
 
@@ -318,16 +446,29 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
             for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
             if (!e.args.empty() && e.args[0] && e.args[0]->inferredType) {
                 if (auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType)) {
-                    if (auto* os = dynamic_cast<const OptionalSemType*>(ft->returnType.get())) {
-                        // os->elementType 可能为 null（none()/未知类型），须判空再解引用
-                        if (os->elementType) {
-                            auto g = std::make_unique<GenericSemType>();
-                            g->name = "Iterator";
-                            g->resolvedName = "aura_rt::Iterator<"
-                                + semTypeToCppName(*os->elementType) + ">";
-                            typeStore_.push_back(std::move(g));
-                            return typeStore_.back()->clone();
+                    // A2：返回类型 `-> Optional<string>` 显式注解物化为
+                    // GenericSemType{name=="Optional"}（非 OptionalSemType，见
+                    // DeclChecker materializeCanonicalName）；统一经 elemTypeOf 提取
+                    // 已知元素。真未知（Optional<error>）→ 干净报错引导标注，
+                    // 不再静默退 int32_t。
+                    auto* retTy = ft->returnType.get();
+                    bool retIsOptional = dynamic_cast<const OptionalSemType*>(retTy)
+                        || (dynamic_cast<const GenericSemType*>(retTy)
+                            && static_cast<const GenericSemType*>(retTy)->name == "Optional");
+                    if (retIsOptional) {
+                        auto elem = elemTypeOf(retTy);
+                        if (dynamic_cast<const ErrorSemType*>(elem.get())) {
+                            error(e, "cannot infer element type of closure return for "
+                                     "'Iterator.from'; annotate the return type "
+                                     "(e.g. fun () -> Optional<string>)");
+                            return ErrorSemType::make();
                         }
+                        auto g = std::make_unique<GenericSemType>();
+                        g->name = "Iterator";
+                        g->resolvedName = "aura_rt::Iterator<"
+                            + semTypeToCppName(*elem) + ">";
+                        typeStore_.push_back(std::move(g));
+                        return typeStore_.back()->clone();
                     }
                 }
             }
@@ -393,6 +534,40 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
         return ErrorSemType::make();
     }
 
+    // record 接收者方法调用（如 p.offset(3) / p.offset(3,4)）：
+    // 在 typeMethods_（buildTypeMethods 构建，key=canonicalName）中按方法名匹配，
+    // 返回声明返回类型；参数用 checkCallArgs 校验（含尾部默认参数计数）。
+    // 找不到方法时保持原放行（返回 ErrorSemType 不报错，由 C++ 编译器兜底）。
+    if (auto* rec = dynamic_cast<const RecordSemType*>(objType.get())) {
+        const std::vector<InterfaceSemType::MethodSig>* methods = nullptr;
+        auto it = typeMethods_.find(rec->canonicalName);
+        if (it != typeMethods_.end()) {
+            methods = &it->second;
+        } else {
+            // 泛型 record：canonicalName 已物化为实例名（如 "Stack<int32_t>"），
+            // typeMethods_ 的 key 是声明时的基名，按基名回退查找
+            auto lt = rec->canonicalName.find('<');
+            if (lt != std::string::npos) {
+                auto it2 = typeMethods_.find(rec->canonicalName.substr(0, lt));
+                if (it2 != typeMethods_.end()) methods = &it2->second;
+            }
+        }
+        if (methods) {
+            for (auto& m : *methods) {
+                if (m.name == e.method) {
+                    checkThrowsContext(e, e.method, m.throws);
+                    std::vector<const SemType*> formalTypes;
+                    for (auto& pt : m.paramTypes) formalTypes.push_back(pt.get());
+                    std::map<std::string, std::unique_ptr<SemType>> genericMap;
+                    checkCallArgs(e, e.method, "method", formalTypes, e.args, genericMap, m.defaultCount);
+                    auto result = m.returnType ? m.returnType->clone() : NoneSemType::make();
+                    return applyGenericMap(std::move(result), genericMap);
+                }
+            }
+        }
+        // 未匹配到方法 → 保持原放行（落入下方"不在表中"路径）
+    }
+
     // Iterator 桥接方法特判（map/filter/collect 为 C++ 桥接，返回类型调用点推导）
     // 覆盖：range/map/filter/from 返回值（GenericSemType name="Iterator"）
     if (isIteratorType(objType.get())) {
@@ -405,28 +580,41 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
             return typeStore_.back()->clone();
         }
         if (e.method == "map" && !e.args.empty() && e.args[0] && e.args[0]->inferredType) {
-            auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType);
-            if (ft && ft->returnType && !dynamic_cast<const ErrorSemType*>(ft->returnType.get())) {
+            // map 结果元素类型 = 闭包/函数实参的返回类型：
+            //   - 闭包：FuncSemType.returnType
+            //   - 顶层函数名：Symbol.type 即返回类型（既有约定，inferIdentifier 返回它）
+            // 已知 → Iterator<retTy>；不可知 → 报干净错误（A5，不再静默退 int32_t）
+            const SemType* retTy = nullptr;
+            if (auto* ft = dynamic_cast<const FuncSemType*>(e.args[0]->inferredType)) {
+                if (ft->returnType) retTy = ft->returnType.get();
+            } else if (auto* id = dynamic_cast<const Identifier*>(e.args[0].get())) {
+                auto* sym = symtab_.lookup(id->name);
+                if (sym && (sym->kind == SymKind::Function || sym->kind == SymKind::Method)
+                    && sym->type)
+                    retTy = sym->type.get();
+            }
+            if (retTy && !dynamic_cast<const ErrorSemType*>(retTy)) {
                 auto g = std::make_unique<GenericSemType>();
                 g->name = "Iterator";
                 g->resolvedName = "aura_rt::Iterator<"
-                                  + semTypeToCppName(*ft->returnType) + ">";
+                                  + semTypeToCppName(*retTy) + ">";
                 typeStore_.push_back(std::move(g));
                 return typeStore_.back()->clone();
             }
-            // U 未知 → 元素类型退化为 int32_t（后续使用会引导标注）
-            auto g = std::make_unique<GenericSemType>();
-            g->name = "Iterator";
-            g->resolvedName = "aura_rt::Iterator<int32_t>";
-            typeStore_.push_back(std::move(g));
-            return typeStore_.back()->clone();
+            // A5：闭包/函数返回类型不可知 → 报干净错误而非静默退化为 Iterator<int32_t>，
+            // 防未来回归（未知元素不伪装成 int）
+            error(e, "cannot infer element type of map result; annotate the closure return type (e.g. fun(x: int) -> int)");
+            return ErrorSemType::make();
         }
         if (e.method == "filter") {
+            if (dynamic_cast<const ErrorSemType*>(elem.get())) {
+                // A5：元素类型不可知（裸 Iterator 无类型实参）→ 报错引导显式标注（参照 receive 风格）
+                error(e, "cannot infer element type of filter input; add explicit type annotation (e.g. filter on Iterator<int>)");
+                return ErrorSemType::make();
+            }
             auto g = std::make_unique<GenericSemType>();
             g->name = "Iterator";
-            std::string elemCpp = dynamic_cast<const ErrorSemType*>(elem.get())
-                ? "int32_t" : semTypeToCppName(*elem);
-            g->resolvedName = "aura_rt::Iterator<" + elemCpp + ">";
+            g->resolvedName = "aura_rt::Iterator<" + semTypeToCppName(*elem) + ">";
             typeStore_.push_back(std::move(g));
             return typeStore_.back()->clone();
         }
@@ -469,6 +657,12 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
             bool needsElem = (ret.kind == ReturnTypeInfo::Kind::Optional)
                 || (ret.kind == ReturnTypeInfo::Kind::Generic
                     && ret.typeName != "[T]" && ret.typeName != "string");
+            // A4：无标注 channel（元素不可知）的 send 也与 receive 对齐报错——
+            // channel/sync.Channel 是模板类型，send 实参类型依赖元素类型，未标注时
+            // 生成裸 Channel* → C++ 模板错误，须在 Sema 层干净拦截
+            if (!needsElem && e.method == "send"
+                && (typeKey == "channel" || typeKey == "sync.Channel"))
+                needsElem = true;
             if (needsElem) {
                 auto elem = elemTypeOf(objType.get());
                 if (dynamic_cast<const ErrorSemType*>(elem.get())) {
@@ -545,6 +739,21 @@ std::unique_ptr<SemType> SemAnalyzer::inferMemberAccess(const MemberAccessExpr& 
         error(e, "record type " + rec->toString() + " has no field '" + e.member + "'");
         return ErrorSemType::make();
     }
+    // 内置无字段类型（string / [T]）：属性集合为空，任何 .xxx 属性访问都报干净错误。
+    // 修复 `.length` 意外暴露——此前 Sema 静默放行 + CodeGen 无脑生成 obj->xxx +
+    // C++ 运行时字段同名（GcString::length / Array<T>::length）三层巧合使 .length 可用。
+    std::string typeKey;
+    if (auto* p = dynamic_cast<const PrimSemType*>(objType.get())) {
+        if (p->kind == PrimSemType::String) typeKey = "string";
+    } else if (dynamic_cast<const ListSemType*>(objType.get())) {
+        typeKey = "[T]";
+    }
+    if (!typeKey.empty()) {
+        std::string typeName = (typeKey == "[T]") ? "array" : typeKey;
+        error(e, "type '" + typeName + "' has no member '" + std::string(e.member)
+                 + "'; use 'len()' instead");
+        return ErrorSemType::make();
+    }
     // 接口类型或其他：允许成员访问（编译时无法确定）
     return ErrorSemType::make();
 }
@@ -592,9 +801,18 @@ std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
         }
     }
     auto targetTy = inferExpr(*e.target);
-    auto valueTy  = inferExpr(*e.value);
+    // 期望类型 = 目标变量类型：空列表 / none() 可从目标类型反推元素（如 xs: [int]; xs = []）
+    auto valueTy  = inferExpr(*e.value, targetTy.get());
     if (!isAssignable(*targetTy, *valueTy)) {
         error(e, "assignment type mismatch: cannot assign '" + valueTy->toString() + "' to '" + targetTy->toString() + "'");
+    }
+    // 目标类型有效但值仍含不可解析元素（如赋值目标自身类型错误时目标为 error 类型，
+    // 此时由目标的 undefined identifier 等错误主导，不再叠加）→ 干净报错拦截 error_type 泄漏
+    // （!diag_.hasErrors() 守卫：value 自身已报错（如 s.length 报无成员）时不再叠加）
+    if (!dynamic_cast<const ErrorSemType*>(targetTy.get())
+        && !diag_.hasErrors()
+        && containsErrorElement(valueTy.get())) {
+        error(e, "cannot infer element type from assignment; add explicit type annotation (e.g. let xs: [int] = []; xs = [])");
     }
 
     return valueTy->clone();
@@ -634,42 +852,58 @@ std::unique_ptr<SemType> SemAnalyzer::inferConditional(const ConditionalExpr& e)
 // 闭包表达式类型推断
 // ============================================================
 
-std::unique_ptr<SemType> SemAnalyzer::inferFunExpr(const FunExpr& e) {
-    // 1. 构建参数类型列表
+std::unique_ptr<SemType> SemAnalyzer::inferFunExpr(const FunExpr& e,
+                                                   const SemType* expected) {
+    // 1. 构建参数类型列表（支持从期望 FuncSemType 反推）
+    const auto* eft = dynamic_cast<const FuncSemType*>(expected);
     std::vector<std::unique_ptr<SemType>> paramTypes;
-    for (auto& p : e.params) {
+    for (size_t i = 0; i < e.params.size(); ++i) {
+        auto& p = e.params[i];
         if (p.type) {
             paramTypes.push_back(resolveType(*p.type));
+        } else if (eft && i < eft->paramTypes.size() && eft->paramTypes[i]) {
+            paramTypes.push_back(eft->paramTypes[i]->clone());   // 从期望类型反推
         } else {
-            // Phase 1: 参数类型必须显式标注
             error(e, "closure parameter '" + p.name + "' requires an explicit type annotation");
             paramTypes.push_back(ErrorSemType::make());
         }
     }
 
-    // 2. 获取返回类型
+    // 2. 获取返回类型：标注 > 期望返回类型 > None
     std::unique_ptr<SemType> returnType;
     if (e.returnType) {
         returnType = resolveType(*e.returnType);
+        // P1-2：保存解析后的闭包返回类型到 returnType->inferredType（typeStore_ 保活），
+        // 供 CodeGen genFunExpr 读取（currentReturnVariantCppTypes_ / HasNoneVariant_ 装箱）
+        typeStore_.push_back(returnType->clone());
+        const_cast<FunExpr&>(e).returnType->inferredType = typeStore_.back().get();
+    } else if (eft && eft->returnType) {
+        returnType = eft->returnType->clone();
     } else {
-        // 从函数体推断：暂简化 — 无 return 语句 → None
-        // Phase 1 先推断为 None，后续可扫描 return 语句
         returnType = NoneSemType::make();
     }
 
-    // 3. 推入新作用域并检查函数体
+    // 3. 推入新作用域并检查函数体 —— 参数符号必须用推断后的 paramTypes[i]
     symtab_.enterScope(ScopeKind::Function);
-    for (auto& p : e.params) {
+    for (size_t i = 0; i < e.params.size(); ++i) {
         Symbol sym;
         sym.kind = SymKind::Parameter;
-        sym.name = p.name;
-        sym.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
+        sym.name = e.params[i].name;
+        sym.type = paramTypes[i]->clone();
         symtab_.define(std::move(sym));
     }
     if (e.body) {
         // 用 FnCtxGuard 保存/恢复外层上下文（闭包体内 return 检查使用闭包自身返回类型）
         FnCtxGuard fc(*this, returnType->clone(), e.throws);
         checkBlock(*e.body);
+        // 漏 return 检查：非 None 返回类型闭包必须所有路径显式 return
+        // （与 checkFunBody/checkMethodBody 对齐；否则 CodeGen 生成 no-return
+        //  lambda → g++ 插 ud2，运行时崩溃）
+        if (!dynamic_cast<const NoneSemType*>(returnType.get())
+            && !dynamic_cast<const ErrorSemType*>(returnType.get())
+            && !blockAllPathsReturn(*e.body)) {
+            error(e, "closure must return a value on all paths (missing explicit return)");
+        }
     }
     symtab_.exitScope();
 

@@ -2,14 +2,28 @@
 
 namespace Aura {
 
-// 列表元素类型链递归检测 ErrorSemType（空列表 [] / 嵌套 [[]] → 元素类型不可知）
-// 仅检查 List 链，不检查整体 Error / Optional（避免误伤 record 方法调用等放行路径）
-static bool listContainsError(const SemType* t) {
-    auto* l = dynamic_cast<const ListSemType*>(t);
-    if (!l) return false;
-    if (!l->elementType) return true;
-    return dynamic_cast<const ErrorSemType*>(l->elementType.get())
-        || listContainsError(l->elementType.get());
+// 递归检测类型中是否含"不可解析"的 error 元素（空列表 [] / none() 无上下文 → 元素类型不可知）
+// 覆盖 List / Optional / Union / Record 的任意嵌套组合（[]、[[]]、[none()]、{ x = [] } 等）。
+// 仅在无期望类型上下文（未标注声明 / 无法从赋值目标反推）时这些 error 元素才会残留，
+// 因此在 let/const/return/赋值 的"提交点"调用可安全拦截，避免 error_type 泄漏到 CodeGen。
+bool SemAnalyzer::containsErrorElement(const SemType* t) {
+    if (!t) return true;                                        // 缺失类型视为不可解析
+    if (dynamic_cast<const ErrorSemType*>(t)) return true;
+    if (auto* l = dynamic_cast<const ListSemType*>(t))
+        return containsErrorElement(l->elementType.get());
+    if (auto* o = dynamic_cast<const OptionalSemType*>(t))
+        return containsErrorElement(o->elementType.get());
+    if (auto* u = dynamic_cast<const UnionSemType*>(t)) {
+        for (auto& v : u->variants)
+            if (containsErrorElement(v.get())) return true;
+        return false;
+    }
+    if (auto* r = dynamic_cast<const RecordSemType*>(t)) {
+        for (auto& fld : r->fields)
+            if (containsErrorElement(fld.type.get())) return true;
+        return false;
+    }
+    return false;
 }
 
 // ============================================================
@@ -126,13 +140,42 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
         symtab_.define(std::move(placeholder));
     }
 
-    auto inferredType = decl.initializer ? inferExpr(*decl.initializer) : ErrorSemType::make();
+    // 期望类型：提前解析声明类型并保活（生命周期需覆盖 inferExpr 及其内部闭包 checkBlock）
+    std::unique_ptr<SemType> declaredType;
+    if (decl.type) declaredType = resolveType(*decl.type);
+
+    auto inferredType = decl.initializer
+        ? inferExpr(*decl.initializer, declaredType ? declaredType.get() : nullptr)
+        : ErrorSemType::make();
     if (decl.type) {
-        auto declaredType = resolveType(*decl.type);
         if (!isAssignable(*declaredType, *inferredType)) {
             error(decl, "type mismatch: cannot assign '" + inferredType->toString() + "' to '" + declaredType->toString() + "'");
+        } else if (!diag_.hasErrors()
+                   && decl.initializer
+                   && dynamic_cast<const CallExpr*>(decl.initializer.get())
+                   && containsErrorElement(inferredType.get())) {
+            // 有标注但初始值为函数调用（如 `X | None` 期望下 some(none()) 的内层
+            // none() 无上下文、标注无法反推其元素）→ 干净报错，避免 error_type 泄漏。
+            // 仅拦截 CallExpr：record 字面量（RecordExpr）字段内空列表元素由字段类型
+            // 决定，语义合法，不能误报（used/1.aura Tree<int> 用例）
+            error(decl, "cannot infer element type from initializer; add explicit type annotation (e.g. let x: [int] = [])");
         }
         inferredType = std::move(declaredType);
+    } else if (!diag_.hasErrors() && containsErrorElement(inferredType.get())) {
+        // 无标注且初始值元素类型不可解析（[] / none() 无上下文）→ 干净报错，
+        // 避免 error_type 泄漏到 CodeGen 变成 C++ 模板错误
+        // （!diag_.hasErrors() 守卫：初始值自身已报错（如 s.length 报无成员）时
+        //   不再叠加本错误，compile 已被主流程 hasErrors 阻断，不会泄漏）
+        error(decl, "cannot infer element type from initializer; add explicit type annotation (e.g. let x: [int] = [])");
+    } else if (!diag_.hasErrors()) {
+        // A4：无标注 channel 构造（channel(10) / sync.Channel(10)）→ 元素类型不可知，
+        // 与 receive/send/for-in 对齐报干净错误引导显式类型标注（避免裸 Channel* → C++ 模板错误）
+        if (auto* g = dynamic_cast<const GenericSemType*>(inferredType.get())) {
+            if ((g->name == "channel" || g->name == "sync.Channel") && g->resolvedName.empty()) {
+                error(decl, "cannot infer element type of '" + g->name
+                      + "'; add explicit type annotation (e.g. " + g->name + "<int>)");
+            }
+        }
     }
     // 存入 typeStore_ 保持稳定（decl.inferredType 不能指向 sym->type.get()，
     // 否则后续若 sym->type 被替换会成为悬垂指针）
@@ -182,15 +225,35 @@ void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
     // None 不能作为独立变量类型
     if (rejectStandaloneNone(decl, decl.type.get())) return;
 
-    auto inferredType = decl.initializer ? inferExpr(*decl.initializer) : ErrorSemType::make();
+    std::unique_ptr<SemType> declaredType;
+    if (decl.type) declaredType = resolveType(*decl.type);
+
+    auto inferredType = decl.initializer
+        ? inferExpr(*decl.initializer, declaredType ? declaredType.get() : nullptr)
+        : ErrorSemType::make();
     if (decl.type) {
-        auto declaredType = resolveType(*decl.type);
         if (!isAssignable(*declaredType, *inferredType)) {
             error(decl, "type mismatch in const: expected '" + declaredType->toString() + "', got '" + inferredType->toString() + "'");
+        } else if (!diag_.hasErrors()
+                   && decl.initializer
+                   && dynamic_cast<const CallExpr*>(decl.initializer.get())
+                   && containsErrorElement(inferredType.get())) {
+            // 与 checkLetDecl 同：仅拦截 CallExpr 初始值（record 字面量字段空列表不误报）
+            error(decl, "cannot infer element type from initializer; add explicit type annotation (e.g. let x: [int] = [])");
         }
         inferredType = std::move(declaredType);
-    } else if (listContainsError(inferredType.get())) {
+    } else if (!diag_.hasErrors() && containsErrorElement(inferredType.get())) {
+        // 与 checkLetDecl 同：已有诊断时不再叠加（如 initializer 报无成员错误）
         error(decl, "cannot infer element type from initializer; add explicit type annotation (e.g. let x: [int] = [])");
+    } else if (!diag_.hasErrors()) {
+        // A4：与 checkLetDecl 同——无标注 channel 构造（channel(10) / sync.Channel(10)）
+        // 元素类型不可知 → 报干净错误引导显式类型标注
+        if (auto* g = dynamic_cast<const GenericSemType*>(inferredType.get())) {
+            if ((g->name == "channel" || g->name == "sync.Channel") && g->resolvedName.empty()) {
+                error(decl, "cannot infer element type of '" + g->name
+                      + "'; add explicit type annotation (e.g. " + g->name + "<int>)");
+            }
+        }
     }
     Symbol sym;
     sym.kind = SymKind::Variable;
@@ -206,7 +269,9 @@ void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
 
 void SemAnalyzer::checkReturnStmt(const ReturnStmt& stmt) {
     if (stmt.expr) {
-        auto retType = inferExpr(*stmt.expr);
+        // 传当前函数返回类型作为期望类型：支持 return fun(msg){...} 从返回类型反推闭包参数
+        auto retType = inferExpr(*stmt.expr,
+                                 currentReturnType_ ? currentReturnType_.get() : nullptr);
         // 存储推断类型到 typeStore_，标注表达式 AST 节点供 CodeGen 使用
         typeStore_.push_back(std::move(retType));
         const_cast<ReturnStmt&>(stmt).inferredType = typeStore_.back().get();
@@ -216,8 +281,15 @@ void SemAnalyzer::checkReturnStmt(const ReturnStmt& stmt) {
         } else {
             const_cast<ASTNode*>(stmt.expr.get())->inferredType = typeStore_.back().get();
         }
-        if (currentReturnType_ && !isAssignable(*currentReturnType_, *typeStore_.back())) {
+        bool mismatch = currentReturnType_
+                     && !isAssignable(*currentReturnType_, *typeStore_.back());
+        if (mismatch) {
             error(*stmt.expr, "return type mismatch: expected '" + currentReturnType_->toString() + "', got '" + typeStore_.back()->toString() + "'");
+        } else if (!diag_.hasErrors() && containsErrorElement(typeStore_.back().get())) {
+            // 返回表达式元素类型不可解析（[] / none() 无上下文，且无法从返回类型反推）
+            // 或错误类型被 isAssignable 静默放行（Error 元素）→ 干净报错，避免 error_type 泄漏到 CodeGen
+            // （!diag_.hasErrors() 守卫：返回表达式自身已报错时不再叠加）
+            error(*stmt.expr, "cannot infer return value type; add explicit return type annotation (e.g. -> [int])");
         }
     }
     // L3: lock 块内禁止 return 跨出
@@ -267,6 +339,15 @@ void SemAnalyzer::checkWhileStmt(const WhileStmt& stmt) {
 
 void SemAnalyzer::checkForStmt(const ForStmt& stmt) {
     auto iterType = inferExpr(*stmt.iterable);
+    // A4：无标注 channel（元素不可知）的 for-in 与 receive/send 对齐报错——
+    // 裸 GenericSemType{channel/sync.Channel} 无 resolvedName（未标注 <T>），
+    // for 元素类型无从推导，须显式标注
+    if (auto* g = dynamic_cast<const GenericSemType*>(iterType.get())) {
+        if ((g->name == "channel" || g->name == "sync.Channel") && g->resolvedName.empty()) {
+            error(stmt, "cannot infer element type of '" + g->name
+                  + "'; add explicit type annotation (e.g. " + g->name + "<int>)");
+        }
+    }
     // 迭代类型默认合法（运行时检查），这里只确保表达式无错误
     ScopedValue<int> loopGuard(loopDepth_, loopDepth_ + 1);
     symtab_.enterScope();
@@ -419,6 +500,13 @@ void SemAnalyzer::checkSyncForStmt(const SyncForStmt& stmt) {
     // 推断迭代器类型 → 获取元素类型作为 spawn 参数类型（含 GenericSemType 通道类型）
     auto iterType = inferExpr(*stmt.iterable);
     auto elemType = elemTypeOf(iterType.get());
+    // A4：无标注 channel（元素不可知）的 sync for-in 与普通 for-in 对齐报错（须显式标注 <T>）
+    if (auto* g = dynamic_cast<const GenericSemType*>(iterType.get())) {
+        if ((g->name == "channel" || g->name == "sync.Channel") && g->resolvedName.empty()) {
+            error(stmt, "cannot infer element type of '" + g->name
+                  + "'; add explicit type annotation (e.g. " + g->name + "<int>)");
+        }
+    }
 
     // 检查 body（spawn 体内 itemName 可用）
     symtab_.enterScope();

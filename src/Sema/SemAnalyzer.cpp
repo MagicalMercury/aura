@@ -446,6 +446,26 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
 
     // 联合类型：source 匹配任一变体即为可赋值
     if (auto* u = dynamic_cast<const UnionSemType*>(&target)) {
+        // P1-3：source 本身为联合 → 子集判定（源联合 ⊆ 目标联合）。
+        // 要求 source 的每个变体都能匹配 target 的某个变体（isAssignable(targetVariant,
+        // sourceVariant)），None/Optional 变体经各自分支自然处理。
+        // 例：int|None 自赋值通过；int|string 赋 int|None 时 string 无对应变体 → 拒绝。
+        // 必须放在单变体匹配之前：否则整源联合作为非 Generic 落入 GenericSemType
+        // target 放行洞（420-425，后续独立项）被误放行。
+        if (auto* us = dynamic_cast<const UnionSemType*>(&source)) {
+            for (auto& sv : us->variants) {
+                if (!sv) continue;
+                bool matched = false;
+                for (auto& tv : u->variants) {
+                    if (tv && isAssignable(*tv, *sv)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) return false;
+            }
+            return true;
+        }
         for (auto& v : u->variants) {
             if (v && isAssignable(*v, source))
                 return true;
@@ -637,8 +657,23 @@ void SemAnalyzer::checkThrowsContext(
     if (!currentFunctionThrows_ && insideTry_ == 0 && calleeThrows) {
         error(callNode, DiagCode::E016_ThrowsViolation,
               "cannot call throwing function '" + calleeName + "' from non-throwing context",
-              "add 'throws' to the function signature or wrap in 'try { ... } catch'");
+              "add 'throws' to the function signature or wrap in 'try { ... }' catch");
     }
+}
+
+// 实参推断是否"需要期望类型"才能得到精确类型：
+//   FunExpr  —— 无标注参数需从形参函数类型反推（缺口 1）
+//   ListExpr —— 空列表元素类型需从形参列表类型反推（缺口 3）；非空也可透传期望
+//   none()   —— 无期望 → Optional<error>（元素推不出）；传参形态 take(none())
+//               （形参 Optional<T>）需期望反推元素，CodeGen 才能生成 make_none<T>
+static bool needsExpectedType(const ASTNode& arg) {
+    if (dynamic_cast<const FunExpr*>(&arg)) return true;
+    if (dynamic_cast<const ListExpr*>(&arg)) return true;
+    if (auto* ce = dynamic_cast<const CallExpr*>(&arg)) {
+        if (auto* id = dynamic_cast<const Identifier*>(ce->callee.get()))
+            return id->name == "none" && ce->args.empty();
+    }
+    return false;
 }
 
 void SemAnalyzer::checkCallArgs(
@@ -658,16 +693,33 @@ void SemAnalyzer::checkCallArgs(
         error(callNode, role + " '" + calleeName + "' expects " + expected +
               " arguments, got " + std::to_string(args.size()));
     }
-    // 参数类型检查 + 泛型映射收集
+    // 两阶段参数检查 + 泛型映射收集：
+    //   阶段一：非"需期望"实参 —— 纯自底向上收集泛型映射（普通表达式 / 非空列表）
+    //   阶段二：需期望实参（FunExpr / ListExpr）—— 先代换已绑定泛型，再带期望推断，
+    //           使泛型闭包实参（apply(fun(n){...}, 5)）能在 T 绑定后反推参数类型
     bool conflict = false;
-    for (size_t i = 0; i < args.size() && i < formalTypes.size(); ++i) {
-        auto argTy = inferExpr(*args[i]);
-        if (formalTypes[i] && !isAssignable(*formalTypes[i], *argTy)) {
-            error(*args[i], "argument type mismatch: expected '" +
-                  formalTypes[i]->toString() + "', got '" + argTy->toString() + "'");
+    for (int phase = 1; phase <= 2; ++phase) {
+        for (size_t i = 0; i < args.size() && i < formalTypes.size(); ++i) {
+            bool needs = needsExpectedType(*args[i]);
+            if (phase == 1 && needs) continue;   // 推迟到阶段二
+            if (phase == 2 && !needs) continue;  // 阶段一已处理
+            std::unique_ptr<SemType> argTy;
+            if (phase == 2 && formalTypes[i]) {
+                // 用已绑定的泛型映射代换形参，得到精确期望类型
+                std::unique_ptr<SemType> substituted = formalTypes[i]->clone();
+                for (auto& [name, concrete] : genericMap)
+                    substituted = substitute(*substituted, name, *concrete);
+                argTy = inferExpr(*args[i], substituted.get());
+            } else {
+                argTy = inferExpr(*args[i]);
+            }
+            if (formalTypes[i] && !isAssignable(*formalTypes[i], *argTy)) {
+                error(*args[i], "argument type mismatch: expected '" +
+                      formalTypes[i]->toString() + "', got '" + argTy->toString() + "'");
+            }
+            if (formalTypes[i])
+                collectGenericMapping(*formalTypes[i], *argTy, genericMap, conflict);
         }
-        if (formalTypes[i])
-            collectGenericMapping(*formalTypes[i], *argTy, genericMap, conflict);
     }
     // P2-2: 泛型绑定冲突从静默忽略改为报错
     if (conflict) {
@@ -826,6 +878,33 @@ void SemAnalyzer::materializeCanonicalName(
 // canonicalName 传播（RecordSemType → 嵌套 RecordExpr AST）
 // ============================================================
 
+std::string SemAnalyzer::resolveAnonymousRecordName(const RecordSemType& rec) const {
+    // A3：无标注 record 列表字面量（[{x=1,y=2},...]）需要把匿名 RecordExpr 解析为
+    // 具体 record 类型名。遍历全局作用域的 TypeAlias（非泛型）符号，按字段结构匹配：
+    //   字段名集合相同 + 每字段 isAssignable(声明字段类型, 字面量字段类型)。
+    // 多个候选时取第一个（结构完全相同；罕见歧义按声明顺序）。无匹配 → 空串。
+    std::string best;
+    for (const auto& scope : symtab_.allScopes()) {
+        if (scope->kind() != ScopeKind::Global) continue;
+        scope->forEach([&](const std::string&, const Symbol& sym) {
+            if (best.empty() && sym.kind == SymKind::TypeAlias
+                && sym.typeParams.empty() && sym.type) {
+                const auto* rs = dynamic_cast<const RecordSemType*>(sym.type.get());
+                if (!rs || rs->fields.size() != rec.fields.size()) return;
+                for (const auto& df : rs->fields) {
+                    auto it = std::find_if(rec.fields.begin(), rec.fields.end(),
+                        [&](const RecordFieldSem& lf) { return lf.name == df.name; });
+                    if (it == rec.fields.end()) return;
+                    if (df.type && it->type && !isAssignable(*df.type, *it->type)) return;
+                }
+                best = rs->canonicalName.empty() ? sym.name : rs->canonicalName;
+            }
+        });
+        break;  // 只查全局作用域
+    }
+    return best;
+}
+
 void SemAnalyzer::propagateCanonicalName(const ASTNode& expr, const SemType* type) {
     if (!type) return;
 
@@ -855,7 +934,29 @@ void SemAnalyzer::propagateCanonicalName(const ASTNode& expr, const SemType* typ
                     }
                 }
             }
-            const_cast<ASTNode&>(expr).inferredType = type;
+            // #1：显式 Optional<X> 注解的 some(record) 实参下钻（与 OptionalSemType
+            // 分支 L977-984 对齐）：否则 some({...}) 的 record 字面量实参 canonicalName
+            // 不传播，genRecordExpr 退化为 designated initializer。从 resolvedName
+            // 提取元素类型（RecordSemType/GenericSemType 均可经符号表解析）下钻。
+            if (gs->name == "Optional") {
+                if (auto* call = dynamic_cast<const CallExpr*>(&expr);
+                    call && call->args.size() == 1 && call->args[0]
+                    && dynamic_cast<const RecordExpr*>(call->args[0].get())) {
+                    if (auto* id = dynamic_cast<const Identifier*>(call->callee.get());
+                        id && id->name == "some") {
+                        auto elemTy = elemTypeOf(type);
+                        if (!dynamic_cast<const ErrorSemType*>(elemTy.get()))
+                            propagateCanonicalName(*call->args[0], elemTy.get());
+                    }
+                }
+            }
+            // #1：Identifier 保留自身类型（符号表类型），不被 GenericSemType{Optional}
+            // 覆盖——否则 `Optional<X> = p`（p 为 Point）与 `Optional<X> = x`
+            // （x 为 Optional 变量）的 p/x 推断类型被改写成相同的 GenericSemType{Optional}，
+            // CodeGen 无法区分「record→view/裸值装箱」与「已是 Optional 值防二次装箱」。
+            // 与 OptionalSemType 分支（L986-987）/ 叶节点（L1023）的 Identifier 保留一致。
+            if (!dynamic_cast<const Identifier*>(&expr))
+                const_cast<ASTNode&>(expr).inferredType = type;
             return;
         }
         auto* sym = symtab_.lookup(gs->name);
@@ -882,6 +983,30 @@ void SemAnalyzer::propagateCanonicalName(const ASTNode& expr, const SemType* typ
                     dynamic_cast<const ListSemType*>(v.get()));
             if (shapeMatch) { propagateCanonicalName(expr, v.get()); return; }
         }
+        return;
+    }
+
+    // OptionalSemType（T | None 折叠 / Optional<T> 上下文）：record 字面量下钻
+    // elementType 传播 canonicalName（否则被覆盖为 OptionalSemType，genRecordExpr
+    // 取不到具体类型退化为 designated initializer）；some(record) 实参同样下钻；
+    // Identifier 保持原样（类型来自符号表），其余表达式保持 OptionalSemType 标注
+    if (auto* os = dynamic_cast<const OptionalSemType*>(type)) {
+        if (os->elementType) {
+            if (dynamic_cast<const RecordExpr*>(&expr)) {
+                propagateCanonicalName(expr, os->elementType.get());
+                return;
+            }
+            if (auto* call = dynamic_cast<const CallExpr*>(&expr);
+                call && call->args.size() == 1 && call->args[0]
+                && dynamic_cast<const RecordExpr*>(call->args[0].get())) {
+                if (auto* id = dynamic_cast<const Identifier*>(call->callee.get());
+                    id && id->name == "some") {
+                    propagateCanonicalName(*call->args[0], os->elementType.get());
+                }
+            }
+        }
+        if (!dynamic_cast<const Identifier*>(&expr))
+            const_cast<ASTNode&>(expr).inferredType = type;
         return;
     }
 
@@ -936,6 +1061,16 @@ void SemAnalyzer::checkDecl(const Decl& decl) {
         if (cfg->ns == "io" && cfg->key == "sync") {
             ioSync_ = (cfg->value == "true");
         }
+        return;
+    }
+    // 模块级 let/const：解析器允许但 Sema/CodeGen 未实现全局变量，
+    // 静默丢弃会让用户代码无声失效 → 报干净错误而不是被忽略
+    if (dynamic_cast<const LetDecl*>(&decl)) {
+        error(decl, "module-level 'let' declarations are not supported; declare variables inside a function");
+        return;
+    }
+    if (dynamic_cast<const ConstDecl*>(&decl)) {
+        error(decl, "module-level 'const' declarations are not supported; declare constants inside a function");
         return;
     }
     if (auto* f = dynamic_cast<const FunDecl*>(&decl)) {

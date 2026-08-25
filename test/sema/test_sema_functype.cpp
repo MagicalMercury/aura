@@ -78,15 +78,53 @@ TEST(SemaFunType, ClosureAsReturn) {
     EXPECT_FALSE(diag.hasErrors());
 }
 
-TEST(SemaFunType, ClosureParamRequiresAnnotation) {
-    // 当前实现：闭包参数必须显式标注类型（即使目标类型已知也不推断）
+TEST(SemaFunType, ClosureParamInferredFromContext) {
+    // 双向推断：闭包赋值给已知函数类型变量时，参数可从期望类型反推（缺口 1）
     Aura::DiagnosticEngine diag;
     analyzeSource(
         "fun main(io: Io) {"
         " let op: fun(int, int) -> int = fun(a, b) { return a + b } }",
         diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, ClosureMissingAnnotationStillErrors) {
+    // 边界：无标注闭包参数 + 无期望类型 → 仍必须显式标注
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let f = fun(a) { return a } }",
+        diag);
     EXPECT_TRUE(diag.hasErrors());
     EXPECT_TRUE(hasErrorContaining(diag, "explicit type annotation"));
+}
+
+TEST(SemaFunType, ClosureParamInferredFromReturn) {
+    // 闭包返回类型 + 参数均从函数返回类型反推（改动 D 挂点）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun make_handler() -> fun(string) -> string { return fun(msg) { return msg } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericClosureArgInference) {
+    // 泛型闭包实参链：T 由非闭包实参绑定后再反推闭包参数（缺口 2，改动 C）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun apply(f: fun(<T>) -> <T>, v: <T>) -> T { return f(v) }"
+        " fun main(io: Io) { let r = apply(fun(n) { return n * 2 }, 5) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, EmptyListWithExpected) {
+    // 空列表实参从形参列表类型反推元素类型（缺口 3，改动 C/E）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun f(a: [int]) -> None { let x = a[0] }"
+        " fun main(io: Io) { f([]) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
 }
 
 TEST(SemaFunType, ClosureNoGeneric) {
@@ -96,6 +134,77 @@ TEST(SemaFunType, ClosureNoGeneric) {
         "fun main(io: Io) { let f = fun<T>(x: T) -> T { return x } }",
         diag);
     EXPECT_TRUE(diag.hasErrors());
+}
+
+// ============================================================
+// #4 闭包缺显式 return：与顶层函数一致，编译期拦截
+// （否则 CodeGen 生成 no-return lambda → g++ 插 ud2 运行时崩溃）
+// ============================================================
+TEST(SemaFunType, ClosureMissingReturnRejected) {
+    // 基础形态：闭包表达式体无 return
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let f = fun(x: int) -> int { x * 2 } }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "missing explicit return"));
+}
+
+TEST(SemaFunType, ClosureMissingReturnMapFilterRejected) {
+    // map/filter 回调闭包缺 return
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " range(5).map(fun(x: int) -> int { x * 2 });"
+        " range(10).filter(fun(x: int) -> bool { x > 0 }) }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "missing explicit return"));
+}
+
+TEST(SemaFunType, ClosureMissingReturnIteratorFromRejected) {
+    // Iterator.from 回调闭包缺 return
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { Iterator.from(fun() -> Optional<int> { none() }) }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "missing explicit return"));
+}
+
+TEST(SemaFunType, ClosureNestedMissingReturnRejected) {
+    // 嵌套闭包缺 return：内层缺 return 必须报错，不因外层有 return 而放行
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let g = fun(step: int) -> fun(int) -> int {"
+        "   return fun(x: int) -> int { x + step } } }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "missing explicit return"));
+}
+
+TEST(SemaFunType, ClosureExplicitReturnOk) {
+    // 显式 return 的闭包（map/filter/Iterator.from 形态）全部正常
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let a = range(5).map(fun(x: int) -> int { return x * 2 });"
+        " let b = range(10).filter(fun(x: int) -> bool { return x % 2 == 0 });"
+        " let c = Iterator.from(fun() -> Optional<int> { return some(1) });"
+        " let d = fun(x: int) -> int { return x + 1 } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, ClosureThrowEndIsReturning) {
+    // throw 结尾闭包视为终结：非 None 返回类型不报 missing explicit return
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) throws {"
+        " let f = fun(x: int) throws -> int { throw { kind = \"e\", message = \"m\" } } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
 }
 
 // ============================================================
@@ -180,6 +289,17 @@ TEST(SemaFunType, PipeChain) {
         "fun inc(a: int) -> int { return a + 1 }"
         " fun dbl(a: int) -> int { return a * 2 }"
         " fun main(io: Io) { let x = 1 |> inc |> dbl }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, UnionReturnAssign) {
+    // 函数类型返回 union 赋同型（P1-3）：matchFuncSig 递归
+    // isAssignable(int|None, int|None) 经 Union 子集判定通过
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let g: fun() -> int | None = fun() -> int | None { return 5 } }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
 }

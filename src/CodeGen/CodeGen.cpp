@@ -151,6 +151,13 @@ CompileUnit CodeGenerator::generate(const Program& program,
         }
     }
 
+    // 内置接口基类（interfaces.aurai，Stringer/Comparable）不在 program.decls 中。
+    // 必须在第三遍 A（函数前向声明）之前生成：函数返回/参数类型引用内置接口时
+    // （如 `-> Stringer | None` → aura_rt::Variant<Stringer, NoneType>*）要求
+    // Stringer 先声明，否则模板实参未声明 → g++ 编译失败（P1-2）。
+    for (auto& i : BuiltinRegistry::get().auraiInterfaces())
+        genInterfaceDecl(header, *i);
+
     // 第三遍 A：先生成所有声明（避免前向引用问题）
     for (auto& d : program.decls) {
         if (!d) continue;
@@ -158,11 +165,8 @@ CompileUnit CodeGenerator::generate(const Program& program,
         genDecl(header, impl, *d, unit, true);
     }
 
-    // 接口收尾（第三遍 A 之后）：内置接口基类（interfaces.aurai）不在 program.decls 中，
-    // 统一在此生成；随后为所有 record × 接口组合生成适配器——
+    // 接口适配器收尾（第三遍 A 之后）：为所有 record × 接口组合生成适配器——
     // 此时所有 record struct 已完整定义，适配器内联方法体可安全解引用 record 方法
-    for (auto& i : BuiltinRegistry::get().auraiInterfaces())
-        genInterfaceDecl(header, *i);
     for (auto* i : allIfaces) {
         for (auto& [rec, ifaces] : interfaceImplementations_) {
             if (!ifaces.count(i->name)) continue;

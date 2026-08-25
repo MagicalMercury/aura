@@ -559,13 +559,20 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
     currentReturnCppType_ = retType;
     // P3b：填充当前函数返回"含堆联合"的变体 C++ 类型列表（供 genReturnStmt 隐式装箱）
     currentReturnVariantCppTypes_.clear();
+    currentReturnHasNoneVariant_ = false;
     if (decl.returnType && decl.returnType->inferredType) {
         if (auto* u = dynamic_cast<const UnionSemType*>(decl.returnType->inferredType)) {
             std::vector<std::string> cppTypes;
             bool hasHeap = false;
             for (auto& v : u->variants) {
                 cppTypes.push_back(v ? mapSemType(*v) : "void");
-                if (v && isHeapSemType(v.get())) hasHeap = true;
+                // P1-2：与 genUnionBoxing（StmtGen.cpp）一致用 isUnionHeapVariant——
+                // 接口/Iterator 视图变体（isIfaceView 含 self GC 指针）也需 Variant 堆封装，
+                // 不能用 isHeapSemType（对视图返回 false）否则 `-> Iterator<int>|None`
+                // 返回 range() 不装箱 → C++ 编译失败。
+                if (v && isUnionHeapVariant(v.get())) hasHeap = true;
+                if (v && dynamic_cast<const NoneSemType*>(v.get()))
+                    currentReturnHasNoneVariant_ = true;   // P1-2：return none() 装箱用
             }
             if (hasHeap) currentReturnVariantCppTypes_ = std::move(cppTypes);
         }
@@ -689,13 +696,20 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     currentReturnCppType_ = retType;
     // P3b：填充当前方法返回"含堆联合"的变体 C++ 类型列表（供 genReturnStmt 隐式装箱）
     currentReturnVariantCppTypes_.clear();
+    currentReturnHasNoneVariant_ = false;
     if (decl.returnType && decl.returnType->inferredType) {
         if (auto* u = dynamic_cast<const UnionSemType*>(decl.returnType->inferredType)) {
             std::vector<std::string> cppTypes;
             bool hasHeap = false;
             for (auto& v : u->variants) {
                 cppTypes.push_back(v ? mapSemType(*v) : "void");
-                if (v && isHeapSemType(v.get())) hasHeap = true;
+                // P1-2：与 genUnionBoxing（StmtGen.cpp）一致用 isUnionHeapVariant——
+                // 接口/Iterator 视图变体（isIfaceView 含 self GC 指针）也需 Variant 堆封装，
+                // 不能用 isHeapSemType（对视图返回 false）否则 `-> Iterator<int>|None`
+                // 返回 range() 不装箱 → C++ 编译失败。
+                if (v && isUnionHeapVariant(v.get())) hasHeap = true;
+                if (v && dynamic_cast<const NoneSemType*>(v.get()))
+                    currentReturnHasNoneVariant_ = true;   // P1-2：return none() 装箱用
             }
             if (hasHeap) currentReturnVariantCppTypes_ = std::move(cppTypes);
         }
@@ -877,8 +891,16 @@ void CodeGenerator::collectTParams(const TypeExpr& type, std::set<std::string>& 
             return;
 
         // 无 typeArgs + 非注册类型 → 是泛型参数（如 Pair<A,B> 中的 A/B）
+        // P1-2：内置接口（interfaces.aurai 的 Stringer/Comparable 等）不在
+        // interfaceNames_（仅 program.decls 收集用户接口）且 findType 查不到
+        // （接口不在 BuiltinRegistry types_）→ 此前被误判为泛型形参，使
+        // `-> Stringer | None` 生成 template 函数。此处显式排除内置接口名。
+        bool isBuiltinIface = false;
+        for (auto& ai : BuiltinRegistry::get().auraiInterfaces())
+            if (ai->name == n->name) { isBuiltinIface = true; break; }
         if (n->typeArgs.empty() && !registeredTypes_.count(n->name)
             && !interfaceNames_.count(n->name)
+            && !isBuiltinIface
             && !BuiltinRegistry::get().findType(n->name))
             out.insert(n->name);
         return;

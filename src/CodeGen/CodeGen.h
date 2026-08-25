@@ -245,6 +245,12 @@ private:
     // 从返回类型 TypeExpr 提取 Optional<T> 的 T（C++ 名）；非 Optional 返回空
     [[nodiscard]] std::string optionalElemOf(const TypeExpr* retType);
 
+    // 从 Optional 语义类型提取元素 C++ 名（P1-1/A1/A2）：
+    //   OptionalSemType{T} → 元素（非 Error）C++ 名；GenericSemType{name=="Optional"}
+    //   → 从 resolvedName 提取 <...> 内元素（显式 `Optional<T>` 注解物化形态，
+    //   mapSemType 对其会加 * 尾缀不适用）。元素未知 / 非 Optional → 返回空。
+    [[nodiscard]] std::string optionalElemCppName(const SemType* optType);
+
     // 值类型映射（不加 *）
     [[nodiscard]] std::string mapValueType(const TypeExpr& type);
 
@@ -409,6 +415,28 @@ private:
                                                   const std::string& recName,
                                                   const std::string& viewCppType);
 
+    // #2：Optional 目标装箱 IIFE——make_optional<elemCpp>(值) 并 GcRootHandle 保护堆值。
+    // OptionalSemType（折叠 union）/ GenericSemType{name=="Optional"}（显式注解）共用；
+    // elemCpp 为空返回空串（调用方回退原逻辑）。值表达式自身已是 Optional 时不适用（调用方判断）。
+    [[nodiscard]] std::string genOptionalBoxIIFE(const std::string& elemCpp,
+                                                 const ASTNode& initExpr,
+                                                 bool isCoroutine);
+
+    // #1：显式 Optional<X> 目标（GenericSemType{name=="Optional"} / NamedType Optional）
+    // 初始化器装箱：some(arg) / 裸值直赋 / record 字面量 → make_optional<X>(...)，
+    // 元素为接口视图时 record→view 预转换、元素为 std::function 时显式模板参数；
+    // initializer 已是 Optional 值（防二次装箱）时返回其裸表达式。elemCpp 为空返回空串。
+    [[nodiscard]] std::string genOptionalTargetInit(const ASTNode& init,
+                                                    const std::string& elemCpp,
+                                                    bool isCoroutine);
+    // #1：按元素 C++ 类型与值形态生成 make_optional<elemCpp>(值)（record→view / 显式模板参数）
+    [[nodiscard]] std::string genOptionalBoxByElem(const std::string& elemCpp,
+                                                   const ASTNode& val,
+                                                   bool isCoroutine);
+    // #1：接口视图元素装箱 IIFE——ViewRoot 保护视图 self 后 make_optional<elemCpp>(视图值)
+    [[nodiscard]] std::string genOptionalViewValueBox(const std::string& elemCpp,
+                                                       const std::string& viewExpr);
+
     // 为 GC 堆类型参数生成 IIFE + GcRootHandle 包装
     // args: (expr_string, inferredType) 对；callExpr: 包装后的调用表达式
     [[nodiscard]] std::string genGcRootedArgs(
@@ -529,6 +557,11 @@ private:
     // 由 funSignature/methodSignature 设置，genReturnStmt 隐式装箱使用
     std::vector<std::string> currentReturnVariantCppTypes_;
 
+    // P1-2：当前函数返回类型是"含 None 变体的 UnionSemType"（全值联合 std::variant
+    // 或含堆联合 Variant* 均置 true）。genReturnStmt 对 return none() 生成 None 变体
+    // 值（全值联合 → aura_rt::None 直接构造 variant；含堆联合 → 上方列表装箱）。
+    bool currentReturnHasNoneVariant_ = false;
+
     // 当前函数返回 Optional<T> 的元素类型 T（C++ 名），空 = 非 Optional
     // none() 直转 make_none<T> 时使用（C3.2）
     std::string currentReturnElem_;
@@ -582,6 +615,16 @@ private:
     // let/const 声明中类型标注的显式模板参数（如 math.Pair<float, bool> → {"float", "bool"}）
     // genLetStmt 设置，genMethodCall 的 ns-ctor 路径消费后清空
     std::vector<std::string> expectedTemplateArgs_;
+
+    // #1：当前显式 Optional<X> 初始化器的目标元素 C++ 名（空 = 非 Optional 目标）。
+    // genOptionalTargetInit 设置/恢复，使条件表达式/传参等复合初始化器内嵌的
+    // some() 感知目标元素（genCallExpr some() 分支消费）；嵌套 some() 时临时清空
+    // 以保持 CTAD。绝不依赖 expectedTemplateArgs_（可能被非 Optional 泛型标注污染）。
+    std::string optionalTargetElem_;
+
+    // 错误类型泄漏兜底：error_type 到达 CodeGen 时只报一次干净错误
+    // （Sema 应已拦截；此处防漏网之鱼变成 C++ 模板错误）
+    bool reportedErrorType_ = false;
 
     // 错误列表
     DiagnosticEngine& diag_;

@@ -53,22 +53,31 @@ TEST(SemaChannel, UnannotatedReceiveErrors) {
     EXPECT_TRUE(diag.hasErrors());
 }
 
-TEST(SemaChannel, UnannotatedSendOk) {
-    // 未标注 + send 不报错（实现不反推类型）
+TEST(SemaChannel, UnannotatedSendErrors) {
+    // A4（行为变更）：未标注 + send 报错（与 receive 对齐，元素类型必须显式标注）
     Aura::DiagnosticEngine diag;
     analyzeSource(
         "fun main(io: Io) { let ch = channel(10); ch.send(1) }",
         diag);
-    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_TRUE(diag.hasErrors());
 }
 
-TEST(SemaChannel, UnannotatedForInOk) {
-    // 规范要求未标注 for-in 报错；实现宽松（记录现状）
+TEST(SemaChannel, UnannotatedForInErrors) {
+    // A4（行为变更）：未标注 for-in 报错（与 receive 对齐，元素类型必须显式标注）
     Aura::DiagnosticEngine diag;
     analyzeSource(
         "fun main(io: Io) { let ch = channel(10); for v in ch { } }",
         diag);
-    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_TRUE(diag.hasErrors());
+}
+
+TEST(SemaChannel, UnannotatedConstructErrors) {
+    // A4：无标注 channel 构造报错（元素类型必须显式标注，避免裸 Channel* 坏代码）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let ch = channel(10) }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
 }
 
 // ============================================================
@@ -86,6 +95,24 @@ TEST(SemaChannel, SyncChannelUnannotatedReceiveErrors) {
     Aura::DiagnosticEngine diag;
     analyzeSource(
         "fun main(io: Io) { let ch = sync.Channel(10); let v = ch.receive() }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+}
+
+TEST(SemaChannel, SyncChannelUnannotatedSendErrors) {
+    // A4：无标注 sync.Channel 的 send 报错（元素类型必须显式标注）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let ch = sync.Channel(10); ch.send(1) }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+}
+
+TEST(SemaChannel, SyncChannelUnannotatedConstructErrors) {
+    // A4：无标注 sync.Channel 构造报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let ch = sync.Channel(10) }",
         diag);
     EXPECT_TRUE(diag.hasErrors());
 }
