@@ -9,6 +9,7 @@
 #include "SymbolTable.h"
 #include "BuiltinRegistry.h"
 #include "../Diag/DiagnosticEngine.h"
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -56,12 +57,20 @@ private:
     // ============ 语义类型工具 ============
     // AST 类型 → 语义类型
     [[nodiscard]] std::unique_ptr<SemType> resolveType(const TypeExpr& astType);
-    [[nodiscard]] std::unique_ptr<SemType> resolveNamedType(const std::string& name);
+    [[nodiscard]] std::unique_ptr<SemType> resolveNamedType(const std::string& name) const;
 
     // 从 Aura 类型名构造 SemType（int→intType；其他注册类型→GenericSemType；None/未知→Error）
-    [[nodiscard]] std::unique_ptr<SemType> semTypeFromAuraName(const std::string& name);
+    [[nodiscard]] std::unique_ptr<SemType> semTypeFromAuraName(const std::string& name) const;
     // 从 C++ 类型名映射回 Aura SemType（供 resolvedName 元素类型提取）
-    [[nodiscard]] std::unique_ptr<SemType> semTypeFromCppName(const std::string& cppName);
+    [[nodiscard]] std::unique_ptr<SemType> semTypeFromCppName(const std::string& cppName) const;
+    // 从"C++ 名 / resolvedName"反解并实例化用户泛型 record（problem.txt 条目 A/B 共享
+    // 工具）：输入如 "Tree<int32_t>*" / "Tree<int32_t>" / "Node"——剥尾 '*' 后提取基名
+    // （符号表键）查 TypeAlias→RecordSemType 原始定义，含 '<' 时从 <...> 提取实参按
+    // typeParams 位置替换形参（仿 applyTypeArgs），再 sealSelfRefs 标注自引用（深层递归
+    // 再走 isAssignable 展开必需）。返回实例化 RecordSemType；无法反解（非 record 别名 /
+    // 未注册 / 内置泛型）返回 nullptr。
+    [[nodiscard]] std::unique_ptr<RecordSemType>
+    instantiateUserRecordFromCppName(const std::string& rawName) const;
 
     // 联合变体是否 GC 不安全（P0 防崩：含堆联合禁止走 std::variant，见 plan/联合类型GC安全问题.md §4.1）
     // 判定目的与 CodeGen isHeapSemType 不同：isHeapSemType 判"要不要根保护"，
@@ -74,7 +83,13 @@ private:
         const SemType& variantType, const MethodCallExpr& e);
 
     // 从迭代器/列表/泛型通道类型推导元素类型（for / sync for 迭代变量类型）
-    [[nodiscard]] std::unique_ptr<SemType> elemTypeOf(const SemType* iterType);
+    [[nodiscard]] std::unique_ptr<SemType> elemTypeOf(const SemType* iterType) const;
+
+    // 从 record 物化 canonicalName（如 "Runner<int32_t>" / "Pair<int32_t, aura_rt::GcString*>"）
+    // 提取 <...> 内类型实参并解析为 SemType（仿 elemTypeOf，供 inferMethodCall record
+    // 分支返回类型做 receiver 泛型实参代换；非泛型 canonicalName 返回空列表）
+    [[nodiscard]] std::vector<std::unique_ptr<SemType>>
+    extractTypeArgsFromCanonicalName(const std::string& canonicalName) const;
 
     // 类型等价性
     [[nodiscard]] bool isAssignable(const SemType& target, const SemType& source) const;
@@ -132,11 +147,32 @@ private:
         std::unique_ptr<SemType> result,
         const std::map<std::string, std::unique_ptr<SemType>>& genericMap);
 
+    // TypeExpr 泛型引用遍历（DeclChecker.cpp / BodyChecker.cpp 共享）
+    static void forEachGenericRef(const TypeExpr& type,
+                                  const std::function<void(const std::string&)>& fn);
+    // 注册 TypeExpr 中所有泛型引用为 GenericParam 符号（checkFunBody/checkMethodBody 复用）
+    static void registerTypeGenerics(SymbolTable& symtab, const TypeExpr& type);
+    // 注册返回类型 FunctionType 中的"裸泛型名"（未声明的 NamedType）为 GenericParam（M5）。
+    // 直接写泛型函数类型返回（`fun makeU() -> fun(U) -> U`）时，U 是裸 NamedType，
+    // registerTypeGenerics 只认 <T> GenericTypeRef 与别名 typeArgs，不收集裸名 → 返回类型
+    // 解析报 undefined type 'U'。须在返回类型解析前调用（checkFunBody/checkMethodBody）。
+    static void registerReturnFuncTypeGenerics(SymbolTable& symtab, const TypeExpr& type);
+
     // ============ 声明注册（第 1 遍） ============
     void declareTopLevel(const Program& program);
     void declareDecl(const Decl& decl);
     // 接口符号注册（用户接口与内置 .aurai 接口共用）
     void declareInterface(const InterfaceDecl& i);
+    // 解析接口方法签名并填充到已注册的接口符号（allowForward=true 为声明时；
+    // false 用于 declareTopLevel 末尾二次解析——此时后置类型已注册，占位 → 完整类型）
+    void resolveInterfaceMethods(const InterfaceDecl& i, bool allowForward);
+    // 递归收集 TypeExpr 中所有 NamedType 引用（含内置泛型实参内，如 Optional<Point> 的 Point）
+    static void forEachIfaceNamedRef(const TypeExpr& type,
+                                     const std::function<void(const NamedType&)>& fn);
+    // 前向注册接口方法签名引用的未注册用户类型名（仿 TypeDecl 前向占位，DeclChecker.cpp）
+    void forwardRegisterIfaceType(const NamedType& n);
+    // declareTopLevel 末尾：二次解析接口方法签名 + 校验前向引用是否为真 undefined
+    void finalizeInterfaceSignatures(const Program& program);
 
     // ============ 体检查（第 2 遍） ============
     void checkProgram(const Program& program);
@@ -186,7 +222,19 @@ private:
     [[nodiscard]] std::unique_ptr<SemType> inferIdentifier(const Identifier& e);
     [[nodiscard]] std::unique_ptr<SemType> inferListExpr(const ListExpr& e,
                                                          const SemType* expected = nullptr);
-    [[nodiscard]] std::unique_ptr<SemType> inferRecordExpr(const RecordExpr& e);
+    [[nodiscard]] std::unique_ptr<SemType> inferRecordExpr(const RecordExpr& e,
+                                                           const SemType* expected = nullptr);
+    // #5：具名 record 字面量 `Point { x = 1, y = 2 }` 类型推断——typeName 显式给出
+    // 类型身份：查符号表（undefined type / Interface / 泛型拦截）→ 校验字段（未知/
+    // 重复/缺失/类型不匹配）→ 构造带 canonicalName 的 RecordSemType（CodeGen 走
+    // gc_alloc）→ 嵌套匿名字段 propagateCanonicalName 下钻。expected 仅作字段值
+    // 反推的额外上下文，可为空（无标注 let 也支持）。
+    [[nodiscard]] std::unique_ptr<SemType> inferNamedRecordExpr(const RecordExpr& e,
+                                                                const SemType* expected);
+    // #4：从期望类型中提取可用于字段反推的 record 形态（RecordSemType 直接返回；
+    // Optional/Union 取 record 变体元素；Generic 经符号表解析为 record 类型别名），
+    // 供 inferRecordExpr 按字段声明类型反推字段值（none()/[] 反推元素）
+    [[nodiscard]] const RecordSemType* recordTypeFromExpected(const SemType* expected);
     [[nodiscard]] std::unique_ptr<SemType> inferBinaryExpr(const BinaryExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferUnaryExpr(const UnaryExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferCall(const CallExpr& e,
@@ -197,7 +245,8 @@ private:
     [[nodiscard]] std::unique_ptr<SemType> inferAssign(const AssignExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferErrorPropagation(const ErrorPropagationExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferPipe(const PipeExpr& e);
-    [[nodiscard]] std::unique_ptr<SemType> inferConditional(const ConditionalExpr& e);
+    [[nodiscard]] std::unique_ptr<SemType> inferConditional(const ConditionalExpr& e,
+                                                            const SemType* expected = nullptr);
 
     // --- 闭包 ---
     [[nodiscard]] std::unique_ptr<SemType> inferFunExpr(const FunExpr& e,
@@ -279,10 +328,14 @@ private:
 
     // ============ 递归类型解析 ============
     void propagateCanonicalName(const ASTNode& expr, const SemType* type);
-    // A3：匿名 record 字面量按字段结构匹配全局 record 类型声明，返回 canonicalName。
-    // 仅匹配非泛型 record（typeParams 为空）——泛型 record 的实例化参数不可知时不能
-    // 误报匹配；无匹配返回空串（元素真未知由调用点报干净错误）
-    [[nodiscard]] std::string resolveAnonymousRecordName(const RecordSemType& rec) const;
+    // #1：实参/赋值/分支等表达式上下文是否为「含匿名 record 字面量」的表达式
+    // （RecordExpr 或 some(RecordExpr)）——是则需期望类型推断 + canonicalName 传播，
+    // 否则匿名 record 无法解析类型（决策 A）
+    static bool isRecordLiteralArg(const ASTNode& arg);
+    // #1：内置方法 ParamInfo.typeName → SemType（"T" 从 objType 元素类型提取；
+    // 基础类型名映射；不可解析返回 nullptr）
+    std::unique_ptr<SemType> semTypeFromBuiltinParam(
+        const std::string& typeName, const SemType* objType);
     // 递归检测类型中是否含"不可解析"的 error 元素（[] / none() 无上下文 → 元素类型不可知），
     // 用于在 let/const/return/赋值提交点拦截，避免 error_type 泄漏到 CodeGen
     static bool containsErrorElement(const SemType* t);
@@ -290,10 +343,26 @@ private:
     // 当前作用域内已注册的泛型参数（泛型函数体内的 T）视为可引用，不视为未绑定；
     // 用于拦截未绑定 T 泄漏到 CodeGen 产生 std::function<T(...)> / auto 等 C++ 错误
     [[nodiscard]] bool containsUnresolvedGeneric(const SemType* t) const;
+    // G4：递归检测类型中是否含"裸泛型变量"（GenericSemType 且 resolvedName 为空，
+    // 无法物化具体类型）。与 containsUnresolvedGeneric 不同——不做 symtab 判定：
+    // 类型别名泛型参数全局注册使 lookup 恒命中（掩盖因素），此处仅按字面判定，
+    // 供 inferListExpr 判定声明元素类型是否含需用首元素具体类型替代的泛型变量
+    [[nodiscard]] bool containsUnboundGenericParam(const SemType* t) const;
+    // G4：递归收集类型中所有"裸泛型变量"名（GenericSemType 且 resolvedName 为空，
+    // 去重）——供 checkFunBody/checkMethodBody/inferFunExpr 收集函数/闭包签名引用的
+    // 泛型参数名，压入 fnGenericStack_（containsUnresolvedGeneric 据此判定可引用）
+    static void collectGenericNames(const SemType* t, std::vector<std::string>& out);
     // seal self-referencing GenericSemType to RecordSemType with full canonicalName
-    void sealSelfRefs(std::unique_ptr<SemType>& node,
-                      const std::string& bareName,
-                      const std::string& fullName);
+    // （static：只修改传入 node 指向的类型，不访问 this——供 const 的
+    //  instantiateUserRecordFromCppName 在深层展开时复用标注）
+    static void sealSelfRefs(std::unique_ptr<SemType>& node,
+                             const std::string& bareName,
+                             const std::string& fullName);
+    // #4：声明完成后折叠自引用 `Node | None` 字段为 Optional<Node>（对齐 mapType 声明
+    // 侧折叠）：解析期 Node 为 GenericSemType 占位、unionVariantGcUnsafe 恒 false 不折叠，
+    // 但 mapType 按 Node* 堆指针折叠为 Optional → 字段值 Variant 装箱与 Optional 字段
+    // 类型不匹配。仅折叠「恰 2 变体、其一 None、另一为已 sealed 的非内置泛型」联合。
+    void foldSelfRefOptionalUnions(std::unique_ptr<SemType>& node);
 
     // resolveType 辅助：应用泛型实参到类型
     [[nodiscard]] std::unique_ptr<SemType> applyTypeArgs(
@@ -305,8 +374,18 @@ private:
     void materializeCanonicalName(
         std::unique_ptr<SemType>& result,
         const NamedType& n);
-    // 正在解析中的类型名集合（用于检测自引用，如 Tree<T> = {..., children: [Tree<T>]}）
+    // 正在解析中的类型名集合（用于检测自引用，如 Tree<T> = {..., children: [Tree<T>]})
     std::set<std::string> resolvingTypes_;
+
+    // ============ 接口前向引用（problem.txt：接口方法签名引用后置类型） ============
+    // 接口方法签名引用后置 record/别名/泛型 record 时前向占位注册（TypeAlias +
+    // resolvingTypes_），declareTopLevel 末尾 finalizeInterfaceSignatures 二次解析
+    // 覆盖为完整类型。此处记录前向引用的类型名与其 AST 位置（校验真 undefined 报错定位）。
+    struct InterfaceFwdRef {
+        std::string name;
+        const TypeExpr* node;
+    };
+    std::vector<InterfaceFwdRef> ifaceFwdRefs_;
 
     // ============ 联合类型 P0 拦截去重 ============
     // 同一 UnionType 变体 AST 节点会被 resolveType 多次解析（如 checkLetDecl 的
@@ -320,6 +399,13 @@ private:
     // ============ 表达式类型存储 ============
     // 持有 inferExpr 返回的临时 SemType（供 ASTNode::inferredType 指向）
     std::vector<std::unique_ptr<SemType>> typeStore_;
+
+    // ============ G4 泛型函数栈 ============
+    // 当前泛型函数/闭包签名引用的泛型参数名集合（每层一个）。类型别名泛型参数
+    // （Transform<T> 的 T）经 defineGlobal 泄漏到全局，symtab lookup 无法区分
+    // 「当前泛型函数体内可引用」与「调用点未绑定」，containsUnresolvedGeneric
+    // 按此栈判定（T 在任一签名中 → 可引用）
+    std::vector<std::vector<std::string>> fnGenericStack_;
 
     // ============ 成员表 ============
     SymbolTable symtab_;

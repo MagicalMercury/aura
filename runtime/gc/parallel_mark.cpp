@@ -36,12 +36,24 @@ void GcHeap::scanObjectFields(GcObject* obj, std::vector<GcObject*>& local) {
     // 内联数组字段
     for (size_t i = 0; i < desc->inlineArrayFieldCount; ++i) {
         const InlineArrayField& iaf = desc->inlineArrayFields[i];
-        if (!iaf.isPtrArray) continue;
+        // #7：无 GC 引用的值数组（isPtrArray=false 且无 self 子偏移）跳过
+        if (!iaf.isPtrArray && iaf.elemGCOffset < 0) continue;
         int32_t count = *reinterpret_cast<int32_t*>(base + iaf.lengthOffset);
-        GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
-        for (int32_t j = 0; j < count; ++j) {
-            GcObject* child = elems[j];
-            if (child && !child->forwarded() && child->tryMark()) local.push_back(child);
+        if (iaf.isPtrArray) {
+            GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
+            for (int32_t j = 0; j < count; ++j) {
+                GcObject* child = elems[j];
+                if (child && !child->forwarded() && child->tryMark()) local.push_back(child);
+            }
+        } else {
+            // #7：接口视图元素——标记元素内 self 子偏移（并行标记与 markInlineArrayFields
+            // 对齐，保证视图适配器在并行标记路径下同样被追踪）
+            char* elemBase = base + iaf.offset;
+            for (int32_t j = 0; j < count; ++j) {
+                GcObject* child = *reinterpret_cast<GcObject**>(
+                    elemBase + static_cast<size_t>(j) * iaf.elemStride + iaf.elemGCOffset);
+                if (child && !child->forwarded() && child->tryMark()) local.push_back(child);
+            }
         }
     }
 }

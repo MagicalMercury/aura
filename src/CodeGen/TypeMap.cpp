@@ -62,6 +62,18 @@ bool CodeGenerator::isIfaceViewTypeName(const std::string& cppType) const {
 
 std::string CodeGenerator::mapType(const TypeExpr& type) {
     if (auto* n = dynamic_cast<const NamedType*>(&type)) {
+        // 泛型接口适配器上下文（ifaceTypeMap_ 非空）：裸泛型形参名（如 Optional<T> 的 T，
+        // TypeParser 将其解析为 NamedType）→ 替换为具体实参类型（tmap 值为完整 C++ 类型，
+        // 如 "Point*"）。仅裸名（无 typeArgs）短路；Name<T> 走下方实例化路径，内部实参经
+        // mapType 递归时同样查 ifaceTypeMap_ → 容器/复合类型内嵌 T 被递归代换
+        if (n->typeArgs.empty()) {
+            auto it = ifaceTypeMap_.find(n->name);
+            if (it != ifaceTypeMap_.end()) return it->second;
+            // M3：默认参数闭包物化——调用点补默认实参时裸泛型名（如闭包参数 x: T
+            // 的 T，TypeParser 解析为 NamedType）已物化为具体类型 → 直接返回
+            auto mit = defaultArgMaterializedTypes_.find(n->name);
+            if (mit != defaultArgMaterializedTypes_.end()) return mit->second;
+        }
         // 有命名空间前缀时，先查全限定名（如 "sync.Channel"）是否在 BuiltinRegistry
         // 命中则直接取 cppType 并注入模板参数，避免后续 mapNamedType 只解析短名 "Channel"
         if (!n->namespacePrefix.empty()) {
@@ -252,14 +264,8 @@ std::string CodeGenerator::optionalElemCppName(const SemType* optType) {
     // 元素 C++ 名可能缺失堆 record 的 *（Sema 的 resolvedName/cppNameOfTypeExpr 对
     // record 不加 *，而声明侧 mapType 对 record 追加 *）→ 统一补 * 与声明侧一致，
     // 否则 `let x: Optional<Point> = none()` 生成 Optional<Point>*（元素无 *）与
-    // 声明 Optional<Point*>* 不匹配。
-    auto finalizeElem = [this](std::string elem) -> std::string {
-        if (elem.empty() || elem.back() == '*') return elem;
-        if (isIfaceViewTypeName(elem)) return elem;   // 值视图（Iterator<...>/接口）无 *
-        auto it = registeredTypes_.find(elem);
-        if (it != registeredTypes_.end() && it->second) return elem + "*";  // 堆 record → 补 *
-        return elem;
-    };
+    // 声明 Optional<Point*>* 不匹配。嵌套容器（list/Iterator/嵌套 Optional）经
+    // finalizeCppElem 递归补全（如 Optional<[Point]> 元素 Array<Point>* → Array<Point*>*）。
 
     if (auto* os = dynamic_cast<const OptionalSemType*>(optType)) {
         if (os->elementType
@@ -267,7 +273,7 @@ std::string CodeGenerator::optionalElemCppName(const SemType* optType) {
             // 元素 GenericSemType（Sema elemTypeOf 经 semTypeFromCppName 还原）：
             //   resolvedName 即元素 C++ 名（可能缺 record 的 *）；其余走 mapSemType
             if (auto* ge = dynamic_cast<const GenericSemType*>(os->elementType.get()))
-                return finalizeElem(ge->resolvedName);
+                return finalizeCppElem(ge->resolvedName);
             return mapSemType(*os->elementType);
         }
         return "";
@@ -277,10 +283,72 @@ std::string CodeGenerator::optionalElemCppName(const SemType* optType) {
             auto lt = gs->resolvedName.find('<');
             auto rt = gs->resolvedName.rfind('>');
             if (lt != std::string::npos && rt != std::string::npos && rt > lt)
-                return finalizeElem(gs->resolvedName.substr(lt + 1, rt - lt - 1));
+                return finalizeCppElem(gs->resolvedName.substr(lt + 1, rt - lt - 1));
         }
     }
     return "";
+}
+
+std::string CodeGenerator::finalizeCppElem(const std::string& elem) {
+    // #2：Optional 元素 C++ 名递归补齐堆 record 的 '*'。
+    // 从 resolvedName 提取的元素名可能缺失内嵌堆 record 的 '*'（Sema 的
+    // cppNameOfTypeExpr 对 record 裸名不加 '*'、对 ListType/Iterator 内嵌 record
+    // 也不加）→ 递归处理容器，叶子按既有 finalizeElem 判定：
+    //   - 已带 '*' 指针（GcString* / 值类型指针）不动
+    //   - 接口/Iterator 值视图不加 '*'
+    //   - registeredTypes_ 命中的堆 record 补 '*'
+    // 与 mapSemType 的容器语义一致（Optional<[Point]> / Optional<Iterator<Point>>
+    // / Optional<Optional<Point>> 内嵌 record 都要补 '*'）。
+    if (elem.empty()) return elem;
+    static const std::string kArray = "aura_rt::Array<";
+    static const std::string kIter  = "aura_rt::Iterator<";
+    static const std::string kOpt   = "aura_rt::Optional<";
+    static const std::string kChn   = "aura_rt::Channel<";
+    static const std::string kTChn  = "aura_rt::ThreadChannel<";
+    // 提取 "Prefix<Inner>" 的内层（末个 '>' 定位，兼容嵌套尖括号与尾缀 '*'
+    // 如 "aura_rt::Array<Point>*" → "Point"）
+    auto templateInner = [](const std::string& s, const std::string& prefix) -> std::string {
+        auto rt = s.rfind('>');
+        if (rt == std::string::npos || rt <= prefix.size()) return "";
+        return s.substr(prefix.size(), rt - prefix.size());
+    };
+    // 容器：Array<X>*（list，堆指针）→ Array<finalize(X)>*
+    if (elem.rfind(kArray, 0) == 0 && elem.back() == '*') {
+        std::string inner = templateInner(elem, kArray);
+        if (!inner.empty()) return kArray + finalizeCppElem(inner) + ">*";
+        return elem;
+    }
+    // 容器：Iterator<X>（值视图，无尾 *；内嵌 record 元素仍要补 *，如 Iterator<Point>）
+    if (elem.rfind(kIter, 0) == 0 && elem.back() == '>') {
+        std::string inner = templateInner(elem, kIter);
+        if (!inner.empty()) return kIter + finalizeCppElem(inner) + ">";
+        return elem;
+    }
+    // 容器：Optional<X>[*]（嵌套 Optional 堆指针，内层补 * 后追加尾 *）
+    if (elem.rfind(kOpt, 0) == 0) {
+        std::string inner = templateInner(elem, kOpt);
+        if (!inner.empty()) return kOpt + finalizeCppElem(inner) + ">*";
+        return elem;
+    }
+    // 容器：Channel<X> / ThreadChannel<X>（channel<T> / sync.Channel<T> 堆指针，
+    // 内嵌 record 元素同样补 *，如 Channel<Point> → Channel<Point*>*，与 mapType
+    // 声明侧一致；修复 [channel<Point>] 列表元素缺 *）
+    if (elem.rfind(kChn, 0) == 0) {
+        std::string inner = templateInner(elem, kChn);
+        if (!inner.empty()) return kChn + finalizeCppElem(inner) + ">*";
+        return elem;
+    }
+    if (elem.rfind(kTChn, 0) == 0) {
+        std::string inner = templateInner(elem, kTChn);
+        if (!inner.empty()) return kTChn + finalizeCppElem(inner) + ">*";
+        return elem;
+    }
+    // 叶子
+    if (elem.back() == '*') return elem;           // 已是指针（GcString*/值类型指针）不动
+    if (isIfaceViewTypeName(elem)) return elem;    // 接口/Iterator 值视图不加 *
+    auto it = registeredTypes_.find(elem);
+    if (it != registeredTypes_.end() && it->second) return elem + "*";  // 堆 record → 补 *
+    return elem;
 }
 
 std::string CodeGenerator::mapNamedType(const std::string& name) {
@@ -313,6 +381,14 @@ std::string CodeGenerator::mapNamedType(const std::string& name) {
 }
 
 std::string CodeGenerator::mapGenericRef(const GenericTypeRef& genericRef) {
+    // 泛型接口适配器上下文（ifaceTypeMap_ 非空）：<T> 泛型引用 → 具体实参类型
+    // （与 mapType NamedType 分支短路一致，覆盖 <T> 解析为 GenericTypeRef 的形态）
+    auto it = ifaceTypeMap_.find(genericRef.name);
+    if (it != ifaceTypeMap_.end()) return it->second;
+    // M3：默认参数闭包物化——调用点补默认实参时 <T> 泛型引用（GenericTypeRef 形态）
+    // 已物化为具体类型（如 useT(inc:<T>,...) 调用 useT(5,10) → T → int32_t）
+    auto mit = defaultArgMaterializedTypes_.find(genericRef.name);
+    if (mit != defaultArgMaterializedTypes_.end()) return mit->second;
     // <A>, <T> → 直接映射为 C++ 模板参数名（A, T）
     return genericRef.name;
 }
@@ -437,9 +513,23 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
     }
     if (auto* gs = dynamic_cast<const GenericSemType*>(&semType)) {
         if (!gs->resolvedName.empty()) {
-            // 内置 Iterator：resolvedName 即值视图类型（aura_rt::Iterator<T>，无 *）
-            if (gs->name == "Iterator") return gs->resolvedName;
-            return gs->resolvedName + "*";
+            const std::string& rn = gs->resolvedName;
+            // 内置 Iterator：resolvedName 即值视图类型（aura_rt::Iterator<T>，无 *）；
+            // 内嵌 record 元素经 finalizeCppElem 补 *（Iterator<Point> → Iterator<Point*>
+            // 与声明侧 mapType 一致，修复 [Iterator<Point>] 列表元素缺 *）
+            if (gs->name == "Iterator") return finalizeCppElem(rn);
+            // unwrap 兜底（2026-08-26）：resolvedName 已含 '*' 或为接口/Iterator 值视图
+            // 时不再追加 '*'，避免双重指针 / 视图值被当指针（与 optionalElemCppName
+            // finalizeElem TypeMap.cpp:256-262 的判定一致）。一律经 finalizeCppElem 递归
+            // 补内嵌堆 record 的 '*'（Optional<Point> → Optional<Point*>*、channel<Point>
+            // → Channel<Point*>*，与 optionalElemCppName / genLetStmt 一致，修复
+            // [[Optional<Point>]] 嵌套列表声明侧元素物化缺 *）
+            std::string fin = finalizeCppElem(rn);
+            // 需堆指针的容器/裸名若未被 finalizeCppElem 补尾 '*'（如自引用泛型
+            // Tree<int32_t>、未知类型名），追加外层 '*' 以保持既有 rn+"*" 语义
+            if (!fin.empty() && fin.back() != '*' && !isIfaceViewTypeName(fin))
+                fin += "*";
+            return fin;
         }
         // 未实例化的泛型：查 BuiltinRegistry 回退（如 sync.Channel → aura_rt::ThreadChannel*）
         if (auto* ti = BuiltinRegistry::get().findType(gs->name))

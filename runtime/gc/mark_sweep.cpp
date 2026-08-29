@@ -239,18 +239,32 @@ void GcHeap::markInlineArrayFields(GcObject* obj) {
 
     for (size_t i = 0; i < desc->inlineArrayFieldCount; ++i) {
         const InlineArrayField& iaf = desc->inlineArrayFields[i];
-        if (!iaf.isPtrArray) continue;
+        // #7：无 GC 引用的值数组（isPtrArray=false 且无 self 子偏移，如 int）跳过
+        if (!iaf.isPtrArray && iaf.elemGCOffset < 0) continue;
 
         // 读取长度字段（如 ArrayChunk::used）
         int32_t* lenField = reinterpret_cast<int32_t*>(base + iaf.lengthOffset);
         int32_t  count = *lenField;
 
-        // 扫描内联数据区中的 GC 指针
-        GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
-        for (int32_t j = 0; j < count; ++j) {
-            GcObject* child = elems[j];
-            if (child) {
-                markObject(child);
+        if (iaf.isPtrArray) {
+            // 快路径：扫描内联数据区中的 GC 指针（元素本身就是指针）
+            GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
+            for (int32_t j = 0; j < count; ++j) {
+                GcObject* child = elems[j];
+                if (child) {
+                    markObject(child);
+                }
+            }
+        } else {
+            // #7：接口视图元素子偏移路径——每个元素在 j*elemStride+elemGCOffset
+            // 处含 GC 指针 self（如 Array<Stringer> 的视图元素），扫描之
+            char* elemBase = base + iaf.offset;
+            for (int32_t j = 0; j < count; ++j) {
+                GcObject* child = *reinterpret_cast<GcObject**>(
+                    elemBase + static_cast<size_t>(j) * iaf.elemStride + iaf.elemGCOffset);
+                if (child) {
+                    markObject(child);
+                }
             }
         }
     }
@@ -354,13 +368,28 @@ void GcHeap::promoteToOld(GcObject* obj) {
     if (!hasYoungRef && desc->inlineArrayFieldCount > 0 && desc->inlineArrayFields) {
         for (size_t i = 0; i < desc->inlineArrayFieldCount; ++i) {
             const InlineArrayField& iaf = desc->inlineArrayFields[i];
-            if (!iaf.isPtrArray) continue;
+            // #7：无 GC 引用的值数组（isPtrArray=false 且无 self 子偏移）跳过
+            if (!iaf.isPtrArray && iaf.elemGCOffset < 0) continue;
             int32_t count = *reinterpret_cast<int32_t*>(base + iaf.lengthOffset);
-            GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
-            for (int32_t j = 0; j < count; ++j) {
-                if (elems[j] && elems[j]->generation() == 0) {
-                    hasYoungRef = true;
-                    break;
+            if (iaf.isPtrArray) {
+                GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
+                for (int32_t j = 0; j < count; ++j) {
+                    if (elems[j] && elems[j]->generation() == 0) {
+                        hasYoungRef = true;
+                        break;
+                    }
+                }
+            } else {
+                // #7：接口视图元素——检查元素内 self 子偏移指向新生代（old→young
+                // 记忆集追踪），否则 minor GC 漏标 → 适配器被回收 → self 悬垂
+                char* elemBase = base + iaf.offset;
+                for (int32_t j = 0; j < count; ++j) {
+                    GcObject* child = *reinterpret_cast<GcObject**>(
+                        elemBase + static_cast<size_t>(j) * iaf.elemStride + iaf.elemGCOffset);
+                    if (child && child->generation() == 0) {
+                        hasYoungRef = true;
+                        break;
+                    }
                 }
             }
             if (hasYoungRef) break;

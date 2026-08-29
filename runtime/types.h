@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>       // is_pointer_v / void_t / enable_if_t / is_convertible_v
 
 namespace aura_rt {
 
@@ -54,6 +55,21 @@ struct NoneType {
 };
 inline constexpr NoneType None{};
 
+// 检测 T 是否为接口视图（含 GcObject* self 字段的值类型视图，如 Stringer / Iterator<T>）
+// 原定义于 builtin/variant.h（P2b：Variant 变体为接口视图时，storage_ 起始 + 视图内
+// self 子偏移 = 有效 GC 指针）；#7 上移到 types.h 供 ArrayChunk<T>::desc()（array.tcc）
+// 复用——视图元素列表的 GC 追踪需要编译期检测 T 内含 self 子字段。
+template <typename T, typename = void>
+struct is_iface_view : std::false_type {};
+template <typename T>
+struct is_iface_view<T, std::void_t<
+    decltype(std::declval<T&>().self),
+    std::enable_if_t<std::is_convertible_v<
+        decltype(std::declval<T&>().self), GcObject*>>
+>> : std::true_type {};
+template <typename T>
+inline constexpr bool is_iface_view_v = is_iface_view<T>::value;
+
 // ============================================================
 // TypeDescriptor — GC 类型描述符
 //
@@ -74,11 +90,18 @@ inline constexpr NoneType None{};
 
 // 内联数组字段描述符（如 ArrayChunk<GcString*> 的数据区在 this + 1 处）
 // 当 chunk 的 T 是指针类型时，data() 区域包含 GC 需要扫描的指针。
+// #7 扩展：除指针数组（isPtrArray=true，元素本身就是 GC 指针）外，还支持
+// 接口视图元素（isPtrArray=false，元素是 { 方法Fn..., GcObject* self } 值视图）——
+// 元素内 self 子偏移经 elemGCOffset 注册，GC 按 base+offset+j*elemStride+elemGCOffset
+// 扫描/重写 self（与 Optional/Variant 的 value_+self 复合子偏移同模式）。
 struct InlineArrayField {
     uint32_t offset;        // 数据区起始偏移（相对于对象基址）
     uint32_t lengthOffset;  // 长度字段偏移（GC 读取它知道数组有多少有效元素）
     bool   isPtrArray;      // 元素是否是指针（int 不用扫，GcString* 要扫）
-};                          // 16B → 12B（P2a 压缩）
+    uint32_t elemStride;    // 元素步长（字节）：指针数组=sizeof(void*)，视图=sizeof(T)
+    int32_t  elemGCOffset;  // 元素内 GC 子偏移；-1=元素本身就是指针（isPtrArray 快路径），
+                            //   >=0=元素内 self 子偏移（接口视图，如 offsetof(T, self)）
+};                          // 20B（原 12B + elemStride 4B + elemGCOffset 4B）
 
 struct TypeDescriptor {
     uint32_t        size;               // 对象总大小（字节），含内联数据（对象 ≤4GB）

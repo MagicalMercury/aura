@@ -867,17 +867,39 @@ const TypeDescriptor& ArrayChunk<T>::desc() {
         offsetof(ArrayChunk, prev)
     };
     if constexpr (std::is_pointer_v<T>) {
+        // 指针元素数组：元素本身是 GC 指针，inlineArrayField 扫 data 区整体指针
+        //（isPtrArray=true 快路径，elemGCOffset=-1）
         static const InlineArrayField inlineFields[] = {
-            { sizeof(ArrayChunk), offsetof(ArrayChunk, used), true }
+            { sizeof(ArrayChunk), offsetof(ArrayChunk, used), true,
+              static_cast<uint32_t>(sizeof(void*)), -1 }
         };
         static const TypeDescriptor d = {
             sizeof(ArrayChunk) + AURA_ARRAY_CHUNK_CAP * sizeof(T),
             2, ptrOffsets,
             1, inlineFields
         };
-
+#pragma GCC diagnostic pop
+        return d;
+    } else if constexpr (is_iface_view_v<T>) {
+        // #7：接口视图元素数组（如 Array<Stringer> / Array<Iterator<int>>）——
+        // 元素是值视图 { 方法Fn..., GcObject* self }，is_pointer_v=false 但含 GC 指针 self。
+        // 注册子偏移 inlineArrayField（isPtrArray=false, elemGCOffset=offsetof(T, self)），
+        // GC 按 base+dataOff+j*stride+selfOff 扫描/重写 self（与 Optional/Variant 复合
+        // 子偏移同模式），修复视图适配器漏扫 → 被回收、self 悬垂崩溃。
+        static const InlineArrayField inlineFields[] = {
+            { sizeof(ArrayChunk), offsetof(ArrayChunk, used), false,
+              static_cast<uint32_t>(sizeof(T)),
+              static_cast<int32_t>(offsetof(T, self)) }
+        };
+        static const TypeDescriptor d = {
+            sizeof(ArrayChunk) + AURA_ARRAY_CHUNK_CAP * sizeof(T),
+            2, ptrOffsets,
+            1, inlineFields
+        };
+#pragma GCC diagnostic pop
         return d;
     } else {
+        // 值元素数组（int/float/bool 等，无 GC 引用）
         static const TypeDescriptor d = {
             sizeof(ArrayChunk) + AURA_ARRAY_CHUNK_CAP * sizeof(T),
             2, ptrOffsets,

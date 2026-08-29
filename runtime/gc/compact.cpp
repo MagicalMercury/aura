@@ -529,13 +529,27 @@ void GcHeap::updateInlineArrayElements(GcObject* obj) {
     char* base = reinterpret_cast<char*>(obj);
     for (size_t i = 0; i < desc->inlineArrayFieldCount; ++i) {
         const InlineArrayField& iaf = desc->inlineArrayFields[i];
-        if (!iaf.isPtrArray) continue;
+        // #7：无 GC 引用的值数组（isPtrArray=false 且无 self 子偏移）跳过
+        if (!iaf.isPtrArray && iaf.elemGCOffset < 0) continue;
 
         int32_t count = *reinterpret_cast<int32_t*>(base + iaf.lengthOffset);
-        GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
-        for (int32_t j = 0; j < count; ++j) {
-            if (elems[j] && elems[j]->forwarded()) {
-                elems[j] = elems[j]->forwardingPtr();
+        if (iaf.isPtrArray) {
+            GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
+            for (int32_t j = 0; j < count; ++j) {
+                if (elems[j] && elems[j]->forwarded()) {
+                    elems[j] = elems[j]->forwardingPtr();
+                }
+            }
+        } else {
+            // #7：接口视图元素——重写元素内 self 子偏移（适配器 compact 移动后
+            // 更新为新地址），否则 self 悬垂 → 访问崩溃
+            char* elemBase = base + iaf.offset;
+            for (int32_t j = 0; j < count; ++j) {
+                GcObject** selfPtr = reinterpret_cast<GcObject**>(
+                    elemBase + static_cast<size_t>(j) * iaf.elemStride + iaf.elemGCOffset);
+                if (*selfPtr && (*selfPtr)->forwarded()) {
+                    *selfPtr = (*selfPtr)->forwardingPtr();
+                }
             }
         }
     }
@@ -570,12 +584,25 @@ void GcHeap::updateObjectAllFields(GcObject* obj) {
     if (desc->inlineArrayFieldCount && desc->inlineArrayFields) {
         for (size_t i = 0; i < desc->inlineArrayFieldCount; ++i) {
             const InlineArrayField& iaf = desc->inlineArrayFields[i];
-            if (!iaf.isPtrArray) continue;
+            // #7：无 GC 引用的值数组（isPtrArray=false 且无 self 子偏移）跳过
+            if (!iaf.isPtrArray && iaf.elemGCOffset < 0) continue;
             int32_t count = *reinterpret_cast<int32_t*>(base + iaf.lengthOffset);
-            GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
-            for (int32_t j = 0; j < count; ++j) {
-                if (elems[j] && elems[j]->forwarded()) {
-                    elems[j] = elems[j]->forwardingPtr();
+            if (iaf.isPtrArray) {
+                GcObject** elems = reinterpret_cast<GcObject**>(base + iaf.offset);
+                for (int32_t j = 0; j < count; ++j) {
+                    if (elems[j] && elems[j]->forwarded()) {
+                        elems[j] = elems[j]->forwardingPtr();
+                    }
+                }
+            } else {
+                // #7：接口视图元素——重写元素内 self 子偏移（见 updateInlineArrayElements）
+                char* elemBase = base + iaf.offset;
+                for (int32_t j = 0; j < count; ++j) {
+                    GcObject** selfPtr = reinterpret_cast<GcObject**>(
+                        elemBase + static_cast<size_t>(j) * iaf.elemStride + iaf.elemGCOffset);
+                    if (*selfPtr && (*selfPtr)->forwarded()) {
+                        *selfPtr = (*selfPtr)->forwardingPtr();
+                    }
                 }
             }
         }

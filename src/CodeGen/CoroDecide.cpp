@@ -1,5 +1,6 @@
 #include "CodeGen.h"
 #include "../Sema/BuiltinRegistry.h"
+#include "../Sema/SemType.h"
 
 namespace Aura {
 
@@ -175,6 +176,30 @@ private:
                         if (BuiltinRegistry::get().methodHasAsync("Io", mc->method))
                             return !ioSync_;
                         return false;  // file_exists / cwd 等无异步版本
+                    }
+                }
+                // 协程 channel send/receive：receiver 推断类型为 GenericSemType "channel"
+                // → 需挂起（同步 ThreadChannel 的 inferredType 是 "sync.Channel"，不匹配，
+                // 且其 send/receive 是阻塞调用，不在协程判定内）。
+                if (mc->object->inferredType) {
+                    if (auto* g = dynamic_cast<const GenericSemType*>(mc->object->inferredType)) {
+                        if (g->name == "channel"
+                            && (mc->method == "send" || mc->method == "receive"))
+                            return true;
+                    }
+                }
+                // 用户自定义协程方法调用传播（self.foo() / p.foo()）：receiver 类型
+                // （RecordSemType.canonicalName 截取 '<' 前，对齐声明侧 receiverType）+
+                // 方法名查 coroFns_（键 = "ReceiverType.methodName"）。与函数侧 CallExpr
+                // 传播对称：调用协程方法的方法也被标为协程（否则方法内 co_await 落普通
+                // 方法 → 坏 C++）。ioSync_ 不豁免（与 CallExpr 分支一致）。
+                if (mc->object->inferredType) {
+                    if (auto* r = dynamic_cast<const RecordSemType*>(mc->object->inferredType)) {
+                        std::string recvKey = r->canonicalName;
+                        size_t lt = recvKey.find('<');
+                        if (lt != std::string::npos) recvKey = recvKey.substr(0, lt);
+                        if (!recvKey.empty() && coroFns_.count(recvKey + "." + mc->method))
+                            return true;
                     }
                 }
             }

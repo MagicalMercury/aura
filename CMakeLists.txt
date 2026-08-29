@@ -60,9 +60,20 @@ set(AURA_SOURCES
     src/Sema/SemType.cpp
     src/Sema/SymbolTable.cpp
     src/Sema/SemAnalyzer.cpp
+    src/Sema/SemTypeUtils.cpp
+    src/Sema/Assignability.cpp
+    src/Sema/GenericSubstitution.cpp
+    src/Sema/TypeResolution.cpp
+    src/Sema/CanonicalPropagation.cpp
     src/Sema/Checker/DeclChecker.cpp
+    src/Sema/Checker/TypeResolver.cpp
+    src/Sema/Checker/BodyChecker.cpp
     src/Sema/Checker/StmtChecker.cpp
+    src/Sema/Checker/StmtFlow.cpp
+    src/Sema/Checker/StmtSync.cpp
     src/Sema/Checker/ExprInfer.cpp
+    src/Sema/Checker/CallInfer.cpp
+    src/Sema/Checker/ExprInferMisc.cpp
     src/CodeGen/CodeGen.cpp
     src/CodeGen/TypeMap.cpp
     src/CodeGen/DeclGen.cpp

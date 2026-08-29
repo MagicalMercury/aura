@@ -112,6 +112,14 @@ private:
     std::unique_ptr<ASTNode> parseCall();
     std::unique_ptr<ASTNode> parsePrimary();
 
+    // N2：调用点显式类型实参 `B<int>(...)` 与比较运算 `a < b` 的语法消歧。
+    // lookaheadTypeArgsBeforeCall：仅当当前 '<' 后是合法类型序列、以 '>' 收尾且紧跟
+    // '(' 时才视为显式类型实参（只读不消费 token）；skipTypeTokens：从 tokens_[i] 跳过
+    // 一个类型（Identifier / ns.Ident / Ident<T1,T2>，含内置类型名 int/string 等），
+    // 成功推进 i 返回 true。参照 C++17 模板实参优先规则。
+    bool lookaheadTypeArgsBeforeCall();
+    bool skipTypeTokens(size_t& i) const;
+
     // --- 解析闭包 ---
     std::unique_ptr<ASTNode> parseFunExpr();
 
@@ -129,6 +137,13 @@ private:
     Param parseParam();
     std::vector<Param> parseParams();
     InterfaceMethodSig parseInterfaceMethodSig();
+
+    // #5：具名 record 字面量 `Point { x = 1, y = 2 }` 的语句头抑制标志。
+    // parseIfStmt/parseWhileStmt/parseForStmt/parseSyncForRest 的语句头表达式
+    // （condition/iterable）位置置位，防止 `Ident { Ident =` 与语句体同形
+    // （used/5.aura `for v in ch26 { v26 = v }` 回归红线）被 parseCall 误吞为具名
+    // record 字面量。解析语句头表达式前后保存/置位/恢复（防嵌套语句头污染）。
+    bool suppressNamedRecordLiteral_ = false;
 
     // --- 数据 ---
     std::vector<Token> tokens_;

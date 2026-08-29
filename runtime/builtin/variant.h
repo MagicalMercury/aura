@@ -24,18 +24,8 @@
 
 namespace aura_rt {
 
-// 检测 T 是否为接口视图（含 GcObject* self 字段的值类型视图，如 Stringer / Iterator<T>）
-// P2b：Variant 变体为接口视图时，storage_ 起始 + 视图内 self 子偏移 = 有效 GC 指针
-template <typename T, typename = void>
-struct is_iface_view : std::false_type {};
-template <typename T>
-struct is_iface_view<T, std::void_t<
-    decltype(std::declval<T&>().self),
-    std::enable_if_t<std::is_convertible_v<
-        decltype(std::declval<T&>().self), GcObject*>>
->> : std::true_type {};
-template <typename T>
-inline constexpr bool is_iface_view_v = is_iface_view<T>::value;
+// is_iface_view_v trait 已上移至 types.h（#7：ArrayChunk<T>::desc() 需复用，
+// 检测视图元素内 GcObject* self 子偏移）；本头 include ../types.h 故仍可直接引用。
 
 template <typename... Ts>
 struct Variant : GcObject {

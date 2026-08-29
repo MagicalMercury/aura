@@ -88,13 +88,26 @@ std::unique_ptr<Stmt> Parser::parseIfStmt() {
     auto stmt = std::make_unique<IfStmt>();
     setNodePos(stmt.get(), tok);
 
-    stmt->condition = parseExpr();
+    // #5：语句头抑制——condition 表达式位置的 `Ident { Ident =` 不解析为具名
+    // record 字面量（`if flag { x = 1 }` 的 `{` 是语句体）。save/restore 防嵌套
+    // 语句头污染（条件表达式内闭包体的 if 语句独立设置自身的抑制）。
+    {
+        bool oldSuppress = suppressNamedRecordLiteral_;
+        suppressNamedRecordLiteral_ = true;
+        stmt->condition = parseExpr();
+        suppressNamedRecordLiteral_ = oldSuppress;
+    }
     stmt->thenBranch = parseBlock();
 
     while (match(TokType::Else)) {
         if (match(TokType::If)) {
             ElseIfBranch branch;
-            branch.condition = parseExpr();
+            {
+                bool oldSuppress = suppressNamedRecordLiteral_;
+                suppressNamedRecordLiteral_ = true;
+                branch.condition = parseExpr();
+                suppressNamedRecordLiteral_ = oldSuppress;
+            }
             branch.body = parseBlock();
             stmt->elseIfs.push_back(std::move(branch));
         } else {
@@ -111,7 +124,12 @@ std::unique_ptr<Stmt> Parser::parseWhileStmt() {
     auto stmt = std::make_unique<WhileStmt>();
     setNodePos(stmt.get(), tok);
 
-    stmt->condition = parseExpr();
+    {
+        bool oldSuppress = suppressNamedRecordLiteral_;
+        suppressNamedRecordLiteral_ = true;
+        stmt->condition = parseExpr();
+        suppressNamedRecordLiteral_ = oldSuppress;
+    }
     stmt->body = parseBlock();
     return stmt;
 }
@@ -135,7 +153,14 @@ std::unique_ptr<Stmt> Parser::parseForStmt() {
 
     consume(TokType::Identifier, "expected 'in' after loop variable");
 
-    stmt->iterable = parseExpr();
+    // #5：语句头抑制——iterable 表达式位置的 `Ident { Ident =` 不解析为具名
+    // record 字面量（`for v in ch26 { v26 = v }` 的 `{` 是语句体，used/5.aura 回归红线）
+    {
+        bool oldSuppress = suppressNamedRecordLiteral_;
+        suppressNamedRecordLiteral_ = true;
+        stmt->iterable = parseExpr();
+        suppressNamedRecordLiteral_ = oldSuppress;
+    }
     stmt->body = parseBlock();
     return stmt;
 }
@@ -261,7 +286,14 @@ std::unique_ptr<Stmt> Parser::parseSyncForRest(Token& syncTok, bool isThread) {
     auto& itemTok = consume(TokType::Identifier, "expected loop variable after 'for'");
     stmt->itemName = itemTok.lexeme;
     consume(TokType::Identifier, "expected 'in' after loop variable");
-    stmt->iterable = parseExpr();
+
+    // #5：语句头抑制——iterable 表达式位置同 for（`sync for v in ch { v2 = v }`）
+    {
+        bool oldSuppress = suppressNamedRecordLiteral_;
+        suppressNamedRecordLiteral_ = true;
+        stmt->iterable = parseExpr();
+        suppressNamedRecordLiteral_ = oldSuppress;
+    }
 
     // === 省略花括号（Feature 3）：仅允许函数/方法调用 ===
     if (check(TokType::LBrace)) {

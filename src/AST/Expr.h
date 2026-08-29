@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ASTNode.h"
+#include "Type.h"
 #include <cstdint>
 #include <memory>
 #include <ostream>
@@ -90,10 +91,15 @@ struct RecordField {
 };
 
 struct RecordExpr : ASTNode {
+    // #5：具名 record 字面量 `Point { x = 1, y = 2 }` 的类型名；空 = 匿名
+    // （`{ x = 1 }`）。类型身份由 typeName 显式给出，Sema 据此查符号表构造带
+    // canonicalName 的 RecordSemType（CodeGen 走 gc_alloc 而非 designated init）。
+    std::string typeName;
     std::vector<RecordField> fields;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<RecordExpr>();
+        n->typeName = typeName;
         for (auto& f : fields) {
             RecordField rf;
             rf.name = f.name;
@@ -151,11 +157,16 @@ struct UnaryExpr : ASTNode {
 struct CallExpr : ASTNode {
     std::unique_ptr<ASTNode> callee;
     std::vector<std::unique_ptr<ASTNode>> args;
+    // 调用点显式类型实参（N2）：B<int>(...) / M<int, string>(...) — 显式给泛型实参，
+    // 空 = 未使用显式类型实参（普通调用，泛型由实参推导 / 期望类型绑定）
+    std::vector<std::unique_ptr<TypeExpr>> typeArgs;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<CallExpr>();
         n->callee = callee ? callee->clone() : nullptr;
         for (auto& a : args) n->args.push_back(a ? a->clone() : nullptr);
+        for (auto& t : typeArgs)
+            n->typeArgs.emplace_back(t ? std::unique_ptr<TypeExpr>(static_cast<TypeExpr*>(t->clone().release())) : nullptr);
         n->line = line; n->col = col;
         return n;
     }

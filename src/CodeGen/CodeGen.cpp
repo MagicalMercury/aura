@@ -1,5 +1,6 @@
 #include "CodeGen.h"
 #include "../Sema/SemAnalyzer.h"
+#include <algorithm>
 #include <filesystem>
 #include <sstream>
 #include <unordered_set>
@@ -128,11 +129,50 @@ CompileUnit CodeGenerator::generate(const Program& program,
         }
         if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
             if (decideCoro(*m) == CoroDecision::Coroutine)
-                coroutineFunctions_.insert(m->name);
+                // 方法键 = "ReceiverType.methodName"（与 methodDefaultArgs_/methodParamCppTypes_
+                // 同键格式）：避免同名方法跨不同 receiver 互相污染协程判定。
+                coroutineFunctions_.insert(m->receiverType + "." + m->name);
         }
     }
 
     // 第三遍：生成代码
+    // Phase 3-⑤：pendingMethods_ 收集（方法签名 mapType 映射）之前，先对所有函数/
+    // 联合/命名类型别名执行 genTypeDecl（DeclGen.cpp:37）的 registerTypeName(name,
+    // false) 覆盖，消除「别名在收集时为堆、在 genTypeDecl A 遍后才覆盖为非堆」的
+    // 时序窗口——否则声明侧（genRecordStruct 内嵌方法签名）元素多 '*' 而定义侧
+    // （genMethodDecl 第三遍 B）无 '*' → g++ no declaration matches。record 类型
+    // 恒堆（genTypeDecl RecordType 分支不覆盖），跳过。
+    for (auto& d : program.decls) {
+        if (!d) continue;
+        if (auto* t = dynamic_cast<const TypeDecl*>(d.get())) {
+            if (!t->type) continue;
+            if (!dynamic_cast<const RecordType*>(t->type.get()))
+                registerTypeName(t->name, false);
+        }
+    }
+    // Phase 3-⑤b：pendingMethods_ 收集前预填充 typeAliasTemplateParams_（与
+    // genTypeDecl 相同的模板参数扫描）——否则 struct 内嵌方法声明的 isFuncAliasRet
+    // 判定（返回泛型函数类型别名 → auto，M1）在收集时因 typeAliasTemplateParams_
+    // 尚未填充（第三遍 A 的 genTypeDecl 才填充）而失效。
+    for (auto& d : program.decls) {
+        if (!d) continue;
+        auto* t = dynamic_cast<const TypeDecl*>(d.get());
+        if (!t || !t->type) continue;
+        std::vector<std::string> tp = t->typeParams;
+        if (tp.empty()) {
+            if (auto* rec = dynamic_cast<const RecordType*>(t->type.get())) {
+                for (auto& f : rec->fields)
+                    if (f.type && dynamic_cast<const GenericTypeRef*>(f.type.get()))
+                        tp.push_back(dynamic_cast<const GenericTypeRef*>(f.type.get())->name);
+            } else {
+                std::set<std::string> tpSet;
+                collectTParams(*t->type, tpSet);
+                tp.assign(tpSet.begin(), tpSet.end());
+            }
+        }
+        if (!tp.empty())
+            typeAliasTemplateParams_[t->name] = tp;
+    }
     // 先收集方法信息（供 genRecordStruct 嵌入声明）
     pendingMethods_.clear();
     for (auto& d : program.decls) {
@@ -142,6 +182,34 @@ CompileUnit CodeGenerator::generate(const Program& program,
                 pm.receiverType  = m->receiverType;
                 pm.methodName    = m->name;
                 pm.returnTypeStr = m->returnType ? mapType(*m->returnType) : "void";
+                // M1/M5：返回泛型函数类型别名（Mapper<A,U>）或直接写泛型函数类型
+                // （fun(U,T)->U，含"未在方法模板参数中的闭包自身泛型"）→ struct 内声明
+                // 写 auto（闭包自身泛型 U/T 未在方法模板参数中，显式写
+                // std::function<U(U,T)> 会 'U' was not declared；auto 由方法定义体推导，
+                // 与 genMethodDecl 一致）。返回泛型均在方法模板参数中的（如
+                // Box<T>::identity() -> fun(T)->T）保持显式返回类型。
+                if (m->returnType && isFuncAliasRet(m->returnType.get()))
+                    pm.returnTypeStr = "auto";
+                else if (m->returnType
+                         && dynamic_cast<const FunctionType*>(m->returnType.get())) {
+                    auto mtp = collectMethodTParams(*m);
+                    std::set<std::string> retGen;
+                    collectTParams(*m->returnType, retGen);
+                    for (auto& g : retGen)
+                        if (std::find(mtp.begin(), mtp.end(), g) == mtp.end()) {
+                            pm.returnTypeStr = "auto";
+                            break;
+                        }
+                }
+                // 方法协程化：体内含异步操作（sync/spawn/io/channel）的方法 → struct 内
+                // 声明包 aura_rt::task<ret>（与定义侧 genMethodDecl 对称）。auto 返回
+                // （泛型闭包）保持 auto（无法表达 task<auto>，声明/定义两侧一致）。
+                if (coroutineFunctions_.count(m->receiverType + "." + m->name)
+                    && pm.returnTypeStr != "auto") {
+                    if (pm.returnTypeStr == "aura_rt::NoneType")
+                        pm.returnTypeStr = "void";  // task<void> 有 return_void，task<NoneType> 没有
+                    pm.returnTypeStr = "aura_rt::task<" + pm.returnTypeStr + ">";
+                }
                 for (auto& p : m->params) {
                     pm.paramTypes.push_back(p.type ? mapType(*p.type) : "auto");
                     pm.paramNames.push_back(p.name);

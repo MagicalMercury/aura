@@ -1,3 +1,582 @@
-Optional<Stringer> = some(p) —— [x] 已修（2026-08-25，plan/issue_遗留三项问题修复规划.md §#1）：显式 Optional<X> 装箱（record→view / lambda→std::function / 裸值 / some(record)）
-let r: Point|None = {x=1,y=2} —— [x] 已修（2026-08-25，§#2）：propagateCanonicalName Optional 下钻 + 目标识别；遗留 [~] #13 列表元素 / #10 record 字段的 Optional 装箱
-range(5).map(fun(x:int)->int{x*2}).collect() 运行时崩溃 —— [x] 已修（2026-08-25，§#4）：非 runtime 问题，闭包缺 return 的 Sema 漏检 + CodeGen 不补 → 已编译期拦截；新发现 [ ] `let x = opt.unwrap()` 对接口/list 元素的推断缺口
+# Aura 缺陷登记（problem.txt）
+#
+# 规则：未修复缺陷 [ ]（含根因/修复方向）；已修复 [x]（含 Phase 与验证统计）。
+# 约定时间：2026-08-26；最后整理：2026-08-29（第十四次整理：全量 24 条修复完成，
+#           未修/已修分区分流 + 压缩——已修条目移入二区压缩版，未修 17 条保留一区）。
+
+# ═══════════════════════════════════════════════════════════════════════
+# 一、未修缺陷（17 条，全部已调研，待修复）
+# ═══════════════════════════════════════════════════════════════════════
+
+[ ] record 直接调 next()（p.next()，p 为 record 变量非 Iterator 视图）未支持：有标注 Sema 放行 → 坏 C++
+    - 2026-08-29 修复「Iterator 视图直接调 next()」时确认（独立既有缺口，与视图 next 不同源）：
+      `let p: Point = {...}; p.next()`（Point 为普通 record）→ inferMethodCall record 分支在
+      typeMethods_ 找不到 next（next 是字段/接口方法，非该 record 方法）→「未匹配到方法 → 保持
+      放行」（CallInfer.cpp record 分支，对照 map/filter/collect 的「record 直调报错（v1 不支持）」
+      路径不同）→ 返回 ErrorSemType：
+      - 有标注 `let r: Optional<Point> = p.next()` → **Sema 放行**，CodeGen 生成 `p->next()`
+        → g++ `'struct Point' has no member named 'next'`（坏 C++，实测 2026-08-29）。
+      - 无标注 `let r = p.next()` → Sema 报误导性干净错误 `cannot infer element type from
+        initializer`（G4 兜底，报错文本像空列表错误，未引导用户转视图）。
+    - 影响：record 上误写 next()（或想用迭代器协议）得不到干净「record 'Point' has no method
+      'next'」报错；有标注直接坏 C++。
+    - 修复方向：inferMethodCall record 分支未匹配方法时，对「该 record 未声明的方法名」报 E013
+      干净错误（`record type 'Point' has no method 'next'`，仿接口/内置分支），并提示正确用法
+      （`let it: Iterator<Point> = p` 转视图后调 next / 或实现 next 方法）；不得静默放行。
+    - 状态：调研完成（待修复）
+
+[ ] decideCoro 一遍扫描顺序依赖：外层（函数/方法）调用后置声明的协程函数/方法 → 传播失败 →
+    调用点不 co_await → task 析构不执行体 → 协程体静默不执行
+    - 2026-08-29 实现方法协程化时实测发现（独立既有缺口，函数侧 CallExpr 传播同样受限）：
+      ```aura
+      fun outer(io: Io) { runner2(io) }        // runner2 声明在后面
+      fun runner2(io: Io) { io.println("r2") } // 协程（io 异步）
+      ```
+      → outer/outerM 不被标为协程（decideCoro 按声明顺序逐个判定，扫描时 coroutineFunctions_
+      尚无后置声明的 runner2）→ outer 内 `runner2(io)` 不 co_await → task 立即析构
+      （~task() handle_.destroy()，initial_suspend=suspend_always 从未 resume）→ 协程体静默
+      不执行（实测仅输出 main done，无 runner2 ran / helperM ran）。
+    - 根因：CodeGen.cpp 一遍循环，decideCoro 依赖已插入的 coroutineFunctions_ 传播；声明顺序
+      颠倒时信息不足。无编译错误（静默错误，更难排查）。
+    - 修复方向：decideCoro 判定改为固定点迭代（多轮扫描 coroutineFunctions_ 直至稳定，限制轮数
+      防死循环），或对依赖做拓扑排序；亦可在 genCallExpr / genMethodCall 对「调用已标协程的
+      被调用者但当前非协程上下文」报编译错误（防静默）。
+    - 状态：调研完成（待修复）
+
+[ ] 泛型方法体 `return []`（函数类型元素列表）生成 `Array<T>::make(0)`（方法声明侧 CodeGen）
+    - 2026-08-28 验证「泛型 record 方法返回类型调用点代换」时发现：泛型 record 方法
+      `fun (self Runner<T>) getTransforms() throws -> [Transform<T>] { return [] }` → 方法体
+      生成 `Array<T>::make(0)`（应为 `Array<Transform<T>>::make(0)`）→ g++ cannot convert
+      'Array<int>*' to 'Array<std::function<int(int)>>*'。对照：非泛型函数 return [] →
+      `Array<std::function<int32_t(int32_t)>>::make(0)` 正确；record 元素 [Node<T>] return []
+      正确（mapSemType 产出 "Node<T>*" 不含 auto）。
+    - 根因：genListExpr 空列表分支（ExprGen.cpp）inferredType 推断元素类型，元素为函数类型别名
+      FuncSemType（Transform<T>）且方法体泛型（T 未实例化）时 mapSemType 产出含 "auto" 的 C++
+      类型被 G4 拦截 → 落 currentTParams_[0] 兜底 `Array<T>::make(0)`，与返回类型不匹配。
+    - 修复方向：空列表兜底改用 currentReturnCppType_（方法/函数声明返回 C++ 类型）提取
+      Array<...> 元素类型生成 make(0)（仿 let 空列表由目标类型取元素），而非硬编码 currentTParams_[0]。
+    - 状态：调研完成（待修复）
+
+[ ] 泛型 record 方法返回泛型函数类型别名时闭包内空列表 `[]` 用 currentTParams_[0]（M1-adj）
+    - 2026-08-29 修 M1 后 A≠U 暴露：方法版闭包 `let result: [U] = []`（U 闭包自身泛型）→
+      genListExpr 空列表 inferredType 路径未命中 → 回退 currentTParams_[0]（receiver 泛型 A）
+      生成 `Array<A>::make(0)`；闭包体内其余位置已 `using U` → A≠U 时类型不匹配（cannot
+      convert Array<GcString*>* to Array<int>*）。顶层函数对照（currentTParams_ 空）走
+      inferredType 生成 Array<U>::make(0) ✅。
+    - 修复方向：空列表分支优先用闭包内期望元素类型（Sema inferredType [U] 应能给出，需查为何
+      方法版闭包未命中），仅确实不可得时回退 currentTParams_[0]。
+    - 状态：调研完成（待修复）
+
+[ ] 泛型 record 方法 Optional/Union 形参调用点装箱键不匹配（methodParamCppTypes_ 声明名 vs 实例化 canonicalName）
+    - 2026-08-28 修 M2 时发现（同源独立缺口）：泛型 record 方法形参 Optional/Union
+      `fun (self Box<T>) pick(o: Optional<T>)` → main `b.pick(9)`（裸值直传）→ 不装箱 →
+      g++ invalid conversion from 'int' to 'aura_rt::Optional<int>*'。
+    - 根因：methodParamCppTypes_ 注册键 = "Box.pick"（声明名）；查询键 = "Box<int32_t>.pick"
+      （receiver canonicalName）→ 键不匹配 → 装箱不命中。与 M2（methodDefaultArgs_）同源；
+      不同点：此处声明侧形参 C++ 类型含未绑定泛型名 T（"aura_rt::Optional<T>*"），归一化后装箱
+      会生成含 T 坏代码，须先把形参类型按调用点 receiver 泛型实参实例化（T→int32_t）。
+    - 影响：泛型 record 方法任何 Optional/Union 形参 + 裸值/裸 record/列表直传实参的调用点装箱
+      全部失效 → C++ 编译错误。methodInterfaceParams_（接口形参 record→view）同键机制可能同源受影响。
+    - 修复方向：查询侧按 receiver 泛型实参数实例化形参类型（提取 canonicalName 的 <...> 实参替换
+      声明侧形参类型中的 T），或 Sema/注册侧登记实例化后的形参类型表。
+    - 状态：调研完成（待修复）
+
+[ ] 跨模块泛型函数默认参数闭包引用函数模板 T → 调用点模板 lambda 无法匹配 std::function<T(T)>（M3-adj）
+    - 2026-08-29 修 M3 后跨模块形态仍坏：`pub fun useT(inc:<T>, v:T, cb:fun(T)->T =
+      fun(x:T)->T{return x})` 被 `m.useT(5,10)`（缺 cb）调用 → 补默认实参生成 `[]<typename T>`
+      模板 lambda → g++ no matching（模板 lambda 不参与 std::function<T(T)> 推导）。
+    - 根因：M3 修复只覆盖同模块函数默认参数补全（fnDefaultArgs_ 分支，物化 T + std::function
+      包装）；跨模块走 genMethodCall isNs 分支（crossDefaults_ 补全）仍 genExpr 直接生成模板
+      lambda，且跨模块形参类型表（fnParamTypeExprs_ 仅注册当前模块函数）不可用。
+    - 修复方向：crossDefaults_ 补全复用 M3 的物化 + std::function 包装——跨模块形参类型表随
+      CrossModuleDefaults 传入 CodeGen，对闭包默认实参按调用点实参推导泛型绑定物化 + 包装。
+    - 状态：调研完成（待修复）
+
+[ ] 方法参数直接写泛型函数类型（`f: fun(U) -> U`）时方法自身裸泛型 U 未注册 → undefined（M5-adj）
+    - 2026-08-29 修 M5（返回类型裸泛型）时发现：`fun (self Box) apply(f: fun(U) -> U) -> int` →
+      Sema 报 `undefined type 'U'`（方法参数 FunctionType 内裸 U 在参数解析时未注册）。
+      registerReturnFuncTypeGenerics 只覆盖返回类型；参数路径（declareDecl MethodDecl 分支 /
+      checkMethodBody / buildTypeMethods）对参数 FunctionType 内裸泛型仍不注册。
+    - 根因：与 M5 同源——裸 U 是 NamedType，registerTypeGenerics 只认 `<T>` 与别名 typeArgs。
+    - 修复方向：仿 registerReturnFuncTypeGenerics 增加「注册参数 FunctionType 内裸泛型」对称入口
+      + 配套 CodeGen collectMethodTParams 对参数 FunctionType 裸泛型的分流。
+    - 状态：调研完成（待修复）
+
+[ ] int/float/bool 值类型（变量/函数调用返回值）上调用方法（如 to_string）被 Sema 放行 → 坏 C++
+    - 2026-08-29 验证 M4 时发现：`let x = 42; x.to_string()` / `get42().to_string()` → Sema 静默
+      通过 → CodeGen 生成 `x->to_string()` → g++ `base operand of '->' is not a pointer`
+      （int 是值类型；README 规定转 string 用 str()）。非干净报错。
+    - 根因：① inferMethodCall BuiltinRegistry 分支 typeKey 只对 String 设置，int/float/bool 不设
+      → 不进方法表查找 →「不在表中 → 放行，由 C++ 编译器验证」→ Sema 静默放行；② CodeGen
+      genMethodCall access 判定对值类型接收者默认 `->`（valueTypeVarNames_ 不含 int）。
+    - 修复方向（推荐 ①）：Sema 对 int/float/bool 的未注册方法报 E013 干净错误（typeKey 扩到
+      int/float/bool，或 PrimSemType 分支查 BuiltinRegistry 无命中即报错，对齐 string 路径）；
+      ② 若设计支持 int.to_string() 等则注册 + CodeGen 生成转换（runtime/types.cpp 已有）+ access
+      对值类型接收者用 `.`。
+    - 状态：调研完成（待修复）
+
+[ ] 接口方法签名引用声明在后的接口（interface A { get() -> B }，B 后置）→ CodeGen 坏 C++（Sema 已拦截半支持）
+    - 2026-08-29 修复「接口后置类型」时发现（与后置 record 不同表现）：接口方法签名引用后置
+      **接口** → 前向注册 + 覆盖使 Sema 放行，但 CodeGen 生成接口视图结构体在 `struct B` 之前，
+      `B (*getFn)` / `std::function<B()>` 需完整 B → g++ 坏 C++。前置接口引用 / 接口自引用 ✅。
+    - 现状：Sema 已在 finalizeInterfaceSignatures 阻止半支持（报干净错误
+      "interface 'B' is declared after this interface method signature references it"）。
+    - 修复方向：CodeGen 层——接口方法签名引用接口类型时，视图函数指针字段 / 闭包适配器对接口值
+      参数/返回的处理需保证被引用接口先定义（调整生成顺序或接口值改指针/引用语义 B*）。
+    - 状态：调研完成（Sema 已拦截半支持；CodeGen 完整支持待后续）
+
+[ ] sync thread 块内 spawn 的显式实参被静默忽略（genSpawnAsThread 不处理 stmt.args）
+    - 2026-08-28 回归 spawn guard 时发现：sync thread 内 `spawn (ch: ..., x: int) { ... }(ch, 3)`
+      （显式实参列表）→ genSpawnAsThread（StmtGen.cpp）捕获列表按参数名生成 `[ch, x]`，完全不看
+      stmt.args——实参 `3` 被静默丢弃；x 外层无同名变量 → g++ 'x' was not declared（坏 C++）；
+      外层恰有同名 x 则静默绑定错误语义。used/5.aura 均用同名自动绑定故未暴露。
+    - 修复方向：genSpawnAsThread 参照 genSpawnStmt 处理 stmt.args（显式实参时按 args[i] 生成捕获
+      初始化/实参传递），或 Sema 对 sync thread 内 spawn 带显式实参报干净错误。
+    - 状态：调研完成（待修复）
+
+[ ] for-in channel 识别/生成覆盖不全：channel 作函数参数走 range-for + 协程 channel 在 sync thread 块内生成 recv_awaiter 坏代码
+    - 2026-08-28 回归 spawn guard 时发现：channel 的 for-in 展开依赖 channelVarNames_
+      （genLetStmt 只注册 `let ch: channel<T> = channel(...)`）：
+      ① channel 作函数参数（fun worker(ch: channel<int>)）→ 不在 channelVarNames_ → genForStmt
+        走默认 range-for `for (auto v : *ch)` → g++ 'begin' was not declared（坏 C++）；
+      ② 协程 channel<T> 在 sync thread 块内 for-in → inSyncThreadBlock_ 分支生成
+        `_opt->is_none()` 但协程 channel 的 receive() 返回 recv_awaiter（co_await awaitable），
+        无 is_none/unwrap → g++ 坏 C++（仅 sync.ThreadChannel 正确）。
+    - 修复方向：① channelVarNames_ 注册放开到 channel 类型变量（参数/字段/按 inferredType 判定）
+      或 genForStmt 依据 iterable inferredType 判定 channel；② inSyncThreadBlock_ 对非
+      ThreadChannel 的 channel 报干净错误或改用协程 receive 路径。
+    - 状态：调研完成（待修复）
+
+[ ] Optional<视图> = some(some(record 变量))（source Optional 层数 > target）→ Sema 放行 → 坏 C++
+    - 2026-08-28 修复「匿名 record → 接口视图」条目时发现（同源 L58 放行但元素非匿名 record，
+      目标窄拦截不覆盖）：`let o: Optional<Greetable> = some(some(p))`（p: Person 显式 impl
+      Greetable，source 2 层 > target 1 层）→ Sema 放行 → CodeGen 生成
+      `make_optional<Greetable>(_ovr0.get())`（_ovr0: Optional<Person*>*）→ g++ could not
+      convert（坏 C++）。不限视图：任何「source 显式多包 some 层数 > target 注解层数」赋值
+      （如 Optional<int> = some(some(5))）同源可能坏 C++。
+    - 根因：isAssignable GenericSemType target 分支（Assignability.cpp）对 OptionalSemType source
+      放行时不校验「source Optional 层数 ≤ target Optional 层数」。
+    - 修复方向：L58 放行前校验 source/target 的 Optional 层数（target 经 elemTypeOf 剥层计数、
+      source 经 elementType 剥层计数），source 层数 > target → return false（报干净 type
+      mismatch）；层数相等或更少维持现状（Optional<Point>=p 单层、2 层对 2 层合法形态不受影响）。
+      需防误伤隐式包装。
+    - 状态：调研完成（待修复）
+
+[ ] record 闭包字段以方法调用形态 `b.f(10)` 调用时 Sema 返回类型推断失败（inferMethodCall 不识别字段闭包）
+    - 2026-08-29 验证 N2 时发现：record 闭包字段（`type B4<T> = { f: Transform<int> }`）以
+      `b.f(10)` / `self.f(10)` 形态调用 → Sema 推断不出返回类型：return 上下文报 `cannot infer
+      return value type`（containsErrorElement），无返回上下文静默放行。对照 `let g = b.f; g(10)`
+      （MemberAccessExpr 取字段 → FuncSemType → 变量调用）编译运行通过。
+    - 根因：`b.f(10)` 解析为 MethodCallExpr → inferMethodCall record 分支在 typeMethods_ 查找
+      方法 f——f 是**字段**（闭包）非方法 →「未匹配到方法 → 保持原放行」→ 返回 ErrorSemType →
+      checkReturnStmt containsErrorElement → cannot infer。inferMemberAccess 对 `b.f` 能正确返回
+      FuncSemType，但 inferMethodCall 从不回退字段查询。
+    - 修复方向（二选一）：① inferMethodCall record 分支未匹配方法时回退查字段（复用
+      inferMemberAccess），字段类型是 FuncSemType 则按闭包调用处理（返回 returnType、实参
+      checkCallArgs，支持 b.f(args) 直接调用）；② 或 Sema 对该形态报干净错误引导
+      `let g = b.f; g(10)`（防坏 C++）。
+    - 状态：调研完成（待修复）
+
+[ ] 方法体内闭包调用传 self 堆 record 字段值实参被 GcRootHandle 误包装（值类型字段误保护）
+    - 2026-08-28 修 T 遮蔽时发现：泛型 record 方法体内闭包调用传 self 字段值时，int 等值类型
+      字段也被 GcRootHandle 包装 → 生成 `GcRootHandle<decltype(this->value)> _h0_0(...)` →
+      g++ `request for member 'get' in '_h0_0', which is of non-class type 'int'`。
+    - 根因：genCallExpr 对实参做 GC 保护（self 堆字段访问）时不区分值类型，对 int/float/bool/
+      std::function 等非堆类型也生成 GcRootHandle 包装。
+    - 修复方向：GC 保护包装前按实参 C++ 类型判定（isGcPointerType / isIfaceViewTypeName 通过才
+      包装，值类型直传），与参数包装逻辑对齐。
+    - 状态：调研完成（待修复）
+
+[ ] 泛型模板参数 T 上的二元 `+` 对 string 实例化失败（GcString* operator+ 缺失）
+    - 2026-08-28 修 T 遮蔽验证 make_adder 时发现（疑似已知限制）：泛型函数
+      `fun make_adder(inc: <T>) -> fun(T) -> T { return fun(x:T)->T { return x + inc } }` 用
+      string 实例化（make_adder("!")）→ 生成 `return (x + inc)`（T→GcString*）→ g++ invalid
+      operands of types 'GcString*' to binary 'operator+'。int 实例化正常。
+    - 根因：CodeGen 字符串拼接识别（isStringExprInChain 等）只认显式 string 类型标注；泛型形参 T
+      无法静态判定为 string → 生成 C++ 原生 `+`（对 GcString* 无效）。
+    - 修复方向（待定）：泛型 `+` 需在调用点按实例化类型分派（string → concat），或 Sema 侧限制
+      「泛型参数 + 仅值类型实例化」。
+    - 状态：调研完成（待修复）
+
+[ ] main 无任何异步调用（非协程）时入口生成 `auto t = ::aura_main(io)` 坏 C++（deduced type 'void'）
+    - 2026-08-28 修泛型接口适配器构造单测形态（main 只做纯计算无 io.println）时发现：
+      `fun main(io: Io) { let x = 1 + 2 }` → aura_main 非协程（返回 void）→ genMainEntry 恒生成
+      `auto t = ::aura_main(io); aura_rt::run_event_loop(t);` → g++ `deduced type 'void' for 't'
+      is incomplete`。现有测试 main 都含 io.println 等异步调用故未暴露。
+    - 修复方向：genMainEntry 按 coroutineFunctions_ 判定——aura_main 非协程时生成
+      `::aura_main(io);`（不 run_event_loop）；协程时保持 `auto t = ...; run_event_loop(t)`。
+    - 状态：调研完成（待修复）
+
+[ ] 泛型 record 类型实参为 record 时，方法体/字面量实例化路径 T 未补 *（gc_alloc<Box2<Rec5>> vs 返回 Box2<Rec5*>*）
+    - 2026-08-28 修泛型接口适配器时发现（独立于适配器，非接口场景同崩）：`type Box2<T> = {
+      val: T }` + 方法返回 `Box2<Rec5>`（Rec5 为 record）→ 方法体 record 字面量生成
+      `gc_alloc<Box2<Rec5>>`（类型实参 T→Rec5 未补 *），方法签名/声明侧返回类型为
+      `Box2<Rec5*>*`（mapType 对 record 实参补 *）→ g++ cannot convert 'Box2<Rec5>*' to
+      'Box2<Rec5*>*'。
+    - 根因：泛型 record 实例化两条路径 record 实参 * 处理不一致——声明侧/签名侧经 mapType 补 *，
+      方法体 record 字面量经 genRecordExpr getCanonical / inferredType canonicalName 生成
+      gc_alloc 时内部 record 实参未补 *（与 Phase 3-⑨ ListType 元素缺 * 不同位置）。
+    - 修复方向：泛型 record 方法体/字面量实例化路径（genRecordExpr getCanonical 或 inferredType
+      canonicalName 物化）对 record 类型实参补 *，与声明侧 mapType 对齐（参照 finalizeCppElem
+      递归补 * 思路）；或 Sema 推断泛型 record 字面量时用实例化后的类型参数补 *。
+    - 状态：调研完成（待修复）
+
+# ═══════════════════════════════════════════════════════════════════════
+# 二、已修缺陷记录（压缩版：根因一句 + 修复要点 + 验证统计）
+# ═══════════════════════════════════════════════════════════════════════
+
+[x] G1 Optional 隐式包装缺口（record/列表/值/视图直赋 Optional 目标）  [2026-08-27 修复]
+    - 根因：genCallExpr/genMethodCall 无 Optional/Union 形参装箱 + inferListExpr 不解
+      GenericSemType{Optional} 期望。
+    - 修复：fnParamCppTypes_/methodParamCppTypes_ 注册表 + genParamBoxing（函数/方法/构造/接口
+      方法形参 Optional/Union 装箱）、genAssignExpr 目标装箱、条件分支逐分支装箱死角、
+      inferListExpr 期望解出。
+    - 验证：735 tests 0 failed（+24）；test.aura/used/6.aura ALL PASSED。
+
+[x] G2 Optional 元素类型在泛型映射/物化/推断层损坏（A/B/C 各自独立）  [2026-08-27 修复]
+    - A collectGenericMapping 误绑已物化内置泛型（Optional<Point> 被当泛型变量）→ case1 跳过
+      resolvedName 非空内置泛型（711）。
+    - B 闭包未隔离 currentReturnCppType_ → some(record) 被外层返回类型污染 → genFunExpr 闭包
+      保存/覆写/恢复自身返回类型。
+    - C cppNameOfTypeExpr UnionType 返回空串 → "aura_rt::Optional<>" → 补 UnionType 分支。
+    - 验证：753 tests 0 failed（A+4，B/C+12）。
+
+[x] G3 接口视图转换缺口：方法参数 / 构造参数 / 构造体写屏障  [2026-08-27 修复]
+    - 根因：genMethodCall 实参无接口转换、isCtor 分支查不到构造注册、写屏障对视图值 static_cast
+      失败。
+    - 修复：methodInterfaceParams_ 方法接口参数表 + 构造参数注册进 fnInterfaceParams_[记录名] +
+      写屏障 .self（非 ctor 专属）+ 连带修 GcRootHandle<视图> 坏根。
+    - 验证：764 tests 0 failed（+11）。
+
+[x] G4 泛型闭包列表元素推断：compose([fun...]) → std::function<auto(auto)>  [2026-08-27 修复]
+    - 根因：inferListExpr 声明元素类型覆盖未绑定泛型 + containsUnresolvedGeneric 别名泛型参数
+      全局注册误放行。
+    - 修复：inferListExpr 泛型元素用首元素具体类型 + 空列表干净报错 + inferCall genericMap 代换
+      + fnGenericStack_ + CodeGen auto 兜底。used/1.aura 全量通过。
+    - 验证：741 tests 0 failed（+6）。
+
+[x] genRecordToViewIIFE 对 aura_rt::Iterator 视图适配器名拼接错误  [2026-08-26 修复]
+    - 根因：从 C++ 类型名截前缀拼适配器名 → Iterator 带 aura_rt:: 前缀 → mangle。
+    - 修复：剥 aura_rt:: 前缀映射回 Iterator；连带修 record 字段 Iterator 视图接线。
+    - 验证：707 tests 0 failed（+5）。
+
+[x] some([record, record]) 列表元素 record 退化 designated init  [2026-08-26 修复]
+    - 根因：some 期望传播三道门（inferCall some/propagateCanonicalName/isRecordLiteralArg）只认
+      RecordExpr 不认 ListExpr。
+    - 修复：inferCall some 传 ListExpr 期望 + propagateCanonicalName 下钻 + isRecordLiteralArg
+      门控 + inferListExpr Optional/Union 解包（C10/C13）。
+    - 验证：702 tests 0 failed（+15）。
+
+[x] [Stringer] 列表元素视图的 runtime GC 追踪缺失  [2026-08-26 修复]
+    - 根因：ArrayChunk::desc() 用 is_pointer_v 判定，视图值元素不注册扫描（mark+compact 双重漏扫）
+      → [Iterator<int>] 运行即崩。
+    - 修复：runtime 方案 A（InlineArrayField elemStride+elemGCOffset + GC 5 处扫描点）+
+      genListExpr record→view 接线 + 跳过 GcRootHandle。
+    - 验证：680 tests 0 failed（+5）。
+
+[x] 内置接口作函数实参注册缺口（fnInterfaceParams_ 只认用户接口）  [2026-08-26 修复]
+    - 根因：DeclGen.cpp:443 注册条件 interfaceNames_ 只收用户接口，内置接口（Stringer/Comparable/
+      Iterator）作函数形参不注册 → 实参直赋 record 指针。
+    - 修复：注册纳入 auraiInterfaces + 连带修 genCallExpr else 分支闭包误判（6.aura）。
+    - 验证：687 tests 0 failed（+7）。
+
+[x] ① [Optional<[Point]>] = [{..}] 裸 record 直赋元素（Sema 放行过宽）  [Phase 1-①+⑩ 2026-08-28 修复]
+    - 根因：isAssignable GenericSemType 分支对非 GenericSemType source 一律放行（L665 洞）。
+    - 修复：按泛型语义分层校验——Optional 递归元素 isAssignable（隐式装箱合法/record 非 list
+      拒绝）、Iterator 查 recordImplIfaces_、channel 拒绝、其余泛型保持兜底（防 Tree<U> 误伤）。
+    - 验证：819 tests 0 failed（+19，与 ⑩ 同批）。
+
+[x] ② let e = a[i] Optional 元素列表下标双重装箱  [Phase 2-② 2026-08-28 修复]
+    - 根因：isAlreadyOptionalValue/initIsOptionalValue 白名单不含 IndexExpr/MemberAccessExpr → 已
+      Optional 值被 make_optional 二次包装。
+    - 修复：判定器补 Index/MemberAccess + Sema propagateCanonicalName 保留真实元素类型（防误伤）；
+      8 调用点全通。
+    - 验证：844 tests 0 failed（+25）。
+
+[x] ③ Optional<Point|None> 构造双重装箱 + 嵌套 some(some(record))  [Phase 2-③ 2026-08-28 修复]
+    - 根因 A：genOptionalBoxIIFE 元素为容器时不内层装箱；根因 B：some guard 不认 CallExpr + 嵌套
+      some canonicalName 不下钻。
+    - 修复：A 容器元素内层装箱（嵌套 Optional 递归/联合 make_variant/恒 GcRootHandle）；B1 some
+      放行 CallExpr；B2 嵌套 canonicalName 递归下钻。支持 3 层嵌套。
+    - 验证：869 tests 0 failed（+25）。
+
+[x] ④ 视图→record 接口方法实参（接口方法实参从不校验）  [Phase 1-④ 2026-08-27 修复]
+    - 根因：inferMethodCall 接口方法分支实参从不 isAssignable → 任意类型放行 + 坏 C++。
+    - 修复：非 record 字面量实参 inferExpr 后补 isAssignable（泛型接口先 substitute 代换 T→Point）；
+      record 字面量分支保持。直接形式 p5.cmp(...) canonical 回归。
+    - 验证：800 tests 0 failed（+11）。
+
+[x] ⑦ record impl Iterator<Point> next() 返回类型注解缺 *（纯 Sema 误报）  [Phase 1-⑦ 2026-08-27 修复]
+    - 根因：impl 声明侧 materialize 缺 * vs 接口 substitute/semTypeToCppName 带 * →
+      GenericSemType::equals 字符串比较误报（CodeGen 恒正确）。
+    - 修复：isAssignable GenericSemType 分支元素级语义兜底（elemTypeOf + semTypeFromCppName
+      递归比较）；返回面+形参面全通。
+    - 验证：789 tests 0 failed（+5）。
+
+[x] ⑧ match 表达式编译器崩溃（checkMatchStmt 空指针解引用）  [Phase 0 2026-08-27 修复]
+    - 根因：parseMatchStmt 不查 parseExpr() null → 空 expr MatchStmt，checkMatchStmt 无防御解引用。
+    - 修复：checkMatchStmt 对空 expr 报错 + 同族 if/while/for/sync for + CallExpr 空实参 + 其余
+      空子节点防御（统一崩溃→干净报错）。
+    - 验证：784 tests 0 failed（+20，含同族）；test_sema_crashguard.cpp 15 用例。
+
+[x] ⑩ inferListExpr 首元素从不校验  [Phase 1-⑩ 2026-08-28 修复]
+    - 根因：覆盖 elemType 后校验循环从 i=1 起，首元素从不 isAssignable。
+    - 修复：覆盖前保存首元素推断、覆盖后补 isAssignable，报「list element type mismatch」。
+    - 验证：819 tests 0 failed（与 ① 同批）。
+
+[x] if / while / for 空条件触发编译器崩溃（同族 match）  [Phase 0 2026-08-27 修复]
+    - checkIfStmt/checkWhileStmt/checkForStmt/checkSyncForStmt 对空 condition/iterable 防御，
+      报「expected expression after if/while/for/sync for」。
+    - 验证：test_sema_crashguard.cpp 回归。
+
+[x] CallExpr 空实参触发编译器崩溃（parseCall 不检查 null）  [Phase 0 2026-08-27 修复]
+    - parseCall 对 CallExpr/MethodCallExpr 实参跳过 null；checkCallArgs 循环对 null 实参兜底防御。
+    - 验证：test_sema_crashguard.cpp + test_parser_stmt.cpp 回归。
+
+[x] 方法形参 `[Transform<T>]` 声明侧与定义侧参数类型不一致（声明侧多 `*`）  [Phase 3-⑤ 2026-08-28 修复]
+    - 根因：pendingMethods_ 收集先于 genTypeDecl 的 registerTypeName(name,false) 覆盖 → 函数/联合
+      类型别名在声明侧按堆映射多 `*`、定义侧非堆无 `*` 不一致。
+    - 修复：收集前对所有非 RecordType 别名幂等覆盖为非堆；t0/t7/t11/t12/t14 全通。
+    - 验证：889 tests 0 failed（+10）。
+
+[x] Transform<T>（NamedType）作回调形参注册边界  [Phase 3-⑥ 2026-08-28 修复]
+    - 根因 A：collectTParams 对全具体 typeArgs 误收集别名模板参数 → 函数模板化且 T 不可推导；
+      根因 B：fnCallbackParams_ 只认内联 FunctionType。
+    - 修复：collectTParams 全具体不收集 + 恒堆 record 不收集形参名；fnCallbackParams_ 放开
+      NamedType 注册（函数+构造侧）；方法侧 T 从 receiver 推导。t1-t4/t8/t9b/t13 全通。
+    - 验证：898 tests 0 failed（+9，含 collectTParams 条目）。
+
+[x] `[[Optional<Point>]]` 声明侧元素物化缺 `*`  [Phase 3-⑨ 2026-08-28 修复]
+    - 根因：mapSemType GenericSemType 分支未调用 finalizeCppElem 递归补内嵌 record `*`。
+    - 修复：mapSemType GenericSemType/Iterator 分支 resolvedName 经 finalizeCppElem 递归补 *
+      （含 Channel/ThreadChannel 分支）。
+    - 验证：879 tests 0 failed（+10）；[[[Optional<Point>]]]/[Iterator<Point>]/[channel<Point>] 全通。
+
+[x] collectTParams 对已实例化类型误收集形参名  [Phase 3-⑥ 2026-08-28 修复]
+    - 根因：collectTParams NamedType 分支对已实例化 record（Pair<T,int>）误收集其声明形参名 A、B。
+    - 修复：与 ⑥ 根因 A 同函数同修——恒堆 record 不收集形参名（typeArgs 的 T 仍递归）。
+    - 验证：898 tests 0 failed（与 ⑥ 同批）。
+
+[x] spawn 闭包显式参数 ≥2 个时，首个参数名未从 gcRootVarNames_ 屏蔽（body 内误生 .get()）  [2026-08-28 修复]
+    - 根因：genSpawnStmt 显式传参模式 guards.emplace_back 未 reserve——IterVarGuard（含引用成员 +
+      用户声明析构函数）vector 扩容时拷贝迁移旧元素后立即析构，析构执行 roots.insert(name) 提前
+      恢复参数名到 gcRootVarNames_ → body 生成期间误生 .get()（受影响参数数 = 小于 N 的最大 2 的幂）。
+    - 修复：guards.reserve(stmt.params.size())（不扩容 → 无拷贝迁移 → 无提前析构恢复）。
+    - 验证：905 tests 0 failed（基线 898，+7）；used/1-6.aura 全量回归（5.aura spawn/sync 形态）。
+
+[x] spawn 无显式实参时同名自动绑定不校验外层同名变量存在性 → 坏 C++  [2026-08-28 修复]
+    - 根因：genSpawnStmt 同名自动绑定输出裸标识符；checkSpawnStmt 只注册参数不校验外层同名变量存在。
+    - 修复：checkSpawnStmt 对「无显式实参 + 参数名外层无同名变量」报干净错误（cannot bind spawn
+      parameter 'x'）；io/_tasks 跳过校验；覆盖协程 + sync thread 两路径。
+    - 验证：915 tests 0 failed（+10，含类型名当值）；回归 spawn(io,i) 循环绑定 / 单参 / 显式实参。
+
+[x] 类型名（type 别名）在值位置被当值使用 → 静默生成坏 C++  [2026-08-28 修复]
+    - 根因：Sema inferIdentifier 对指向 TypeAlias 的 Identifier 未拦（当作值）→ `Point* p_raw =
+      Point;` 坏 C++。
+    - 修复：inferIdentifier 对 SymKind::TypeAlias 报干净错误 `cannot use type 'Point' as a value`；
+      构造调用/类型位置不受影响。
+    - 验证：915 tests 0 failed（本批 +10 含 spawn 同名绑定）。
+
+[x] type 别名（指向 record）作 let 类型标注时 CodeGen 用别名名生成 gc_alloc<别名> → 坏 C++  [2026-08-29 随 #5 修复]
+    - 根因：DeclChecker.cpp 对 `type MyPoint = Point` 把 resolveType 返回的底层 RecordSemType
+      canonicalName 无条件覆盖为别名名 "MyPoint"，C++ 层只有底层 record 类（struct Point）。
+    - 修复：别名 canonicalName 覆盖改为仅 RecordType 本体用自身名；别名保持底层 record 名 →
+      gc_alloc<Point>。连带修 `MyPoint {..}` 具名字面量 / let 标注 / 匿名 record 推断。
+    - 验证：1034 tests 0 failed（随 #5 批 +26）。
+
+[x] 方法（含泛型方法）体内异步操作未协程化：方法签名/调用点缺 task 支持 → 坏 C++  [2026-08-29 修复]
+    - 根因：decideCoro 标方法为协程但方法签名从不包 aura_rt::task<...>、genMethodCall 对用户方法
+      从不 co_await → 方法内 co_await 落 void 方法 → promise type 错误。
+    - 修复：① coroutineFunctions_ 方法键改 "ReceiverType.methodName"；② struct 内声明
+      （pendingMethods_）按协程包 task<ret>（NoneType→void）；③ 定义侧签名包 task<ret> + 无
+      return 补 co_return；④ genMethodCall 用户协程方法调用点补 co_await；⑤ CoroScanner 方法调用
+      传播（调用协程方法的方法也标协程）；⑥ 连带修参数 channel send/receive 未协程化（ExprGen
+      channel 判定加 inferredType + CoroScanner 挂起判定）。
+    - 验证：1041 tests 0 failed（基线 1034，+7）；方法内 sync{spawn}/io.println/channel 各形态 +
+      泛型方法 + task<int>/task<Calc*> 返回全通过；used/1-6.aura 全量回归。
+
+[x] 泛型 record 构造函数形参不含 receiver 泛型时 T 无法推导（B_ctor 模板参数冗余推导缺口）  [2026-08-29 修复]
+    - 根因：collectMethodTParams 无条件从 receiverTypeArgs 收集 T → B_ctor 模板化但形参不含 T →
+      C++ 函数模板无法从返回值/字段推导 T。
+    - 修复：① genCallExpr isCtor 分支 targs 优先复用 expectedTemplateArgs_（let 标注）生成
+      B_ctor<int32_t>（覆盖有参/零参构造）；② inferCall ctor 分支对「receiver 泛型不在 ctor 形参
+      且无期望类型且非 fnGenericStack_ 提供 T」报干净错误。
+    - 验证：994 tests 0 failed（基线 987，+7）；used/1-6.aura 全量回归。
+
+[x] 泛型 record 构造调用点显式模板实参在 return / 函数实参位置缺失（N3）  [2026-08-29 由 N2 显式语法覆盖]
+    - 根因：expectedTemplateArgs_ 只在 genLetStmt/genConstStmt 填充，genReturnStmt 与函数实参位置
+      不填充 → 有参构造无显式 targs。
+    - 覆盖：N2 显式类型实参语法落地后，用户可写 `return B<int>(closure)` / `take(B<int>(closure))`
+      → 生成 B_ctor<int32_t>（实测 makeB/takeB 通过）；原自动填充方案未落地（`return B(closure)`
+      无显式语法仍坏 C++，可用显式语法规避）。
+
+[x] 泛型 record 方法返回类型在调用点不做 receiver 泛型实参代换（T 泄漏为 auto）  [2026-08-28 修复]
+    - 根因：inferMethodCall record 分支只 applyGenericMap 实参推导绑定，不含 receiver 泛型实参。
+    - 修复：methods 命中后 receiver canonicalName 含 '<' 时用 extractTypeArgsFromCanonicalName
+      （SemTypeUtils.cpp 新增）提取实参，查 symtab_.lookup(基名).typeParams 按位置 substitute 到
+      返回类型；CodeGen 无需改。
+    - 验证：931 tests 0 failed（基线 925，+6）；有/无标注 let/return/嵌套 receiver/多容器全通过。
+
+[x] 泛型接口视图方法调用返回类型在 Sema 未 substitute receiver typeArgs  [2026-08-28 修复]
+    - 根因：inferMethodCall 接口分支返回类型原样返回，未用 iface->typeArgs 做 substitute（形参面
+      Phase 1-④ 已修、返回面不对称）。
+    - 修复：iface->typeArgs 非空时查 symtab_.lookup(iface->name).typeParams 按位置对
+      m.returnType->clone() 逐个 substitute。
+    - 验证：931 tests 0 failed（+6，含上条）；有/无标注 let 均正确实例化。
+
+[x] 泛型 record 构造函数调用返回类型未 applyGenericMap（inferCall ctor 分支缺口，N1）  [2026-08-28 修复]
+    - 根因：inferCall TypeAlias ctor 分支返回 sym->type->clone() 未 applyGenericMap（与 Function
+      分支不对称）。
+    - 修复：ctor 分支返回 applyGenericMap(std::move(result), genericMap)（genericMap 空时 no-op）。
+    - 验证：917 tests 0 failed（基线 915，+2）；形参含 T + 标注不再误报。
+
+[x] 调用点显式类型实参语法 `B<int>(...)` 未实现（N2）  [2026-08-29 修复]
+    - 根因：parseCall 不支持 callee 标识符后 `<TypeArgs>` 前缀，与 `x < y` 比较运算二义。
+    - 修复（三层）：① Parser parseCall 增 `Identifier <` 前瞻消歧（lookaheadTypeArgsBeforeCall，
+      仅 `<` 后合法类型序列 + `>` + `(` 才按显式类型实参，比较运算全回退）；② CallInfer inferCall
+      ctor 分支按 typeParams 位置绑定 genericMap（冲突报 conflicting）；③ ExprGen genCallExpr
+      isCtor targs 来源优先级：显式实参 → expectedTemplateArgs_ → 零参 currentTParams_。
+    - 验证：1008 tests 0 failed（基线 994，+14：Parser 6 + Sema 5 + CodeGen 3）；B<int>(closure)/
+      多类型参数/record 实参/N3 return 与实参位置全通过；比较运算消歧回归全 ✅。
+
+[x] 方法体内泛型闭包参数引用外层方法模板参数时 genFunExpr 错误重声明 template<typename T>（T 遮蔽）  [2026-08-28 修复]
+    - 根因：genFunExpr 把闭包参数/返回类型 GenericTypeRef 全收集进 genericParams，未排除
+      currentTParams_ 中已有泛型名 → 重声明 T 遮蔽。
+    - 修复：genFunExpr 在 returnOnlyGenerics 处理后对 genericParams/returnOnlyGenerics/
+      callableResultGenerics 剔除 currentTParams_ 中已有泛型名（闭包自身泛型仍声明）。
+    - 验证：925 tests 0 failed（基线 917，+8）；泛型方法/顶层泛型函数/构造体/嵌套闭包全通过，
+      对照 make_adder/非模板函数保持。
+
+[x] 泛型 record 方法返回泛型函数类型别名时 collectMethodTParams 误收集别名模板参数 + receiver 多拼（M1）  [2026-08-29 修复]
+    - 根因：collectMethodTParams 对返回函数式别名（Mapper<A,U>）误收集别名模板参数（T、U）→
+      方法模板参数变 {A,T,U} → receiver 多拼 + 'U' was not declared（函数侧 plan12 不对称）。
+    - 修复：① isFuncAliasRet 判定 + collectMethodTParams 返回泛型函数别名时不收集返回类型；
+      ② genMethodDecl/pendingMethods_ 该类返回写 "auto"（pendingMethods_ 收集前预填充
+      typeAliasTemplateParams_）；③ receiver 拼装改用 receiverTypeArgs。
+    - 验证：966 tests 0 failed（基线 964，+2）；生成 `template<typename A> auto Box<A>::makeM()`。
+
+[x] 泛型 record 方法默认参数不补全（methodDefaultArgs_ 键不匹配：声明侧 Box vs 实例化侧 Box<int32_t>）（M2）  [2026-08-28 修复]
+    - 根因：注册键 "Box.useCb"（声明名）vs 查询键 "Box<int32_t>.useCb"（canonicalName）→ 不匹配
+      → 默认参数不补全。
+    - 修复：ExprGen genMethodCall 新增 methodDefKey（RecordSemType canonicalName 截 '<' 前归一化），
+      methodDefaultArgs_ 补全与 mArgType 查询改用 methodDefKey；装箱/接口查表保持原 recvTypeKey。
+    - 验证：953 tests 0 failed（基线 951，+2）；泛型方法/构造默认参数补全、跨模块回归全通过。
+
+[x] 函数默认参数中的闭包引用函数模板参数 T → 调用点模板 lambda 无法匹配 std::function<T(T)>（M3）  [2026-08-29 修复]
+    - 根因：默认参数在调用点补实参时 genExpr 直接生成模板 lambda，且 lambda 不参与 std::function
+      模板推导——必须包装为显式 std::function<具体类型>。
+    - 修复：fnParamTypeExprs_ + defaultArgMaterializedTypes_ 物化映射——从「形参类型表达式 + 调用点
+      实参 SemType」推导泛型绑定，物化闭包为普通 lambda + 按 fnCallbackParams_ 包装 std::function；
+      方法默认参数不设物化（P4-9 已解决）、非泛型不包装。
+    - 验证：977 tests 0 failed（基线 973，+4）；int/string/泛型上下文/显式全实参全通过。
+
+[x] 嵌套闭包：内层闭包 returnOnlyGenerics 的 srcType 兜底 "auto" → declval<auto> 坏 C++（M4）  [2026-08-29 修复]
+    - 根因：srcType 只处理「首参数 NamedType 且 typeArgs[0] 非空」，内层闭包首参 int → srcType 保持
+      "auto" → std::declval<auto>()；内层 using U 与外层嵌套遮蔽。
+    - 修复：① srcType 对具体 NamedType/ListType/FunctionType 用 mapType，仅泛型容器取 typeArgs[0]；
+      ② declaredReturnOnlyGenerics_ 内层复用外层 using U（消除嵌套遮蔽）；③ currentTParams_ 压栈
+      防内层重声明外层闭包模板参数；④ 连带修外层闭包捕获误捕获内层闭包参数（DeclaredCollector 对称）。
+    - 验证：980 tests 0 failed（基线 977，+3）；nestouter/M5 各形态/嵌套模板参数全通过。
+
+[x] 直接写泛型函数类型作为函数/方法返回类型不被 Sema 支持（§6.2.5 只认别名，M5）  [2026-08-29 修复]
+    - 根因：裸 U 是 NamedType，registerTypeGenerics 只认 `<T>` 与别名 typeArgs → 返回 FunctionType
+      内裸泛型 resolveType 报 undefined。
+    - 修复：① Sema 新增 registerReturnFuncTypeGenerics（仅返回 FunctionType 时注册内部裸泛型），
+      在 checkFunBody/checkMethodBody/declareDecl/buildTypeMethods 三处解析路径前调用（顶层裸
+      `-> T` 仍报错）；② CodeGen 方法侧 collectMethodTParams 仅当返回 FunctionType 含闭包自身新
+      泛型时不收集，genMethodDecl/pendingMethods_ retType=auto（定义入 header）。
+    - 验证：973 tests 0 failed（基线 966，+7）；makeU/makeMapper2/方法/混合 Box<T>::makeMixed 全通过。
+
+[x] 用户自定义泛型接口的 CodeGen 适配器生成缺陷（Optional<T> 未实例化）  [2026-08-28 修复]
+    - 根因：genIfaceAdapter mapIfaceType 只对顶层裸泛型做 tmap 替换，容器/复合类型内嵌 T 不递归。
+    - 修复：CodeGen.h 新增 ifaceTypeMap_（作用域化 tmap），genIfaceAdapter 构造后 std::exchange
+      挂入/恢复；mapType NamedType 裸名分支 + mapGenericRef 查表 → 容器内 T 经 mapType 递归代换。
+    - 验证：934 tests 0 failed（基线 931，+3）；Optional<T>/[T]/Iterator<T>/Transform<T>/多类型参数/
+      impl 换具体类型全通过，顶层裸 T/形参面不误伤。
+
+[x] 接口声明中引用后置类型（record/类型别名）报 undefined type（无前向可见性）  [2026-08-29 修复]
+    - 根因：declareInterface 按声明顺序逐一声明，方法签名直接 resolveType，无 record 分支的
+      defineGlobal 前向占位机制。
+    - 修复：① declareInterface 先注册接口符号（空方法集，接口自引用可解析）；②
+      resolveInterfaceMethods(allowForward) 对签名（含内置泛型实参内）引用未注册用户类型做前向占位
+      注册；③ declareTopLevel 末尾 finalizeInterfaceSignatures 二次解析（真 undefined 干净报错）；
+      ④ CodeGen emitIfaceRecordForwardDecls 补 C++ 前向声明（struct Wrapper; / template<typename T>
+      struct Transform;）。
+    - 验证：987 tests 0 failed（基线 980，+7）；后置 record/别名/泛型 record/参数/接口自引用/
+      P4-8 Optional<Point> 全通过，真 undefined 仍报错。
+
+[x] 接口方法签名内置泛型实参内引用后置 record（如 take(o: Optional<Point>)）→ Sema 漏检 → 坏 C++  [2026-08-29 修复]
+    - 根因：resolveType 对内置泛型实参走 materializeCanonicalName 不做符号表存在性检查 → 后置
+      Point 不报错但 CodeGen 生成在 Point 定义之前 → 坏 C++。
+    - 修复：与「接口后置类型」同批——Sema 前向注册 + CodeGen emitIfaceRecordForwardDecls 覆盖
+      （Optional<Point*> 只需前向声明 struct Point;）。
+    - 验证：987 tests 0 failed（随上条 +7）；实测 Optional<Point> 后置 Point 编译运行 ✅。
+
+[x] Iterator 视图直接调用 next() 的 Sema 方法查找缺口（E013，valid methods 空）  [2026-08-29 修复]
+    - 设计意图确认：设计允许视图直接调 next()（README 核心纯虚方法返回 Optional<T>，for-in 即
+      直连视图 .next()，iterator.h 有 Iterator<T>::next()）。
+    - 根因：Iterator<Point> 解析为 GenericSemType（BuiltinRegistry 优先），BuiltinRegistry 方法表未
+      注册 next → E013。
+    - 修复：CallInfer isIteratorType 分支补 next() → 返回 OptionalSemType{elementType=elem}（裸
+      Iterator → 干净报错引导标注）；ExprGen objIsIterator 分支补 next() 生成 + genGcRootedArgs。
+    - 验证：1044 tests 0 failed（基线 1041，+3）；视图 next()/match/unwrap/链式全通过。
+
+[x] 匿名 record → 接口视图：Optional 视图中 some({..}) 应干净报错而非坏 C++  [2026-08-28 修复]
+    - 根因：isAssignable GenericSemType target 分支对 OptionalSemType source 一律放行（唯一漏洞；
+      直赋路径已递归拦截干净报错）。
+    - 修复：放行前窄拦截——target/source 同步剥 Optional 层，最内层 tElem 为接口视图且 sInner 为
+      canonicalName 空匿名 record → return false（调用方报干净 mismatch）。
+    - 验证：946 tests 0 failed（基线 934，+12）；some({..})/嵌套/形参/返回/字段/泛型接口视图全干净
+      报错；#6/record→Optional/record 变量合法形态不误伤。
+
+[x] 自引用 record（泛型 Tree<int> / 非泛型 Node）isAssignable 深层结构匹配不完整（L720 兜底放行）  [2026-08-28 修复]
+    - 根因：自引用字段被 sealSelfRefs 保留为 GenericSemType，深层递归比较 target 停在 L720 兜底
+      return true → children 深层结构不匹配漏检。
+    - 修复：共享工具 instantiateUserRecordFromCppName（从 C++ 名反解并实例化用户泛型 record：
+      剥 * → 查 TypeAlias → 按 typeParams 位置 replaceGenericRef 替换 → sealSelfRefs 副本）；
+      L720 前 `if (auto inst = instantiate...) return isAssignable(*inst, source)`；recordTypeFromExpected
+      对 resolvedName 非空先 instantiate。
+    - 验证：964 tests 0 failed（基线 953，+11）；Tree<int>/Node 深层不匹配干净报错、匹配版/used/1.aura
+      map_tree 不误伤。
+
+[x] Optional<用户泛型 record> = some({..}) 的 children 期望传播缺口（semTypeFromCppName 反解失败）  [2026-08-28 修复]
+    - 根因：semTypeFromCppName 对 "Tree<int32_t>*" 反解失败（注册键 "Tree"）→ GenericSemType 占位
+      → recordTypeFromExpected 查不到 → children 期望断裂 → 匹配版也报 cannot infer。
+    - 修复：semTypeFromCppName 反解失败后调用 instantiateUserRecordFromCppName 返回实例化
+      RecordSemType（与上条共享工具）。
+    - 验证：964 tests 0 failed（随上条 +11）；匹配版 Optional<Tree<int>> = some({..}) 编译运行通过。
+
+[x] 泛型接口视图方法 + 匿名 record 字面量实参无法推断（a.cmp({..})）  [2026-08-28 修复]
+    - 根因：inferMethodCall 接口分支 record 字面量分支缺 substitute 代换（非 record 分支 Phase 1-④
+      已修、不对称）。
+    - 修复：把 typeArgs 代换提取到实参循环体顶部（两分支共用），iface->typeArgs 非空时按位置
+      substitute 后作期望传给 inferExpr 与 propagateCanonicalName。
+    - 验证：951 tests 0 failed（基线 946，+5 含下条）；a.cmp({..})/pc.compare({..},{..}) 全通过，
+      决策 A（泛型函数/ctor 形参 T）保持 cannot infer。
+
+[x] 接口方法 record 字面量实参对非 record 形参不校验（形参 int/视图等 → 坏 C++）  [2026-08-28 修复]
+    - 根因：record 字面量分支从不做 isAssignable 校验（形参 int 时 record 带期望推断成功但不匹配，
+      propagateCanonicalName 不写 canonicalName → designated init 坏 C++）。
+    - 修复：record 字面量分支前判断「代换后形参可承载 record」（canCarryRecordLiteral helper——
+      Record/Optional/Union/Generic 可承载），不可承载则带期望推断 + isAssignable 校验报干净
+      argument type mismatch。
+    - 验证：951 tests 0 failed（+5 含上条）；int/视图形参 + {..} 干净报错，可承载形态不误伤。
+
+[x] 具名 record 字面量语法 `Point { x=1, y=2 }` 未实现（内联构造路径，#5）  [2026-08-29 修复]
+    - 根因：Parser parseCall 无 `Ident { Ident =` 分支；Sema 无 typeName 路径；且语句头
+      `for v in ch26 { v26 = v }`（used/5.aura）与具名 record 同形必须配语句头抑制标志。
+    - 修复：① Parser parseCall 增 `{` 分支（Identifier + 前瞻 `{ Ident =` + 语句头抑制标志
+      suppressNamedRecordLiteral_ 于 if/while/for/sync-for 头前后置位恢复）；② AST RecordExpr 增
+      typeName + clone/ASTPrinter；③ Sema inferNamedRecordExpr（undefined/泛型拦截/字段校验
+      未知/重复/缺失/类型不匹配 + 构造带 canonicalName RecordSemType + propagateCanonicalName
+      下钻嵌套匿名字段）；CodeGen 零改动。
+    - 验证：1034 tests 0 failed（基线 1008，+26：Parser 8 + Sema 15 + CodeGen 3；翻转
+      NamedRecordLiteralNotSupported）；used/5.aura for 同形回归红线通过；视图/Optional 内联构造/
+      嵌套下钻/链式/传参/字段校验全通过。
+
+[x] 外层闭包捕获分析误捕获内层闭包参数名（DeclaredCollector 不遍历 FunExpr）  [2026-08-29 修复]
+    - 根因：IdRefCollector 遍历内层闭包体收集引用名，DeclaredCollector 不深入内层也不收集其参数名
+      → 内层闭包参数被误判为外层自由变量加入 captures。
+    - 修复：DeclaredCollector 与 IdRefCollector 对称——collectExpr 遍历表达式树，visit(FunExpr)
+      收集内层闭包参数名并遍历体内声明。
+    - 验证：980 tests 0 failed（随 M4 同批）；nestouter 外层捕获列表 [transform] 非 [transform, y]。

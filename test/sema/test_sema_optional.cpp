@@ -642,4 +642,1026 @@ TEST(SemaOptional, ExplicitOptNormalSomeCtadUnchanged) {
     EXPECT_CONTAINS(unit.impl, "make_none<double>");   // float → double
 }
 
+// ============================================================
+// match None 不一致修复（2026-08-26）：显式 `Optional<T>` 注解物化为
+// GenericSemType{name=="Optional"}，constCompatibleWith 原只处理
+// UnionSemType/OptionalSemType，Generic 形态回退 equals → 误报
+// `match constant type 'None' does not match 'aura_rt::Optional<...>'`。
+// 修复：Sema constCompatibleWith 对称 OptionalSemType 分支（None→true + 元素常量）；
+//       CodeGen genMatchStmt isOptional 判定扩展 GenericSemType{Optional}，
+//       并复用 optionalElemCppName 提取元素 / 指针后缀判堆 / 接口视图 ViewRoot 绑定。
+// 回归红线：折叠 T|None（OptionalSemType）/ 无标注 some() / 全值 int|None 不破坏。
+// ============================================================
+TEST(SemaOptional, MatchNoneExplicitOptionalInt) {
+    // 显式 Optional<int> match None + int 元素 → 0 error
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let o: Optional<int> = some(5)"
+        " match o { None => io.println(\"none\") int v => io.println(str(v)) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, MatchNoneExplicitOptionalRecord) {
+    // 显式 Optional<Point> match None + Point 元素（record 堆元素）→ 0 error
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) {"
+        " let o: Optional<Point> = some({ x = 1, y = 2 })"
+        " match o { None => io.println(\"none\") Point p => io.println(str(p.x)) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, MatchNoneExplicitOptionalList) {
+    // 显式 Optional<[int]> match None（list 元素无类型模式，用 _ 兜底）→ 0 error
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let o: Optional<[int]> = some([1, 2, 3])"
+        " match o { None => io.println(\"none\") _ => io.println(\"some\") } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, MatchNoneExplicitOptionalIface) {
+    // 显式 Optional<G> match None + G 元素（接口视图元素）→ 0 error
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface G { greet() -> string }"
+        " type P = { x: int }"
+        " fun (self P impl G) greet() -> string { return \"hi\" }"
+        " fun main(io: Io) {"
+        " let p: P = { x = 1 }; let o: Optional<G> = some(p)"
+        " match o { None => io.println(\"none\") G g => io.println(g.greet()) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, MatchNoneExplicitOptionalElemConst) {
+    // 元素常量判定（同源次要不一致，随修）：Optional<int> 写 5=> → 0 error
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let o: Optional<int> = some(5)"
+        " match o { None => io.println(\"none\") 5 => io.println(\"five\") int v => io.println(str(v)) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, MatchNoneElemConstMismatch) {
+    // 元素常量判定不过度放行：Optional<Point> 写 5=>（元素为 record，非 int）→ 仍报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) {"
+        " let o: Optional<Point> = some({ x = 1, y = 2 })"
+        " match o { None => io.println(\"none\") 5 => io.println(\"five\") } }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "does not match the matched type"));
+}
+
+TEST(SemaOptional, MatchNoneFoldUnionStillOk) {
+    // 回归红线：折叠 Point|None（OptionalSemType）match None 不破坏
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) {"
+        " let o: Point | None = { x = 1, y = 2 }"
+        " match o { None => io.println(\"none\") Point p => io.println(str(p.x)) }"
+        " let n: Point | None = none()"
+        " match n { None => io.println(\"none\") Point p => io.println(str(p.x)) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, MatchNoneUnionIntNoneStillOk) {
+    // 回归红线：全值 int|None（UnionSemType 非堆不折叠 → std::variant）match None 不破坏
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let u: int | None = 21"
+        " match u { None => io.println(\"none\") int v => io.println(str(v)) }"
+        " let n: int | None = none()"
+        " match n { None => io.println(\"none\") int v => io.println(str(v)) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, MatchNoneNoNoneConstStillOk) {
+    // 回归红线：无 None 常量（M7/M12）显式 Optional 普通 match 不破坏
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let o: Optional<int> = some(7)"
+        " match o { int v => io.println(str(v)) _ => io.println(\"other\") } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, MatchNoneExplicitOptionalIntCodegen) {
+    // CodeGen：显式 Optional<int> match 生成 is_none() + unwrap 元素绑定（而非恒 true）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let o: Optional<int> = some(5)"
+        " match o { None => io.println(\"none\") int v => io.println(str(v)) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "_match_val->is_none()");
+    EXPECT_CONTAINS(unit.impl, "auto v = _match_val->unwrap()");
+}
+
+TEST(SemaOptional, MatchNoneExplicitOptionalRecordCodegen) {
+    // CodeGen：显式 Optional<Point> match 元素为堆 record → GcRootHandle 包裹 unwrap 值
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) {"
+        " let o: Optional<Point> = some({ x = 1, y = 2 })"
+        " match o { None => io.println(\"none\") Point p => io.println(str(p.x)) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "_match_val->is_none()");
+    EXPECT_CONTAINS(unit.impl, "auto p_raw = _match_val->unwrap()");
+    EXPECT_CONTAINS(unit.impl, "GcRootHandle<decltype(p_raw)> p");
+}
+
+TEST(SemaOptional, MatchNoneExplicitOptionalIfaceCodegen) {
+    // CodeGen：显式 Optional<G> match 接口视图元素 → ViewRoot 包裹（值视图 + 最新 self）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "interface G { greet() -> string }"
+        " type P = { x: int }"
+        " fun (self P impl G) greet() -> string { return \"hi\" }"
+        " fun main(io: Io) {"
+        " let p: P = { x = 1 }; let o: Optional<G> = some(p)"
+        " match o { None => io.println(\"none\") G g => io.println(g.greet()) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "auto g_raw = _match_val->unwrap()");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::ViewRoot<G> g(g_raw, aura_rt::GcRootScope::ThreadLocal)");
+}
+
+TEST(SemaOptional, MatchNoneExplicitOptionalElemConstCodegen) {
+    // CodeGen：元素常量 cond → !is_none() && unwrap() == 常量
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let o: Optional<int> = some(5)"
+        " match o { None => io.println(\"none\") 5 => io.println(\"five\") int v => io.println(str(v)) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "!_match_val->is_none() && _match_val->unwrap() == 5");
+}
+
+// ============================================================
+// unwrap 消费方向元素推断（2026-08-26）
+// 显式 Optional<接口/list/显式 Iterator/std::function/record> 的 unwrap 声明侧类型修复：
+// Sema semTypeFromCppName 语义化还原（SemAnalyzer.cpp）+ CodeGen 补 '*' 兜底。
+// ============================================================
+
+TEST(SemaOptional, UnwrapExplicitOptionalIface) {
+    // t01：显式 Optional<G> unwrap → 接口视图值（修复前生成 G*，unwrap 返回视图值 G 多补 *）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "interface G { greet() -> string }"
+        " type P = { x: int }"
+        " fun (self P impl G) greet() -> string { return \"hi\" }"
+        " fun main(io: Io) {"
+        " let p: P = { x = 1 }; let o: Optional<G> = some(p)"
+        " let g = o.unwrap()"
+        " io.println(g.greet()) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "G g_raw = ");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::ViewRoot<G> g(g_raw");
+}
+
+TEST(SemaOptional, UnwrapExplicitOptionalList) {
+    // t02：显式 Optional<[int]> unwrap → Array<int32_t>*（修复前 Array<int>** 双重指针）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let o: Optional<[int]> = some([1, 2, 3])"
+        " let l = o.unwrap()"
+        " io.println(str(l.len())) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Array<int32_t>* l_raw = ");
+}
+
+TEST(SemaOptional, UnwrapExplicitOptionalIterator) {
+    // t04：显式 Optional<Iterator<int>> unwrap → 迭代器视图（修复前 Iterator<int>*）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let o: Optional<Iterator<int>> = some(range(0, 3))"
+        " let it = o.unwrap()"
+        " io.println(str(it.collect().len())) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Iterator<int32_t> it_raw = ");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::ViewRoot<aura_rt::Iterator<int32_t>> it(it_raw");
+}
+
+TEST(SemaOptional, UnwrapExplicitOptionalRecord) {
+    // t03 回归：Optional<Point> unwrap → Point*（record 堆指针，行为不变）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) {"
+        " let p: Point = { x = 1, y = 2 }; let o: Optional<Point> = some(p)"
+        " let q = o.unwrap()"
+        " io.println(str(q.x)) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "Point* q_raw = ");
+}
+
+TEST(SemaOptional, UnwrapNested) {
+    // t11：嵌套 unwrap（修复前内层 unwrap 的元素 GenericSemType{name=原始 C++ 名}，
+    // typeKey 不命中 Optional 方法表 → Sema 报 cannot infer element type）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let o: Optional<Optional<int>> = some(some(5))"
+        " let v = o.unwrap().unwrap()"
+        " io.println(str(v)) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, UnwrapAsArgument) {
+    // t10：unwrap 作实参（修复前元素 GenericSemType 与形参 Prim/Record 结构不匹配）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun dbl(v: int) -> int { return v * 2 }"
+        " fun main(io: Io) {"
+        " let o: Optional<int> = some(9)"
+        " io.println(str(dbl(o.unwrap()))) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, UnwrapAsReturn) {
+    // t12：unwrap 作返回（修复前 GenericSemType 元素无法赋给接口/函数类型返回）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun ret(o: Optional<int>) -> int { return o.unwrap() }"
+        " fun main(io: Io) {"
+        " let o: Optional<int> = some(4)"
+        " io.println(str(ret(o))) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, UnwrapFuncElement) {
+    // t06a：显式 Optional<fun(int) -> int> unwrap → 函数值（修复前 std::function 被当指针
+    // 且 materializeCanonicalName 对 FunctionType 实参拼不出 resolvedName）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let f1: fun(int) -> int = fun(x: int) -> int { return x * 2 }"
+        " let o: Optional<fun(int) -> int> = some(f1)"
+        " let f2 = o.unwrap()"
+        " io.println(str(f2(4))) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "unwrap()");
+}
+
+TEST(SemaOptional, MatchConstIntGroupStillOk) {
+    // 回归红线：普通类型 match 常量分组（1|2|3）/ 字符串常量不受影响
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let x: int = 5"
+        " match x { 1 | 2 | 3 => io.println(\"low\") _ => io.println(\"high\") }"
+        " let s: string = \"a\""
+        " match s { \"a\" => io.println(\"a\") \"b\" => io.println(\"b\") _ => io.println(\"other\") } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// #2（2026-08-26）：无标注 let 声明侧 Optional record 元素缺 `*`。
+// 无标注 `let o = make_opt()`（make_opt 返回显式 `Optional<Point>`）的 inferredType
+// 为 GenericSemType{name=="Optional"}（resolvedName="aura_rt::Optional<Point>"，
+// record 元素无 *）→ genLetStmt GenericSemType 分支原对 resolvedName 整体追加 *，
+// 生成 Optional<Point>*（元素缺 *）与返回侧 Optional<Point*>* 不匹配。修复：声明侧
+// 元素 C++ 名复用 optionalElemCppName + finalizeCppElem 递归补全（record 补 *、
+// 嵌套 [Point]/Iterator<Point> 内嵌 record 同样补 *、接口/Iterator 值视图不加 *）。
+// 回归红线：显式标注 / 值元素（Optional<[int]> / Optional<Iterator<int>>）/
+// 接口视图（Optional<Stringer>）不破坏。
+// ============================================================
+
+TEST(SemaOptional, NoAnnotLetOptionalRecordDecl) {
+    // S1：Optional<Point> 无标注声明侧 → Optional<Point*>*（元素补 *）+ unwrap 可用
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Point = { x: int, y: int }"
+        " fun make_opt() -> Optional<Point> { return some({ x = 1, y = 2 }) }"
+        " fun main(io: Io) throws { let o = make_opt(); let p = o.unwrap(); io.println(str(p.x)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Optional<Point*>* o_raw = make_opt();");
+    // unwrap 声明侧 Point*（RecordSemType 分支，与返回一致）
+    EXPECT_CONTAINS(unit.impl, "Point* p_raw = ");
+}
+
+TEST(SemaOptional, NoAnnotLetOptionalListRecordDecl) {
+    // S2：Optional<[Point]> 无标注声明侧 → Optional<Array<Point*>*>*（嵌套 record 补 *）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Point = { x: int, y: int }"
+        " fun make_opt_pts() -> Optional<[Point]> {"
+        " let a: Point = { x = 1, y = 2 }; let b: Point = { x = 3, y = 4 }"
+        " let pts: [Point] = [a, b]; return some(pts) }"
+        " fun main(io: Io) throws { let ol = make_opt_pts(); let pts = ol.unwrap(); io.println(str(pts.len())) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl,
+        "aura_rt::Optional<aura_rt::Array<Point*>*>* ol_raw = make_opt_pts();");
+    // unwrap 声明侧 Array<Point*>*（ListSemType 分支，不回归）
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Array<Point*>* pts_raw = ");
+}
+
+TEST(SemaOptional, NoAnnotLetOptionalIterRecordDecl) {
+    // S2b：Optional<Iterator<Point>> 无标注声明侧 → Optional<Iterator<Point*>>*
+    // （Iterator 内嵌 record 补 *）。注：构造侧（Iterator.from 闭包内 some(record)
+    // 被外层 Optional<Iterator<Point>> 返回目标污染）另有独立缺陷，仅断言声明侧。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Point = { x: int, y: int }"
+        " fun make_opt_iter_pts() -> Optional<Iterator<Point>> {"
+        " let n = 0"
+        " let it = Iterator.from(fun() -> Optional<Point> {"
+        "   if n < 2 { let v = n; n = n + 1; return some({ x = v, y = v }) }"
+        "   return none() })"
+        " return some(it) }"
+        " fun main(io: Io) throws { let oi = make_opt_iter_pts(); let it = oi.unwrap(); io.println(str(it.collect().len())) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl,
+        "aura_rt::Optional<aura_rt::Iterator<Point*>>* oi_raw = make_opt_iter_pts();");
+    // unwrap 元素声明侧 Iterator<Point*>（GenericSemType{Iterator} 内嵌 record 补 *）
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Iterator<Point*> it_raw = ");
+}
+
+TEST(SemaOptional, NoAnnotLetExplicitAnnotationStillOk) {
+    // 回归：显式标注 `let o2: Optional<Point> = make_opt()` 走 mapType，不受影响
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Point = { x: int, y: int }"
+        " fun make_opt() -> Optional<Point> { return some({ x = 1, y = 2 }) }"
+        " fun main(io: Io) throws { let o2: Optional<Point> = make_opt(); let p2 = o2.unwrap(); io.println(str(p2.x)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Optional<Point*>* o2_raw = make_opt();");
+}
+
+TEST(SemaOptional, NoAnnotLetOptionalValueElemsStillOk) {
+    // 回归：值元素 / 接口视图不补 *（Optional<[int]> / Optional<Iterator<int>> /
+    // Optional<Stringer> 声明侧与返回侧一致）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Person = { name: string }"
+        " fun (self Person impl Stringer) to_string() -> string { return self.name }"
+        " fun make_list() -> Optional<[int]> { return some([1, 2, 3]) }"
+        " fun make_iter() -> Optional<Iterator<int>> { return some(range(0, 3)) }"
+        " fun make_iface() -> Optional<Stringer> { let p: Person = { name = \"z\" }; return some(p) }"
+        " fun main(io: Io) throws {"
+        " let a = make_list(); let la = a.unwrap()"
+        " let b = make_iter(); let ib = b.unwrap()"
+        " let c = make_iface(); let sc = c.unwrap()"
+        " io.println(str(la.len() + ib.collect().len() + sc.to_string().len())) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Optional<aura_rt::Array<int32_t>*>* a_raw = make_list();");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Optional<aura_rt::Iterator<int32_t>>* b_raw = make_iter();");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Optional<Stringer>* c_raw = make_iface();");
+}
+
+// ============================================================
+// G2-A（2026-08-27）：collectGenericMapping 误绑已物化内置泛型修复
+// ============================================================
+// 显式 `Optional<X>` 注解经 materializeCanonicalName 物化为
+// GenericSemType{name=="Optional", resolvedName=="aura_rt::Optional<...>"}
+// （非 OptionalSemType）。旧实现 collectGenericMapping case 1 不检查 resolvedName，
+// 把该已物化内置泛型当泛型变量 <T> 绑定 → 多实参同族泛型元素类型不同
+// （Optional<Point> + Optional<int>）时误报 conflicting type arguments。
+// 修复：resolvedName 非空（已物化内置泛型）即跳过绑定，仅裸泛型变量 T 才绑定。
+TEST(SemaOptional, DualExplicitOptionalParamsNoConflict) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun take_two(a: Optional<Point>, b: Optional<int>) -> int {"
+        "   let pa = a.unwrap(); let pb = b.unwrap(); return pa.x + pa.y + pb }"
+        " fun main(io: Io) throws {"
+        "   let r = take_two(some({x=1,y=2}), some(5))"
+        "   io.println(str(r)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, DualExplicitIteratorParamsNoConflict) {
+    // Iterator 双参不同元素类型（string + int）：同族误绑冲突 → 修复后不报
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " fun take_iters(a: Iterator<string>, b: Iterator<int>) -> int {"
+        "   return a.collect().len() + b.collect().len() }"
+        " fun main(io: Io) throws {"
+        "   let it_cnt = 0"
+        "   let siter = Iterator.from(fun() -> Optional<string> {"
+        "       if it_cnt > 0 { return none() }"
+        "       it_cnt = it_cnt + 1"
+        "       return some(\"hi\") })"
+        "   let r = take_iters(siter, range(0, 4))"
+        "   io.println(str(r)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, ListExplicitOptionalParamsNoConflict) {
+    // `[Optional<X>]` 列表形参：collectGenericMapping case 2 递归到元素，
+    // 元素为已物化 Optional（resolvedName 非空）→ 修复后跳过绑定不误报
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun take_list_opt(a: [Optional<Point>], b: [Optional<int>]) -> int {"
+        "   return a.len() + b.len() }"
+        " fun main(io: Io) throws {"
+        "   let r = take_list_opt([some({x=1,y=2})], [some(5), some(6)])"
+        "   io.println(str(r)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// G1 现象 B（2026-08-27）：显式 `Optional<[Point]>` 注解（GenericSemType 物化）
+// 作列表期望时 inferListExpr 解出元素类型（否则列表元素 record 无期望报
+// 「cannot infer type of record literal」）。覆盖 let / 函数形参 / return / 字段。
+// ============================================================
+TEST(SemaOptional, OptListExplicitLetExpected) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let o: Optional<[Point]> = [{ x = 1, y = 2 }] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptListExplicitParamExpected) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun take_opt_list(ps: Optional<[Point]>) -> int { return 1 }"
+        " fun main(io: Io) { let r = take_opt_list([{ x = 1, y = 2 }]) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptListExplicitReturnExpected) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun ret() -> Optional<[Point]> { return [{ x = 1, y = 2 }] }"
+        " fun main(io: Io) { let r = ret() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptListExplicitFieldExpected) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " type Holder = { p: Optional<[Point]> }"
+        " fun main(io: Io) { let h: Holder = { p = [{ x = 1, y = 2 }] } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// G1 现象 A（Sema 放行侧）：record/值/列表直传 Optional/Union 函数形参
+//  Sema 应放行（isAssignable Optional/Union 兼容），CodeGen 装箱另测。
+// ============================================================
+TEST(SemaOptional, OptFunArgRecordSemaPass) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun take_opt(p: Optional<Point>) -> int { return 1 }"
+        " fun main(io: Io) { let r = take_opt({ x = 1, y = 2 }) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, UnionFunArgRecordSemaPass) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun take_union(p: Point | None) -> int { return 1 }"
+        " fun main(io: Io) { let r = take_union({ x = 1, y = 2 }) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, UnionFunArgIntSemaPass) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun take_u(v: int | string) -> int { return 1 }"
+        " fun main(io: Io) { let r = take_u(5) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptFunArgIntSemaPass) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun take_opt_int(v: Optional<int>) -> int { return 1 }"
+        " fun main(io: Io) { let r = take_opt_int(5) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, ConditionalOptInitSemaPass) {
+    // G1 条件分支死角：let o: Optional<Point> = flag ? {..} : {..} Sema 放行
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let o: Optional<Point> = true ? { x = 1, y = 2 } : { x = 3, y = 4 } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// G2-C（2026-08-27）：显式 Optional<[Point|None]> / Optional<Point|None> 注解
+//（GenericSemType 物化，union 元素）——cppNameOfTypeExpr 补 UnionType 分支后
+// resolvedName 非空，some()/none() 元素期望可传播（否则 elemTypeOf 提空串报
+// 「cannot infer type of record literal」+「list element type mismatch」）。
+// ============================================================
+TEST(SemaOptional, OptListUnionElemExpected) {
+    // let 形态：some([record, none()]) 列表元素 union，元素期望经 elemTypeOf 传播
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let o: Optional<[Point|None]> = some([{x=1,y=2}, none()]) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptListUnionParamExpected) {
+    // 函数形参形态：take(some([record, none()])) 实参元素 union
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun take(o: Optional<[Point|None]>) -> int { return 1 }"
+        " fun main(io: Io) { let r = take(some([{x=1,y=2}, none()])) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptDirectUnionElemNoInferError) {
+    // Optional<Point|None> 直接 union 元素：Sema 不再报「cannot infer type of
+    // record literal」（resolvedName 非空）。注：构造 Optional<Optional<Point>>
+    // 需双重装箱，CodeGen 侧为独立缺口（本测试仅断言 Sema 无 cannot-infer）。
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let o: Optional<Point|None> = some({x=1,y=2}) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptListUnionEmptyListOk) {
+    // 空列表 some([]) 元素期望：Optional<[Point|None]> 空列表不误报
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let o: Optional<[Point|None]> = some([]) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptListPlainUnionRegression) {
+    // 回归红线：显式 Optional<[Point]>（无 union）不受 union 分支影响；
+    // 折叠 [Point|None] 列表 / Point|None 联合全链路不回归
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) {"
+        "   let a: Optional<[Point]> = some([{x=1,y=2}])"
+        "   let b: [Point|None] = [some({x=3,y=4}), none()]"
+        "   let c: Point|None = some({x=5,y=6}) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// Phase 2-③（2026-08-28）：嵌套 some(some(record)) 期望传播（根因 B）
+// inferCall "some" guard 放行 CallExpr 实参（callee 为 some/none）并 elemExpected
+// 下钻——内层 record 拿期望（不报 cannot infer）、内层 none() 反推元素类型。
+// 覆盖：显式嵌套 Optional / 视图 / 字段 / 列表元素 / 深层。
+// ============================================================
+
+TEST(SemaOptional, NestedSomeRecordNoInferError) {
+    // p2：Optional<Optional<Point>> = some(some({..}))——内层 record 拿期望
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let o: Optional<Optional<Point>> = some(some({x=1,y=2})) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, NestedSomeRecordTripleNoInferError) {
+    // p5：Optional<Optional<Optional<Point>>> = some(some(some({..}))) 三层
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) {"
+        " let o: Optional<Optional<Optional<Point>>> = some(some(some({x=1,y=2}))) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, NestedSomeViewAnonymousRecordCleanError) {
+    // p10 翻转：Optional<Optional<Stringer>> = some(some({..}))——匿名 record 元素赋
+    // 接口视图应干净报错（修复前 Sema 放行 → CodeGen 生成 designated init 坏 C++）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Person = { name: string }"
+        " fun (self Person impl Stringer) to_string() -> string { return self.name }"
+        " fun main(io: Io) { let o: Optional<Optional<Stringer>> = some(some({name = \"z\"})) }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, SomeNoneNestedNoInferError) {
+    // p3b：Optional<Optional<Point>> = some(none())——none() 元素类型反推
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let o: Optional<Optional<Point>> = some(none()) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, SomeSomeNoneNoInferError) {
+    // p6：Optional<Optional<Optional<Point>>> = some(some(none()))——两层 some 下钻
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) {"
+        " let o: Optional<Optional<Optional<Point>>> = some(some(none())) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, NestedSomeFieldNoInferError) {
+    // p13：字段 { p = some(some({..})) }（p: Optional<Optional<Point>>）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " type H = { p: Optional<Optional<Point>> }"
+        " fun main(io: Io) { let h: H = { p = some(some({x=1,y=2})) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, NestedSomeListElementNoInferError) {
+    // p7：列表元素 [Optional<Optional<Point>>] = [some(some({..}))]
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let arr: [Optional<Optional<Point>>] = [some(some({x=1,y=2}))] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, NestedSomeUnionElemNoInferError) {
+    // p11：Optional<Iterator<int>|None> = some(range(1,3))——联合元素 Sema 放行
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " fun main(io: Io) { let o: Optional<Iterator<int>|None> = some(range(1, 3)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, NestedSomeCtadRegression) {
+    // 回归红线：无标注 some(some(7)) CTAD 不受 some guard 扩展影响
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " fun main(io: Io) { let c = some(some(7)); io.println(str(c.unwrap().unwrap())) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+
+// ============================================================
+// Phase 2-②（2026-08-28）：Optional 元素列表下标/字段（Sema 侧无错）
+// isAlreadyOptionalValue / initIsOptionalValue 不认 IndexExpr / MemberAccessExpr
+// 导致的 CodeGen 二次装箱在 test_codegen.cpp 断言；本组验证各调用点在 Sema
+// 语义放行（含 Sema 保留 IndexExpr/MemberAccessExpr 真实类型不误判）。
+// ============================================================
+TEST(SemaOptional, IndexOptionalElemLet) {
+    // 调用点① let e = a[0]（[Optional<Point>] 显式元素）Sema 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let a: [Optional<Point>] = [some({x=1,y=2}), none()]; let e = a[0] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, IndexFoldElemLet) {
+    // 调用点② let e = a[0]（[Point|None] 折叠元素）Sema 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let a: [Point|None] = [some({x=1,y=2}), none()]; let e = a[0] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, NestedIndexOptionalElem) {
+    // 调用点③ let e = a[0][0]（嵌套 [[Point|None]]）Sema 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let a: [[Point|None]] = [[some({x=1,y=2})]]; let e = a[0][0] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, MemberAccessOptionalField) {
+    // 调用点④ let e = h.opt（字段 Optional）Sema 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " type Holder = { opt: Optional<Point>, n: int }"
+        " fun main(io: Io) { let h: Holder = { opt = some({x=1,y=2}), n = 1 }; let e = h.opt }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, MethodReturnSelfOptionalField) {
+    // 调用点⑤ 方法体 return self.opt Sema 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " type R = { opt: Optional<Point> }"
+        " fun (self R) getOpt() -> Optional<Point> { return self.opt }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, AssignIndexOptionalElem) {
+    // 调用点⑥ e = a[i]（赋值）Sema 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let a: [Optional<Point>] = [some({x=1,y=2})]; let e: Optional<Point> = none(); e = a[0] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, ReturnIndexOptionalElem) {
+    // 调用点⑦ return a[i] Sema 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun getIdx() -> Optional<Point> { let a: [Optional<Point>] = [some({x=1,y=2})]; return a[0] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, ParamIndexOptionalElem) {
+    // 调用点⑧ pass(a[i])（函数实参）Sema 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun take(p: Optional<Point>) -> int { return 1 }"
+        " fun main(io: Io) { let a: [Optional<Point>] = [some({x=1,y=2})]; let r = take(a[0]) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, IndexPlainElemStaysPlain) {
+    // 防误伤：非 Optional 元素列表 [Point] 下标 let e = a[0] Sema 无错（e 为 Point）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let a: [Point] = [{x=1,y=2}, {x=3,y=4}]; let e = a[0] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptionalTargetFromPlainIndexElem) {
+    // 防误伤：`let o: Optional<Point> = a[0]`（a: [Point] 非 Optional 元素）Sema 无错
+    //（Sema 保留 IndexExpr 真实元素类型 Point，CodeGen 正常 make_optional 一次）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let a: [Point] = [{x=1,y=2}, {x=3,y=4}]; let o: Optional<Point> = a[1] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, FoldTargetFromPlainIndexElem) {
+    // 防误伤：`let o: Point|None = a[0]`（a: [Point] 折叠目标 + 非 Optional 元素）Sema 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let a: [Point] = [{x=1,y=2}, {x=3,y=4}]; let o: Point|None = a[1] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, IndexValueTypeOptionalElem) {
+    // 防误伤：值类型 Optional<int> 列表元素 let e = a[0] Sema 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let a: [Optional<int>] = [some(1), none(), some(3)]; let e = a[0] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// problem.txt「匿名 record → 接口视图」条目（2026-08-28 修复）：
+// Optional 视图中 some({..}) 匿名 record 元素应干净报错而非坏 C++
+// isAssignable GenericSemType target 分支的 OptionalSemType source 放行
+// 前做窄拦截（target/source 同步剥 Optional 层）。覆盖全部同源形态：
+// 主线 / 泛型接口视图 / 形参 / 返回 / 字段 / 嵌套 some；合法形态保持通过。
+// ============================================================
+
+namespace {
+const char* kPersonImplStringer =
+    "type Person = { name: string }"
+    " fun (self Person impl Stringer) to_string() -> string { return self.name }";
+const char* kMainStart = " fun main(io: Io) { ";
+} // namespace
+
+TEST(SemaOptional, SomeAnonRecordToOptionalViewCleanError) {
+    // 主线：Optional<Stringer> = some({..})——匿名 record 元素 → 视图目标干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kPersonImplStringer) + kMainStart +
+        " let o: Optional<Stringer> = some({ name = \"z\" }) }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, SomeAnonRecordToGenericIfaceViewCleanError) {
+    // 泛型接口视图：Optional<Cmp<Point>> = some({..})——semTypeFromCppName 对
+    // "Cmp<Point*>" 反解为 GenericSemType 占位，基名 Cmp 查符号表为接口 → 拦截
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string("type Point = { x: int, y: int }") +
+        std::string(" interface Cmp<T> { cmp(o: T) -> int }") + kMainStart +
+        " let o: Optional<Cmp<Point>> = some({ x = 1, y = 2 }) }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, SomeAnonRecordArgToOptionalViewCleanError) {
+    // 函数形参：show(io, some({..}))——实参 OptionalSemType 对 Optional<视图> 形参
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kPersonImplStringer) +
+        std::string(" fun show(s: Optional<Stringer>) -> int { return 1 }") + kMainStart +
+        " let r = show(io, some({ name = \"w\" })) }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+}
+
+TEST(SemaOptional, SomeAnonRecordReturnToOptionalViewCleanError) {
+    // 函数返回：return some({..})——返回 OptionalSemType 对 Optional<视图> 返回类型
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kPersonImplStringer) +
+        std::string(" fun make() -> Optional<Stringer> { return some({ name = \"v\" }) }") + kMainStart +
+        " let o = make() }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+}
+
+TEST(SemaOptional, SomeAnonRecordFieldToOptionalViewCleanError) {
+    // record 字段：{ opt = some({..}) }——字段类型 Optional<Stringer> 对 some({..})
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kPersonImplStringer) +
+        std::string(" type H = { opt: Optional<Stringer> }") + kMainStart +
+        " let h: H = { opt = some({ name = \"u\" }) } }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, SomeSomeAnonRecordToOptionalViewCleanError) {
+    // 嵌套 some(some({..}))：Optional<Optional<Stringer>>——同步剥层拦截
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kPersonImplStringer) + kMainStart +
+        " let o: Optional<Optional<Stringer>> = some(some({ name = \"t\" })) }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, SomeRecordVarToOptionalViewStaysOk) {
+    // 合法形态（不误伤）：record 变量 some(some(p))（p: Person 显式 impl Stringer）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kPersonImplStringer) + kMainStart +
+        " let p: Person = { name = \"u\" };"
+        " let o: Optional<Optional<Stringer>> = some(some(p)) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, SomeListToOptionalViewStaysOk) {
+    // 合法形态（不误伤）：#6 形态 Optional<[Point]> = some([{..}])
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string("type Point = { x: int, y: int }") + kMainStart +
+        " let o: Optional<[Point]> = some([{ x = 1, y = 2 }]) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, SomeRecordToOptionalPointStaysOk) {
+    // 合法形态（不误伤）：Optional<Point> = some({..})——具体 record 目标
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string("type Point = { x: int, y: int }") + kMainStart +
+        " let o: Optional<Point> = some({ x = 1, y = 2 }) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, DirectAnonRecordToOptionalViewCleanError) {
+    // 直赋回归：Optional<Stringer> = {..}（source 非 OptionalSemType，
+    // 走 L703-708 递归 isAssignable → 接口分支拦截）——现有行为保持
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kPersonImplStringer) + kMainStart +
+        " let o: Optional<Stringer> = { name = \"s\" } }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+}
+
+TEST(SemaOptional, DirectAnonRecordToStringerViewCleanError) {
+    // 直赋回归：let s: Stringer = {..}——接口分支拦截，现有行为保持
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kPersonImplStringer) + kMainStart +
+        " let s: Stringer = { name = \"s\" } }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+}
+
+TEST(SemaOptional, ListAnonRecordToStringerViewCleanError) {
+    // 列表回归：[Stringer] = [{..}]——list element mismatch，现有行为保持
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kPersonImplStringer) + kMainStart +
+        " let s: [Stringer] = [{ name = \"s\" }] }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+}
+
+// ============================================================
+// problem.txt「Optional<用户泛型 record> = some({..}) 的 children 期望传播缺口
+// （semTypeFromCppName 反解用户泛型 record 失败）」（2026-08-28 修复）：
+// declaredType=GenericSemType{Optional,"aura_rt::Optional<Tree<int32_t>*>"}，
+// inferCall some 分支 elemTypeOf 经 semTypeFromCppName("Tree<int32_t>*") 反解失败
+// 落占位 → recordTypeFromExpected 查符号表失败 → children 元素无上下文 cannot infer。
+// 修复：semTypeFromCppName 反解用户泛型 record → 实例化 RecordSemType（canonicalName
+// "Tree<int32_t>"），children 深层带期望正常推断 + CodeGen gc_alloc<Tree>。
+// ============================================================
+TEST(SemaOptional, OptionalGenericRecordSomeOk) {
+    // 匹配版：Optional<Tree<int>> = some({..})（修复前 cannot infer）→ Sema 0 error
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Tree<T> = { value: T, children: [Tree<T>] }"
+        " fun main(io: Io) throws {"
+        "   let o: Optional<Tree<int>> = some({"
+        "     value = 1, children = [{ value = 2, children = [] }] }) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptionalGenericRecordSomeCodegen) {
+    // CodeGen：some({..}) 推断出具体 record → gc_alloc<Tree> + Optional<Tree*>
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Tree<T> = { value: T, children: [Tree<T>] }"
+        " fun main(io: Io) throws {"
+        "   let o: Optional<Tree<int>> = some({"
+        "     value = 1, children = [{ value = 2, children = [] }] }) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "gc_alloc<Tree<int32_t>>");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Optional<Tree<int32_t>*>*");
+}
+
+TEST(SemaOptional, OptionalGenericRecordSomeDeepMismatchError) {
+    // 条目 B + A 协同：some({..}) children 深层 value:string → 干净报错（修复前坏 C++）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Tree<T> = { value: T, children: [Tree<T>] }"
+        " fun main(io: Io) throws {"
+        "   let o: Optional<Tree<int>> = some({"
+        "     value = 1, children = [{ value = \"x\", children = [] }] }) }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "list element type mismatch"));
+}
+
+
+
 

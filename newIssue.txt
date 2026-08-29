@@ -6,3 +6,4 @@
 6、sync.Channel登记注册乱了（暂不处理）
 7、sema架构改变支持反推类型
 8、VarInt
+9、编译期Channel死锁检查

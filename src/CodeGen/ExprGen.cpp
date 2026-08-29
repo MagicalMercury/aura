@@ -7,6 +7,82 @@
 namespace Aura {
 
 // ============================================================
+// G1：形参 C++ 类型名辅助——Optional 元素 / Variant 变体列表提取。
+// 形参 C++ 类型由 mapType 生成（与 funSignature/mapParamType 同源），已含 record '*'，
+// 前缀判定只认 aura_rt::Optional< / aura_rt::Variant<，其余形参类型不命中、不装箱。
+// ============================================================
+
+// "aura_rt::Optional<X>*" → "X"（末个 '>' 定位，兼容嵌套尖括号与尾 '*'）
+static std::string optionalElemFromParamCpp(const std::string& paramCpp) {
+    static const std::string prefix = "aura_rt::Optional<";
+    if (paramCpp.rfind(prefix, 0) != 0 || paramCpp.size() < prefix.size() + 2) return "";
+    size_t rt = paramCpp.rfind('>');
+    if (rt == std::string::npos || rt <= prefix.size()) return "";
+    return paramCpp.substr(prefix.size(), rt - prefix.size());
+}
+
+// 按顶层逗号分割 C++ 模板参数列表（"aura_rt::Variant<A, B>*" → {A, B}，含嵌套尖括号），
+// 并 trim 空白（形参 C++ 名中 "int32_t, aura_rt::GcString*" 的变体间有空格）
+static std::vector<std::string> splitCppTemplateArgs(const std::string& s) {
+    std::vector<std::string> parts;
+    std::string cur;
+    int depth = 0;
+    for (char c : s) {
+        if (c == '<' || c == '(') ++depth;
+        else if (c == '>' || c == ')') --depth;
+        else if (c == ',' && depth == 0) { parts.push_back(cur); cur.clear(); continue; }
+        cur += c;
+    }
+    if (!cur.empty()) parts.push_back(cur);
+    for (auto& p : parts) {
+        auto b = p.find_first_not_of(" \t");
+        auto e = p.find_last_not_of(" \t");
+        p = (b == std::string::npos) ? "" : p.substr(b, e - b + 1);
+    }
+    return parts;
+}
+
+// G1：生成 Optional/Union 形参的实参装箱表达式。paramCpp 为形参 C++ 类型名：
+//   - "aura_rt::Optional<X>*" → genOptionalTargetInit（some/none/已 Optional 直通，
+//     裸值/record/列表 → make_optional<X>；条件分支逐分支装箱）
+//   - "aura_rt::Variant<...>*" → genUnionBoxingImpl（已 Union 值 idx 匹配失败返回空，
+//     自然防二次装箱）
+// 非 Optional/Variant 形参或提取失败 → 返回 ""（不装箱）。
+std::string CodeGenerator::genParamBoxing(const std::string& paramCpp,
+                                          const ASTNode& arg,
+                                          bool isCoroutine) {
+    if (paramCpp.rfind("aura_rt::Optional<", 0) == 0
+        && !paramCpp.empty() && paramCpp.back() == '*') {
+        std::string elem = optionalElemFromParamCpp(paramCpp);
+        if (!elem.empty())
+            return genOptionalTargetInit(arg, elem, isCoroutine);
+        return "";
+    }
+    if (paramCpp.rfind("aura_rt::Variant<", 0) == 0
+        && !paramCpp.empty() && paramCpp.back() == '*') {
+        const std::string prefix = "aura_rt::Variant<";
+        // 去尾 ">*" 两字符后剩余变体列表（如 "int32_t, aura_rt::GcString*"）
+        std::string inner = paramCpp.substr(prefix.size(),
+                                            paramCpp.size() - prefix.size() - 2);
+        std::vector<std::string> cppTypes = splitCppTemplateArgs(inner);
+        if (!cppTypes.empty() && !cppTypes[0].empty())
+            return genUnionBoxingImpl(cppTypes, arg, isCoroutine);
+    }
+    return "";
+}
+
+// G3：构造接口视图类型标记（record→view 转换后的实参类型）。仅供 genGcRootedArgs
+// 的 isIfaceView/isHeapSemType 判定：视图是值类型（{Fn, self}），若按原 record 堆
+// 指针类型传递，genGcRootedArgs 会生成 GcRootHandle<视图>——视图非指针，GcRootHandle
+// 的 ptr_ref_ 指向视图首 8B（方法 Fn 指针）被 GC 当 GcObject* 扫描 → 坏根 → GC 扫描
+// 崩溃。标记为视图后走值拷贝（非协程）/ ViewRoot（协程）分支。name 仅占位不做 mapType。
+static std::unique_ptr<InterfaceSemType> makeIfaceViewMarker(const std::string& ifaceName) {
+    auto v = std::make_unique<InterfaceSemType>();
+    v->name = ifaceName;
+    return v;
+}
+
+// ============================================================
 // escapeStringLiteral — 转义字符串字面量内容，使其可安全嵌入生成的 C++ 源码
 // 不转义则源串中的 "、\、\n、\t、\r 会破坏生成的 C++ 字符串字面量或被解释为控制字符
 // ============================================================
@@ -310,14 +386,55 @@ std::string CodeGenerator::genIdentifier(const Identifier& e) {
 // ============================================================
 
 std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
+    // #13：识别 Optional 元素列表（折叠 union `T|None` → OptionalSemType / 显式
+    // `Optional<T>` 注解 → GenericSemType{name=="Optional"}）。元素 C++ 名经
+    // optionalElemCppName 提取（record 元素统一补 *），列表元素类型为
+    // aura_rt::Optional<elemCpp>*；listElemCpp 为空 = 非 Optional 元素（维持原逻辑）。
+    std::string listElemCpp;
+    if (e.inferredType) {
+        if (auto* lt = dynamic_cast<const ListSemType*>(e.inferredType)) {
+            if (lt->elementType) {
+                const SemType* et = lt->elementType.get();
+                bool isOpt = dynamic_cast<const OptionalSemType*>(et)
+                    || (dynamic_cast<const GenericSemType*>(et)
+                        && static_cast<const GenericSemType*>(et)->name == "Optional");
+                if (isOpt) listElemCpp = optionalElemCppName(et);
+            }
+        }
+    }
+
+    // #7：接口视图元素列表（[Stringer]/[Comparable<Point>]/[Iterator<int>]）——
+    // 元素是值视图 { 方法Fn..., GcObject* self }（非 GC 指针）：① 元素为 record 时
+    // 需 record→view 转换（genRecordToViewIIFE），否则 Array<Stringer>::append 直传
+    // record 指针类型不匹配；② append 的是视图值，不能 GcRootHandle（视图非指针）。
+    // runtime 侧 ArrayChunk<Stringer>::desc() 已注册 self 子偏移（#7 方案 A）支撑 GC 追踪。
+    bool elemIsIfaceView = false;
+    std::string elemViewCpp;
+    if (listElemCpp.empty() && e.inferredType) {
+        if (auto* lt = dynamic_cast<const ListSemType*>(e.inferredType)) {
+            if (lt->elementType) {
+                std::string etCpp = mapSemType(*lt->elementType);
+                if (isIfaceViewTypeName(etCpp)) {
+                    elemIsIfaceView = true;
+                    elemViewCpp = etCpp;
+                }
+            }
+        }
+    }
+
     if (e.elements.empty()) {
         // 优先用 inferredType 推断空列表元素类型
         if (e.inferredType) {
             auto* listTy = dynamic_cast<const ListSemType*>(e.inferredType);
             if (listTy && listTy->elementType) {
-                std::string semElem = mapSemType(*listTy->elementType);
+                // #13：Optional 元素列表 → aura_rt::Optional<elemCpp>*（optionalElemCppName
+                // 已补 record 元素 *，顺带修 B/L 显式 Optional 元素缺 *）
+                std::string semElem = !listElemCpp.empty()
+                    ? "aura_rt::Optional<" + listElemCpp + ">*"
+                    : mapSemType(*listTy->elementType);
                 if (semElem.find("GcObject") == std::string::npos
-                    && semElem != "auto")
+                    && semElem != "auto"
+                    && semElem.find("auto") == std::string::npos)   // G4：拦截 std::function<auto(...)>
                     return "aura_rt::Array<" + semElem + ">::make(0)";
             }
         }
@@ -330,8 +447,28 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
 
     // 生成所有元素表达式
     std::vector<std::string> elemExprs;
-    for (auto& elem : e.elements)
-        elemExprs.push_back(elem ? genExpr(*elem, isCoroutine) : "???");
+    for (auto& elem : e.elements) {
+        // #13：Optional 元素列表——元素值经 genOptionalTargetInit 按目标元素 C++ 类型
+        // 装箱：some(arg)/none()/已 Optional 值（Optional 变量、返回 Optional 的调用）直通，
+        // 裸值（record 字面量等）make_optional<elemCpp> 装箱；非 Optional 元素保持 genExpr。
+        // #7：接口视图元素且值为 record → record→view 转换（否则 Array<视图>::append
+        // 直传 record 指针类型不匹配）；元素已是视图值（range 产 Iterator 等）直用。
+        if (elem) {
+            if (!listElemCpp.empty()) {
+                elemExprs.push_back(genOptionalTargetInit(*elem, listElemCpp, isCoroutine));
+            } else if (elemIsIfaceView
+                       && dynamic_cast<const RecordSemType*>(elem->inferredType)
+                       && !static_cast<const RecordSemType*>(elem->inferredType)->canonicalName.empty()) {
+                auto* rt = static_cast<const RecordSemType*>(elem->inferredType);
+                elemExprs.push_back(genRecordToViewIIFE(genExpr(*elem, isCoroutine),
+                                                        rt->canonicalName, elemViewCpp));
+            } else {
+                elemExprs.push_back(genExpr(*elem, isCoroutine));
+            }
+        } else {
+            elemExprs.push_back("???");
+        }
+    }
 
     // 从第一个元素推断列表元素类型
     std::string elemType = "int32_t";  // 默认 int
@@ -340,7 +477,11 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
     if (e.inferredType) {
         auto* listTy = dynamic_cast<const ListSemType*>(e.inferredType);
         if (listTy && listTy->elementType) {
-            std::string semElemType = mapSemType(*listTy->elementType);
+            // #13：Optional 元素列表 → aura_rt::Optional<elemCpp>*（optionalElemCppName
+            // 已补 record 元素 *，顺带修 B/L 显式 Optional 元素缺 *）；非 Optional 走 mapSemType
+            std::string semElemType = !listElemCpp.empty()
+                ? "aura_rt::Optional<" + listElemCpp + ">*"
+                : mapSemType(*listTy->elementType);
             // 无效时（GenericSemType → "auto"），回退到第一个元素的 inferredType
             if (semElemType == "auto" && e.elements.size() > 0 && e.elements[0]) {
                 if (auto* rs = dynamic_cast<const RecordSemType*>(e.elements[0]->inferredType)) {
@@ -350,7 +491,8 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
             }
             if (semElemType.find("GcObject") == std::string::npos
                 && semElemType.find("/*") == std::string::npos
-                && semElemType != "auto") {
+                && semElemType != "auto"
+                && semElemType.find("auto") == std::string::npos) {   // G4：拦截 std::function<auto(...)>
                 elemType = semElemType;
             } else if (e.elements.size() > 0 && e.elements[0]
                        && dynamic_cast<const RecordExpr*>(e.elements[0].get())) {
@@ -412,7 +554,14 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
     // 每个元素：预求值并用 GcRootHandle 保护（防止 append 内部 alloc 触发 GC 回收临时值）
     // append 内部 ArrayChunk::make 会触发 GC，未保护的临时 GcString* 会被 mark-sweep 回收
     for (size_t i = 0; i < elemExprs.size(); ++i) {
-        bool isHeap = e.elements[i] && isHeapSemType(e.elements[i]->inferredType);
+        // #13：Optional 元素列表的元素均为堆指针（aura_rt::Optional<elemCpp>*，含
+        // make_optional 装箱结果 / some/none 直通值）→ 一律 GcRootHandle 保护，
+        // 防 append 内部 alloc 触发 GC 回收未保护临时值
+        // #7：接口视图元素是值类型（含 GcObject* self，非指针）→ 跳过 GcRootHandle
+        //（GcRootHandle<视图> 模板参数不成立会编译失败）；self 由 ArrayChunk desc
+        // 子偏移（mark+compact）与保守栈扫描保护
+        bool isHeap = e.elements[i] && (!listElemCpp.empty()
+            || (!elemIsIfaceView && isHeapSemType(e.elements[i]->inferredType)));
         std::string vi = "_e" + std::to_string(idx) + "_" + std::to_string(i);
         oss << "    auto " << vi << " = (" << elemExprs[i] << ");\n";
         if (isHeap) {
@@ -465,8 +614,12 @@ std::string CodeGenerator::genRecordExpr(const RecordExpr& e, bool isCoroutine) 
         oss << "    aura_rt::GcRootHandle<decltype(_raw)> " << var << "(_raw);\n";
         for (auto& f : e.fields) {
             // 堆类型字段值：预求值并用 GcRootHandle 保护
-            std::string fval = f.value ? genExpr(*f.value, isCoroutine) : "???";
-            if (f.value && isHeapSemType(f.value->inferredType)) {
+            // #10：按字段声明类型（e.inferredType->fields）装箱（Optional/Variant 字段）
+            // #3：接口视图字段（值类型）→ outViewValue 置 true，跳过 GcRootHandle
+            bool isViewField = false;
+            std::string fval = f.value
+                ? genRecordFieldValue(e.inferredType, *f.value, f.name, isCoroutine, &isViewField) : "???";
+            if (f.value && isHeapSemType(f.value->inferredType) && !isViewField) {
                 oss << "    auto _fv_" << safeName(f.name) << " = (" << fval << ");\n";
                 oss << "    aura_rt::GcRootHandle<decltype(_fv_" << safeName(f.name)
                     << ")> _fh_" << safeName(f.name) << "(_fv_" << safeName(f.name) << ");\n";
@@ -825,10 +978,31 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
     std::string calleeExpr = isCtor ? (calleeName + "_ctor") : genExpr(*e.callee, isCoroutine);
 
     // 泛型构造函数模板参数：
-    // 零参构造函数（如 Stack()）需要 currentTParams_ 推断类型
-    // 有参构造函数让 CTAD 从参数推导（如 Pair(p.second, p.first) → Pair_ctor(B, A)）
+    // ① N2 调用点显式类型实参 B<int>(...) 最优先（targs 来源=显式实参，mapType 映射
+    //    int→int32_t、Point→Point*，与声明侧 B_ctor<T> 的 T 一致）；
+    // ② 其次用 let/const 类型标注的显式模板实参（expectedTemplateArgs_，genLetStmt
+    //    从 `let b: B<int>` 填充）——覆盖"构造形参不含 receiver 泛型 T"的有参/零参
+    //    构造（B_ctor<int32_t>(closure)）：collectMethodTParams 使 B_ctor 模板化
+    //    （T 来自 receiverTypeArgs），T 不出现在 C++ 形参时 g++ 无法推导，必须显式给出；
+    // ③ 无标注时零参构造退回 currentTParams_（当前模板上下文，如泛型函数内 Stack()）；
+    //    有参构造让 CTAD 从形参推导（如 Pair(p.second, p.first) → Pair_ctor(B, A)）
+    //    ——不能对有参构造用 currentTParams_（是外层函数模板参数，非 receiver 泛型）。
     std::string targs;
-    if (isCtor && e.args.empty() && !currentTParams_.empty()) {
+    if (isCtor && !e.typeArgs.empty()) {
+        targs = "<";
+        for (size_t i = 0; i < e.typeArgs.size(); ++i) {
+            if (i > 0) targs += ", ";
+            targs += e.typeArgs[i] ? mapType(*e.typeArgs[i]) : "int32_t";
+        }
+        targs += ">";
+    } else if (isCtor && !expectedTemplateArgs_.empty()) {
+        targs = "<";
+        for (size_t i = 0; i < expectedTemplateArgs_.size(); ++i) {
+            if (i > 0) targs += ", ";
+            targs += expectedTemplateArgs_[i];
+        }
+        targs += ">";
+    } else if (isCtor && e.args.empty() && !currentTParams_.empty()) {
         targs = "<";
         for (size_t i = 0; i < currentTParams_.size(); ++i) {
             if (i > 0) targs += ", ";
@@ -849,6 +1023,9 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
     auto ipIt = fnInterfaceParams_.find(calleeName);
     auto cbIt = fnCallbackParams_.find(calleeName);
     std::vector<std::string> argExprs;
+    // G3：被 record→view / XFunc 转换的实参 idx → 视图类型标记（genGcRootedArgs
+    // 据此走视图值分支，不生成 GcRootHandle<视图> 坏根；见 makeIfaceViewMarker）
+    std::map<size_t, std::unique_ptr<SemType>> viewArgTypes;
     // 先收集实参（保持参数顺序：前面的实参 + 尾部的默认参数）
     for (size_t i = 0; i < e.args.size(); ++i) {
         std::string arg = genExpr(*e.args[i], isCoroutine);
@@ -874,7 +1051,8 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
                               + ">(&" + adName + "::desc(), _ah.get());\n"
                               "    return " + adName + "::view(_ad);\n"
                               "  }()";
-                    } else {
+                        viewArgTypes[i] = makeIfaceViewMarker(ifaceName);
+                    } else if (dynamic_cast<const FuncSemType*>(argTy)) {
                         // 闭包 → XFunc GC 化：值拷贝 std::function 后 gcConstruct 分配适配器
                         // （func 捕获的 GcRootHandle 为全局根 ValueGlobal，alloc 期间安全；
                         //   finalizer 析构 func，见 genInterfaceDecl XFunc）
@@ -884,7 +1062,13 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
                               "(&" + ifaceName + "Func::desc(), std::move(_cf));\n"
                               "    return " + ifaceName + "Func::view(_cd);\n"
                               "  }()";
+                        viewArgTypes[i] = makeIfaceViewMarker(ifaceName);
                     }
+                    // 其余（inferredType 缺失/非闭包的视图变量等，如闭包内捕获的
+                    // 接口视图变量）→ 透传不包装：仅 FuncSemType 才构造 XFunc，
+                    // 防未知类型实参被误当闭包生成不存在的 XFunc（#8 回归：内置
+                    // 接口无 XFunc 适配器，且视图变量透传分支依据 InterfaceSemType，
+                    // 捕获变量 inferredType 缺失时会落入此处）
                     break;
                 }
             }
@@ -907,6 +1091,17 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
                 }
             }
         }
+        // G1：Optional/Union 形参装箱——实参裸值（record/值/列表/视图）直传 Optional/Union
+        // 形参时 make_optional / make_variant 装箱（take_opt({..})/take_opt_int(5)/
+        // take_opt_list([{..}])/take_union({..})/take_u(5)）。fnParamCppTypes_ 同时
+        // 覆盖构造函数形参（isCtor 分支 calleeName = 记录名）。genParamBoxing 内部
+        // 防二次装箱：some()/none()/已是 Optional 值 → genOptionalTargetInit 直通；
+        // 已是 Union 值 → genUnionBoxingImpl idx 匹配失败返回空。
+        auto ppIt = fnParamCppTypes_.find(calleeName);
+        if (ppIt != fnParamCppTypes_.end() && i < ppIt->second.size()) {
+            std::string boxed = genParamBoxing(ppIt->second[i], *e.args[i], isCoroutine);
+            if (!boxed.empty()) arg = boxed;
+        }
         argExprs.push_back(arg);
     }
     // C5.1/C5.3: 同模块函数 / ctor 默认参数补齐（调用点补实参，支持任意表达式）
@@ -915,8 +1110,48 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
             for (size_t k = e.args.size(); k < ctIt->second.size(); ++k)
                 if (ctIt->second[k]) argExprs.push_back(genExpr(*ctIt->second[k], isCoroutine));
     } else if (auto fit = fnDefaultArgs_.find(calleeName); fit != fnDefaultArgs_.end()) {
+        // M3：泛型函数默认参数闭包引用函数模板 T 时，调用点需将闭包参数/返回类型中
+        // 的 T 物化为调用点实参推导的具体类型（生成普通 lambda），并包装为显式
+        // std::function<具体类型> 实参——否则裸 lambda（即便普通 lambda）不参与函数
+        // 模板 std::function<T(T)> 的实参推导（g++ 'lambda' is not derived from
+        // 'std::function<T(T)>'），T 无法从实参推导。仅默认实参含闭包且闭包引用函数
+        // 模板泛型时设置映射；方法默认参数（methodDefaultArgs_ 分支）不设（P4-9 已靠
+        // receiver 具体类型让模板 lambda 隐式转换，设置会改变既有形态）。
+        std::map<std::string, std::string> materialized;
+        bool hasFunDefault = false;
         for (size_t k = e.args.size(); k < fit->second.size(); ++k)
-            if (fit->second[k]) argExprs.push_back(genExpr(*fit->second[k], isCoroutine));
+            if (fit->second[k] && dynamic_cast<const FunExpr*>(fit->second[k])) {
+                hasFunDefault = true; break;
+            }
+        std::map<std::string, std::string> savedMat;
+        if (hasFunDefault) {
+            collectDefaultArgGenericMap(calleeName, e.args, materialized);
+            if (!materialized.empty()) {
+                savedMat = defaultArgMaterializedTypes_;
+                defaultArgMaterializedTypes_ = materialized;
+            }
+        }
+        // fnCallbackParams_ 注册的回调形参索引（默认实参闭包须按物化类型包装 std::function）
+        auto cbIt = fnCallbackParams_.find(calleeName);
+        for (size_t k = e.args.size(); k < fit->second.size(); ++k) {
+            if (!fit->second[k]) continue;
+            std::string arg = genExpr(*fit->second[k], isCoroutine);
+            if (!materialized.empty() && cbIt != fnCallbackParams_.end()) {
+                for (auto& [idx, ftStr] : cbIt->second) {
+                    if (idx == k) {
+                        // 物化映射生效期间 mapType 输出 std::function<int32_t(int32_t)>
+                        // （回调形参类型含裸泛型名 T，mapType 递归物化）
+                        const TypeExpr* ft = (k < fnParamTypeExprs_[calleeName].size())
+                            ? fnParamTypeExprs_[calleeName][k] : nullptr;
+                        std::string wrapType = ft ? mapType(*ft) : ftStr;
+                        arg = wrapType + "(" + arg + ")";
+                        break;
+                    }
+                }
+            }
+            argExprs.push_back(arg);
+        }
+        if (!materialized.empty()) defaultArgMaterializedTypes_ = savedMat;
     }
 
     std::string prefix = needAwait ? "co_await " : "";
@@ -934,7 +1169,10 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
         std::vector<std::pair<std::string, const SemType*>> gcArgs;
         for (size_t i = 0; i < argExprs.size(); ++i) {
             const SemType* ty = nullptr;
-            if (i < e.args.size()) {
+            auto vit = viewArgTypes.find(i);
+            if (vit != viewArgTypes.end()) {
+                ty = vit->second.get();   // G3：record→view 转换后的实参按视图类型
+            } else if (i < e.args.size()) {
                 ty = e.args[i]->inferredType;
             } else if (isCtor) {
                 auto ctIt = methodDefaultArgs_.find(calleeName);
@@ -1078,6 +1316,16 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
             gArgs.emplace_back(obj, e.object->inferredType);
             return genGcRootedArgs(gArgs, call, isCoroutine);
         }
+        if (e.method == "next" && iArgs.empty()) {
+            // 视图直接调用 next()：值视图 {nextFn, self} 的运行时方法（与 for-in
+            // 循环体内 _it.get().next() 同入口，iterator.h Iterator<T>::next()）。
+            // 返回 Optional<T>* 为 GC 堆对象，调用点 let/match 绑定会按类型走
+            // GcRootHandle 保护，此处仅按 collect 惯例保护接收者视图 self。
+            std::string call = obj + ".next()";
+            std::vector<std::pair<std::string, const SemType*>> gArgs;
+            gArgs.emplace_back(obj, e.object->inferredType);
+            return genGcRootedArgs(gArgs, call, isCoroutine);
+        }
     }
 
     // 判断是否是 io 调用
@@ -1111,15 +1359,46 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
 
     // channel.send / channel.receive 需要 co_await（协程 channel 专用）
     // sync.ThreadChannel 的 send/receive 是阻塞调用，非协程 awaitable
-    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
-        if (channelVarNames_.count(id->name) && (e.method == "send" || e.method == "receive")) {
+    if (e.method == "send" || e.method == "receive") {
+        // 协程 channel 判定：变量名（channelVarNames_，let/构造跟踪）或 receiver 推断
+        // 类型（GenericSemType "channel"，覆盖方法/函数参数等未进 channelVarNames_ 的
+        // channel）。sync.Channel 的 inferredType 是 "sync.Channel"，不匹配，不受影响。
+        bool isCoroChannel = false;
+        if (auto* id = dynamic_cast<const Identifier*>(e.object.get()))
+            if (channelVarNames_.count(id->name)) isCoroChannel = true;
+        if (!isCoroChannel && e.object->inferredType) {
+            if (auto* g = dynamic_cast<const GenericSemType*>(e.object->inferredType))
+                if (g->name == "channel") isCoroChannel = true;
+        }
+        if (isCoroChannel) {
             bool isSyncChannel = false;
-            auto it = gcRootTypes_.find(id->name);
-            if (it != gcRootTypes_.end() && it->second.find("ThreadChannel") != std::string::npos)
-                isSyncChannel = true;
+            if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+                auto it = gcRootTypes_.find(id->name);
+                if (it != gcRootTypes_.end() && it->second.find("ThreadChannel") != std::string::npos)
+                    isSyncChannel = true;
+            }
             if (!isSyncChannel)
                 needAwait = needAwait || isCoroutine;
         }
+    }
+
+    // 用户自定义协程方法调用：receiver 类型（RecordSemType.canonicalName 截取 '<' 前，
+    // 与声明侧 receiverType 对齐）+ 方法名查 coroutineFunctions_（键 = "ReceiverType.
+    // methodName"）→ co_await。仅在当前协程上下文加（非协程上下文不能 co_await）。
+    // 方法体内调用协程方法（self.xxx()）由 decideCoro 传播标为协程，故 isCoroutine 恒真。
+    if (isCoroutine) {
+        std::string recvKey;
+        if (e.object->inferredType) {
+            if (auto* r = dynamic_cast<const RecordSemType*>(e.object->inferredType)) {
+                if (!r->canonicalName.empty()) {
+                    recvKey = r->canonicalName;
+                    size_t lt = recvKey.find('<');
+                    if (lt != std::string::npos) recvKey = recvKey.substr(0, lt);
+                }
+            }
+        }
+        if (!recvKey.empty() && coroutineFunctions_.count(recvKey + "." + e.method))
+            needAwait = true;
     }
 
     std::string prefix = needAwait ? "co_await " : "";
@@ -1164,6 +1443,10 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
             } else {
                 access = "->";
             }
+        } else if (e.object->inferredType && isIfaceView(e.object->inferredType)) {
+            // #3：对象是视图值（接口视图字段 r.s / Iterator 字段 / 条件表达式结果等）
+            // → 用 . 访问（视图是值类型，C++ 不允许 ->；视图字段的接口方法调用）
+            access = ".";
         } else {
             access = "->";
         }
@@ -1182,15 +1465,67 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
             recvTypeKey = g->name;
         } else if (auto* r = dynamic_cast<const RecordSemType*>(e.object->inferredType)) {
             if (!r->canonicalName.empty()) recvTypeKey = r->canonicalName;
+        } else if (auto* is = dynamic_cast<const InterfaceSemType*>(e.object->inferredType)) {
+            // G3：接口视图接收者（s.put(...)，s: Stringer 视图）→ 键 = 接口名，
+            // 与 genInterfaceDecl 注册的 methodInterfaceParams_/"接口名.methodName"
+            // 同键（methodDefaultArgs_/methodParamCppTypes_ 亦然）。此前视图接收者
+            // recvTypeKey 恒空，接口方法实参转换/默认参数/装箱全部查表不命中。
+            recvTypeKey = is->name;
         }
+    }
+    // M2：方法默认参数查询键 = 声明侧 receiver 名（与 methodDefaultArgs_ 注册键
+    // decl.receiverType + "." + decl.name 一致）。泛型 record 实例化的 canonicalName
+    // 含类型实参（如 "Box<int32_t>"）→ 截取 '<' 前为声明名 "Box"；非泛型 canonicalName
+    // 无 '<' 原样。仅 methodDefaultArgs_（默认参数补全）使用；装箱/接口参数查表仍用
+    // 原 recvTypeKey（形参 C++ 类型含未绑定泛型名 T，无法在调用点直接实例化装箱）。
+    std::string methodDefKey = recvTypeKey;
+    {
+        size_t lt = methodDefKey.find('<');
+        if (lt != std::string::npos) methodDefKey = methodDefKey.substr(0, lt);
     }
     // 先收集参数表达式（保持参数顺序：前面的实参 + 尾部的默认参数）
     std::vector<std::string> mArgExprs;
-    for (size_t i = 0; i < e.args.size(); ++i)
-        mArgExprs.push_back(genExpr(*e.args[i], isCoroutine));
+    // G1：方法/接口方法形参 Optional/Union 装箱（键 = recvTypeKey + "." + method，与
+    // methodDefaultArgs_ 同机制；record 方法由 genMethodDecl 注册、接口视图方法由
+    // genInterfaceDecl 注册）。b.use({..}) / s.put({..}) / Box2({..} ctor 走 genCallExpr
+    // isCtor 分支，不在此）→ 裸 record/值/列表直传 Optional/Union 方法形参时装箱。
+    auto mpIt = methodParamCppTypes_.find(recvTypeKey + "." + e.method);
+    // G3：方法/接口方法接口参数（record 实参直传接口视图形参 → record→view）。
+    auto miIt = methodInterfaceParams_.find(recvTypeKey + "." + e.method);
+    // G3：被 record→view 转换的实参 idx → 视图类型标记（genGcRootedArgs 据此走
+    // 视图值分支，不生成 GcRootHandle<视图> 坏根；见 makeIfaceViewMarker）。
+    std::map<size_t, std::unique_ptr<SemType>> viewArgTypes;
+    for (size_t i = 0; i < e.args.size(); ++i) {
+        std::string marg = genExpr(*e.args[i], isCoroutine);
+        // G3：接口参数转换——record 实参直传接口视图形参 → genRecordToViewIIFE
+        // （gcConstruct 适配器 + ::view，与 genCallExpr fnInterfaceParams_ 同构）。
+        // 视图变量实参（InterfaceSemType）透传不二次包装；Optional/Union 形参
+        // （paramCpp 非直连接口名，未注册进 methodInterfaceParams_）不在此处理。
+        if (miIt != methodInterfaceParams_.end()) {
+            for (auto& [idx, ifaceName] : miIt->second) {
+                if (idx == i) {
+                    const SemType* argTy = e.args[i]->inferredType;
+                    if (argTy && dynamic_cast<const InterfaceSemType*>(argTy)) {
+                        // 视图变量透传：不包装
+                    } else if (auto* rt = dynamic_cast<const RecordSemType*>(argTy)) {
+                        if (!rt->canonicalName.empty()) {
+                            marg = genRecordToViewIIFE(marg, rt->canonicalName, ifaceName);
+                            viewArgTypes[i] = makeIfaceViewMarker(ifaceName);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if (mpIt != methodParamCppTypes_.end() && i < mpIt->second.size()) {
+            std::string boxed = genParamBoxing(mpIt->second[i], *e.args[i], isCoroutine);
+            if (!boxed.empty()) marg = boxed;
+        }
+        mArgExprs.push_back(marg);
+    }
     // C5.3: 方法默认参数补齐（跨模块 ctor（isNsCtor）默认参数 v1 不支持）
     if (!isNs && !isNsCtor) {
-        if (auto mmIt = methodDefaultArgs_.find(recvTypeKey + "." + e.method); mmIt != methodDefaultArgs_.end())
+        if (auto mmIt = methodDefaultArgs_.find(methodDefKey + "." + e.method); mmIt != methodDefaultArgs_.end())
             for (size_t k = e.args.size(); k < mmIt->second.size(); ++k)
                 if (mmIt->second[k]) mArgExprs.push_back(genExpr(*mmIt->second[k], isCoroutine));
     }
@@ -1207,9 +1542,12 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         }
     }
     // 第 i 个参数的 inferredType（实参 → 方法默认 → 跨模块默认），供 GC 保护判断
+    // G3：record→view 转换后的实参返回视图类型标记（isIfaceView 判定用）
     auto mArgType = [&](size_t i) -> const SemType* {
+        auto vit = viewArgTypes.find(i);
+        if (vit != viewArgTypes.end()) return vit->second.get();
         if (i < e.args.size()) return e.args[i]->inferredType;
-        if (auto mmIt = methodDefaultArgs_.find(recvTypeKey + "." + e.method);
+        if (auto mmIt = methodDefaultArgs_.find(methodDefKey + "." + e.method);
             mmIt != methodDefaultArgs_.end() && i < mmIt->second.size() && mmIt->second[i])
             return mmIt->second[i]->inferredType;
         if (isNs) {
@@ -1354,7 +1692,10 @@ std::string CodeGenerator::genUnionDispatch(const MethodCallExpr& e,
             << e.method << "'\");\n";
         out << indentStr();
         if (!retIsVoid) out << "return ";
-        out << "_dsp_v->get<" << I << ">()->" << safeName(e.method) << "(";
+        // #3：接口视图变体是值类型（Stringer），用 . 访问；其余变体用 ->
+        out << "_dsp_v->get<" << I << ">()"
+            << (isIfaceView(u.variants[I].get()) ? "." : "->")
+            << safeName(e.method) << "(";
         for (size_t i = 0; i < argExprs.size(); ++i) {
             if (i > 0) out << ", ";
             out << argExprs[i];
@@ -1370,7 +1711,9 @@ std::string CodeGenerator::genUnionDispatch(const MethodCallExpr& e,
         for (size_t k : sups) {
             out << indentStr() << "case " << k << ": ";
             if (!retIsVoid) out << "return ";
-            out << "_dsp_v->get<" << k << ">()->" << safeName(e.method) << "(";
+            out << "_dsp_v->get<" << k << ">()"
+                << (isIfaceView(u.variants[k].get()) ? "." : "->")
+                << safeName(e.method) << "(";
             for (size_t i = 0; i < argExprs.size(); ++i) {
                 if (i > 0) out << ", ";
                 out << argExprs[i];
@@ -1467,10 +1810,22 @@ std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) 
         value = unionHasNone ? "aura_rt::None" : genExpr(*e.value, isCoroutine);
     } else {
         // P3b 隐式装箱：目标为含堆联合（Variant 指针）且赋非联合值 → make_variant<I>
+        // G1 延伸：目标为 Optional（OptionalSemType / GenericSemType{name=="Optional"}）
+        // 且赋裸值（record/值/列表，如 o = {..} / arr[0] = {..}）→ make_optional 装箱
         std::string boxed;
         if (e.target && e.target->inferredType) {
             if (auto* u = dynamic_cast<const UnionSemType*>(e.target->inferredType))
                 boxed = genUnionBoxing(*u, *e.value, isCoroutine);
+            else if (auto* os = dynamic_cast<const OptionalSemType*>(e.target->inferredType)) {
+                std::string elem = os->elementType ? mapSemType(*os->elementType) : "";
+                if (!elem.empty())
+                    boxed = genOptionalTargetInit(*e.value, elem, isCoroutine);
+            } else if (auto* gs = dynamic_cast<const GenericSemType*>(e.target->inferredType);
+                       gs && gs->name == "Optional") {
+                std::string elem = optionalElemCppName(gs);
+                if (!elem.empty())
+                    boxed = genOptionalTargetInit(*e.value, elem, isCoroutine);
+            }
         }
         if (!boxed.empty())
             value = boxed;
@@ -1554,6 +1909,33 @@ std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) 
                      + ", " + fieldAddr + ", " + value + ")";
             }
         }
+        // G3：接口视图值（InterfaceSemType，isIfaceView）是值类型 {方法Fn, self}
+        // 非指针 → static_cast<GcObject*>(value) 编译失败（方法体/构造体
+        // `self.s = s`，s: Stringer/Greetable 视图）。视图的 GC 引用在 self 成员
+        // （desc 已按 offsetof(Box,s)+offsetof(Stringer,self) 注册 self 子偏移）→
+        // 写屏障取 fieldAddr.self / value.self。值本身是指针（如
+        // Optional<Stringer>*）时 isIfaceView=false 走下方 static_cast 不变。
+        // 仅当目标字段未被装箱成指针（union/Optional 目标已把视图 make_variant/
+        // make_optional 成 Variant/Optional 指针，value 非视图，.self 对指针非法）
+        // 时取 .self；目标类型缺失时视图值必非指针，.self 安全。
+        if (isIfaceView(e.value->inferredType)) {
+            bool boxedToPointer = false;
+            if (e.target && e.target->inferredType) {
+                if (dynamic_cast<const UnionSemType*>(e.target->inferredType))
+                    boxedToPointer = true;
+                else if (dynamic_cast<const OptionalSemType*>(e.target->inferredType))
+                    boxedToPointer = true;
+                else if (auto* gs = dynamic_cast<const GenericSemType*>(e.target->inferredType);
+                         gs && gs->name == "Optional")
+                    boxedToPointer = true;
+            }
+            if (!boxedToPointer) {
+                return target + " = " + value + ";\n" + indentStr()
+                     + "aura_rt::gc_write_barrier(" + parentObj
+                     + ", &(" + target + ".self)"
+                     + ", (" + value + ").self)";
+            }
+        }
         return target + " = " + value + ";\n" + indentStr()
              + "aura_rt::gc_write_barrier(" + parentObj
              + ", " + fieldAddr
@@ -1628,6 +2010,92 @@ std::string CodeGenerator::genConditionalExpr(const ConditionalExpr& e, bool isC
 // ============================================================
 // 闭包表达式 → C++20 lambda
 // ============================================================
+
+// M3：从「形参类型表达式 + 调用点实参 SemType」递归推导泛型绑定（泛型名 → 具体
+// C++ 类型）。调用点 useT(5,10) 缺默认实参 cb 时，cb 默认闭包 fun(x:T)->T 中的 T
+// 需按调用点实参物化为 int32_t，否则生成模板 lambda []<typename T>(T x)->T 无法向
+// 具体 std::function<int(int)> 函数模板形参推导匹配。currentTParams_ 中的外层模板
+// 参数名不物化（由外层声明提供，闭包直接引用即可）。
+void CodeGenerator::collectMaterializedFromType(
+    const TypeExpr& formal, const SemType& arg,
+    std::map<std::string, std::string>& out)
+{
+    auto notInOuter = [this](const std::string& name) {
+        for (auto& tp : currentTParams_)
+            if (tp == name) return false;
+        return true;
+    };
+    // 实参 → 可物化的 C++ 类型串；返回空表示不可物化（Error / 未绑定泛型且非外层
+    // 模板参数）。未绑定泛型实参仅当它是外层模板参数（如泛型函数体内调用
+    // useT2(inc,v) 的 U）时有 C++ 名（其模板参数名），否则 mapSemType 会兜底 "auto"。
+    auto argCpp = [this](const SemType& a) -> std::string {
+        if (dynamic_cast<const ErrorSemType*>(&a)) return "";
+        if (auto* gs = dynamic_cast<const GenericSemType*>(&a)) {
+            if (gs->resolvedName.empty()) {
+                for (auto& tp : currentTParams_)
+                    if (tp == gs->name) return gs->name;
+                return "";
+            }
+        }
+        return mapSemType(a);
+    };
+    // <T> 泛型引用：实参可物化时绑定
+    if (auto* g = dynamic_cast<const GenericTypeRef*>(&formal)) {
+        if (notInOuter(g->name)) {
+            std::string cpp = argCpp(arg);
+            if (!cpp.empty()) out[g->name] = cpp;
+        }
+        return;
+    }
+    if (auto* n = dynamic_cast<const NamedType*>(&formal)) {
+        // 裸名泛型形参（v: T，TypeParser 解析为 NamedType）→ 绑定
+        if (n->typeArgs.empty() && notInOuter(n->name)
+            && !registeredTypes_.count(n->name)
+            && !interfaceNames_.count(n->name)
+            && !BuiltinRegistry::get().findType(n->name)) {
+            std::string cpp = argCpp(arg);
+            if (!cpp.empty()) out[n->name] = cpp;
+            return;
+        }
+        // 泛型类型别名/record 实例化（Transform<T>）：从函数类型实参递归匹配 typeArgs
+        if (auto* fst = dynamic_cast<const FuncSemType*>(&arg)) {
+            for (size_t k = 0; k < n->typeArgs.size(); ++k)
+                if (n->typeArgs[k] && k < fst->paramTypes.size() && fst->paramTypes[k])
+                    collectMaterializedFromType(*n->typeArgs[k], *fst->paramTypes[k], out);
+        }
+        return;
+    }
+    if (auto* l = dynamic_cast<const ListType*>(&formal)) {
+        if (auto* ls = dynamic_cast<const ListSemType*>(&arg))
+            if (l->elementType && ls->elementType)
+                collectMaterializedFromType(*l->elementType, *ls->elementType, out);
+        return;
+    }
+    if (auto* fn = dynamic_cast<const FunctionType*>(&formal)) {
+        if (auto* fst = dynamic_cast<const FuncSemType*>(&arg)) {
+            for (size_t k = 0; k < fn->paramTypes.size() && k < fst->paramTypes.size(); ++k)
+                if (fn->paramTypes[k] && fst->paramTypes[k])
+                    collectMaterializedFromType(*fn->paramTypes[k], *fst->paramTypes[k], out);
+            if (fn->returnType && fst->returnType)
+                collectMaterializedFromType(*fn->returnType, *fst->returnType, out);
+        }
+        return;
+    }
+}
+
+void CodeGenerator::collectDefaultArgGenericMap(
+    const std::string& calleeName,
+    const std::vector<std::unique_ptr<ASTNode>>& args,
+    std::map<std::string, std::string>& out)
+{
+    auto pIt = fnParamTypeExprs_.find(calleeName);
+    if (pIt == fnParamTypeExprs_.end()) return;
+    for (size_t i = 0; i < args.size() && i < pIt->second.size(); ++i) {
+        const TypeExpr* ft = pIt->second[i];
+        if (!ft || !args[i] || !args[i]->inferredType) continue;
+        collectMaterializedFromType(*ft, *args[i]->inferredType, out);
+    }
+}
 
 std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     if (!e.body) return "[]{}";
@@ -1733,6 +2201,45 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
                 genericParams.erase(g);
                 returnOnlyGenerics.insert(g);
             }
+        }
+    }
+
+    // 剔除外层函数/方法模板参数（currentTParams_）中的泛型名：闭包类型位置引用外层
+    // 模板参数（如泛型方法 `fun(x: T) -> T` 中的 T）时 genericParams 会收集到 T；若
+    // 再为闭包声明 `typename T` 将遮蔽外层 template<...>（g++ -Wtemplate-body error）。
+    // 外层参数由外层声明、闭包直接引用即可，故从三个泛型集合中剔除；闭包自身新泛型
+    // （不在 currentTParams_ 中，如 make_adder 的 T / 闭包独立 U）仍正常声明。
+    // 同时剔除 M3 调用点已物化的默认参数闭包泛型名（defaultArgMaterializedTypes_）：
+    // 物化后闭包按具体类型生成普通 lambda（[](int32_t x)->int32_t），不得再声明模板
+    // 参数——模板 lambda 无法向具体 std::function<int(int)> 函数模板形参推导匹配。
+    std::vector<std::string> excludeNames = currentTParams_;
+    for (auto& [g, cpp] : defaultArgMaterializedTypes_) excludeNames.push_back(g);
+    for (auto& tp : excludeNames) {
+        genericParams.erase(tp);
+        returnOnlyGenerics.erase(tp);
+        // 回调返回类型泛型（callableResultGenerics 为逗号分隔名列表）同样剔除：
+        // 否则 `using T = invoke_result_t<...>` 同样遮蔽外层 T。
+        for (auto& cs : callableResultGenerics) {
+            std::string filtered;
+            bool firstPart = true;
+            size_t pos = 0;
+            while (pos <= cs.size()) {
+                size_t comma = cs.find(',', pos);
+                std::string part = cs.substr(pos, comma == std::string::npos
+                                                 ? std::string::npos : comma - pos);
+                size_t ts = part.find_first_not_of(" \t");
+                if (ts != std::string::npos) part = part.substr(ts);
+                size_t te = part.find_last_not_of(" \t");
+                if (te != std::string::npos) part = part.substr(0, te + 1);
+                if (!part.empty() && part != tp) {
+                    if (!firstPart) filtered += ", ";
+                    filtered += part;
+                    firstPart = false;
+                }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            cs = filtered;
         }
     }
 
@@ -1848,6 +2355,15 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     }
 
     // === 函数体 ===
+    // M4/M5：外层闭包自身模板参数压栈——内层闭包引用外层闭包泛型（如 makeU 的 U）
+    // 时，内层 genFunExpr 从 currentTParams_ 剔除外层泛型名（复用外层模板参数），
+    // 避免内层重声明 `[]<typename U>` 遮蔽外层 → g++ -Wtemplate-body error。
+    // 必须在外层闭包自身泛型剔除（上方 excludeNames 用旧 currentTParams_ 算完）之后
+    // 压栈：外层闭包仍声明自身模板参数，而内层闭包生成时可见外层泛型名。兄弟闭包
+    // 互不影响（退出恢复）。
+    auto savedClosureTParams = currentTParams_;
+    for (auto& g : genericParams) currentTParams_.push_back(g);
+
     oss << " {\n";
     indentLevel_++;
 
@@ -1896,35 +2412,70 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     }
 
     // returnOnlyGenerics via captured callables（如 make_tree_mapper 闭包中的 U）
+    // M4：保存外层闭包链的已声明 returnOnlyGenerics 集合——内层闭包生成 using 时感知
+    // 外层已声明的别名（跳过重复声明复用外层 U）；生成 body 后恢复，兄弟闭包互不影响
+    auto savedDeclaredROG = declaredReturnOnlyGenerics_;
     if (!returnOnlyGenerics.empty() && callableParamIndices.empty() && !calledCaptures.empty()) {
         // 用第一个被调用的捕获变量 + 第一个闭包模板参数（或闭包参数类型）计算
         std::string delegate = *calledCaptures.begin();
         // 尝试从闭包的第一个参数获取输入类型
+        // M4：此前只对「NamedType + typeArgs[0] 非空」（如 Tree<T> → T）取类型，其余
+        // （首参数为具体 NamedType 如 int，typeArgs 空）兜底 "auto" → 生成
+        // std::declval<auto>() 坏 C++。现对具体类型（int → int32_t）与其他类型形态
+        // （ListType/FunctionType 等）一律 mapType 整体类型；仅泛型容器保留取 typeArgs[0]
+        // （make_tree_mapper 形态：delegate 输入是节点内容泛型 T 而非整棵树）。
         std::string srcType = "auto";
         if (!e.params.empty() && e.params[0].type) {
-            auto* nt = dynamic_cast<const NamedType*>(e.params[0].type.get());
-            if (nt) {
-                // root: Tree<T> → srcType = T
+            if (auto* nt = dynamic_cast<const NamedType*>(e.params[0].type.get())) {
+                // root: Tree<T> → srcType = T（delegate 输入为内容泛型）
                 if (!nt->typeArgs.empty() && nt->typeArgs[0])
                     srcType = mapType(*nt->typeArgs[0]);
+                else
+                    srcType = mapType(*nt);   // 具体类型：int → int32_t
+            } else {
+                srcType = mapType(*e.params[0].type);
             }
         }
         for (auto& g : returnOnlyGenerics) {
+            // M4：若 g 已由外层闭包 returnOnlyGenerics 声明 `using g`，内层直接复用外层
+            // 别名（嵌套 lambda 体内可见），不再重复声明——否则内层 using U 与外层
+            // using U 嵌套遮蔽，且内层按自身 delegate/srcType 推导可能与外层不一致。
+            if (declaredReturnOnlyGenerics_.count(g)) continue;
             oss << indentStr()
                 << "using " << g << " = decltype("
                 << delegate << "(std::declval<" << srcType << ">()));\n";
+            declaredReturnOnlyGenerics_.insert(g);
         }
     }
 
     // C3.2: 闭包返回 Optional<T> 时跟踪元素类型（none() 直转 make_none<T> 用）
     // P1-2：闭包返回含 None 联合 / 含堆联合时同样填充 union 装箱状态（供 genReturnStmt
     // return none()/record→view 装箱），并保存/恢复外层函数状态防污染
+    // G2-B：同时保存/覆写/恢复 currentReturnCppType_——否则闭包体的 genReturnStmt
+    // （some/裸值装箱、RecordExpr returnIsOptional）读到外层函数的返回类型，外层返回
+    // Optional<X> 时闭包内 some(record)/return record 用外层元素 X 装箱（如外层
+    // Optional<Iterator<Point>> + 闭包 Optional<Point> → 错用 Iterator 元素）。
     auto savedReturnElem = currentReturnElem_;
+    auto savedReturnCppType = currentReturnCppType_;
     auto savedRetVariantTypes = std::move(currentReturnVariantCppTypes_);
     auto savedHasNoneVariant = currentReturnHasNoneVariant_;
     currentReturnVariantCppTypes_.clear();
     currentReturnHasNoneVariant_ = false;
     currentReturnElem_ = optionalElemOf(e.returnType.get());
+    // 覆写为闭包自身返回类型（与 lambda 签名 `-> ...` 的 mapType/mapSemType 一致）：
+    //   - 显式返回标注 → mapType（funSignature/methodSignature 同机制）
+    //   - 无标注但 Sema 推断出具体返回类型 → mapSemType
+    //   - 其余（无标注无推断 / void）→ 清空（genReturnStmt 不做任何 Optional/视图装箱）
+    if (e.returnType) {
+        currentReturnCppType_ = mapType(*e.returnType);
+    } else if (auto* fst = dynamic_cast<const FuncSemType*>(e.inferredType);
+               fst && fst->returnType
+               && !dynamic_cast<const NoneSemType*>(fst->returnType.get())
+               && !dynamic_cast<const ErrorSemType*>(fst->returnType.get())) {
+        currentReturnCppType_ = mapSemType(*fst->returnType);
+    } else {
+        currentReturnCppType_.clear();
+    }
     if (e.returnType && e.returnType->inferredType) {
         if (auto* u = dynamic_cast<const UnionSemType*>(e.returnType->inferredType)) {
             std::vector<std::string> cppTypes;
@@ -1972,8 +2523,11 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     stringVarNames_ = savedStringVars;
     valueTypeVarNames_ = savedValueVars;
     currentReturnElem_ = savedReturnElem;
+    currentReturnCppType_ = savedReturnCppType;
     currentReturnVariantCppTypes_ = std::move(savedRetVariantTypes);
     currentReturnHasNoneVariant_ = savedHasNoneVariant;
+    declaredReturnOnlyGenerics_ = savedDeclaredROG;   // M4：恢复外层闭包链声明状态
+    currentTParams_ = savedClosureTParams;            // M4/M5：恢复外层模板参数栈
 
     lastClosureIsCoro_ = closureIsCoro;
     return oss.str();

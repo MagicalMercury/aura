@@ -51,6 +51,30 @@ TEST(SemaIterator, RecordImplMissingNext) {
     EXPECT_TRUE(hasErrorContaining(diag, "does not implement required method 'next'"));
 }
 
+TEST(SemaIterator, RecordImplNextRecordElem) {
+    // gap7（2026-08-27）：record impl Iterator<Point> next() 返回 Optional<Point>。
+    // 声明侧物化缺 record '*'（Optional<Point>）vs 接口侧 substitute 补 '*'
+    // （Optional<Point*>）→ GenericSemType equals 字符串误报；修复后元素级语义
+    // 比较消除 '*' 差异 → 0 error。
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun (self Point impl Iterator<Point>) next() -> Optional<Point> { return none() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaIterator, RecordImplNextRecordElemCallable) {
+    // gap7 延伸：修复后 impl 方法可在 main 中直接调用（Sema 不报错）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun (self Point impl Iterator<Point>) next() -> Optional<Point> { return none() }"
+        " fun main(io: Io) { let p: Point = { x = 1, y = 2 }; let o = p.next() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
 // ============================================================
 // Iterator.from
 // ============================================================
@@ -173,4 +197,51 @@ TEST(SemaIterator, ForInString) {
         "fun main(io: Io) { let s = \"Aura\"; for ch in s { io.println(ch) } }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// Iterator 视图直接调用 next()（Sema 方法查找缺口修复）
+// ============================================================
+TEST(SemaIterator, ViewDirectNext) {
+    // next() 是 Iterator 接口核心纯虚方法，视图应允许直接调用，返回 Optional<elem>
+    // （修复前 GenericSemType{name=Iterator} 走 BuiltinRegistry 查表无 next → E013）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int, done: bool }"
+        " fun (self Point impl Iterator<Point>) next() -> Optional<Point> {"
+        "   if self.done { return none() }"
+        "   self.done = true"
+        "   let np: Point = { x = self.x, y = self.y, done = true }"
+        "   return some(np) }"
+        " fun main(io: Io) {"
+        "   let p: Point = { x = 1, y = 2, done = false };"
+        "   let it: Iterator<Point> = p;"
+        "   let o = it.next();"
+        "   let u = it.next().unwrap() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaIterator, ViewDirectNextChain) {
+    // range/map/filter 返回值（GenericSemType Iterator）也可直接调 next()
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let o1 = range(3).next();"
+        " let o2 = range(3).map(fun(x: int) -> int { return x * 2 }).next();"
+        " let o3 = range(3).filter(fun(x: int) -> bool { return x > 0 }).next() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaIterator, ViewDirectNextBareErrors) {
+    // 裸 Iterator（无类型实参，元素不可知）上 next() → 干净报错引导显式标注（仿 filter A5）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let it: Iterator = Iterator.from(fun() -> int { return 1 });"
+        " let o = it.next() }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot infer element type of next input"));
 }

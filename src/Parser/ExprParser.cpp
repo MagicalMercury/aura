@@ -184,19 +184,44 @@ std::unique_ptr<ASTNode> Parser::parseUnary() {
 std::unique_ptr<ASTNode> Parser::parseCall() {
     auto expr = parsePrimary();
 
+    // 解析调用实参（N2：普通调用 / B<int>(...) 显式类型实参调用共用）
+    auto parseCallArgs = [this](CallExpr* c) {
+        advance(); // (
+        if (!check(TokType::RParen)) {
+            do {
+                // 尽力模式防御：`f(match 5)` 等实参 parseExpr 失败返回 null →
+                // 跳过 null 实参（Parser 已报语法错误），避免 null 实参流入 Sema
+                // inferCall/checkCallArgs 空指针崩溃（⑬ CallExpr 空实参）
+                if (auto a = parseExpr()) c->args.push_back(std::move(a));
+            } while (match(TokType::Comma));
+        }
+        consume(TokType::RParen, "expected ')' after arguments");
+    };
+
     while (true) {
         if (check(TokType::LParen)) {
             auto call = std::make_unique<CallExpr>();
             setNodePos(call.get(), peek());
             call->callee = std::move(expr);
+            parseCallArgs(call.get());
+            expr = std::move(call);
+        } else if (dynamic_cast<Identifier*>(expr.get()) && check(TokType::Less)
+                   && lookaheadTypeArgsBeforeCall()) {
+            // N2：调用点显式类型实参 `B<int>(...)` / `M<int, string>(...)` ——仅当 < 后
+            // 确为类型列表、以 > 收尾且紧跟 '(' 时才按显式类型实参解析（lookahead 已与
+            // 比较运算消歧）；否则 < 留给 parseComparison 当比较运算。解析完 typeArgs
+            // 后继续循环，下一迭代 LParen 分支接管实参并挂上 typeArgs。
+            auto call = std::make_unique<CallExpr>();
+            setNodePos(call.get(), peek());
+            call->callee = std::move(expr);
 
-            advance(); // (
-            if (!check(TokType::RParen)) {
-                do {
-                    call->args.push_back(parseExpr());
-                } while (match(TokType::Comma));
-            }
-            consume(TokType::RParen, "expected ')' after arguments");
+            advance(); // <
+            do {
+                call->typeArgs.push_back(parseType());
+            } while (match(TokType::Comma));
+            consume(TokType::Greater, "expected '>' after type arguments");
+            // lookahead 已确认 '>' 后紧跟 '(' → 实参解析与普通调用共用
+            parseCallArgs(call.get());
             expr = std::move(call);
         } else if (match(TokType::Dot)) {
             auto& memberTok = consume(TokType::Identifier, "expected member name after '.'");
@@ -210,7 +235,8 @@ std::unique_ptr<ASTNode> Parser::parseCall() {
                 advance(); // (
                 if (!check(TokType::RParen)) {
                     do {
-                        mc->args.push_back(parseExpr());
+                        // 同 CallExpr：跳过 null 实参（parseExpr 失败），防 Sema 空指针崩溃
+                        if (auto a = parseExpr()) mc->args.push_back(std::move(a));
                     } while (match(TokType::Comma));
                 }
                 consume(TokType::RParen, "expected ')' after method arguments");
@@ -229,6 +255,41 @@ std::unique_ptr<ASTNode> Parser::parseCall() {
             idx->index  = parseExpr();
             consume(TokType::RBracket, "expected ']' after index expression");
             expr = std::move(idx);
+        } else if (check(TokType::LBrace)) {
+            // #5：具名 record 字面量 `TypeName { field = val, ... }`（README §3.4）。
+            // 仅当 expr 为 Identifier 且 !suppressNamedRecordLiteral_ 且前瞻命中
+            // `{ Ident =`（或空 `{}`）时构造 RecordExpr；否则 break 保持现状——
+            // `{` 留给语句头 parseBlock / 上层报错。语句头抑制标志防止
+            // `for v in ch26 { v26 = v }` 等语句体被误当具名 record 字面量。
+            if (!suppressNamedRecordLiteral_) {
+                if (auto* id = dynamic_cast<Identifier*>(expr.get())) {
+                    bool lookaheadField = currentIdx_ + 2 < tokens_.size()
+                        && peekNext().type == TokType::Identifier
+                        && tokens_[currentIdx_ + 2].type == TokType::Assign;
+                    bool lookaheadEmpty = peekNext().type == TokType::RBrace;
+                    if (lookaheadField || lookaheadEmpty) {
+                        auto rec = std::make_unique<RecordExpr>();
+                        setNodePos(rec.get(), peek());
+                        rec->typeName = id->name;
+                        advance(); // {
+                        if (!check(TokType::RBrace)) {
+                            do {
+                                RecordField f;
+                                auto& nameTok = consume(TokType::Identifier, "expected field name");
+                                f.name = nameTok.lexeme;
+                                consume(TokType::Assign, "expected '=' in record field");
+                                f.value = parseExpr();
+                                rec->fields.push_back(std::move(f));
+                            } while (match(TokType::Comma));
+                        }
+                        consume(TokType::RBrace, "expected '}' after record literal");
+                        expr = std::move(rec);
+                        // 循环继续：天然支持 Point{x=1}.x / take(Point{x=1}) 等后缀
+                        continue;
+                    }
+                }
+            }
+            break;
         } else {
             break;
         }
@@ -376,6 +437,48 @@ std::unique_ptr<ASTNode> Parser::parseFunExpr() {
 
     fe->body = parseBlock();
     return fe;
+}
+
+// ============================================================
+// N2：调用点显式类型实参 `B<int>(...)` 与比较运算 `a < b` 的语法消歧
+// ============================================================
+
+bool Parser::skipTypeTokens(size_t& i) const {
+    // 命名空间前缀 + 类型名：a.b.C（仅标识符开头，覆盖内置类型名 int/string/bool 等）
+    if (i >= tokens_.size() || tokens_[i].type != TokType::Identifier) return false;
+    ++i;
+    while (i + 1 < tokens_.size() && tokens_[i].type == TokType::Dot
+           && tokens_[i + 1].type == TokType::Identifier) i += 2;
+    // 嵌套泛型实参：Ident<T1, T2, ...>（T1/T2 递归跳过；如 Transform<int>）
+    if (i < tokens_.size() && tokens_[i].type == TokType::Less) {
+        ++i;  // 跳过 '<'
+        if (i < tokens_.size() && tokens_[i].type == TokType::Greater) { ++i; return true; }
+        while (i < tokens_.size()) {
+            if (tokens_[i].type == TokType::Greater) { ++i; return true; }
+            if (tokens_[i].type == TokType::Comma) { ++i; continue; }
+            if (!skipTypeTokens(i)) return false;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Parser::lookaheadTypeArgsBeforeCall() {
+    // 调用方已确认 peek() 是 '<'（currentIdx_ 指向 '<'）。跳过 '<' 后逐个类型实参，
+    // 必须以 '>' 收尾且紧跟 '(' 才判定为显式类型实参；任何其他 token 都判定为
+    // 比较运算（交给 parseComparison）。
+    size_t i = currentIdx_ + 1;  // 跳过 '<'
+    while (i < tokens_.size()) {
+        if (!skipTypeTokens(i)) return false;
+        if (i >= tokens_.size()) return false;
+        if (tokens_[i].type == TokType::Greater) {
+            ++i;
+            return i < tokens_.size() && tokens_[i].type == TokType::LParen;
+        }
+        if (tokens_[i].type == TokType::Comma) { ++i; continue; }
+        return false;
+    }
+    return false;
 }
 
 } // namespace Aura

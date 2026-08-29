@@ -462,6 +462,62 @@ TEST(ParserExpr, RecordLiteral) {
 }
 
 // ============================================================
+// #5：具名 record 字面量 `TypeName { field = val, ... }`
+// ============================================================
+TEST(ParserExpr, NamedRecordLiteral) {
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("let r = Point { x = 1, y = 2 }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* rec = as<RecordExpr>(letInitOf(*prog));
+    ASSERT_TRUE(rec != nullptr);
+    EXPECT_EQ(rec->typeName, "Point");
+    EXPECT_EQ(rec->fields.size(), (size_t)2);
+    EXPECT_EQ(rec->fields[0].name, "x");
+    EXPECT_EQ(rec->fields[1].name, "y");
+}
+
+TEST(ParserExpr, NamedRecordLiteralEmpty) {
+    // 空 `Point {}` → typeName="Point" 的空字段 record（Sema 报缺失字段）
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("let r = Point {}", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* rec = as<RecordExpr>(letInitOf(*prog));
+    ASSERT_TRUE(rec != nullptr);
+    EXPECT_EQ(rec->typeName, "Point");
+    EXPECT_EQ(rec->fields.size(), (size_t)0);
+}
+
+TEST(ParserExpr, NamedRecordLiteralChain) {
+    // Point { x = 1 }.x → 具名 record 后缀 member access（parseCall 循环继续）
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("let v = Point { x = 1, y = 2 }.x", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* ma = as<MemberAccessExpr>(letInitOf(*prog));
+    ASSERT_TRUE(ma != nullptr);
+    EXPECT_EQ(ma->member, "x");
+    auto* rec = as<RecordExpr>(ma->object.get());
+    ASSERT_TRUE(rec != nullptr);
+    EXPECT_EQ(rec->typeName, "Point");
+}
+
+TEST(ParserExpr, NamedRecordLiteralInCall) {
+    // take(Point { x = 1 }) → 实参位置具名 record
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("let r = take(Point { x = 1, y = 2 })", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* call = as<CallExpr>(letInitOf(*prog));
+    ASSERT_TRUE(call != nullptr);
+    ASSERT_EQ(call->args.size(), (size_t)1);
+    auto* rec = as<RecordExpr>(call->args[0].get());
+    ASSERT_TRUE(rec != nullptr);
+    EXPECT_EQ(rec->typeName, "Point");
+}
+
+// ============================================================
 // 闭包
 // ============================================================
 TEST(ParserExpr, ClosureBasic) {
@@ -559,3 +615,95 @@ TEST(ParserExpr, UnexpectedBrace) {
     ASSERT_TRUE(prog != nullptr);
     EXPECT_TRUE(diag.hasErrors());
 }
+
+// ============================================================
+// 调用点显式类型实参 B<int>(...)（N2，2026-08-29）
+// ============================================================
+TEST(ParserExpr, ExplicitTypeArgsCall) {
+    // B<int>(x)：<int> 解析为显式类型实参（typeArgs），(x) 为调用实参
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("B<int>(5)", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* call = as<CallExpr>(exprOf(*prog));
+    ASSERT_TRUE(call != nullptr);
+    EXPECT_EQ(call->typeArgs.size(), (size_t)1);
+    auto* nt = as<NamedType>(call->typeArgs[0].get());
+    ASSERT_TRUE(nt != nullptr);
+    EXPECT_EQ(nt->name, "int");
+    EXPECT_EQ(call->args.size(), (size_t)1);
+}
+
+TEST(ParserExpr, ExplicitTypeArgsCallMulti) {
+    // M<int, string>(a, b)：多类型参数 + 多实参
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("M<int, string>(1, \"s\")", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* call = as<CallExpr>(exprOf(*prog));
+    ASSERT_TRUE(call != nullptr);
+    EXPECT_EQ(call->typeArgs.size(), (size_t)2);
+    auto* nt0 = as<NamedType>(call->typeArgs[0].get());
+    auto* nt1 = as<NamedType>(call->typeArgs[1].get());
+    ASSERT_TRUE(nt0 != nullptr);
+    ASSERT_TRUE(nt1 != nullptr);
+    EXPECT_EQ(nt0->name, "int");
+    EXPECT_EQ(nt1->name, "string");
+    EXPECT_EQ(call->args.size(), (size_t)2);
+}
+
+TEST(ParserExpr, ExplicitTypeArgsNestedGeneric) {
+    // B<Transform<int>>(x)：嵌套泛型类型实参
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("B<Transform<int>>(5)", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* call = as<CallExpr>(exprOf(*prog));
+    ASSERT_TRUE(call != nullptr);
+    EXPECT_EQ(call->typeArgs.size(), (size_t)1);
+    auto* nt = as<NamedType>(call->typeArgs[0].get());
+    ASSERT_TRUE(nt != nullptr);
+    EXPECT_EQ(nt->name, "Transform");
+    EXPECT_EQ(nt->typeArgs.size(), (size_t)1);
+}
+
+TEST(ParserExpr, ExplicitTypeArgsNotParsedForComparison) {
+    // 消歧：a < b 是普通比较，不得解析为显式类型实参
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("a < b", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* bin = as<BinaryExpr>(exprOf(*prog));
+    ASSERT_TRUE(bin != nullptr);
+    EXPECT_EQ(bin->op, "<");
+    EXPECT_TRUE(as<Identifier>(bin->right.get()) != nullptr);
+}
+
+TEST(ParserExpr, ExplicitTypeArgsNotParsedForChain) {
+    // 消歧：a < b > c 链式比较（(a<b)>c），不得解析为 a<b>(c) 显式类型实参
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("a < b > c", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* bin = as<BinaryExpr>(exprOf(*prog));
+    ASSERT_TRUE(bin != nullptr);
+    EXPECT_EQ(bin->op, ">");
+    auto* lhs = as<BinaryExpr>(bin->left.get());
+    ASSERT_TRUE(lhs != nullptr);
+    EXPECT_EQ(lhs->op, "<");
+}
+
+TEST(ParserExpr, ExplicitTypeArgsNotParsedForAddRight) {
+    // 消歧：a < b + c 是 a < (b+c) 比较，< 后是 b 然后是 + → 不得解析为类型实参
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("a < b + c", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* bin = as<BinaryExpr>(exprOf(*prog));
+    ASSERT_TRUE(bin != nullptr);
+    EXPECT_EQ(bin->op, "<");
+    auto* rhs = as<BinaryExpr>(bin->right.get());
+    ASSERT_TRUE(rhs != nullptr);
+    EXPECT_EQ(rhs->op, "+");
+}
+

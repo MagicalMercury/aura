@@ -143,7 +143,10 @@ void ListExpr::print(std::ostream& os, int indent) const {
 
 void RecordExpr::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "RecordExpr" << '\n';
+    // #5：具名 record 字面量带类型名（RecordExpr[Point]），匿名保持 RecordExpr
+    os << "RecordExpr";
+    if (!typeName.empty()) os << "[" << typeName << "]";
+    os << '\n';
     for (auto& f : fields) {
         printIndent(os, indent + 1);
         os << f.name << " =" << '\n';
@@ -184,6 +187,13 @@ void CallExpr::print(std::ostream& os, int indent) const {
     printIndent(os, indent + 1);
     os << "callee:" << '\n';
     if (callee) callee->print(os, indent + 2);
+    if (!typeArgs.empty()) {
+        printIndent(os, indent + 1);
+        os << "typeArgs:" << '\n';
+        for (auto& t : typeArgs) {
+            if (t) t->print(os, indent + 2);
+        }
+    }
     printIndent(os, indent + 1);
     os << "args:" << '\n';
     for (auto& a : args) {

@@ -105,6 +105,73 @@ TEST(ParserStmt, ForMissingIn) {
 }
 
 // ============================================================
+// #5：语句头抑制回归——`for v in ch26 { v26 = v }` 等语句头 `Ident { Ident =`
+// 与具名 record 字面量完全同形，必须保证 iterable/condition 不被误吞（最高红线）
+// ============================================================
+TEST(ParserStmt, ForHeaderNotSwallowedAsNamedRecord) {
+    // used/5.aura L313/324/333 同形：ch26 { v26 = v } → iterable 是 Identifier{ch26}，
+    // `{` 是语句体（块内 v26 = v 赋值）
+    DiagnosticEngine diag;
+    auto prog = parseSource("fun f() { for v in ch26 { v26 = v } }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* fs = as<ForStmt>(firstStmt(*prog));
+    ASSERT_TRUE(fs != nullptr);
+    EXPECT_EQ(fs->itemName, "v");
+    auto* id = as<Identifier>(fs->iterable.get());
+    ASSERT_TRUE(id != nullptr);
+    EXPECT_EQ(id->name, "ch26");
+    ASSERT_TRUE(fs->body != nullptr);
+    ASSERT_EQ(fs->body->stmts.size(), (size_t)1);
+    // v26 = v 是表达式语句（ExprStmt 包 AssignExpr）
+    auto* es = as<ExprStmt>(fs->body->stmts[0].get());
+    ASSERT_TRUE(es != nullptr);
+    EXPECT_TRUE(as<AssignExpr>(es->expr.get()) != nullptr);
+}
+
+TEST(ParserStmt, WhileHeaderNotSwallowedAsNamedRecord) {
+    // while flag { x = 1 }：condition 是 Identifier{flag}，`{` 是语句体
+    DiagnosticEngine diag;
+    auto prog = parseSource("fun f() { while flag { x = 1 } }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* ws = as<WhileStmt>(firstStmt(*prog));
+    ASSERT_TRUE(ws != nullptr);
+    auto* id = as<Identifier>(ws->condition.get());
+    ASSERT_TRUE(id != nullptr);
+    EXPECT_EQ(id->name, "flag");
+    ASSERT_TRUE(ws->body != nullptr);
+}
+
+TEST(ParserStmt, IfHeaderNotSwallowedAsNamedRecord) {
+    // if cond { x = 1 }：condition 是 Identifier{cond}
+    DiagnosticEngine diag;
+    auto prog = parseSource("fun f() { if cond { x = 1 } }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* ifs = as<IfStmt>(firstStmt(*prog));
+    ASSERT_TRUE(ifs != nullptr);
+    auto* id = as<Identifier>(ifs->condition.get());
+    ASSERT_TRUE(id != nullptr);
+    EXPECT_EQ(id->name, "cond");
+    ASSERT_TRUE(ifs->thenBranch != nullptr);
+}
+
+TEST(ParserStmt, BlockAfterIdentNotSwallowedAsNamedRecord) {
+    // x { io.println(1) }：`{` 前瞻不命中 `{ Ident =`（io 后是 .），保持
+    // x 表达式语句 + 块语句（非具名 record）
+    DiagnosticEngine diag;
+    auto prog = parseSource("fun f() { x { io.println(1) } }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* es = as<ExprStmt>(firstStmt(*prog));
+    ASSERT_TRUE(es != nullptr);
+    auto* id = as<Identifier>(es->expr.get());
+    ASSERT_TRUE(id != nullptr);
+    EXPECT_EQ(id->name, "x");
+}
+
+// ============================================================
 // return / throw
 // ============================================================
 TEST(ParserStmt, ReturnNoExpr) {
@@ -497,4 +564,65 @@ TEST(ParserStmt, MultipleStatements) {
     ASSERT_TRUE(fn != nullptr);
     ASSERT_TRUE(fn->body != nullptr);
     EXPECT_EQ(fn->body->stmts.size(), (size_t)4);
+}
+
+// ============================================================
+// Phase 0 崩溃防御：语句头表达式解析失败产出空节点
+// Parser 对 `match { }` / `if { }` / `while { }` / `for x in { }`
+// 容忍产出空 expr/condition/iterable 节点（Sema check* 已防御并
+// 干净报错，见 test_sema_crashguard.cpp）。此处断言空节点形态，
+// 防 Parser 侧意外返回 nullptr 破坏 AST。
+// ============================================================
+TEST(ParserStmt, MatchNoExprAst) {
+    DiagnosticEngine diag;
+    auto prog = parseSource("fun f() { match { 1 => 2 } }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(diag.hasErrors());   // "unexpected '{' in expression"
+    auto* ms = as<MatchStmt>(firstStmt(*prog));
+    ASSERT_TRUE(ms != nullptr);
+    EXPECT_TRUE(ms->expr == nullptr);
+}
+
+TEST(ParserStmt, IfNoConditionAst) {
+    DiagnosticEngine diag;
+    auto prog = parseSource("fun f() { if { } }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(diag.hasErrors());
+    auto* ifs = as<IfStmt>(firstStmt(*prog));
+    ASSERT_TRUE(ifs != nullptr);
+    EXPECT_TRUE(ifs->condition == nullptr);
+}
+
+TEST(ParserStmt, WhileNoConditionAst) {
+    DiagnosticEngine diag;
+    auto prog = parseSource("fun f() { while { } }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(diag.hasErrors());
+    auto* ws = as<WhileStmt>(firstStmt(*prog));
+    ASSERT_TRUE(ws != nullptr);
+    EXPECT_TRUE(ws->condition == nullptr);
+}
+
+TEST(ParserStmt, ForNoIterableAst) {
+    DiagnosticEngine diag;
+    auto prog = parseSource("fun f() { for x in { } }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(diag.hasErrors());
+    auto* fs = as<ForStmt>(firstStmt(*prog));
+    ASSERT_TRUE(fs != nullptr);
+    EXPECT_TRUE(fs->iterable == nullptr);
+}
+
+TEST(ParserStmt, CallArgsSkipNull) {
+    // ⑬：实参 parseExpr 失败（match 5 非表达式开头）→ parseCall 跳过 null 实参，
+    // 不把 null 实参 push 进 args（Sema checkCallArgs 另有兜底防御）
+    DiagnosticEngine diag;
+    auto prog = parseSource("fun f() { take(match 5) }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(diag.hasErrors());
+    auto* es = as<ExprStmt>(firstStmt(*prog));
+    ASSERT_TRUE(es != nullptr);
+    auto* call = as<CallExpr>(es->expr.get());
+    ASSERT_TRUE(call != nullptr);
+    EXPECT_EQ(call->args.size(), (size_t)0);  // null 实参被跳过
 }

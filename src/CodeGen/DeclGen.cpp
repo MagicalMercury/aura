@@ -1,6 +1,9 @@
 #include "CodeGen.h"
 #include "../Sema/BuiltinRegistry.h"
+#include <algorithm>
+#include <set>
 #include <sstream>
+#include <utility>
 
 namespace Aura {
 
@@ -130,10 +133,41 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
                                       const InterfaceDecl& decl) {
     std::string name = decl.name;
 
+    // G1：注册接口方法形参 C++ 类型名（键 = "接口名.methodName"，与 genMethodCall 的
+    // recvTypeKey 机制一致；接口视图调用 s.put(u) 时实参 Optional/Union 装箱）。
+    // 必须在生成视图结构体前注册（A 遍，调用点可能先于接口声明生成）。
+    for (auto& m : decl.methods) {
+        std::vector<std::string> ptys;
+        ptys.reserve(m.params.size());
+        for (auto& p : m.params)
+            ptys.push_back(p.type ? mapType(*p.type) : "");
+        methodParamCppTypes_[name + "." + m.name] = std::move(ptys);
+        // G3：注册接口方法接口参数（键 = "接口名.methodName"，同键机制；接口视图
+        // 调用 g.use(u) 的 record 实参直传接口视图形参 → genMethodCall 做
+        // record→view）。注册条件与 #8 一致（用户接口 + 内置接口）。
+        methodInterfaceParams_.erase(name + "." + m.name);
+        for (size_t i = 0; i < m.params.size(); ++i) {
+            auto* nt = m.params[i].type
+                ? dynamic_cast<const NamedType*>(m.params[i].type.get())
+                : nullptr;
+            if (!nt) continue;
+            bool builtinIface = false;
+            for (auto& ai : BuiltinRegistry::get().auraiInterfaces())
+                if (ai->name == nt->name) { builtinIface = true; break; }
+            if (interfaceNames_.count(nt->name) || builtinIface)
+                methodInterfaceParams_[name + "." + m.name].push_back({i, nt->name});
+        }
+    }
+
     // 内置 Iterator：C++ 形态来自 runtime/builtin/iterator.h（aura_rt::Iterator<T>），
     // 不在此生成视图（避免与 runtime 的 Iterator<T> 重复/冲突）。
     // interfaces.aurai 中的声明仅供 Sema（方法签名），record impl 适配器走 genIfaceAdapter 特判。
     if (name == "Iterator") return;
+
+    // 接口视图结构体引用用户 record（Wrapper* / Transform<T>*），而 record struct 完整
+    // 定义在第三遍 B 才生成 → 此处输出 C++ 前向声明（problem.txt「接口声明中引用后置
+    // 类型」CodeGen 侧：接口方法签名引用后置 record 时视图结构体引用未声明类型）。
+    emitIfaceRecordForwardDecls(h, decl);
 
     // 泛型接口 → 模板视图（template<typename T> struct Comparable { ... }）
     // 方法签名中的泛型引用（GenericTypeRef → "T"）在模板作用域内有效
@@ -242,6 +276,75 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
 }
 
 // ============================================================
+// 接口视图引用的用户 record C++ 前向声明
+// ============================================================
+// 接口视图结构体（genInterfaceDecl）在第三遍 A 生成，而用户 record struct 完整定义在
+// 第三遍 B 才输出——接口方法签名引用后置 record（如 interface Getter { get() -> Wrapper }
+// 且 Wrapper 声明在接口之后）时，视图结构体/闭包适配器的 `Wrapper*` 引用未声明类型 →
+// g++ 'Wrapper' was not declared。此处递归收集签名引用的用户堆 record（registeredTypes_
+// 命中且为堆；排除接口名/内置类型），输出 C++ 前向声明（指针引用只需前向声明）。
+// 泛型 record（Transform<T>）输出模板前向声明，参数列表取自 typeAliasTemplateParams_。
+void CodeGenerator::emitIfaceRecordForwardDecls(std::ostream& h,
+                                                const InterfaceDecl& decl) {
+    std::set<std::string> emitted;
+    auto emitFwd = [&](const TypeExpr* t, auto&& self) -> void {
+        if (!t) return;
+        if (auto* n = dynamic_cast<const NamedType*>(t)) {
+            // 用户堆 record 才需前向声明（registeredTypes_ true）；接口名/内置类型/
+            // 非 record 别名（isHeap false）跳过；跨模块（命名空间限定）暂不处理
+            auto rt = registeredTypes_.find(n->name);
+            if (n->namespacePrefix.empty() && rt != registeredTypes_.end() && rt->second
+                && !interfaceNames_.count(n->name) && emitted.insert(n->name).second) {
+                auto tp = typeAliasTemplateParams_.find(n->name);
+                if (tp != typeAliasTemplateParams_.end() && !tp->second.empty()) {
+                    h << "template<";
+                    for (size_t i = 0; i < tp->second.size(); ++i) {
+                        if (i > 0) h << ", ";
+                        h << "typename " << tp->second[i];
+                    }
+                    h << ">\nstruct " << n->name << ";\n";
+                } else {
+                    h << "struct " << n->name << ";\n";
+                }
+            }
+            for (auto& a : n->typeArgs)
+                if (a) self(a.get(), self);
+            return;
+        }
+        if (auto* l = dynamic_cast<const ListType*>(t)) {
+            self(l->elementType.get(), self);
+            return;
+        }
+        if (auto* r = dynamic_cast<const RecordType*>(t)) {
+            for (auto& f : r->fields)
+                if (f.type) self(f.type.get(), self);
+            return;
+        }
+        if (auto* u = dynamic_cast<const UnionType*>(t)) {
+            for (auto& v : u->types)
+                if (v) self(v.get(), self);
+            return;
+        }
+        if (auto* fn = dynamic_cast<const FunctionType*>(t)) {
+            for (auto& p : fn->paramTypes)
+                if (p) self(p.get(), self);
+            self(fn->returnType.get(), self);
+            return;
+        }
+        if (auto* tp2 = dynamic_cast<const TupleTypeExpr*>(t)) {
+            for (auto& e : tp2->elementTypes)
+                if (e) self(e.get(), self);
+        }
+    };
+    for (auto& m : decl.methods) {
+        if (m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge) continue;
+        for (auto& p : m.params)
+            emitFwd(p.type.get(), emitFwd);
+        emitFwd(m.returnType.get(), emitFwd);
+    }
+}
+
+// ============================================================
 // "类型 × 接口"适配器（方案 B：record 保持不动，适配器持值持有根）
 // ============================================================
 
@@ -288,6 +391,11 @@ void CodeGenerator::genIfaceAdapter(std::ostream& h,
         }
         return t ? mapType(*t) : "auto";
     };
+    // 将 tmap 挂到全局类型映射上下文：mapType/mapGenericRef 递归代换泛型形参名，
+    // 使容器/复合类型内嵌 T（Optional<T> / [T] / Iterator<T> / Transform<T> / Box2<T>）
+    // 在 getFn 签名中递归实例化（对应 Sema 侧 substitute 在 TypeExpr 层的实现）。
+    // 仅本函数作用域内有效（退出前恢复），不影响其余 CodeGen 对 T 的原样输出。
+    auto savedTypeMap = std::exchange(ifaceTypeMap_, tmap);
     // 内置 Iterator：适配器 GC 化（单继承 GcObject），owner 裸指针经 desc 扫描；
     // 视图 {nextFn, self} 分派到 owner->next()（self 恒为适配器对象起始）
     if (iface.name == "Iterator") {
@@ -314,6 +422,7 @@ void CodeGenerator::genIfaceAdapter(std::ostream& h,
         h << "    return d;\n";
         h << "  }\n";
         h << "};\n\n";
+        ifaceTypeMap_ = std::move(savedTypeMap);
         return;
     }
     // 非 Iterator 接口：适配器 GC 化（单继承 GcObject），owner 裸指针经 desc 扫描；
@@ -359,6 +468,7 @@ void CodeGenerator::genIfaceAdapter(std::ostream& h,
     h << "    return d;\n";
     h << "  }\n";
     h << "};\n\n";
+    ifaceTypeMap_ = std::move(savedTypeMap);
 }
 
 // ============================================================
@@ -436,19 +546,62 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     // 注册回调类型参数（必须在 declarationsOnly return 之前，确保其他函数闭包体可见）
     fnInterfaceParams_.erase(decl.name);
     fnCallbackParams_.erase(decl.name);
+    // G1：注册函数形参 C++ 类型名（供 genCallExpr 的 Optional/Union 形参装箱判定）。
+    // 同样必须在 declarationsOnly return 之前注册（调用点可能先于定义生成）。
+    // 与 funSignature/mapParamType 同源（mapType），前缀判定只认 Optional/Variant，
+    // 泛型形参 T（mapType → "T"）与普通 record/list 形参均不命中、不装箱。
+    {
+        std::vector<std::string> ptys;
+        ptys.reserve(decl.params.size());
+        for (auto& p : decl.params)
+            ptys.push_back(p.type ? mapType(*p.type) : "");
+        fnParamCppTypes_[decl.name] = std::move(ptys);
+    }
+    // M3：注册函数形参类型表达式列表（供调用点补默认参数闭包时推导泛型绑定）。
+    // 与 fnParamCppTypes_ 同机制在 A 遍注册（调用点可能先于定义生成）。
+    {
+        std::vector<const TypeExpr*> ptes;
+        ptes.reserve(decl.params.size());
+        for (auto& p : decl.params)
+            ptes.push_back(p.type.get());
+        fnParamTypeExprs_[decl.name] = std::move(ptes);
+    }
     for (size_t i = 0; i < decl.params.size(); ++i) {
         if (auto* nt = decl.params[i].type
                 ? dynamic_cast<const NamedType*>(decl.params[i].type.get())
                 : nullptr) {
-            if (interfaceNames_.count(nt->name)) {
+            // #8：fnInterfaceParams_ 注册同时纳入内置接口（interfaces.aurai：
+            // Stringer / Comparable / Iterator）。interfaceNames_ 仅收集用户接口
+            // （CodeGen.cpp:91），内置接口作函数形参时不注册 → 调用点实参
+            // record→view 不接线 → 直赋 record 指针编译失败。此放开使
+            // f(u: Stringer) / f(q: Comparable<Point>) / f(fib: Iterator<int>)
+            // 均生成 gcConstruct<适配器> + ::view。
+            bool builtinIface = false;
+            for (auto& ai : BuiltinRegistry::get().auraiInterfaces())
+                if (ai->name == nt->name) { builtinIface = true; break; }
+            if (interfaceNames_.count(nt->name) || builtinIface) {
                 fnInterfaceParams_[decl.name].push_back({i, nt->name});
             }
         }
         // 仅当函数本身是模板时，才注册回调包装（需要模板参数 T, U 在作用域内）
-        if (!tparams.empty() && decl.params[i].type
-            && dynamic_cast<const FunctionType*>(decl.params[i].type.get())) {
-            auto ft = dynamic_cast<const FunctionType*>(decl.params[i].type.get());
-            fnCallbackParams_[decl.name].push_back({i, mapType(*ft)});
+        if (!tparams.empty() && decl.params[i].type) {
+            if (auto* ft = dynamic_cast<const FunctionType*>(decl.params[i].type.get())) {
+                fnCallbackParams_[decl.name].push_back({i, mapType(*ft)});
+            } else if (auto* nt = dynamic_cast<const NamedType*>(decl.params[i].type.get())) {
+                // 根因 B：NamedType 类型别名形参（Transform<int>/Transform<T>）同样注册
+                // 回调——此前仅认内联 FunctionType，NamedType 不注册 → genCallExpr 查表
+                // 不命中 → 裸 lambda 直传模板形参无法推导。仅模板类型别名
+                // （typeAliasTemplateParams_ 命中）+ 非堆（registeredTypes_ 为 false，
+                // 函数/联合类型别名；record 恒堆非回调）才注册：mapType 产出
+                // "Transform<int>"/"Transform<T>"，genCallExpr 用其构造 std::function
+                // （using 别名直接构造，等价 std::function<T(T)>），T 从实参 lambda 推导。
+                if (typeAliasTemplateParams_.count(nt->name)) {
+                    auto rt = registeredTypes_.find(nt->name);
+                    if (rt != registeredTypes_.end() && !rt->second)
+                        fnCallbackParams_[decl.name].push_back(
+                            {i, mapType(*decl.params[i].type)});
+                }
+            }
         }
     }
 
@@ -627,6 +780,72 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
             ? decl.receiverType                                   // ctor 键 = "ReceiverType"
             : decl.receiverType + "." + decl.name] = std::move(defaults);
     }
+    // G1：注册方法/构造形参 C++ 类型名（供 genMethodCall / genCallExpr isCtor 的
+    // Optional/Union 形参装箱）。构造函数键 = receiverType（genCallExpr isCtor 的
+    // calleeName = 记录名）；方法键 = "ReceiverType.methodName"。必须在 A 遍注册。
+    {
+        std::vector<std::string> ptys;
+        ptys.reserve(decl.params.size());
+        for (auto& p : decl.params)
+            ptys.push_back(p.type ? mapType(*p.type) : "");
+        if (decl.isConstructor)
+            fnParamCppTypes_[decl.receiverType] = std::move(ptys);
+        else
+            methodParamCppTypes_[decl.receiverType + "." + decl.name] = std::move(ptys);
+    }
+    // G3：注册方法接口参数（键 = "ReceiverType.methodName"，与 methodParamCppTypes_
+    // 同键机制；record 方法实参 record 直传接口视图形参 → genMethodCall 做
+    // record→view）。构造函数注册进 fnInterfaceParams_[receiverType]（genCallExpr
+    // isCtor 分支 calleeName = 记录名，L924 查表即命中，构造实参同样 record→view）。
+    // 注册条件与 genFunDecl（#8）一致：用户接口（interfaceNames_）+ 内置接口
+    // （Stringer/Comparable/Iterator，auraiInterfaces）。必须在 A 遍注册。
+    {
+        auto regIface = [&](std::map<std::string, std::vector<std::pair<size_t, std::string>>>& tbl,
+                            const std::string& key) {
+            tbl.erase(key);
+            for (size_t i = 0; i < decl.params.size(); ++i) {
+                auto* nt = decl.params[i].type
+                    ? dynamic_cast<const NamedType*>(decl.params[i].type.get())
+                    : nullptr;
+                if (!nt) continue;
+                bool builtinIface = false;
+                for (auto& ai : BuiltinRegistry::get().auraiInterfaces())
+                    if (ai->name == nt->name) { builtinIface = true; break; }
+                if (interfaceNames_.count(nt->name) || builtinIface)
+                    tbl[key].push_back({i, nt->name});
+            }
+        };
+        if (decl.isConstructor)
+            regIface(fnInterfaceParams_, decl.receiverType);
+        else
+            regIface(methodInterfaceParams_, decl.receiverType + "." + decl.name);
+    }
+    // Phase 3-⑥ 根因 B（构造侧）：构造函数 NamedType 类型别名回调形参注册进
+    // fnCallbackParams_[receiverType]（仿 G3 fnInterfaceParams_ 的 ctor 分支，genCallExpr
+    // isCtor 分支 calleeName = 记录名查表即命中）。仅模板构造函数（collectMethodTParams
+    // 非空，如 B<T> 的 receiverTypeArgs T）+ NamedType 非堆模板类型别名（Transform 函数/
+    // 联合类型别名）才注册：`B(f: Transform<T>)` 传裸闭包时调用点包装
+    // std::function<int(int)>(lambda) → B_ctor 的 T 可从形参推导。record（恒堆）非回调。
+    // 方法侧无需等价注册：方法模板参数 T 从 receiver 推导后形参具体化，裸 lambda 隐式
+    // 转换即可（t8 实测；且注册键 ReceiverType.methodName 对泛型 receiver 的调用点
+    // canonicalName 含类型实参无法匹配）。
+    if (decl.isConstructor) {
+        fnCallbackParams_.erase(decl.receiverType);
+        std::vector<std::string> ctparams = collectMethodTParams(decl);
+        if (!ctparams.empty()) {
+            for (size_t i = 0; i < decl.params.size(); ++i) {
+                if (auto* nt = decl.params[i].type
+                        ? dynamic_cast<const NamedType*>(decl.params[i].type.get())
+                        : nullptr) {
+                    if (!typeAliasTemplateParams_.count(nt->name)) continue;
+                    auto rt = registeredTypes_.find(nt->name);
+                    if (rt != registeredTypes_.end() && !rt->second)
+                        fnCallbackParams_[decl.receiverType].push_back(
+                            {i, mapType(*decl.params[i].type)});
+                }
+            }
+        }
+    }
     if (decl.isConstructor) {
         if (declarationsOnly) {
             // A 遍：生成 ctor 前向声明（调用点可能先于定义生成，如 main 在前调用 Counter()）
@@ -648,7 +867,7 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     }
     if (declarationsOnly) return;  // 方法声明已在 struct 内部，无需重复
 
-    bool isCoro = coroutineFunctions_.count(decl.name);
+    bool isCoro = coroutineFunctions_.count(decl.receiverType + "." + decl.name);
     currentFunctionIsCoroutine_ = isCoro;
     // Bug 2-B: 方法入口同样重置闭包协程标记（防跨函数泄漏，见 genFunDecl）
     lastClosureIsCoro_ = false;
@@ -666,13 +885,15 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
         tprefix += ">\n";
     }
 
-    // 构建带模板参数的接收者类型名
+    // 构建带模板参数的接收者类型名（只用 receiverTypeArgs——receiver 自身的泛型
+    // 参数；方法模板参数还可能含方法自身泛型（如形参 U），拼进 receiver 会造成
+    // 多拼（M1：Box<A,T,U>），故不复用全部 tparams）
     std::string recvFullType = decl.receiverType;
-    if (!tparams.empty()) {
+    if (!decl.receiverTypeArgs.empty()) {
         recvFullType += "<";
-        for (size_t i = 0; i < tparams.size(); ++i) {
+        for (size_t i = 0; i < decl.receiverTypeArgs.size(); ++i) {
             if (i > 0) recvFullType += ", ";
-            recvFullType += tparams[i];
+            recvFullType += decl.receiverTypeArgs[i];
         }
         recvFullType += ">";
     }
@@ -691,6 +912,24 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     }
 
     std::string retType = decl.returnType ? mapType(*decl.returnType) : "void";
+    // plan12 对称（对照 funSignature）：返回泛型函数类型别名（如 Mapper<A,U>）或
+    // 直接写泛型函数类型（fun(U,T)->U，且含"未在方法模板参数中的闭包自身泛型"）→
+    // 返回类型写 auto——闭包自身泛型 U/T 未在方法模板参数中，显式写
+    // std::function<U(U,T)> 会 'U' was not declared（M1/M5）；返回类型由闭包体推导。
+    // 若返回泛型均在方法模板参数中（如 Box<T>::identity() -> fun(T)->T 的 T），
+    // 保持显式返回类型（ClosureRefsOuterMethodTParamNoShadow 回归）。
+    if (decl.returnType && isFuncAliasRet(decl.returnType.get()))
+        retType = "auto";
+    else if (decl.returnType
+             && dynamic_cast<const FunctionType*>(decl.returnType.get())) {
+        std::set<std::string> retGen;
+        collectTParams(*decl.returnType, retGen);
+        for (auto& g : retGen)
+            if (std::find(tparams.begin(), tparams.end(), g) == tparams.end()) {
+                retType = "auto";
+                break;
+            }
+    }
 
     // 存储 C++ 返回类型，供 genReturnStmt 生成正确 RecordExpr
     currentReturnCppType_ = retType;
@@ -721,7 +960,15 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     if (fnIt != structFieldNames_.end() && fnIt->second.count(methodCppName))
         methodCppName += "_fun";
 
-    std::string sig = retType + " " + recvFullType + "::" + methodCppName + "(";
+    // 协程方法：签名包 aura_rt::task<ret>（对照函数侧 funSignature L739）。
+    // NoneType → void（task<void> 有 return_void()，task<NoneType> 没有）；auto（泛型
+    // 闭包返回）保持 auto，与 struct 内声明（pendingMethods_ 收集）一致。
+    std::string sigRet = retType;
+    if (isCoro && sigRet != "auto") {
+        if (sigRet == "aura_rt::NoneType") sigRet = "void";
+        sigRet = "aura_rt::task<" + sigRet + ">";
+    }
+    std::string sig = sigRet + " " + recvFullType + "::" + methodCppName + "(";
     for (size_t i = 0; i < decl.params.size(); ++i) {
         if (i > 0) sig += ", ";
         sig += (decl.params[i].type ? mapParamType(*decl.params[i].type) : "auto")
@@ -737,10 +984,12 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     }
     sig += ")";
 
-    // 模板方法：体放入头文件（跨模块可见）
-    std::ostream& out = tparams.empty()
-        ? static_cast<std::ostream&>(cpp)
-        : static_cast<std::ostream&>(h);
+    // 模板方法 / 返回类型推导方法（auto）：体放入头文件（跨模块可见）——
+    // 模板参数非空（模板方法）或返回类型为 auto（泛型闭包/函数式别名，返回类型依赖
+    // 闭包体推导，定义须在使用点可见，否则跨模块调用点无法推导 auto）
+    std::ostream& out = (!tparams.empty() || retType == "auto")
+        ? static_cast<std::ostream&>(h)
+        : static_cast<std::ostream&>(cpp);
 
     out << tprefix << sig << " {\n";
     currentReceiverName_ = decl.receiverName;
@@ -764,6 +1013,12 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
         }
     }
     if (decl.body) genBlock(out, *decl.body, isCoro);
+    bool lastIsReturn = decl.body && !decl.body->stmts.empty()
+        && dynamic_cast<const ReturnStmt*>(decl.body->stmts.back().get());
+    // 协程方法末尾无 return 时补 co_return（对齐函数侧 genFunDecl：task<void> 走
+    // return_void；仅依赖体内 co_await 也可被识别为协程，但显式 co_return 更稳健）
+    if (isCoro && !lastIsReturn)
+        out << "  co_return;\n";
     currentReceiverName_.clear();
     out << "}\n\n";
     clearVarTrackingState();
@@ -877,12 +1132,30 @@ void CodeGenerator::collectTParams(const TypeExpr& type, std::set<std::string>& 
         return;
     }
     if (auto* n = dynamic_cast<const NamedType*>(&type)) {
+        // 先递归收集 typeArgs 中的泛型变量（这些变量会原样出现在 C++ 形参类型中，
+        // 需作为函数/方法模板参数；如 Transform<T> 的 T、Pair<A,B> 的 A/B）。先收集
+        // 到独立集合 argGen 供下方「typeArgs 是否含泛型」判定复用（含嵌套，如
+        // Transform<[T]> 的 argGen={T}）。
+        std::set<std::string> argGen;
         for (auto& a : n->typeArgs)
-            if (a) collectTParams(*a, out);
-        // 若该名称是模板类型别名，添加其模板参数
+            if (a) collectTParams(*a, argGen);
+        for (auto& g : argGen) out.insert(g);
+        // 若该名称是模板类型别名，添加其模板参数——但仅当 typeArgs 含泛型变量且该
+        // 类型非已实例化 record（恒堆）时：
+        // - Transform<int>（typeArgs 全具体）→ C++ 形参 std::function<int(int)> 不含
+        //   T，收集 T 使函数/方法模板化但 T 不在形参 → 调用点无法推导（g++ no
+        //   matching / couldn't deduce template parameter）；
+        // - Transform<T>（typeArgs 含泛型 T）→ C++ 形参 std::function<T(T)> 含 T，
+        //   需收集（根因 A 修复后 t3/t4 由根因 B 的 std::function 包装推导）；
+        // - Pair<T,int>（已实例化 record）→ 其声明形参 A/B 不直接出现在 C++ 形参
+        //   （Pair<T,int>*），收集 A/B 造成方法模板参数冗余 Runner<A,B,T>（t13）。
         auto aliasIt = typeAliasTemplateParams_.find(n->name);
         if (aliasIt != typeAliasTemplateParams_.end()) {
-            for (auto& tp : aliasIt->second) out.insert(tp);
+            auto rit = registeredTypes_.find(n->name);
+            bool isRecord = rit != registeredTypes_.end() && rit->second;
+            if (!isRecord && !argGen.empty()) {
+                for (auto& tp : aliasIt->second) out.insert(tp);
+            }
             return;
         }
         // 排除内置类型（int/float/bool/string/None 不是泛型参数，无需 template<...>）
@@ -952,6 +1225,15 @@ std::vector<std::string> CodeGenerator::collectFunTParams(const FunDecl& decl) c
     return {names.begin(), names.end()};
 }
 
+bool CodeGenerator::isFuncAliasRet(const TypeExpr* retType) const {
+    if (!retType) return false;
+    auto* nt = dynamic_cast<const NamedType*>(retType);
+    if (!nt) return false;
+    auto it = registeredTypes_.find(nt->name);
+    return typeAliasTemplateParams_.count(nt->name) > 0
+        && it != registeredTypes_.end() && !it->second; // 函数式别名 registered non-heap
+}
+
 std::vector<std::string> CodeGenerator::collectMethodTParams(const MethodDecl& decl) const {
     std::set<std::string> names;
     // 优先从 receiverTypeArgs（如 Stack<T> 中的 T）
@@ -960,7 +1242,23 @@ std::vector<std::string> CodeGenerator::collectMethodTParams(const MethodDecl& d
     // 从参数类型中收集
     for (auto& p : decl.params)
         if (p.type) collectTParams(*p.type, names);
-    if (decl.returnType) collectTParams(*decl.returnType, names);
+    // 返回类型收集：函数式别名（Mapper<A,U>）不收集（闭包自身泛型 U 由闭包声明/调用点
+    // 推断，对照 collectFunTParams 的 FunctionType 分支，M1）；直接写泛型函数类型
+    // （fun(U,T)->U）仅在返回 FunctionType 含"未在 receiver/参数中出现的闭包自身新泛型"
+    // 时不收集返回类型泛型——否则外层方法被迫模板化 + struct 内声明 'U' was not declared
+    // （M5）；若返回泛型均在 receiver/参数中（如 Box<T>::identity() -> fun(T)->T 的 T），
+    // 保持收集（方法模板化 + 显式 std::function<T(T)>，ClosureRefsOuterMethodTParamNoShadow）。
+    if (decl.returnType && !isFuncAliasRet(decl.returnType.get())) {
+        bool skipRetGen = false;
+        if (auto* ft = dynamic_cast<const FunctionType*>(decl.returnType.get())) {
+            std::set<std::string> retGen;
+            collectTParams(*ft, retGen);
+            for (auto& g : retGen)
+                if (!names.count(g)) { skipRetGen = true; break; }
+        }
+        if (!skipRetGen)
+            collectTParams(*decl.returnType, names);
+    }
     return {names.begin(), names.end()};
 }
 

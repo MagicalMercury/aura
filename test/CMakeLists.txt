@@ -35,9 +35,20 @@ set(AURA_LIB_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/SemType.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/SymbolTable.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/SemAnalyzer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/SemTypeUtils.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Assignability.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/GenericSubstitution.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/TypeResolution.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/CanonicalPropagation.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/DeclChecker.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/TypeResolver.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/BodyChecker.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/StmtChecker.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/StmtFlow.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/StmtSync.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/ExprInfer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/CallInfer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/ExprInferMisc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/CodeGen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/TypeMap.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/DeclGen.cpp
@@ -79,10 +90,13 @@ set(AURA_TEST_SOURCES
     sema/test_sema_modules.cpp
     sema/test_sema_channel.cpp
     sema/test_sema_lock.cpp
+    sema/test_sema_list_optional.cpp
     sema/test_sema_record.cpp
+    sema/test_sema_record_optional.cpp
     sema/test_sema_spawn.cpp
     sema/test_sema_iterator.cpp
     sema/test_sema_functype.cpp
+    sema/test_sema_crashguard.cpp
 
     # ---- 代码生成 ----
     codegen/test_codegen.cpp

@@ -244,6 +244,52 @@ TEST(SemaFunType, GenericFunTypeAliasUse) {
     EXPECT_FALSE(diag.hasErrors());
 }
 
+// 方法体内闭包参数/返回类型引用外层方法模板参数 T 的合法形态（CodeGen 须不重声明
+// typename T 遮蔽外层模板参数；Sema 侧 T 是方法模板参数，应合法）
+TEST(SemaFunType, ClosureRefsOuterMethodTParamOk) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { value: T }"
+        " fun (self Box<T>) identity() -> fun(T) -> T {"
+        "   return fun(x: T) -> T { return x } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, ClosureRefsOuterFunTParamOk) {
+    // 顶层泛型函数体（函数被模板化）闭包引用函数模板 T
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun use_t(v: <T>) -> int {"
+        "   let f = fun(x: T) -> T { return x }"
+        "   return 0 }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, ClosureRefsOuterCtorTParamOk) {
+    // 泛型 record 构造体内闭包引用构造模板参数 T
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { value: T }"
+        " fun (self Box<T>) Box(v: T) {"
+        "   let f = fun(x: T) -> T { return x }"
+        "   self.value = f(v) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, ClosureRefsUnintroducedTRejected) {
+    // 对照：非模板函数内闭包引用未引入的 T → Sema 干净报错（不生成坏 C++）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun non_gen() -> int {"
+        "   let f = fun(x: T) -> T { return x }"
+        "   return 0 }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+}
+
 // ============================================================
 // 泛型函数
 // ============================================================
@@ -300,6 +346,56 @@ TEST(SemaFunType, UnionReturnAssign) {
     analyzeSource(
         "fun main(io: Io) {"
         " let g: fun() -> int | None = fun() -> int | None { return 5 } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// M5：返回类型直接写泛型函数类型（非别名形态）——裸泛型隐式引入
+// README §6.2.5 声称 `-> fun(U) -> U` / `-> fun([T], fun(T)->U) -> [U]` 时
+// 泛型自动隐式引入，此前 Sema 只对 NamedType 别名（Mapper<T,U>）生效
+// ============================================================
+TEST(SemaFunType, GenericFunTypeRetTopFun) {
+    // 顶层函数直接写泛型函数类型返回：U 隐式引入
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun makeU() -> fun(U) -> U {"
+        " return fun(x: U) -> U { return x } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericFunTypeRetMethod) {
+    // 方法直接写泛型函数类型返回（throws）：U/T 隐式引入（方法自身泛型）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box = { value: int }"
+        " fun (self Box) getU() -> fun(U, T) throws -> U {"
+        "   return fun(x: U, y: T) throws -> U { return x } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericFunTypeRetReaderForm) {
+    // README §6.2.5 原始示例（非别名）：fun([T], fun(T)->U) -> [U] 直接写
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun makeMapper2() -> fun([T], fun(T) -> U) -> [U] {"
+        "   return fun(items: [T], transform: fun(T) -> U) -> [U] {"
+        "     let r: [U] = []; for item in items { r.append(transform(item)) }"
+        "     return r } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericFunTypeRetNotShadowReceiver) {
+    // 回归：泛型 record 方法返回 fun(T)->T 时 T 是 receiver 泛型，仍合法
+    // （不被误当作闭包自身新泛型；CodeGen 侧保持显式 std::function<T(T)>）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { value: T }"
+        " fun (self Box<T>) identity() -> fun(T) -> T {"
+        "   return fun(x: T) -> T { return x } }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
 }
