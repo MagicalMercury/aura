@@ -174,6 +174,19 @@ inline GcString* concat(const T& a, GcString* b) {
     return a.to_string()->concat(*b);
 }
 
+// 泛型模板参数 T 上的二元 +（配套 CodeGen genBinaryExpr `+` 分支泛型短路，bug-15/bug-23）：
+// 模板体在 CodeGen 阶段生成时 T 未具体，无法静态区分 string（GcString*）与数值类型。
+// 任一侧可转为 GcString* 即走 concat（concat 重载族覆盖 GcString*×GcString* /
+// 数值×GcString* 双向），否则原生 +（数值加法）→ 同一模板 string/int/float 多实例化共存。
+template <typename A, typename B>
+auto plus_generic(A a, B b) {
+    if constexpr (std::is_convertible_v<A, GcString*> || std::is_convertible_v<B, GcString*>) {
+        return concat(a, b);
+    } else {
+        return a + b;
+    }
+}
+
 // ============================================================
 // 向后兼容别名（逐步迁移后可移除）
 // ============================================================

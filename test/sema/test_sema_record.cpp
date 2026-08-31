@@ -624,3 +624,223 @@ TEST(SemaRecord, NamedRecordLiteralForHeaderSameShape) {
         diag);
     EXPECT_FALSE(diag.hasErrors());
 }
+
+// ============================================================
+// bug-01 / bug-13（2026-08-30）：record 直调未注册方法 E013 +
+// record 闭包字段方法调用 b.f(10) 推断（CallInfer.cpp:548 统一修复点「先字段后 E013」）
+// ============================================================
+TEST(SemaRecord, UnknownMethodCallE013) {
+    // bug-01：record 直调未注册方法 → 不再静默放行（原坏 C++/G4 误导），报干净 E013
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let p: Point = { x = 1, y = 2 }; let r = p.next() }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorCode(diag, Aura::DiagCode::E013_MethodNotFound));
+    EXPECT_TRUE(hasErrorContaining(diag, "record type 'Point' has no method 'next'"));
+}
+
+TEST(SemaRecord, UnknownMethodCallNoG4Stack) {
+    // bug-01：无标注形态只报一条 E013——G4 兜底（cannot infer element type）被
+    // !diag_.hasErrors() 守卫抑制，不叠加误导
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let p: Point = { x = 1, y = 2 }; let r = p.next() }",
+        diag);
+    EXPECT_EQ(diag.errorCount(), 1);
+}
+
+TEST(SemaRecord, UnknownMethodHintListsMethods) {
+    // bug-01：hint 列出已声明方法名（仿内置 listMethodNames 格式），引导正确用法
+    // （hint 存于 Diagnostic::fixHint，errorMessages() 仅含 message）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun (self Point) offset(dx: int) -> int { return self.x + dx }"
+        " fun main(io: Io) { let p: Point = { x = 1, y = 2 }; let r = p.next() }",
+        diag);
+    bool hintFound = false;
+    for (const auto& d : diag.diagnostics())
+        if (d.fixHint.find("valid methods: offset") != std::string::npos) { hintFound = true; break; }
+    EXPECT_TRUE(hintFound);
+}
+
+TEST(SemaRecord, FieldClosureCallInfers) {
+    // bug-13：record 闭包字段 b.f(10) 方法形态 → 回退字段为 FuncSemType → 按闭包调用
+    // 推断出返回类型（int），无标注不再 G4、不报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Transform<T> = fun(T) -> T"
+        " type B4<T> = { f: Transform<T> }"
+        " fun main(io: Io) {"
+        "   let b: B4<int> = { f = fun(x: int) -> int { return x + 1 } }"
+        "   let r = b.f(10) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaRecord, NonClosureFieldNotCallable) {
+    // 修复方案 3（审查验证项 3）：字段命中但非 FuncSemType → 报 field not callable（非 E013）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let p: Point = { x = 1, y = 2 }; let r = p.x(5) }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "is not callable"));
+}
+
+TEST(SemaRecord, TupleRecordUnknownMethodE013) {
+    // 审查验证项 2：元组 record（isTuple=true、canonicalName 空）直调未注册方法 →
+    // typeMethods_.find("") 安全未命中 → E013，无空键误命中路径
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun get_pair() -> (int, int) { return 1, 2 }"
+        " fun main(io: Io) { let t: (int, int) = get_pair(); let r = t.next() }",
+        diag);
+    EXPECT_TRUE(hasErrorCode(diag, Aura::DiagCode::E013_MethodNotFound));
+    EXPECT_TRUE(hasErrorContaining(diag, "has no method 'next'"));
+}
+
+// ============================================================
+// bug-08（2026-08-31）：int/float/bool 值类型上调用方法被 Sema 放行 →
+// 坏 C++。修复：PrimSemType 分支补 Int/Float/Bool typeKey →
+// BuiltinRegistry 查表恒空 → 报干净 E013。
+// ============================================================
+TEST(SemaRecord, IntValueMethodCallE013) {
+    // int 变量 x.to_string()（无标注）→ 干净 E013，不再静默放行
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let x = 42; let r = x.to_string() }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorCode(diag, Aura::DiagCode::E013_MethodNotFound));
+    EXPECT_TRUE(hasErrorContaining(diag, "type 'int' has no method 'to_string'"));
+}
+
+TEST(SemaRecord, IntValueMethodCallNoG4Stack) {
+    // bug-08 无标注形态只报一条 E013——G4 兜底（cannot infer element type）被
+    // !diag_.hasErrors() 守卫抑制，不叠加误导
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let x = 42; let r = x.to_string() }",
+        diag);
+    EXPECT_EQ(diag.errorCount(), 1);
+}
+
+TEST(SemaRecord, IntCallRetMethodCallE013) {
+    // int 调用返回值 get42().to_string() → 干净 E013
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun get42() -> int { return 42 }"
+        " fun main(io: Io) { let r = get42().to_string() }",
+        diag);
+    EXPECT_TRUE(hasErrorCode(diag, Aura::DiagCode::E013_MethodNotFound));
+    EXPECT_TRUE(hasErrorContaining(diag, "type 'int' has no method 'to_string'"));
+}
+
+TEST(SemaRecord, FloatValueMethodCallE013) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let f = 3.14; let r = f.to_string() }",
+        diag);
+    EXPECT_TRUE(hasErrorCode(diag, Aura::DiagCode::E013_MethodNotFound));
+    EXPECT_TRUE(hasErrorContaining(diag, "type 'float' has no method 'to_string'"));
+}
+
+TEST(SemaRecord, BoolValueMethodCallE013) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let b = true; let r = b.to_string() }",
+        diag);
+    EXPECT_TRUE(hasErrorCode(diag, Aura::DiagCode::E013_MethodNotFound));
+    EXPECT_TRUE(hasErrorContaining(diag, "type 'bool' has no method 'to_string'"));
+}
+
+TEST(SemaRecord, OptionalUnwrapMethodCallE013) {
+    // Optional<int>.unwrap() 返回 int 后调 to_string()（同源：PrimSemType Int 接收者）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let o = some(5); let r = o.unwrap().to_string() }",
+        diag);
+    EXPECT_TRUE(hasErrorCode(diag, Aura::DiagCode::E013_MethodNotFound));
+    EXPECT_TRUE(hasErrorContaining(diag, "type 'int' has no method 'to_string'"));
+}
+
+TEST(SemaRecord, StringMethodCallStillWorks) {
+    // bug-08 对照：string 合法方法 len() 不误伤
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let s = \"abc\"; let n = s.len(); io.println(str(n)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaRecord, StrGlobalFuncStillWorks) {
+    // bug-08 对照：str(x)/str(f)/str(b) 为全局函数（非方法），不受本次修复影响
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        "   let x = 42; let f = 3.14; let b = true"
+        "   io.println(str(x)); io.println(str(f)); io.println(str(b)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// bug-40（2026-08-31，bug-08 同源）：int/float/bool 值类型成员访问
+// （x.foo 非方法调用）被 inferMemberAccess 放行 → 有标注生成 x->foo 坏 C++。
+// 修复：inferMemberAccess PrimSemType 分支补 Int/Float/Bool typeKey → 干净报错。
+// ============================================================
+TEST(SemaRecord, IntValueMemberAccessE013) {
+    // 有标注形态此前生成 x->foo 坏 C++（base operand of '->' is not a pointer）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let x = 42; let r: int = x.foo }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type 'int' has no member 'foo'"));
+}
+
+TEST(SemaRecord, FloatValueMemberAccessE013) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let f = 3.14; let r: float = f.bar }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type 'float' has no member 'bar'"));
+}
+
+TEST(SemaRecord, BoolValueMemberAccessE013) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let b = true; let r: bool = b.baz }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type 'bool' has no member 'baz'"));
+}
+
+// ============================================================
+// bug-41（2026-08-31，bug-08 同源）：int/float/bool 值类型索引
+// （x[0]）被 inferIndexExpr 放行 → 有标注生成 (*x)[0] 坏 C++。
+// 修复：inferIndexExpr 对 int/float/bool 报 "is not indexable"。
+// ============================================================
+TEST(SemaRecord, PrimValueIndexE013) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let x = 42; let r: int = x[0] }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type 'int' is not indexable"));
+}
+
+TEST(SemaRecord, ListIndexStillWorks) {
+    // bug-41 对照：[T] 列表索引不误伤
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let a = [1, 2, 3]; let r = a[0]; io.println(str(r)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}

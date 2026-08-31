@@ -206,14 +206,15 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e,
         // g++ couldn't deduce（坏 C++）。有标注（expected 非空，含 `B<T>` 泛型上下文
         // 由外层函数模板绑定）或形参含 T（t9b）均不触发。
         if (!sym->typeParams.empty() && !diag_.hasErrors() && !expected) {
-            std::vector<std::string> formalG;
-            for (auto& ft : formalTypes) collectGenericNames(ft, formalG);
             std::vector<std::string> unboundFromFormal;
             for (auto& tp : sym->typeParams)
-                // N2：显式类型实参 B<int>(...) 已绑定该泛型（genericMap 中有且形参
-                // 不含它）→ 不再计入未绑定，避免误报 cannot infer
-                if (std::find(formalG.begin(), formalG.end(), tp) == formalG.end()
-                    && genericMap.find(tp) == genericMap.end())
+                // 干净报错判定按「genericMap 实际绑定」而非「形参提及（formalG）」
+                // （bug-19）：Union(T|int) 形参的变体泛型 T ∈ formalG（collectGenericNames
+                // 递归收集）但 collectGenericMapping 无 Union 分支绑不上 → 旧判定放行
+                // → 坏 C++。改为只要未被实参绑定即计入未绑定 → 报 cannot infer。
+                // 纯 T 形参由 case 1 绑定、[T]/fun(T) 由 case 2/3 绑定、N2 显式实参
+                // B<int>(...) 在上方预绑定 → 均不误报；零参外层泛型栈走下方逃生舱。
+                if (genericMap.find(tp) == genericMap.end())
                     unboundFromFormal.push_back(tp);
             if (!unboundFromFormal.empty()) {
                 // 零参构造 + receiver 泛型在当前函数/闭包泛型栈中（如泛型函数内
@@ -500,20 +501,28 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     // record 接收者方法调用（如 p.offset(3) / p.offset(3,4)）：
     // 在 typeMethods_（buildTypeMethods 构建，key=canonicalName）中按方法名匹配，
     // 返回声明返回类型；参数用 checkCallArgs 校验（含尾部默认参数计数）。
-    // 找不到方法时保持原放行（返回 ErrorSemType 不报错，由 C++ 编译器兜底）。
+    // 未命中方法时不再静默放行（bug-01/bug-13 统一修复点）：先回退查字段
+    // （闭包字段按调用处理，见 L548 下方），字段也未命中 → 报 E013 干净报错，
+    // 阻断坏 C++/G4 误导（原"由 C++ 编译器兜底"设计意图已被本修复推翻）。
     if (auto* rec = dynamic_cast<const RecordSemType*>(objType.get())) {
+        // 方法查找：本模块声明（typeMethods_）+ 跨模块导入（importedMethods_，
+        // 由 importExports 注入，key = 限定 canonicalName 如 "math::Pair"）
+        auto findMethods = [&](const std::string& key)
+            -> const std::vector<InterfaceSemType::MethodSig>* {
+            auto it = typeMethods_.find(key);
+            if (it != typeMethods_.end()) return &it->second;
+            auto it2 = importedMethods_.find(key);
+            if (it2 != importedMethods_.end()) return &it2->second;
+            return nullptr;
+        };
         const std::vector<InterfaceSemType::MethodSig>* methods = nullptr;
-        auto it = typeMethods_.find(rec->canonicalName);
-        if (it != typeMethods_.end()) {
-            methods = &it->second;
-        } else {
+        methods = findMethods(rec->canonicalName);
+        if (!methods) {
             // 泛型 record：canonicalName 已物化为实例名（如 "Stack<int32_t>"），
             // typeMethods_ 的 key 是声明时的基名，按基名回退查找
             auto lt = rec->canonicalName.find('<');
-            if (lt != std::string::npos) {
-                auto it2 = typeMethods_.find(rec->canonicalName.substr(0, lt));
-                if (it2 != typeMethods_.end()) methods = &it2->second;
-            }
+            if (lt != std::string::npos)
+                methods = findMethods(rec->canonicalName.substr(0, lt));
         }
         if (methods) {
             for (auto& m : *methods) {
@@ -545,7 +554,49 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
                 }
             }
         }
-        // 未匹配到方法 → 保持原放行（落入下方"不在表中"路径）
+        // 未匹配到方法 → 先回退查字段（bug-01/bug-13 统一修复点，顺序必须「先字段后 E013」）：
+        //   1) 字段命中且为 FuncSemType → 按闭包调用处理（bug-13：b.f(10) 方法形态）
+        //   2) 字段命中但非闭包 → 报 field not callable（审查验证项 3，v1 仅 FuncSemType 直命中）
+        //   3) 字段未命中 → 报 E013（不再放行；bug-01：record 直调未注册方法不再坏 C++/G4）
+        for (auto& f : rec->fields) {
+            if (f.name != e.method) continue;
+            if (auto* ft = dynamic_cast<const FuncSemType*>(f.type.get())) {
+                // 字段为闭包 → 按闭包调用处理（对齐 inferCall 函数调用形态）：checkThrowsContext +
+                // checkCallArgs（校验数量/类型 + inferExpr 实参设置 inferredType → 连带修复实参
+                // GC 保护缺口）+ 返回类型 applyGenericMap（泛型 record 字段经 substitute 已物化）
+                checkThrowsContext(e, e.method, ft->throws);
+                std::vector<const SemType*> formalTypes;
+                for (auto& pt : ft->paramTypes) formalTypes.push_back(pt.get());
+                std::map<std::string, std::unique_ptr<SemType>> genericMap;
+                checkCallArgs(e, e.method, "method", formalTypes, e.args, genericMap, 0);
+                auto result = ft->returnType ? ft->returnType->clone() : NoneSemType::make();
+                return applyGenericMap(std::move(result), genericMap);
+            }
+            // 字段存在但非闭包（Optional<闭包>/接口视图/普通字段等）→ 报 field not callable
+            error(e, "field '" + e.method + "' of record type '" + rec->toString()
+                 + "' is not callable");
+            return ErrorSemType::make();
+        }
+        // 字段也未命中 → 报 E013（对齐内置分支 L704-707 格式），不再静默放行
+        std::string recName = rec->canonicalName.empty() ? rec->toString() : rec->canonicalName;
+        std::string hint;
+        if (methods && !methods->empty()) {
+            // 仿内置 listMethodNames 列出该 record 已声明方法名 + 提示正确用法
+            hint = "valid methods: ";
+            for (size_t i = 0; i < methods->size(); ++i) {
+                if (i > 0) hint += ", ";
+                hint += (*methods)[i].name;
+            }
+            hint += "; or implement '" + std::string(e.method) + "'";
+        } else {
+            hint = "implement '" + std::string(e.method) +
+                   "', or convert the value to an Iterator view first "
+                   "(e.g. let it: Iterator<" + recName + "> = p) then call next()";
+        }
+        error(e, DiagCode::E013_MethodNotFound,
+              "record type '" + recName + "' has no method '" + e.method + "'",
+              hint);
+        return ErrorSemType::make();
     }
 
     // Iterator 桥接方法特判（map/filter/collect 为 C++ 桥接，返回类型调用点推导）
@@ -624,7 +675,15 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     // 返回注册的返回类型。
     std::string typeKey;
     if (auto* p = dynamic_cast<const PrimSemType*>(objType.get())) {
-        if (p->kind == PrimSemType::String) typeKey = "string";
+        // bug-08：int/float/bool 也设 typeKey → 进 BuiltinRegistry 查表 →
+        // 注册表无基元方法 → 报 E013（type 'int' has no method ...），
+        // 不再静默放行生成 `x->to_string()` 坏 C++ / G4 误导。
+        switch (p->kind) {
+            case PrimSemType::String: typeKey = "string"; break;
+            case PrimSemType::Int:    typeKey = "int";    break;
+            case PrimSemType::Float:  typeKey = "float";  break;
+            case PrimSemType::Bool:   typeKey = "bool";   break;
+        }
     } else if (dynamic_cast<const ListSemType*>(objType.get())) {
         typeKey = "[T]";
     } else if (dynamic_cast<const OptionalSemType*>(objType.get())) {

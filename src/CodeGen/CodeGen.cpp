@@ -27,9 +27,11 @@ CompileUnit CodeGenerator::generate(const Program& program,
                                      const std::vector<CodeGenImport>& imports,
                                      const std::string& nsName,
                                      const CodeGenConfig& config,
-                                     const CrossModuleDefaults& crossDefaults) {
+                                     const CrossModuleDefaults& crossDefaults,
+                                     const CrossModuleParamSemTypes& crossParamSemTypes) {
     ioSync_ = config.ioSync;
     crossDefaults_ = crossDefaults;   // C5.4: 跨模块函数默认参数表
+    crossModuleParamSemTypes_ = crossParamSemTypes;  // bug-06: 跨模块函数形参 SemType 表
     CompileUnit unit;
     unit.moduleName = moduleName;
     unit.nsName     = nsName;
@@ -120,18 +122,36 @@ CompileUnit CodeGenerator::generate(const Program& program,
     for (auto& i : BuiltinRegistry::get().auraiInterfaces())
         allIfaces.push_back(i.get());
 
-    // 第二遍：协程判定（提前一轮，函数体内需要知道自己的协程状态）
-    for (auto& d : program.decls) {
-        if (!d) continue;
-        if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
-            if (decideCoro(*f) == CoroDecision::Coroutine)
-                coroutineFunctions_.insert(f->name);
-        }
-        if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
-            if (decideCoro(*m) == CoroDecision::Coroutine)
-                // 方法键 = "ReceiverType.methodName"（与 methodDefaultArgs_/methodParamCppTypes_
-                // 同键格式）：避免同名方法跨不同 receiver 互相污染协程判定。
-                coroutineFunctions_.insert(m->receiverType + "." + m->name);
+    // 第二遍：协程判定（固定点迭代，bug-02）
+    // decideCoro 单调：直接挂起点（io.xxx 异步 / channel send-receive）或调用已标协程者
+    // 即判 Coroutine，且 coroutineFunctions_ 只增不减 → 反复扫描直至一轮无新增即收敛。
+    // 这使判定与声明顺序无关：外层函数/方法调用「后置声明」的协程函数/方法时，后续轮会
+    // 补标（原单遍 for 按声明顺序扫描，外层先扫时后置者不在集合 → 判 Plain → 调用点不
+    // co_await → task 立即析构 → 协程体静默不执行）。已标协程者判定单调、重扫结果不变，
+    // 跳过仅优化性能；kMax 截断理论不可达（有限集合单调必收敛），仅作防死循环保险。
+    constexpr int kMaxCoroPasses = 16;
+    bool changed = true;
+    for (int pass = 0; pass < kMaxCoroPasses && changed; ++pass) {
+        changed = false;
+        for (auto& d : program.decls) {
+            if (!d) continue;
+            if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
+                if (coroutineFunctions_.count(f->name)) continue;
+                if (decideCoro(*f) == CoroDecision::Coroutine) {
+                    coroutineFunctions_.insert(f->name);
+                    changed = true;
+                }
+            }
+            if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
+                std::string key = m->receiverType + "." + m->name;
+                if (coroutineFunctions_.count(key)) continue;
+                if (decideCoro(*m) == CoroDecision::Coroutine) {
+                    // 方法键 = "ReceiverType.methodName"（与 methodDefaultArgs_/methodParamCppTypes_
+                    // 同键格式）：避免同名方法跨不同 receiver 互相污染协程判定。
+                    coroutineFunctions_.insert(key);
+                    changed = true;
+                }
+            }
         }
     }
 
@@ -201,18 +221,32 @@ CompileUnit CodeGenerator::generate(const Program& program,
                             break;
                         }
                 }
+                // 方法 NoneType 返回 → void（无条件，与定义侧 genMethodDecl 统一；否则
+                // struct 内声明 `aura_rt::NoneType zero();` 与类外定义 `void Point::zero()`
+                // 返回类型不匹配 → C++ 编译错误）。task<void> 有 return_void、
+                // task<NoneType> 没有 → 协程分支直接包已映射的 void。
+                if (pm.returnTypeStr == "aura_rt::NoneType")
+                    pm.returnTypeStr = "void";
                 // 方法协程化：体内含异步操作（sync/spawn/io/channel）的方法 → struct 内
                 // 声明包 aura_rt::task<ret>（与定义侧 genMethodDecl 对称）。auto 返回
                 // （泛型闭包）保持 auto（无法表达 task<auto>，声明/定义两侧一致）。
                 if (coroutineFunctions_.count(m->receiverType + "." + m->name)
                     && pm.returnTypeStr != "auto") {
-                    if (pm.returnTypeStr == "aura_rt::NoneType")
-                        pm.returnTypeStr = "void";  // task<void> 有 return_void，task<NoneType> 没有
                     pm.returnTypeStr = "aura_rt::task<" + pm.returnTypeStr + ">";
                 }
                 for (auto& p : m->params) {
                     pm.paramTypes.push_back(p.type ? mapType(*p.type) : "auto");
                     pm.paramNames.push_back(p.name);
+                }
+                // bug-07：struct 内方法声明的模板前缀参数 = collectMethodTParams 中
+                // 非 receiver 泛型部分（receiver 泛型已在 struct 模板作用域内）。方法
+                // 自身裸泛型（apply(f: fun(U)->U) 的 U）须声明为类内函数模板。
+                {
+                    std::vector<std::string> mtp = collectMethodTParams(*m);
+                    std::set<std::string> recvGen(m->receiverTypeArgs.begin(),
+                                                  m->receiverTypeArgs.end());
+                    for (auto& g : mtp)
+                        if (!recvGen.count(g)) pm.templateParams.push_back(g);
                 }
                 pendingMethods_.push_back(std::move(pm));
             }

@@ -152,11 +152,14 @@ private:
                                   const std::function<void(const std::string&)>& fn);
     // 注册 TypeExpr 中所有泛型引用为 GenericParam 符号（checkFunBody/checkMethodBody 复用）
     static void registerTypeGenerics(SymbolTable& symtab, const TypeExpr& type);
-    // 注册返回类型 FunctionType 中的"裸泛型名"（未声明的 NamedType）为 GenericParam（M5）。
-    // 直接写泛型函数类型返回（`fun makeU() -> fun(U) -> U`）时，U 是裸 NamedType，
-    // registerTypeGenerics 只认 <T> GenericTypeRef 与别名 typeArgs，不收集裸名 → 返回类型
-    // 解析报 undefined type 'U'。须在返回类型解析前调用（checkFunBody/checkMethodBody）。
-    static void registerReturnFuncTypeGenerics(SymbolTable& symtab, const TypeExpr& type);
+    // 注册 FunctionType（泛型函数类型）中的"裸泛型名"（未声明的 NamedType）为 GenericParam
+    // （M5 返回侧 + bug-07 参数侧）。直接写泛型函数类型（`fun makeU() -> fun(U) -> U` 返回 /
+    // `f: fun(U) -> U` 参数）时，U 是裸 NamedType，registerTypeGenerics 只认 <T>
+    // GenericTypeRef 与别名 typeArgs，不收集裸名 → resolveType 报 undefined type 'U'。
+    // 仅从 FunctionType 根递归（顶层非 FunctionType 裸 NamedType 不隐式引入，保持 undefined
+    // 报错语义）；已注册名（TypeAlias/Interface/GenericParam）跳过（幂等，接口泛型 T 与
+    // 方法裸 U 同 scope 时不遮蔽）。须在类型解析前调用（checkFunBody/checkMethodBody）。
+    static void registerFuncTypeGenerics(SymbolTable& symtab, const TypeExpr& type);
 
     // ============ 声明注册（第 1 遍） ============
     void declareTopLevel(const Program& program);
@@ -414,6 +417,11 @@ private:
     // ============ 接口显式 impl（Interface 改造）============
     // receiverType 规范名 → 该 record 类型拥有的方法签名（buildTypeMethods 构建）
     std::map<std::string, std::vector<InterfaceSemType::MethodSig>> typeMethods_;
+    // 跨模块导入的 record 方法：限定 canonicalName（如 "math::Pair"）→ 方法签名。
+    // 与 typeMethods_ 分离存放——buildTypeMethods 会 clear typeMethods_（每模块只含
+    // 本模块声明），而 importedMethods_ 由 importExports 注入且须在 analyze 全程存活，
+    // 否则跨模块 record 方法调用被 bug-01 E013 误伤。
+    std::map<std::string, std::vector<InterfaceSemType::MethodSig>> importedMethods_;
     // 第 1 遍末尾统一构建（resolveType 安全时刻）
     void buildTypeMethods(const Program& program);
     // receiverType 规范名（查符号表 RecordSemType.canonicalName）

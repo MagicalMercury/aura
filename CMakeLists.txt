@@ -77,9 +77,23 @@ set(AURA_SOURCES
     src/CodeGen/CodeGen.cpp
     src/CodeGen/TypeMap.cpp
     src/CodeGen/DeclGen.cpp
+    src/CodeGen/DeclFun.cpp
+    src/CodeGen/DeclTParams.cpp
     src/CodeGen/StmtGen.cpp
     src/CodeGen/ExprGen.cpp
+    src/CodeGen/ExprBinary.cpp
+    src/CodeGen/ExprCall.cpp
+    src/CodeGen/ExprMethodCall.cpp
+    src/CodeGen/ExprAccess.cpp
+    src/CodeGen/ExprClosure.cpp
     src/CodeGen/CoroDecide.cpp
+    src/CodeGen/StmtLet.cpp
+    src/CodeGen/UnionBoxing.cpp
+    src/CodeGen/StmtControl.cpp
+    src/CodeGen/StmtTry.cpp
+    src/CodeGen/StmtSync.cpp
+    src/CodeGen/StmtSpawn.cpp
+    src/CodeGen/StmtMatch.cpp
     src/Module/ModuleManager.cpp
     src/Diag/DiagnosticEngine.cpp
 )

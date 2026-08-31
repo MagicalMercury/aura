@@ -23,14 +23,26 @@ std::unique_ptr<SemType> SemAnalyzer::inferMemberAccess(const MemberAccessExpr& 
     // C++ 运行时字段同名（GcString::length / Array<T>::length）三层巧合使 .length 可用。
     std::string typeKey;
     if (auto* p = dynamic_cast<const PrimSemType*>(objType.get())) {
-        if (p->kind == PrimSemType::String) typeKey = "string";
+        // bug-40：int/float/bool 也设 typeKey → 报 "has no member" 干净错误，
+        // 不再静默放行生成 x->foo 坏 C++（与 bug-08 方法调用修复同源）。
+        switch (p->kind) {
+            case PrimSemType::String: typeKey = "string"; break;
+            case PrimSemType::Int:    typeKey = "int";    break;
+            case PrimSemType::Float:  typeKey = "float";  break;
+            case PrimSemType::Bool:   typeKey = "bool";   break;
+        }
     } else if (dynamic_cast<const ListSemType*>(objType.get())) {
         typeKey = "[T]";
     }
     if (!typeKey.empty()) {
         std::string typeName = (typeKey == "[T]") ? "array" : typeKey;
-        error(e, "type '" + typeName + "' has no member '" + std::string(e.member)
-                 + "'; use 'len()' instead");
+        // "use 'len()' instead" 提示仅对拥有 len() 的 string/[T] 有意义；
+        // int/float/bool 无任何成员，报错主体已足够定位。
+        std::string msg = "type '" + typeName + "' has no member '"
+                          + std::string(e.member) + "'";
+        if (typeKey == "string" || typeKey == "[T]")
+            msg += "; use 'len()' instead";
+        error(e, msg);
         return ErrorSemType::make();
     }
     // 接口类型或其他：允许成员访问（编译时无法确定）
@@ -47,6 +59,15 @@ std::unique_ptr<SemType> SemAnalyzer::inferIndexExpr(const IndexExpr& e) {
     if (auto* list = dynamic_cast<const ListSemType*>(objType.get())) {
         if (e.index) (void)inferExpr(*e.index);
         return list->elementType ? list->elementType->clone() : ErrorSemType::make();
+    }
+    // bug-41：int/float/bool 值类型不可索引 → 干净报错，不再静默放行生成
+    // `(*x)[0]` 坏 C++（与 bug-08/bug-40 值类型成员/方法修复同源）。
+    if (auto* p = dynamic_cast<const PrimSemType*>(objType.get())) {
+        if (p->kind != PrimSemType::String) {
+            if (e.index) (void)inferExpr(*e.index);
+            error(e, "type '" + p->toString() + "' is not indexable");
+            return ErrorSemType::make();
+        }
     }
     // P4：联合接收者索引——各 ListSemType 变体的元素类型并集（与 inferMethodCallOnVariant 合并一致）
     if (auto* u = dynamic_cast<const UnionSemType*>(objType.get())) {

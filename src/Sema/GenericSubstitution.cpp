@@ -123,6 +123,30 @@ std::unique_ptr<SemType> SemAnalyzer::substitute(
         n->elementType = l->elementType ? substitute(*l->elementType, genericName, concrete) : nullptr;
         return n;
     }
+    if (auto* is = dynamic_cast<const InterfaceSemType*>(&type)) {
+        // 接口视图递归代换（typeArgs + 方法签名）：泛型接口方法返回泛型接口自身/其它
+        // 泛型接口（如 Box<T>::next() -> Box<T>）时，返回类型的 typeArgs 须随调用点
+        // 实参代换（T→int），否则 CodeGen 生成 Box<auto> 坏 C++（bug-20 暴露的独立
+        // 缺陷，Sema 修复前该形态被 has no method 阻断）。方法克隆结构与
+        // resolveNamedType 接口分支一致；视图深度有界（resolveInterfaceMethods 每轮
+        // 产生有限深克隆），递归可终止。
+        auto n = std::make_unique<InterfaceSemType>();
+        n->name = is->name;
+        for (auto& ta : is->typeArgs)
+            n->typeArgs.push_back(ta ? substitute(*ta, genericName, concrete) : nullptr);
+        for (auto& m : is->methods) {
+            InterfaceSemType::MethodSig ms;
+            ms.name = m.name;
+            for (auto& pt : m.paramTypes)
+                ms.paramTypes.push_back(pt ? substitute(*pt, genericName, concrete) : nullptr);
+            ms.returnType = m.returnType ? substitute(*m.returnType, genericName, concrete) : nullptr;
+            ms.throws = m.throws;
+            ms.hasDefault = m.hasDefault;
+            ms.hasCppImpl = m.hasCppImpl;
+            n->methods.push_back(std::move(ms));
+        }
+        return n;
+    }
     return type.clone();
 }
 
@@ -230,6 +254,52 @@ void SemAnalyzer::collectGenericMapping(
     std::map<std::string, std::unique_ptr<SemType>>& map,
     bool& conflict) const
 {
+    // case 0: formal 是 Optional 容器（物化 GenericSemType{Optional} / OptionalSemType）
+    // bug-18：泛型 ctor/方法/函数形参为 Optional<T> 时物化为 GenericSemType{name=="Optional",
+    // resolvedName="aura_rt::Optional<T>"}，case 1 因 resolvedName 非空直接 return → T 永远
+    // 无法从实参绑定。此处剥 Optional 层后对元素递归匹配，使 (Optional<T>, int) → (T, int)
+    // → T=int。actual 侧对称剥壳：formal 剥一层 Optional 后 actual 亦为 Optional
+    // （OptionalSemType=some() 结构化推断 / 物化 GenericSemType{Optional}=Optional<int> 变量）
+    // 时同样取元素类型再递归——否则 Box(some(9)) 的 (Optional<T>, Optional<int>) 会把 T
+    // 误绑为 Optional<int> 而非 int（审查点 1 硬性）；actual 为裸值（Box(9)）才直接递归。
+    // 嵌套 Optional<Optional<T>> 经递归多层同步剥壳（与 Assignability.cpp 同步剥层循环同构）。
+    // UnionSemType 变体泛型无法从实参可靠唯一绑定 → 不绑（bug-19「genericMap 实际绑定」
+    // 判定干净报错兜底，已落地）。
+    if (auto* gF = dynamic_cast<const GenericSemType*>(&formal);
+        gF && gF->name == "Optional" && !gF->resolvedName.empty()) {
+        auto fElem = elemTypeOf(&formal);
+        if (!dynamic_cast<const ErrorSemType*>(fElem.get())) {
+            if (auto* oA = dynamic_cast<const OptionalSemType*>(&actual)) {
+                if (oA->elementType)
+                    collectGenericMapping(*fElem, *oA->elementType, map, conflict);
+            } else if (auto* gA = dynamic_cast<const GenericSemType*>(&actual);
+                       gA && gA->name == "Optional" && !gA->resolvedName.empty()) {
+                auto aElem = elemTypeOf(&actual);
+                if (!dynamic_cast<const ErrorSemType*>(aElem.get()))
+                    collectGenericMapping(*fElem, *aElem, map, conflict);
+            } else {
+                collectGenericMapping(*fElem, actual, map, conflict);
+            }
+        }
+        return;
+    }
+    if (auto* oF = dynamic_cast<const OptionalSemType*>(&formal)) {
+        if (oF->elementType) {
+            if (auto* oA = dynamic_cast<const OptionalSemType*>(&actual)) {
+                if (oA->elementType)
+                    collectGenericMapping(*oF->elementType, *oA->elementType, map, conflict);
+            } else if (auto* gA = dynamic_cast<const GenericSemType*>(&actual);
+                       gA && gA->name == "Optional" && !gA->resolvedName.empty()) {
+                auto aElem = elemTypeOf(&actual);
+                if (!dynamic_cast<const ErrorSemType*>(aElem.get()))
+                    collectGenericMapping(*oF->elementType, *aElem, map, conflict);
+            } else {
+                collectGenericMapping(*oF->elementType, actual, map, conflict);
+            }
+        }
+        return;
+    }
+
     // case 1: formal 是泛型变量 <T> → actual 就是 T 的具体绑定
     if (auto* gf = dynamic_cast<const GenericSemType*>(&formal)) {
         // G2-A：已物化的内置泛型（resolvedName 非空，如 Optional<Point> →

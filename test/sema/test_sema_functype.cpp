@@ -399,3 +399,120 @@ TEST(SemaFunType, GenericFunTypeRetNotShadowReceiver) {
         diag);
     EXPECT_FALSE(diag.hasErrors());
 }
+
+// ============================================================
+// bug-07：参数侧直接写泛型函数类型（`f: fun(U) -> U`）——裸泛型 U 隐式注册
+// 覆盖：方法参数 / 顶层函数参数 / 构造参数 / 容器内 / 接口方法参数 / 接口返回侧
+// 非 FunctionType 顶层参数（`xs: [U]`）保持 undefined 报错语义
+// ============================================================
+TEST(SemaFunType, GenericFunTypeParamMethod) {
+    // 方法参数 fun(U)->U（U 是闭包自身新泛型）：注册后方法体可调用 f(42)
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box = { value: int }"
+        " fun (self Box) apply(f: fun(U) -> U) -> int { return f(42) }"
+        " fun main(io: Io) {"
+        " let b = Box { value = 1 }"
+        " io.println(str(b.apply(fun(x: int) -> int { return x + 1 }))) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericFunTypeParamTopFun) {
+    // 顶层函数参数 fun(U)->U：函数侧参数路径同样注册
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun applyAll(f: fun(U) -> U, v: int) -> int { return f(v) }"
+        " fun main(io: Io) {"
+        " io.println(str(applyAll(fun(x: int) -> int { return x + 1 }, 41))) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericFunTypeParamCtor) {
+    // 构造参数 fun(U)->U：构造侧参数路径同样注册
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box = { value: int }"
+        " fun (self Box) Box(f: fun(U) -> U) { self.value = f(42) }"
+        " fun main(io: Io) {"
+        " let b = Box(fun(x: int) -> int { return x + 1 })"
+        " io.println(str(b.value)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericFunTypeParamContainer) {
+    // 容器内裸泛型 fun([U]) -> U：registerFuncTypeGenerics 递归 ListType
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box = { value: int }"
+        " fun (self Box) apply(f: fun([U]) -> U) -> int {"
+        "   let xs: [int] = [42]; return f(xs) }"
+        " fun main(io: Io) {"
+        " let b = Box { value = 1 }"
+        " io.println(str(b.apply(fun(xs: [int]) -> int { return xs[0] }))) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericFunTypeParamMixedReceiver) {
+    // 混合：fun(U, T) -> U，T 是 receiver 泛型、U 是方法自身裸泛型（receiver 区分信号）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { value: T }"
+        " fun (self Box<T>) apply(f: fun(U, T) -> U) -> U { return f(1, self.value) }"
+        " fun main(io: Io) {"
+        " let b: Box<int> = { value = 7 }"
+        " io.println(str(b.apply(fun(x: int, y: int) -> int { return x + y }))) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericFunTypeParamIfaceMethod) {
+    // 接口方法参数 fun(U)->U：接口路径（⑥）注册；record 直调编译
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface Applier { apply(f: fun(U) -> U) -> int }"
+        " type Box = { value: int }"
+        " fun (self Box impl Applier) apply(f: fun(U) -> U) -> int { return f(42) }"
+        " fun main(io: Io) {"
+        " let b = Box { value = 1 }"
+        " io.println(str(b.apply(fun(x: int) -> int { return x + 1 }))) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericFunTypeRetIfaceM5) {
+    // 接口方法返回 fun(U)->U（M5 接口返回侧缺口一并补齐）：接口签名解析不报 undefined
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface Getter { getU() -> fun(U) -> U }"
+        " type Box = { value: int }"
+        " fun (self Box impl Getter) getU() -> fun(U) -> U {"
+        "   return fun(x: U) -> U { return x } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericFunTypeParamNonFuncTopKeepsUndefined) {
+    // 负例：非 FunctionType 顶层参数 `xs: [U]` 不注册 → 保持 undefined 报错语义
+    //（registerFuncTypeGenerics 仅从 FunctionType 根递归）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun bad(xs: [U]) -> int { return 0 }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+}
+
+TEST(SemaFunType, GenericFunTypeParamIfaceReuseGeneric) {
+    // 接口幂等性（review 点 4）：接口方法参数 fun(T)->T 复用接口泛型 T——
+    // registerFuncTypeGenerics 对已注册 GenericParam 跳过（不重复注册/遮蔽，不误报
+    // undefined）。仅测接口声明（泛型 record impl 接口在 v1 受限，不涉及）。
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface Cmp<T> { cmp(f: fun(T) -> T) -> T }"
+        " fun main(io: Io) { io.println(\"ok\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}

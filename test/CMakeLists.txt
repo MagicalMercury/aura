@@ -52,9 +52,23 @@ set(AURA_LIB_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/CodeGen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/TypeMap.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/DeclGen.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/DeclFun.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/DeclTParams.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtGen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprGen.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprBinary.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprCall.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprMethodCall.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprAccess.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprClosure.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/CoroDecide.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtLet.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/UnionBoxing.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtControl.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtTry.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtSync.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtSpawn.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtMatch.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Module/ModuleManager.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Diag/DiagnosticEngine.cpp
 )

@@ -64,6 +64,19 @@ void qualifyRecordTypes(std::unique_ptr<SemType>& t, const std::string& alias) {
         qualifyRecordTypes(it->elementType, alias);
     }
 }
+
+// 深拷贝一份方法签名（MethodSig 含 unique_ptr 成员，不能直接拷贝）
+InterfaceSemType::MethodSig cloneMethodSig(const InterfaceSemType::MethodSig& s) {
+    InterfaceSemType::MethodSig n;
+    n.name = s.name;
+    for (auto& p : s.paramTypes) n.paramTypes.push_back(p ? p->clone() : nullptr);
+    n.returnType = s.returnType ? s.returnType->clone() : nullptr;
+    n.throws = s.throws;
+    n.hasDefault = s.hasDefault;
+    n.hasCppImpl = s.hasCppImpl;
+    n.defaultCount = s.defaultCount;
+    return n;
+}
 } // namespace
 
 // ============================================================
@@ -208,6 +221,22 @@ void SemAnalyzer::importExports(const std::string& alias, const ModuleExports& e
     };
     for (auto& [name, f] : exports.ctors) importFuncSymbol(qualified(name), f, alias);
     for (auto& [name, f] : exports.funcs) importFuncSymbol(qualified(name), f, alias);
+    // 跨模块 record 方法：导入到 importedMethods_（key = 限定 canonicalName，如
+    // "math::Pair"），供 inferMethodCall record 分支回退查找——否则跨模块 record
+    // 已注册方法调用被 bug-01 E013 误伤。签名内的 record 类型经 qualifyRecordTypes
+    // 限定为 C++ 完整名（与导入类型一致，返回类型 isAssignable / CodeGen 才可对齐）。
+    for (auto& [key, sigs] : exports.methods) {
+        std::string qkey = alias.empty() ? key : (alias + "::" + key);
+        std::vector<InterfaceSemType::MethodSig> qsigs;
+        qsigs.reserve(sigs.size());
+        for (auto& s : sigs) {
+            auto q = cloneMethodSig(s);
+            for (auto& p : q.paramTypes) qualifyRecordTypes(p, alias);
+            qualifyRecordTypes(q.returnType, alias);
+            qsigs.push_back(std::move(q));
+        }
+        importedMethods_[qkey] = std::move(qsigs);
+    }
     // 注册 import 别名本身（供 inferMethodCall 检测命名空间调用）
     if (!alias.empty()) {
         Symbol aliasSym;
@@ -259,6 +288,19 @@ ModuleExports SemAnalyzer::extractExports() const {
             }
         });
         break;
+    }
+    // 导出 record 方法：对每个导出的 record 类型，按 canonicalName 从 typeMethods_
+    // 取出方法签名（key 用本地未限定 canonicalName；导入侧 importExports 再限定）。
+    // 注意须先 cloneMethodSig 深拷贝——typeMethods_ 与导出表生命周期不同。
+    for (auto& [name, type] : e.types) {
+        auto* rec = dynamic_cast<const RecordSemType*>(type.get());
+        if (!rec || rec->canonicalName.empty()) continue;
+        auto it = typeMethods_.find(rec->canonicalName);
+        if (it == typeMethods_.end()) continue;
+        std::vector<InterfaceSemType::MethodSig> sigs;
+        sigs.reserve(it->second.size());
+        for (auto& s : it->second) sigs.push_back(cloneMethodSig(s));
+        e.methods[rec->canonicalName] = std::move(sigs);
     }
     return e;
 }

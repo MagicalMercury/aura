@@ -43,6 +43,15 @@ public:
     }
     bool visit(const ForStmt& n, CoroScanner& self) {
         if (n.iterable && self.scanExpr(*n.iterable)) return true;
+        // bug-11 方向②：for-in 协程 channel（iterable 推断类型 GenericSemType{name=="channel"}）
+        // 循环体内 co_await ch->receive() → 函数须标协程，否则 co_await 落非协程函数坏 C++
+        // （repro_pure_forin_plain_fn：纯 for-in channel 的普通函数被判 Plain）。仿 isSuspending
+        // （L183-188）同构判定；sync.Channel 的 inferredType 为 "sync.Channel"，不匹配不误判
+        // （其 receive 阻塞、不需 co_await）。
+        if (n.iterable && n.iterable->inferredType) {
+            if (auto* g = dynamic_cast<const GenericSemType*>(n.iterable->inferredType))
+                if (g->name == "channel") return true;
+        }
         if (n.body && self.scanStmt(*n.body)) return true;
         return false;
     }

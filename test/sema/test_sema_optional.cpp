@@ -1662,6 +1662,167 @@ TEST(SemaOptional, OptionalGenericRecordSomeDeepMismatchError) {
     EXPECT_TRUE(hasErrorContaining(diag, "list element type mismatch"));
 }
 
+// ============================================================
+// bug-12（2026-08-31）：Optional 层数校验——显式 Optional<X> 注解 target 赋多包
+// some 的 OptionalSemType source（source 层数 > target 层数）→ 干净 type mismatch
+//（修复前 Sema 放行 → CodeGen 把内层 some 结果当值装箱 → 坏 C++）。
+// isAssignable GenericSemType target 分支放行前补层数校验；source 侧 Optional 层
+// 含 OptionalSemType（some()/折叠推断）与 GenericSemType{Optional}（显式注解变量
+// 引用物化）两种表示（repro_var_carried_2to1）。仅拦「source > target」；
+// 1=1 / 2=2 / 1 层 source 对 2 层 target（少包=隐式补包）不误伤。
+// ============================================================
+namespace {
+const char* kBug12Iface =
+    "interface G { greet() -> string }"
+    " type P = { name: string }"
+    " fun (self P impl G) greet() -> string { return \"hi\" }";
+} // namespace
+
+TEST(SemaOptional, OptLayerMismatchLetViewError) {
+    // 主线：Optional<G> = some(some(p))（2>1 视图）→ 干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kBug12Iface) +
+        " fun main(io: Io) { let p: P = { name = \"w\" };"
+        " let o: Optional<G> = some(some(p)) }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, OptLayerMismatchLetIntError) {
+    // 值类型：Optional<int> = some(some(5))（2>1）→ 干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " fun main(io: Io) { let o: Optional<int> = some(some(5)) }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, OptLayerMismatchLetRecordError) {
+    // record：Optional<Point> = some(some(p))（2>1）→ 干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let p: Point = { x = 1, y = 2 };"
+        " let o: Optional<Point> = some(some(p)) }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, OptLayerMismatchArgError) {
+    // 函数实参：show(some(some(p)))（2>1）→ 干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kBug12Iface) +
+        " fun show(g: Optional<G>) -> int { return 1 }"
+        " fun main(io: Io) { let p: P = { name = \"w\" }; let r = show(some(some(p))) }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, OptLayerMismatchReturnError) {
+    // 函数返回：return some(some(p))（2>1）→ 干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kBug12Iface) +
+        " fun make() -> Optional<G> { let p: P = { name = \"w\" }; return some(some(p)) }"
+        " fun main(io: Io) { let o = make() }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, OptLayerMismatchFieldError) {
+    // record 字段：{ opt = some(some(p)) }（2>1）→ 干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kBug12Iface) +
+        " type H = { opt: Optional<G> }"
+        " fun main(io: Io) { let p: P = { name = \"w\" };"
+        " let h: H = { opt = some(some(p)) } }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, OptLayerMismatchVarCarriedError) {
+    // 变量携带层数：some(Optional<G> 变量)（内层 GenericSemType{Optional}）2>1 → 干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kBug12Iface) +
+        " fun main(io: Io) { let p: P = { name = \"w\" };"
+        " let p2: Optional<P> = some(p); let o: Optional<G> = some(p2) }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, OptLayerMismatchTripleError) {
+    // 三层：Optional<G> = some(some(some(p)))（3>1）→ 干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kBug12Iface) +
+        " fun main(io: Io) { let p: P = { name = \"w\" };"
+        " let o: Optional<G> = some(some(some(p))) }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaOptional, OptLayerMismatchEqualOneToOneOk) {
+    // 对照：Optional<G> = some(p)（1=1）→ 无错，不误伤
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kBug12Iface) +
+        " fun main(io: Io) { let p: P = { name = \"w\" };"
+        " let o: Optional<G> = some(p) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptLayerMismatchEqualTwoToTwoIntOk) {
+    // 对照：Optional<Optional<int>> = some(some(5))（2=2 值类型）→ 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " fun main(io: Io) { let o: Optional<Optional<int>> = some(some(5)) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptLayerMismatchEqualTwoToTwoViewOk) {
+    // 对照：Optional<Optional<G>> = some(some(p))（2=2 视图，P4-7 合法形态）→ 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kBug12Iface) +
+        " fun main(io: Io) { let p: P = { name = \"w\" };"
+        " let o: Optional<Optional<G>> = some(some(p)) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptLayerMismatchSourceLessOk) {
+    // 对照（审查附注边界）：Optional<Optional<int>> = some(5)（source 1 层 < target 2 层，
+    // 少包=隐式补包）→ 现状编译运行通过，记录为合法形态
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " fun main(io: Io) { let o: Optional<Optional<int>> = some(5) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptLayerMismatchEqualTwoToTwoVarCarriedOk) {
+    // 对照：Optional<Optional<G>> = some(Optional<G> 变量)（2=2，source 内层为
+    // GenericSemType{Optional}，变量携带）→ 层数相等，不误伤
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kBug12Iface) +
+        " fun main(io: Io) { let p: P = { name = \"w\" };"
+        " let p2: Optional<G> = some(p); let o: Optional<Optional<G>> = some(p2) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaOptional, OptLayerMismatchBareValueOk) {
+    // 对照：Optional<Point> = p（裸值直赋，非 OptionalSemType source，走 L113 隐式装箱）→ 无错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let p: Point = { x = 1, y = 2 };"
+        " let o: Optional<Point> = p }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
 
 
 

@@ -102,11 +102,14 @@ void SemAnalyzer::checkFunBody(const FunDecl& decl) {
     // 1. 先注册泛型参数（后续类型解析需要能查到 T）
     for (auto& p : decl.params) {
         if (p.type) registerTypeGenerics(symtab_, *p.type);
+        // bug-07：参数直接写泛型函数类型（`f: fun(U) -> U`）时 U 是裸 NamedType，
+        // registerTypeGenerics 不收集；仿返回侧提前注册（仅顶层 FunctionType）
+        if (p.type) registerFuncTypeGenerics(symtab_, *p.type);
     }
     if (decl.returnType) registerTypeGenerics(symtab_, *decl.returnType);
     // M5：返回类型直接写泛型函数类型（`-> fun(U) -> U`）时，U 是裸 NamedType，
     // registerTypeGenerics 不收集；此处仿其提前注册，使返回类型解析不报 undefined
-    if (decl.returnType) registerReturnFuncTypeGenerics(symtab_, *decl.returnType);
+    if (decl.returnType) registerFuncTypeGenerics(symtab_, *decl.returnType);
 
     // 2. 注册参数（此时泛型已可解析）
     // G4：同时从解析后的参数类型收集"裸泛型变量"名（含类型别名实例化泄漏的 T，
@@ -125,6 +128,15 @@ void SemAnalyzer::checkFunBody(const FunDecl& decl) {
     // 3. 解析返回类型（泛型已注册，T 可正确解析为 GenericSemType）
     //    用 FnCtxGuard 保存/恢复外层上下文（支持闭包体嵌套检查）
     auto retType = decl.returnType ? resolveType(*decl.returnType) : nullptr;
+    // bug-28：main 入口禁止声明非 None 返回类型。genMainEntry（DeclFun.cpp）异步分支恒走
+    // `auto t = ::aura_main(io); run_event_loop(t);`，而 run_event_loop 只接受 task<void>&
+    // （task.h/event_loop.h/task.cpp 非模板）→ int/task<int> 均无法绑定 → g++ 坏 C++。
+    // 无标注（retType=null）与 `-> None`（NoneSemType）放行；ErrorSemType 跳过防级联。
+    if (decl.name == "main" && retType
+        && !dynamic_cast<const NoneSemType*>(retType.get())
+        && !dynamic_cast<const ErrorSemType*>(retType.get())) {
+        error(decl, "entry function 'main' must not declare a return type (expected None)");
+    }
     // P1-2：保存解析后的返回类型到 returnType->inferredType（typeStore_ 保活），
     // 供 CodeGen funSignature 读取（currentReturnVariantCppTypes_ / HasNoneVariant_ 装箱）
     if (retType && decl.returnType) {
@@ -172,11 +184,14 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
     // 2. 注册参数泛型 + 返回类型泛型
     for (auto& p : decl.params) {
         if (p.type) registerTypeGenerics(symtab_, *p.type);
+        // bug-07：方法参数直接写泛型函数类型（`f: fun(U) -> U`）时 U 是裸 NamedType，
+        // registerTypeGenerics 不收集；仿返回侧提前注册（仅顶层 FunctionType）
+        if (p.type) registerFuncTypeGenerics(symtab_, *p.type);
     }
     if (decl.returnType) registerTypeGenerics(symtab_, *decl.returnType);
     // M5：返回类型直接写泛型函数类型（`-> fun(U,T) throws -> U`）时，U/T 是裸
     // NamedType，registerTypeGenerics 不收集；此处仿其提前注册，使返回类型解析不报 undefined
-    if (decl.returnType) registerReturnFuncTypeGenerics(symtab_, *decl.returnType);
+    if (decl.returnType) registerFuncTypeGenerics(symtab_, *decl.returnType);
 
     // 3. 注册接收者 self
     {
@@ -233,6 +248,14 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
 
     // impl 接口一致性验证
     if (!decl.implInterface.empty()) {
+        // bug-07：impl 一致性校验下方 resolveType(参数/返回类型) 需要方法自身裸泛型 U
+        // 在作用域（方法体 scope 已在 L241 退出）。临时 Function scope + 注册（仅顶层
+        // FunctionType 内部裸泛型），使 `fun (self Box impl Getter) getU() -> fun(U)->U`
+        // 的签名解析不报 undefined type 'U'。
+        symtab_.enterScope(ScopeKind::Function);
+        for (auto& p : decl.params)
+            if (p.type) registerFuncTypeGenerics(symtab_, *p.type);
+        if (decl.returnType) registerFuncTypeGenerics(symtab_, *decl.returnType);
         // 泛型 record 实现接口 → v1 报错（适配器类型名无法对应，见 C3.2）
         if (!decl.receiverTypeArgs.empty()) {
             error(decl, "generic type '" + decl.receiverType
@@ -305,6 +328,7 @@ void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
                       "' has no method '" + decl.name + "'");
             }
         }
+        symtab_.exitScope();
     }
 }
 

@@ -69,18 +69,37 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
                 const SemType* tCur = gt;
                 const SemType* sCur = &source;
                 // 同步剥层：target 经 elemTypeOf 从 resolvedName 提取 <...> 内元素，
-                // source 取 OptionalSemType.elementType；任一侧不再是 Optional 即停止
+                // source 取 OptionalSemType.elementType；任一侧不再是 Optional 即停止。
+                // source 侧 Optional 层除 OptionalSemType（some()/折叠推断）外，还可能是
+                // GenericSemType{name=="Optional", resolvedName 非空}——显式 Optional<X>
+                // 注解变量引用经 materialize 物化（bug-12 扩展：repro_var_carried_2to1，
+                // some(Optional<Person> 变量) 内层为 GenericSemType 而非 OptionalSemType）。
                 while (true) {
                     auto* tg = dynamic_cast<const GenericSemType*>(tCur);
                     auto* so = dynamic_cast<const OptionalSemType*>(sCur);
+                    auto* sg = dynamic_cast<const GenericSemType*>(sCur);
+                    bool sIsOptLayer = (so && so->elementType)
+                        || (sg && sg->name == "Optional" && !sg->resolvedName.empty());
                     if (!tg || tg->name != "Optional" || tg->resolvedName.empty()
-                        || !so || !so->elementType)
+                        || !sIsOptLayer)
                         break;
                     ownedT.push_back(elemTypeOf(tCur));
                     tCur = ownedT.back().get();
-                    ownedS.push_back(so->elementType->clone());
+                    ownedS.push_back(so ? so->elementType->clone() : elemTypeOf(sCur));
                     sCur = ownedS.back().get();
                 }
+                // bug-12 Optional 层数校验：source（some 结构化推断）层数 > target
+                // （显式 Optional<X> 注解）层数时放行会令 CodeGen 把内层 some 结果当
+                // 值装箱 → 坏 C++（Optional<Greetable> = some(some(p)) 2 层 > 1 层）。
+                // 同步剥层循环两侧各剥一层（循环次数 = min(两侧层数)）；循环终止后
+                // source 若仍残留 Optional 层（OptionalSemType 或 GenericSemType{Optional}
+                // 且元素可提取），说明 source 层数 > target 层数 → 拒绝（调用方报干净
+                // type mismatch）。相等或更少则继续走下方 P4-7 窄拦截，不误伤。
+                if (auto* restSo = dynamic_cast<const OptionalSemType*>(sCur))
+                    if (restSo->elementType) return false;
+                if (auto* restSg = dynamic_cast<const GenericSemType*>(sCur))
+                    if (restSg->name == "Optional" && !restSg->resolvedName.empty())
+                        return false;
                 // 最内层 target 元素须为接口视图（InterfaceSemType，或泛型接口物化
                 // 占位 GenericSemType{name="Cmp<Point*>"}——semTypeFromCppName 对
                 // "Cmp<Point*>" 反解失败落入占位，基名 Cmp 查符号表为 Interface）

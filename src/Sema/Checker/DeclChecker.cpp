@@ -79,13 +79,14 @@ void SemAnalyzer::registerTypeGenerics(SymbolTable& symtab, const TypeExpr& type
     });
 }
 
-// M5：注册返回类型 FunctionType 中的"裸泛型名"（未声明的 NamedType）为 GenericParam。
-// 直接写泛型函数类型返回（`fun makeU() -> fun(U) -> U`）时，T/U 是裸 NamedType（解析器
-// 仅将 <T> 尖括号形式解析为 GenericTypeRef）；forEachGenericRef 对 NamedType 只遍历
-// typeArgs、不收集裸名 → resolveType 报 undefined type 'U'。此处仿 registerTypeGenerics
-// 在返回类型解析前注册：仅注册"未声明（非 builtin、非 TypeAlias/Interface/GenericParam）
-// 且无实参的裸类型名"，已声明类型名（如 Point）不受影响。
-void SemAnalyzer::registerReturnFuncTypeGenerics(SymbolTable& symtab, const TypeExpr& type) {
+// M5 + bug-07：注册 FunctionType 中的"裸泛型名"（未声明的 NamedType）为 GenericParam。
+// 直接写泛型函数类型（`fun makeU() -> fun(U) -> U` 返回 / `f: fun(U) -> U` 参数）时，
+// T/U 是裸 NamedType（解析器仅将 <T> 尖括号形式解析为 GenericTypeRef）；forEachGenericRef
+// 对 NamedType 只遍历 typeArgs、不收集裸名 → resolveType 报 undefined type 'U'。此处仿
+// registerTypeGenerics 在类型解析前注册：仅注册"未声明（非 builtin、非 TypeAlias/Interface/
+// GenericParam）且无实参的裸类型名"，已声明类型名（如 Point）不受影响。对已注册的
+// GenericParam（接口泛型 T）跳过（幂等，防遮蔽）。
+void SemAnalyzer::registerFuncTypeGenerics(SymbolTable& symtab, const TypeExpr& type) {
     auto visit = [&](const TypeExpr* t, auto&& self) -> void {
         if (!t) return;
         if (auto* fn = dynamic_cast<const FunctionType*>(t)) {
@@ -172,8 +173,11 @@ void SemAnalyzer::buildTypeMethods(const Program& program) {
             // M5：方法返回类型直接写泛型函数类型（`-> fun(U,T) throws -> U`）时，U/T 是
             // 裸 NamedType 全局未注册，需临时 Function scope 提前注册再解析，否则报 undefined
             symtab_.enterScope(ScopeKind::Function);
-            if (m->returnType) registerReturnFuncTypeGenerics(symtab_, *m->returnType);
+            if (m->returnType) registerFuncTypeGenerics(symtab_, *m->returnType);
             for (auto& p : m->params) {
+                // bug-07：方法参数直接写泛型函数类型（`f: fun(U) -> U`）时 U 是裸
+                // NamedType，registerTypeGenerics 不收集；此处仿返回侧提前注册
+                if (p.type) registerFuncTypeGenerics(symtab_, *p.type);
                 if (p.type) sig.paramTypes.push_back(resolveType(*p.type));
                 else        sig.paramTypes.push_back(ErrorSemType::make());
             }
@@ -385,11 +389,14 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         symtab_.enterScope(ScopeKind::Function);
         for (auto& p : f->params) {
             if (p.type) registerTypeGenerics(symtab_, *p.type);
+            // bug-07：参数直接写泛型函数类型（`f: fun(U) -> U`）时 U 是裸 NamedType，
+            // registerTypeGenerics 不收集；仿返回侧 M5 提前注册（仅顶层 FunctionType）
+            if (p.type) registerFuncTypeGenerics(symtab_, *p.type);
         }
         if (f->returnType) registerTypeGenerics(symtab_, *f->returnType);
         // M5：返回类型直接写泛型函数类型（`-> fun(U) -> U`）时，U 是裸 NamedType，
         // registerTypeGenerics 不收集；第 1 遍声明阶段也要解析返回类型，需同样提前注册
-        if (f->returnType) registerReturnFuncTypeGenerics(symtab_, *f->returnType);
+        if (f->returnType) registerFuncTypeGenerics(symtab_, *f->returnType);
 
         for (auto& p : f->params) {
             SymParam sp;
@@ -414,8 +421,11 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         // 裸 NamedType（非 receiver 泛型，全局未注册），需临时 Function scope 提前注册，
         // 使第 1 遍参数/返回类型解析不报 undefined type
         symtab_.enterScope(ScopeKind::Function);
-        if (m->returnType) registerReturnFuncTypeGenerics(symtab_, *m->returnType);
+        if (m->returnType) registerFuncTypeGenerics(symtab_, *m->returnType);
         for (auto& p : m->params) {
+            // bug-07：方法参数直接写泛型函数类型（`f: fun(U) -> U`）时 U 是裸 NamedType，
+            // registerTypeGenerics 不收集；仿返回侧提前注册（仅顶层 FunctionType）
+            if (p.type) registerFuncTypeGenerics(symtab_, *p.type);
             SymParam sp;
             sp.name = p.name;
             sp.type = p.type ? resolveType(*p.type) : ErrorSemType::make();

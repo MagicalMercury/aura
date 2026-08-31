@@ -531,6 +531,12 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
                 fin += "*";
             return fin;
         }
+        // 未实例化的泛型：先查调用点默认参数闭包物化映射（bug-06，跨模块默认参数
+        // 闭包引用函数模板 T 时按调用点实参物化；与 mapType NamedType L74-75 /
+        // mapGenericRef L390-391 行为统一。作用域由 genMethodCall isNs 默认参数补全
+        // save-restore 限定，避免同名外层模板参数被误物化）
+        auto mit = defaultArgMaterializedTypes_.find(gs->name);
+        if (mit != defaultArgMaterializedTypes_.end()) return mit->second;
         // 未实例化的泛型：查 BuiltinRegistry 回退（如 sync.Channel → aura_rt::ThreadChannel*）
         if (auto* ti = BuiltinRegistry::get().findType(gs->name))
             return ti->cppType;

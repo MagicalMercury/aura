@@ -590,3 +590,119 @@ TEST(SemaInterfaces, LateIfaceUndefinedStillRejected) {
     EXPECT_TRUE(diag.hasErrors());
     EXPECT_TRUE(hasErrorContaining(diag, "undefined type 'Nope'"));
 }
+
+// ============================================================
+// bug-20「接口自引用方法返回自身时调用点链式调用方法集空（next().val() 报 has no method）」
+// （2026-08-30 修复）：resolveInterfaceMethods 先 clear 再逐个 push → 解析 next() 返回
+// 类型（引用自身 Node）时 interfaceMethods 既无 next 也无后续 val → resolveNamedType
+// 复制空/不完整方法集快照。修复：占位 + 三轮填充（第一遍全方法占位 sig，第二/三遍
+// 按索引就地覆写 paramTypes/returnType，禁止 clear 后重推）。以下断言覆盖：主线
+// nd.next().val()、自身方法 nd.next().next()（审查点 3b）、返回值参与运算（审查点 3a，
+// None 退化已消除）、泛型接口自引用（含 CodeGen Box<int32_t> 完整类型名）、
+// val-先声明顺序部分缓解回归、无自引用/前置接口引用对照组不误伤。
+// ============================================================
+TEST(SemaInterfaces, IfaceSelfRefChainNextVal) {
+    // 主线：next 先 val 后，nd.next().val()——修复前报 has no method 'val'
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface Node { next() -> Node val() -> int }"
+        " type NodeRec = { n: int }"
+        " fun (self NodeRec impl Node) next() -> Node { let self2: Node = self; return self2 }"
+        " fun (self NodeRec impl Node) val() -> int { return self.n }"
+        " fun main(io: Io) { let nd: Node = NodeRec { n = 5 }; let v = nd.next().val() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaInterfaces, IfaceSelfRefChainNextNext) {
+    // 审查点 3b：自身方法链式 nd.next().next()——占位轮后自身签名完整
+    // （val-先声明形态无法覆盖此路径：next 自身恒缺）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface Node { next() -> Node val() -> int }"
+        " type NodeRec = { n: int }"
+        " fun (self NodeRec impl Node) next() -> Node { let self2: Node = self; return self2 }"
+        " fun (self NodeRec impl Node) val() -> int { return self.n }"
+        " fun main(io: Io) { let nd: Node = NodeRec { n = 5 }; let n2 = nd.next().next() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaInterfaces, IfaceSelfRefChainValArith) {
+    // 审查点 3a：nd.next().val() 返回值参与运算（let v: int = nd.next().val() + 1）
+    // 验证 None 退化已消除——若中间态把 val.returnType 推断为 None，则 None + 1 无法
+    // 赋给 int（报错/坏 C++）。第三轮就地覆写后 val.returnType=int → 无错误且生成 int 运算。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "interface Node { next() -> Node val() -> int }"
+        " type NodeRec = { n: int }"
+        " fun (self NodeRec impl Node) next() -> Node { let self2: Node = self; return self2 }"
+        " fun (self NodeRec impl Node) val() -> int { return self.n }"
+        " fun main(io: Io) { let nd: Node = NodeRec { n = 5 };"
+        "   let v: int = nd.next().val() + 1 }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "int32_t v");
+    EXPECT_NOT_CONTAINS(unit.impl, "None");
+}
+
+TEST(SemaInterfaces, IfaceSelfRefGenericChain) {
+    // 泛型接口自引用 Box<T>：Sema 通过 + CodeGen 完整类型名 Box<int32_t>
+    // （修复前 Sema 报 has no method 'val'；Sema 修复后暴露的独立缺陷——无标注 let
+    // 绑定泛型接口视图 typeArgs 丢失（ViewRoot<Box>）与 substitute 未递归 InterfaceSemType
+    // 导致 Box<auto>——一并修复。断言 ViewRoot<Box<int32_t>> 且无 Box<auto>/裸 Box）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "interface Box<T> { next() -> Box<T> val() -> int }"
+        " type BoxRec = { n: int }"
+        " fun (self BoxRec impl Box<int>) next() -> Box<int> { let s: Box<int> = self; return s }"
+        " fun (self BoxRec impl Box<int>) val() -> int { return self.n }"
+        " fun main(io: Io) { let nd: Box<int> = BoxRec { n = 5 };"
+        "   let b = nd.next(); let v = b.val() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "ViewRoot<Box<int32_t>>");
+    EXPECT_NOT_CONTAINS(unit.impl, "Box<auto>");
+    EXPECT_NOT_CONTAINS(unit.impl, "ViewRoot<Box> ");
+}
+
+TEST(SemaInterfaces, IfaceSelfRefValFirstNoRegression) {
+    // 顺序部分缓解回归：val 先声明时 nd.next().val() 本可编译（顺序缓解），修复后不误伤
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface Node { val() -> int next() -> Node }"
+        " type NodeRec = { n: int }"
+        " fun (self NodeRec impl Node) val() -> int { return self.n }"
+        " fun (self NodeRec impl Node) next() -> Node { let self2: Node = self; return self2 }"
+        " fun main(io: Io) { let nd: Node = NodeRec { n = 5 }; let v = nd.next().val() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaInterfaces, IfaceNoSelfRefChainControl) {
+    // 对照组：无自引用接口 + 直接调用 → 不误伤
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface Greeter { greet() -> int }"
+        " type GRec = { n: int }"
+        " fun (self GRec impl Greeter) greet() -> int { return self.n }"
+        " fun main(io: Io) { let g: Greeter = GRec { n = 42 }; let v = g.greet() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaInterfaces, IfaceForwardRefChainControl) {
+    // 对照组：接口返回【前置】接口 B（B 声明在 A 之前）+ a.get().val() → 不误伤
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface B { val() -> int } interface A { get() -> B }"
+        " type BRec = { x: int }"
+        " fun (self BRec impl B) val() -> int { return self.x }"
+        " type ARec = { b: B }"
+        " fun (self ARec impl A) get() -> B { return self.b }"
+        " fun main(io: Io) { let b: B = BRec { x = 9 }; let a: A = ARec { b = b };"
+        "   let v = a.get().val() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+

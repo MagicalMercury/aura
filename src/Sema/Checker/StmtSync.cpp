@@ -149,7 +149,7 @@ void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
     // 同名自动绑定校验：无显式实参列表（stmt.args 为空）时，CodeGen 按参数名引用
     // 外层同名变量（genSpawnStmt 同名自动绑定 / genSpawnAsThread 捕获列表）。若外层
     // 无该变量，生成的裸标识符落到 g++ "'x' was not declared"（坏 C++）——此处提前
-    // 干净报错。io/_tasks 由 CodeGen 特殊追加实参（genSpawnStmt L1928-1929），不参与
+    // 干净报错。io/_tasks 由 CodeGen 特殊追加实参（StmtSpawn.cpp L82-83），不参与
     // 同名绑定，跳过校验（避免误伤 `spawn (io: Io, i: int)` 循环变量绑定形态）。
     if (stmt.args.empty()) {
         for (auto& p : stmt.params) {
@@ -158,6 +158,41 @@ void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
             if (!symtab_.lookup(p.name)) {
                 error(stmt, "cannot bind spawn parameter '" + p.name
                       + "': no outer variable of that name");
+            }
+        }
+    }
+
+    // 显式实参校验（bug-21）：spawn 闭包形态 (args) 的显式实参修复前从不被校验
+    // （不 inferExpr、不校验数量/类型）→ 数量多/少、类型不匹配、未定义标识符全部
+    // 静默放行 → CodeGen genSpawnStmt 按位置生成实参 → g++ too many/few /
+    // invalid conversion（坏 C++）。此处补上完整校验。
+    // 关键：inferExpr(args) 必须在外层作用域（enterScope 之前）执行——进入参数
+    // 作用域后，与参数同名的实参标识符会被遮蔽 → 误报（control_coro_args_same_name
+    // 验证外层求值是正确语义）。
+    if (!stmt.args.empty()) {
+        // 1. 数量校验：spawn 无默认参数、严格相等；io/_tasks 也占参数位
+        if (stmt.args.size() != stmt.params.size()) {
+            error(stmt, "spawn argument count mismatch: "
+                  + std::to_string(stmt.args.size()) + " args for "
+                  + std::to_string(stmt.params.size()) + " parameters");
+        }
+        // 2. 类型校验：逐参 inferExpr + isAssignable（外层作用域求值）
+        for (size_t i = 0; i < stmt.args.size() && i < stmt.params.size(); ++i) {
+            if (!stmt.args[i]) continue;   // 防御 null（parseExpr 失败兜底）
+            std::unique_ptr<SemType> argTy;
+            std::unique_ptr<SemType> paramTy;
+            const Param& p = stmt.params[i];
+            // _tasks 为内部类型（无法 resolveType），跳过类型校验（仍占数量位）
+            if (p.type && p.name != "_tasks")
+                paramTy = resolveType(*p.type);
+            // 匿名 record 字面量实参需期望类型才能解析（决策 A，与 checkCallArgs 对齐）
+            if (paramTy && isRecordLiteralArg(*stmt.args[i]))
+                argTy = inferExpr(*stmt.args[i], paramTy.get());
+            else
+                argTy = inferExpr(*stmt.args[i]);
+            if (paramTy && !isAssignable(*paramTy, *argTy)) {
+                error(*stmt.args[i], "spawn argument type mismatch: expected '"
+                      + paramTy->toString() + "', got '" + argTy->toString() + "'");
             }
         }
     }

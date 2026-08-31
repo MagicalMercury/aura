@@ -7,6 +7,16 @@
 #include "framework/test_framework.h"
 #include "framework/test_helpers.h"
 
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 using namespace aura_test;
 
 // ============================================================
@@ -294,6 +304,136 @@ TEST(CodeGen, GenericTemplateGenerated) {
     EXPECT_FALSE(diag.hasErrors());
     EXPECT_CONTAINS(unit.header, "template<typename A, typename B>");
     EXPECT_CONTAINS(unit.header, "struct Pair : aura_rt::GcObject");
+}
+
+TEST(CodeGen, GenericCtorOptionalBoxingNoBareTLeak) {
+    // bug-18 CodeGen 联动：泛型 ctor 形参 Optional<T> + Box(9)（无标注）时，调用点
+    // 非模板作用域裸 T 未定义 → 装箱须用调用点已知 receiver 泛型实参实例化，生成
+    // make_optional<int32_t>(9)（CTAD 推导 Box_ctor<int32_t>），不得泄漏 make_optional<T>。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: Optional<T>) { }"
+        " fun main(io: Io) { let b = Box(9) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "make_optional<int32_t>(");
+    EXPECT_NOT_CONTAINS(unit.impl, "make_optional<T>(");
+}
+
+TEST(CodeGen, GenericMethodOptionalBoxingBareValue) {
+    // bug-05：泛型 record 方法形参 Optional<T> + 裸值直传（b.pick(9)）→ 注册键
+    // "Box.pick"（DeclFun.cpp 声明侧 receiverType 无 <>）vs 查询键 "Box<int32_t>.pick"
+    // （实例化 canonicalName）不匹配 → methodDefKey fallback + 字符串实例化（T→int32_t）
+    // 后装箱，生成 make_optional<int32_t>(9)；不得泄漏 make_optional<T>。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Box<T> = { val: T }"
+        " fun (self Box<T>) pick(o: Optional<T>) -> T { return o.unwrap() }"
+        " fun main(io: Io) { let b: Box<int> = { val = 5 }; let r = b.pick(9); io.println(str(r)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "make_optional<int32_t>(");
+    EXPECT_NOT_CONTAINS(unit.impl, "make_optional<T>(");
+}
+
+TEST(CodeGen, GenericMethodOptionalBoxingRecordVar) {
+    // bug-05：Optional<T> + record 变量直传（T=Point）→ canonicalName "Box<Point>"
+    // 的 record 实参补 '*'（T→"Point*"）→ make_optional<Point*>（防 "Point" 缺 * 坏 C++）。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Point = { x: int, y: int }"
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) pick(o: Optional<T>) -> T { return o.unwrap() }"
+        " fun main(io: Io) { let p: Point = { x = 1, y = 2 }; let b: Box<Point> = { val = p };"
+        "   let q: Point = { x = 3, y = 4 }; let r = b.pick(q); io.println(str(r.x)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "make_optional<Point*>(");
+    EXPECT_NOT_CONTAINS(unit.impl, "make_optional<Point>(");
+}
+
+TEST(CodeGen, GenericMethodOptionalBoxingList) {
+    // bug-05：Optional<T> + 列表直传（T=[int]）→ T→"aura_rt::Array<int32_t>*"
+    // → make_optional<Array<int32_t>*>；不泄漏 make_optional<T>。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Box<T> = { val: T }"
+        " fun (self Box<T>) pick(o: Optional<T>) -> T { return o.unwrap() }"
+        " fun main(io: Io) { let b: Box<[int]> = { val = [1, 2] }; let r = b.pick([3, 4]); io.println(str(r.len())) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "make_optional<aura_rt::Array<int32_t>*>(");
+    EXPECT_NOT_CONTAINS(unit.impl, "make_optional<T>(");
+}
+
+TEST(CodeGen, GenericMethodOptionalBoxingUnion) {
+    // bug-05：Union(Point|T) 形参 + 裸值直传（T=int）→ T→int32_t → make_variant<Point*, int32_t>。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Point = { x: int, y: int }"
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) pick(o: Point | T) -> int { return 0 }"
+        " fun main(io: Io) { let b: Box<int> = { val = 5 }; b.pick(9); io.println(\"done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "make_variant<Point*, int32_t>(");
+}
+
+TEST(CodeGen, GenericMethodPureTParamNoBoxingControl) {
+    // bug-05 对照：纯 T 形参（paramCpp = "T" 非 Optional/Variant 前缀）不受键不匹配影响，
+    // 且修复后不得误装箱（不出现 make_optional）。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Box<T> = { val: T }"
+        " fun (self Box<T>) pick(v: T) -> T { return v }"
+        " fun main(io: Io) { let b: Box<int> = { val = 5 }; let r = b.pick(9); io.println(str(r)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_NOT_CONTAINS(unit.impl, "make_optional<");
+}
+
+TEST(CodeGen, GenericMethodOptionalSomeNoDoubleBoxControl) {
+    // bug-05 对照：some() 直传 Optional<T> 形参（已 Optional 值）→ genOptionalTargetInit
+    // 直通不二次装箱；修复后键匹配（fallback 命中）亦不改变 some 直通行为。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Box<T> = { val: T }"
+        " fun (self Box<T>) pick(o: Optional<T>) -> T { return o.unwrap() }"
+        " fun main(io: Io) { let b: Box<int> = { val = 5 }; let r = b.pick(some(9)); io.println(str(r)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // some(9) 为 CTAD 形态 make_optional(9)，不是显式模板参数形态；拦截"二次装箱"
+    // make_optional<int32_t>( 出现于 some( 内层（a=b.pick(some(make_optional<int32_t>(9)))）
+    EXPECT_NOT_CONTAINS(unit.impl, "make_optional<int32_t>(aura_rt::make_optional");
+}
+
+TEST(CodeGen, GenericPlusStringGeneratesPlusGeneric) {
+    // bug-15：泛型函数返回泛型闭包 fun(T)->T，体内 x + inc（操作数 derived 自泛型 T）
+    // → 生成 aura_rt::plus_generic（runtime if constexpr 分派：string→concat / 数值→原生+）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun make_adder(inc: <T>) -> fun(T) -> T {"
+        "  return fun(x: T) -> T { return x + inc } }"
+        " fun main(io: Io) { let add = make_adder(\"!\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // make_adder 是模板函数（模板体进 header）
+    EXPECT_CONTAINS(unit.header, "aura_rt::plus_generic");
+    EXPECT_NOT_CONTAINS(unit.header, "return (x + inc);");
+}
+
+TEST(CodeGen, GenericPlusStringLiteralGeneratesPlusGeneric) {
+    // bug-23：泛型 T + 字面量"!"（右侧 intern_string 子串曾被过度判 string）
+    // → 泛型短路置于 substring 判定之前 → 同样生成 aura_rt::plus_generic
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun add(x: <T>) -> T { return x + \"!\" }"
+        " fun main(io: Io) { let s = add(\"hello\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // add 是模板函数（模板体进 header）
+    EXPECT_CONTAINS(unit.header, "aura_rt::plus_generic");
 }
 
 // ============================================================
@@ -2112,6 +2252,57 @@ TEST(CodeGen, GenericRecordMethodFnAliasReturnNoExtraStar) {
     EXPECT_CONTAINS(unit.header, "aura_rt::Array<Transform<T>>* Runner<T>::getTransforms()");
 }
 
+// bug-03：泛型方法体 `return []` 空列表兜底——用 currentReturnCppType_（返回类型
+// "aura_rt::Array<Transform<T>>*"）提取元素生成 Array<Transform<T>>::make(0)，
+// 而非 currentTParams_[0] 兜底生成的 Array<T>::make(0)（与返回类型不匹配坏 C++）。
+TEST(CodeGen, GenericMethodReturnEmptyListUsesReturnElem) {
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Transform<T> = fun(T) throws -> T"
+        " type Runner<T> = { label: string }"
+        " fun (self Runner<T>) getTransforms() throws -> [Transform<T>] { return [] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.header, "return aura_rt::Array<Transform<T>>::make(0);");
+    EXPECT_NOT_CONTAINS(unit.header, "return aura_rt::Array<T>::make(0);");
+}
+
+// bug-03 嵌套形态：返回 [[Transform<T>]] 的 `return []` → 提取内层（首 '<' 后 / 末 '>' 前
+// 恒等于内层，任意嵌套深度成立）→ Array<aura_rt::Array<Transform<T>>*>::make(0)
+// （内层元素是 [Transform<T>] → aura_rt::Array<Transform<T>>* 指针）。
+TEST(CodeGen, GenericMethodReturnNestedEmptyListUsesReturnElem) {
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Transform<T> = fun(T) throws -> T"
+        " type Runner<T> = { label: string }"
+        " fun (self Runner<T>) getNested() throws -> [[Transform<T>]] { return [] }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.header,
+        "return aura_rt::Array<aura_rt::Array<Transform<T>>*>::make(0);");
+}
+
+// bug-04 let 主线：闭包内 `let result: [U] = []`（U 闭包自身泛型，非 receiver 泛型 A）。
+// genListExpr 空列表兜底 currentTParams_[0] = A → Array<A>::make(0)，StmtLet 空列表修复
+// 不再硬编码 "Array<T>/Array<U>"（否则 Array<A> 不命中），改用 decl.type [U] 的 mapType
+// 精确纠正 → Array<U>::make(0)。
+TEST(CodeGen, ClosureLetEmptyListUsesDeclTypeElem) {
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Mapper<T, U> = fun([T], fun(T) -> U) -> [U]"
+        " type Box<A> = { value: A }"
+        " fun (self Box<A>) makeM() -> Mapper<A, U> {"
+        "  return fun(items: [A], transform: fun(A) -> U) -> [U] {"
+        "   let result: [U] = []"
+        "   for item in items { result.append(transform(item)) }"
+        "   return result"
+        "  }"
+        " }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.header, "result_raw = aura_rt::Array<U>::make(0);");
+}
+
 TEST(CodeGen, GenericRecordMethodAliasFormsNoRegression) {
     // 回归套件：t1 [T] / t2 Optional<T> / t3 T / t4 返回 T / t6 泛型函数 /
     // t8 字段 [Transform<T>] / t16 ctor IntFn —— 声明侧均不得多 '*'
@@ -2506,6 +2697,95 @@ TEST(CodeGen, SpawnMultiParamSyncMaxNoGet) {
 }
 
 // ============================================================
+// bug-10（2026-08-31）：sync thread 内 spawn 显式实参被静默忽略
+// 根因：genSpawnAsThread 捕获列表只按参数名生成（不读 stmt.args）→ 实参被丢弃 / 坏 C++ /
+//       外层同名静默绑错。修复：显式实参按位置 init-capture——
+//       - 值类型实参：裸 init-capture `x = <expr>`（外层作用域求值）
+//       - 堆类型实参：init-capture 持 GcRootHandle Global 根（对齐 ExprClosure 跨线程捕获
+//         先例，worker 线程 GC 扫描可见，避免裸 .get() 指针悬垂）；body 内参数名 .get() 联动
+//       - io 参数保持 &io 引用捕获（位置对齐，跳过 io 勿收缩 args 索引）
+//       - 同名自动绑定（无实参）保持裸名捕获不误伤
+// ============================================================
+TEST(CodeGen, SyncThreadSpawnExplicitArgsInitCapture) {
+    // 主线：sync thread 内 spawn 显式实参（实参与参数名异）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let ch: sync.Channel<int> = sync.Channel(10)"
+        " sync thread {"
+        "   spawn (ch: sync.Channel<int>, x: int) { ch.send(x) }(ch, 3)"
+        " }"
+        " ch.close() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 值类型实参 x → 裸 init-capture x = 3（修复前 [ch, x] 按参数名裸捕获、实参被丢弃）
+    EXPECT_CONTAINS(unit.impl, "x = 3");
+    // 堆类型实参 ch → GcRootHandle Global 根 init-capture（跨线程安全）
+    EXPECT_CONTAINS(unit.impl, "GcRootScope::Global");
+    EXPECT_CONTAINS(unit.impl,
+        "GcRootHandle<aura_rt::ThreadChannel<int32_t>*>(ch.get(), aura_rt::GcRootScope::Global)");
+    // 不再出现修复前按参数名捕获的裸名形态
+    EXPECT_NOT_CONTAINS(unit.impl, "submit([ch, x]");
+}
+
+TEST(CodeGen, SyncThreadSpawnExplicitHeapArgGlobalRoot) {
+    // 堆类型实参（record / GcString）→ Global 根 init-capture + body 内参数名 .get() 联动
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) throws {"
+        " let ch: sync.Channel<string> = sync.Channel(10)"
+        " let p: Point = { x = 10, y = 20 }"
+        " sync thread {"
+        "   spawn (c: sync.Channel<string>, pt: Point, tag: string) {"
+        "     c.send(\"pt: \" + pt.x + \",\" + pt.y + \" tag: \" + tag)"
+        "   }(ch, p, \"hello\")"
+        " }"
+        " ch.close() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // record 实参 → GcRootHandle<Point*> Global 根
+    EXPECT_CONTAINS(unit.impl, "GcRootHandle<Point*>(p.get(), aura_rt::GcRootScope::Global)");
+    // GcString 字面量实参 → GcRootHandle<GcString*> Global 根
+    EXPECT_CONTAINS(unit.impl,
+        "GcRootHandle<aura_rt::GcString*>(aura_rt::intern_string(\"hello\"), aura_rt::GcRootScope::Global)");
+    // body 内 record 参数名经 .get() 解引用（字段访问 pt.x → pt.get()->x 形态）
+    EXPECT_CONTAINS(unit.impl, ".get()->x");
+}
+
+TEST(CodeGen, SyncThreadSpawnAutoBindNoInitCapture) {
+    // bug-10 对照：同名自动绑定（无显式实参）保持裸名捕获，不制造 init-capture / Global 根
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let ch: sync.Channel<int> = sync.Channel(10)"
+        " let x = 3"
+        " sync thread {"
+        "   spawn (ch: sync.Channel<int>, x: int) { ch.send(x) }"
+        " }"
+        " ch.close() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "submit([ch, x]");
+    EXPECT_NOT_CONTAINS(unit.impl, "GcRootScope::Global");
+}
+
+TEST(CodeGen, SyncThreadSpawnIoParamArgsAligned) {
+    // bug-10：io 参数在 params 中占位，(io,x)(io,3) 中 args[0]=io 跳过、args[1]=3 用于 x
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " sync thread {"
+        "   spawn (io: Io, x: int) { io.println(\"x: \" + x) }(io, 3)"
+        " }"
+        " io.println(\"done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "submit([x = 3, &io]");
+    EXPECT_NOT_CONTAINS(unit.impl, "submit([io");
+}
+
+// ============================================================
 // M2：泛型 record 方法默认参数不补全（problem.txt 条目）
 //  注册键（DeclGen genMethodDecl A 遍）= decl.receiverType + "." + name = "Box.useCb"（声明名）；
 //  查询键（ExprGen genMethodCall）原为 recvTypeKey = 实例化 canonicalName "Box<int32_t>"
@@ -2719,6 +2999,809 @@ TEST(CodeGen, OuterClosureCaptureExcludesInnerClosureParams) {
     // 外层闭包只捕获 transform（不捕获内层参数 y）
     EXPECT_CONTAINS(unit.header, "return [transform](int32_t x)");
     EXPECT_NOT_CONTAINS(unit.header, "[transform, y]");
+}
+
+// ============================================================
+// bug-07：方法/构造/接口方法参数直接写泛型函数类型（`f: fun(U)->U`）
+//  — struct 内方法声明模板前缀 + 定义侧分开模板列表
+//  — 调用点闭包实参 std::function 双分支包装（具体 FuncSemType / fallback 原串）
+//  — receiver 泛型区分信号（T ∈ receiverTypeArgs 不包装，t8 回归）
+//  — 接口方法集填充（bug-20）与 U 注册正交性
+// ============================================================
+TEST(CodeGen, MethodParamGenericFunTypeWrapped) {
+    // 方法参数 fun(U)->U（非模板 record）：struct 内声明 template<U> 前缀 +
+    // 定义侧 template<U>；调用点具体 FuncSemType → std::function<int32_t(int32_t)> 包装
+    // （同一类模板特化，g++ 从函数类型推导 U=int32_t）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Box = { value: int }"
+        " fun (self Box) apply(f: fun(U) -> U) -> int { return f(42) }"
+        " fun main(io: Io) throws {"
+        " let b = Box { value = 1 }"
+        " io.println(str(b.apply(fun(x: int) -> int { return x + 1 }))) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // struct 内方法声明：方法自身裸泛型 U 需 template<U> 前缀（receiver 非模板）
+    EXPECT_CONTAINS(unit.header, "template<typename U>\n  int32_t apply(std::function<U(U)> f);");
+    // 定义侧模板前缀
+    EXPECT_CONTAINS(unit.header, "template<typename U>\nint32_t Box::apply(std::function<U(U)> f)");
+    // 调用点具体 FuncSemType 分支包装
+    EXPECT_CONTAINS(unit.impl, "std::function<int32_t(int32_t)>([](int32_t x) -> int32_t");
+}
+
+TEST(CodeGen, MethodParamGenericFunTypeFallbackInGenericBody) {
+    // ③a：泛型函数体内调用 apply——实参 g 的 inferredType 含未绑定 U（外层函数模板
+    // 参数，∈ currentTParams_ 作用域）→ semTypeIsConcrete false → fallback 原串
+    // std::function<U(U)>(g)（U 在作用域，g++ 与方法模板 U 同一化推导）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Box = { value: int }"
+        " fun (self Box) apply(f: fun(U) -> U) -> int { return f(42) }"
+        " fun genericCaller(b: Box, g: fun(U) -> U) -> int { return b.apply(g) }"
+        " fun main(io: Io) throws {"
+        " let b = Box { value = 1 }"
+        " io.println(str(genericCaller(b, fun(x: int) -> int { return x + 1 }))) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 泛型函数体（模板函数，定义入 header）内 fallback 原串包装（含 U）
+    EXPECT_CONTAINS(unit.header, "std::function<U(U)>(g)");
+    // 顶层 main 调用 genericCaller：函数侧具体 FuncSemType 分支（impl）
+    EXPECT_CONTAINS(unit.impl, "std::function<int32_t(int32_t)>([](int32_t x) -> int32_t");
+    EXPECT_CONTAINS(unit.impl, "genericCaller(_h1_0.get(), _a1_1)");
+}
+
+TEST(CodeGen, MethodParamGenericReceiverTypeArgsNotWrapped) {
+    // t8 回归面（receiver 泛型区分信号）：Box<T>::useCb(v:T, cb:fun(T)->T) 的 cb 形参
+    // 泛型 T ∈ receiverTypeArgs → 不注册 methodCallbackParams_ → 调用点不包装
+    //（receiver 实例化后形参 std::function<int(int)> 具体化，裸 lambda 隐式转换即可）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Box<T> = { value: T }"
+        " fun (self Box<T>) useCb(v: T, cb: fun(T) -> T) -> T { return cb(v) }"
+        " fun main(io: Io) throws {"
+        " let b: Box<int> = { value = 5 }"
+        " io.println(str(b.useCb(5, fun(x: int) -> int { return x + 1 }))) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 无 std::function<T(T)> 包装（T ∈ receiverTypeArgs 不包装）；直接传模板 lambda
+    EXPECT_NOT_CONTAINS(unit.impl, "std::function<T(T)>(");
+    EXPECT_CONTAINS(unit.impl, "useCb(_a1_1, _a1_2)");
+}
+
+TEST(CodeGen, MethodParamGenericFunTypeCtorWrapped) {
+    // 构造参数 fun(U)->U：ctor 回调注册（内联 FunctionType）+ 调用点 std::function 包装；
+    // receiver 类型只用 receiverTypeArgs（非模板 Box 不拼 <U>）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Box = { value: int }"
+        " fun (self Box) Box(f: fun(U) -> U) { self.value = f(42) }"
+        " fun main(io: Io) throws {"
+        " let b = Box(fun(x: int) -> int { return x + 1 })"
+        " io.println(str(b.value)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 构造签名：receiver 非模板 → Box*（不拼 <U>）
+    EXPECT_CONTAINS(unit.header, "template<typename U>\nBox* Box_ctor(std::function<U(U)> f);");
+    // 调用点具体 FuncSemType 分支包装
+    EXPECT_CONTAINS(unit.impl, "Box_ctor(std::function<int32_t(int32_t)>([](int32_t x) -> int32_t");
+}
+
+TEST(CodeGen, IfaceMethodBareGenericOrthogonalToMethodSetFill) {
+    // ③b：接口方法集填充（bug-20 自引用 next() -> Node）与 U 注册正交性——
+    // nd.next().val() 链式调用方法集完整（视图 Fn 仅跳过含 U 的 apply）；
+    // record 直调含 U 方法 apply 正常包装。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "interface Node {"
+        " next() -> Node"
+        " apply(f: fun(U) -> U) -> int"
+        " val() -> int }"
+        " type NodeRec = { n: int }"
+        " fun (self NodeRec impl Node) next() -> Node { let self2: Node = self; return self2 }"
+        " fun (self NodeRec impl Node) apply(f: fun(U) -> U) -> int { return f(self.n) }"
+        " fun (self NodeRec impl Node) val() -> int { return self.n }"
+        " fun main(io: Io) throws {"
+        " let r: NodeRec = { n = 5 }"
+        " let nd: Node = r"
+        " let n2 = nd.next()"
+        " let v = n2.val()"
+        " io.println(str(v + r.apply(fun(x: int) -> int { return x + 1 }))) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 接口视图结构体跳过含 U 的 apply Fn（无 std::function<U(U)> 泄漏），保留 next/val Fn
+    EXPECT_NOT_CONTAINS(unit.header, "std::function<U(U)> (*applyFn)");
+    EXPECT_CONTAINS(unit.header, "valFn");
+    // record 直调含 U 方法：具体 FuncSemType 包装
+    EXPECT_CONTAINS(unit.impl, "std::function<int32_t(int32_t)>([](int32_t x) -> int32_t");
+}
+
+// ============================================================
+// bug-02（2026-08-30）：decideCoro 后置声明协程传播（固定点迭代）
+//  外层函数调用「后置声明」的协程函数 → 固定点迭代使外层标协程 → task<void> 签名
+//  （修复前单遍扫描，outer 判 Plain → 调用点不 co_await → task 立即析构静默不执行）
+// ============================================================
+TEST(CodeGen, PosteriorCoroFunctionPropagates) {
+    // 后置声明：outer 先声明，调用的 runner2 声明在其后
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun outer(io: Io) { runner2(io) }"
+        " fun runner2(io: Io) { io.println(\"runner2 ran\") }"
+        " fun main(io: Io) throws { io.println(\"main start\"); outer(io); io.println(\"main done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // outer 因调用后置协程 runner2 被标为协程（task<void> 定义）
+    EXPECT_CONTAINS(unit.impl, "aura_rt::task<void> outer(aura_rt::Io io)");
+    EXPECT_CONTAINS(unit.impl, "co_await");
+}
+
+TEST(CodeGen, ForwardCoroFunctionStillPropagates) {
+    // 对照组：协程 runner2 声明在前，outer 调用在后 → 不误伤，仍判协程
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun runner2(io: Io) { io.println(\"runner2 ran\") }"
+        " fun outer(io: Io) { runner2(io) }"
+        " fun main(io: Io) throws { io.println(\"main start\"); outer(io); io.println(\"main done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "aura_rt::task<void> outer(aura_rt::Io io)");
+}
+
+// ============================================================
+// bug-14（2026-08-30）：未绑定泛型 T 值实参不生成 GcRootHandle 假根
+//  泛型方法体内闭包调用传 self 值字段（value: T）→ genGcRootedArgs 对未绑定
+//  泛型生成 if constexpr 延迟判定（std::is_convertible_v），T=int 时不包装
+//  （修复前直接生成 GcRootHandle<int32_t> 假根 → GC mark 读 int 当根指针崩溃）
+// ============================================================
+TEST(CodeGen, GenericClosureArgUnboundTValueNoFakeRoot) {
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Transform<T> = fun(T) -> T"
+        " type Box<T> = { value: T }"
+        " fun (self Box<T>) apply(cb: Transform<T>) -> T { return cb(self.value) }"
+        " fun main(io: Io) throws {"
+        " let b: Box<int> = { value = 42 }"
+        " let cb: Transform<int> = fun(x: int) -> int { return x + 1 }"
+        " let r = b.apply(cb); io.println(\"r=\" + str(r)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 泛型方法（模板）定义体入 header：if constexpr 延迟判定（修复后形态）
+    EXPECT_CONTAINS(unit.header, "std::is_convertible_v");
+    // 值类型实例化不生成假根 GcRootHandle<int32_t>（修复前形态）
+    EXPECT_NOT_CONTAINS(unit.header + unit.impl, "GcRootHandle<int32_t>");
+}
+
+// ============================================================
+// bug-16（2026-08-30）：非协程 main 直接调用，不生成 run_event_loop
+//  genMainEntry 按 coroutineFunctions_ 分派：main 无挂起点 → aura_main 返回 void
+//  → footer 直接 `::aura_main(io); return 0;`（修复前恒走
+//  `auto t = ::aura_main(io); run_event_loop(t);` → deduced type 'void' 坏 C++）
+// ============================================================
+TEST(CodeGen, NonCoroMainDirectCallNoEventLoop) {
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) { let x = 1 + 2; let y = x * 3; let s = \"sum:\" }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_TRUE(unit.hasMain);
+    // 入口直接调用 aura_main（非协程返回 void），不包 auto t / run_event_loop
+    EXPECT_CONTAINS(unit.footer, "::aura_main(io);");
+    EXPECT_NOT_CONTAINS(unit.footer, "run_event_loop");
+}
+
+TEST(CodeGen, CoroMainKeepsRunEventLoop) {
+    // 对照组：协程 main（io.println 异步）仍走 run_event_loop，不误伤
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) { io.println(\"x\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.footer, "aura_rt::run_event_loop(t);");
+}
+
+// ============================================================
+// bug-25（2026-08-30）：非协程函数 -> None 且体无 return → void + return;
+//  funSignature 把 NoneType 映射为 void，genFunDecl 补 `return;`（修复前补
+//  `return aura_rt::NoneType{};` 与 void 签名冲突 → g++ 坏 C++）
+// ============================================================
+TEST(CodeGen, NoneFnNoReturnVoidBody) {
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun helper() -> None { let x = 1 }"
+        " fun main(io: Io) { io.println(\"main ran\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 签名映射 void + 体末补裸 return;
+    EXPECT_CONTAINS(unit.impl, "void helper()");
+    EXPECT_CONTAINS(unit.impl, "return;");
+    // 不再生成与 void 冲突的 return aura_rt::NoneType{};
+    EXPECT_NOT_CONTAINS(unit.impl, "return aura_rt::NoneType{};");
+}
+
+// ============================================================
+// bug-26（2026-08-30）：非协程方法 -> None 且体无 return → void 签名 + return;
+//  修复前方法签名保留 aura_rt::NoneType 且无 fallback → 走到 non-void 末尾
+//  → SIGILL（0xC00000DD）；M1 声明/定义侧统一映射 void + 体末补 return;
+// ============================================================
+TEST(CodeGen, NoneMethodNoReturnVoidSig) {
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Point = { x: int }"
+        " fun (self Point) zero() -> None { let a = 1 }"
+        " fun main(io: Io) { let p = Point { x = 1 }; p.zero(); io.println(\"main ran\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // struct 内声明 void zero();
+    EXPECT_CONTAINS(unit.header, "void zero();");
+    // 定义侧 void Point::zero() + 体末 return;
+    EXPECT_CONTAINS(unit.impl, "void Point::zero()");
+    // 不再生成 NoneType 签名（修复前形态）
+    EXPECT_NOT_CONTAINS(unit.impl, "NoneType Point::zero");
+}
+
+// ============================================================
+// bug-27（2026-08-30）：闭包隐式 None 返回类型发射 -> aura_rt::NoneType
+//  无显式标注闭包赋 fun() -> None：lambda 返回类型写 -> aura_rt::NoneType
+//  （修复前 -> auto 推导 void → std::function<NoneType()> 构造失败）
+// ============================================================
+TEST(CodeGen, ClosureImplicitNoneReturnType) {
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let cb: fun() -> None = fun() { let x = 1 }"
+        " cb(); io.println(\"main ran\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // lambda 返回类型显式 NoneType → std::function<NoneType()> 构造成立
+    EXPECT_CONTAINS(unit.impl, "-> aura_rt::NoneType");
+    // 体末尾 fallback 补 return aura_rt::NoneType{};
+    EXPECT_CONTAINS(unit.impl, "return aura_rt::NoneType{};");
+}
+
+TEST(CodeGen, ExplicitNoneClosureReturnStmtFixed) {
+    // bug-34 顺带（2026-08-30）：显式 `-> None` 闭包 + 体含 return;（配套 C）
+    // 修复前 NoneType lambda 中裸 return; → g++ 坏 C++；修复后生成
+    // return aura_rt::NoneType{};
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let cb: fun() -> None = fun() -> None { let x = 1; return }"
+        " cb(); io.println(\"main ran\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "return aura_rt::NoneType{};");
+}
+
+// ============================================================
+// bug-13（2026-08-30）：record 闭包字段方法调用 b.f(10)
+//  inferMethodCall record 分支未命中方法时回退查字段（CallInfer.cpp:548
+//  「先字段后 E013」统一修复点）：字段为 FuncSemType → 按闭包调用推断返回
+//  类型并设置实参 inferredType → CodeGen 正常生成 b->f(...)（修复前 Sema
+//  返回 ErrorSemType → 有标注 isAssignable 恒真静默放行，标注不匹配坏 C++）
+// ============================================================
+TEST(CodeGen, RecordClosureFieldMethodCall) {
+    // b.f(10) 无标注：CodeGen 生成字段闭包调用 _hN_0.get()->f(...)
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Transform<T> = fun(T) -> T"
+        " type B4<T> = { f: Transform<T> }"
+        " fun main(io: Io) {"
+        "   let b: B4<int> = { f = fun(x: int) -> int { return x + 1 } }"
+        "   let r = b.f(10) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 字段闭包调用形态：GcRootHandle 保护接收者后 ->f(...)（bug-13 核心断言）
+    EXPECT_CONTAINS(unit.impl, "->f(");
+    // 字段闭包实参具体物化为 int32_t lambda（非未绑定 T / auto）
+    EXPECT_CONTAINS(unit.impl, "[](int32_t x) -> int32_t");
+}
+
+TEST(CodeGen, RecordClosureFieldMethodCallReturnInferred) {
+    // b.f(10) 有标注且匹配：推断返回 int，let r: int 赋值 isAssignable 通过
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Transform<T> = fun(T) -> T"
+        " type B4<T> = { f: Transform<T> }"
+        " fun main(io: Io) {"
+        "   let b: B4<int> = { f = fun(x: int) -> int { return x + 1 } }"
+        "   let r: int = b.f(10) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "->f(");
+}
+
+TEST(CodeGen, RecordClosureFieldMethodCallMismatchNoCodegen) {
+    // 标注不匹配（字段返回 int 但标注 string）：Sema 报干净 mismatch 错误，
+    // 阻断 CodeGen（修复前 isAssignable(string, Error) 恒真 → 坏 C++）
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Transform<T> = fun(T) -> T"
+        " type B4<T> = { f: Transform<T> }"
+        " fun main(io: Io) {"
+        "   let b: B4<int> = { f = fun(x: int) -> int { return x + 1 } }"
+        "   let r: string = b.f(10) }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot assign 'int' to 'string'"));
+}
+
+// ============================================================
+// bug-01（2026-08-30）：record 直调未注册方法 → Sema E013 阻断 CodeGen
+//  （修复前静默放行 → 无标注 G4 误导 / 有标注生成坏 C++ p->next() no member）
+// ============================================================
+TEST(CodeGen, RecordUnknownMethodNoCodegen) {
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Point = { x: int, y: int }"
+        " fun main(io: Io) { let p: Point = { x = 1, y = 2 }; let r = p.next() }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorCode(diag, Aura::DiagCode::E013_MethodNotFound));
+    // CodeGen 因 Sema 错误被跳过（compileSource 返回默认空 CompileUnit）
+    EXPECT_TRUE(unit.impl.empty());
+}
+
+// ============================================================
+// bug-22（2026-08-30）：sync.ThreadChannel 在协程 sync 块内 spawn 闭包 send 被 co_await void
+// 根因：spawn 参数名与外层 let 同名 ch → channelVarNames_ 泄漏命中 isCoroChannel=true，
+// 而 IterVarGuard 屏蔽 gcRootTypes_ → isSyncChannel 判定（只查 gcRootTypes_）失败 → send 被
+// co_await void（ThreadChannel::send 返回 void 非 awaitable）→ 坏 C++。
+// 修复：isSyncChannel 主判定改查 receiver inferredType（GenericSemType "sync.Channel"，Sema
+// 填充不受 IterVarGuard 屏蔽），gcRootTypes_ 查 "ThreadChannel" 仅作兜底（inferredType 缺失时）；
+// StmtControl.cpp genForStmt 同法改查 iterable inferredType。
+// 断言：sync.Channel 的 spawn 同名参数 send 生成裸 `->send(`（不被 co_await 包裹）；
+// 对照组协程 channel 同名参数 send 仍被 co_await（不误伤）。
+// ============================================================
+
+// 判定 cpp 中第一个 "->send(" 是否被 "co_await [&]() -> auto {" IIFE 包裹：
+// 向前找最近的 co_await IIFE 头，若其与 send 之间无 "}();"（前一语句结束），则该 co_await
+// 直接包裹 send 所在 IIFE → 被 co_await。
+static bool firstSendWrappedInCoAwait(const std::string& cpp) {
+    const std::string marker = "co_await [&]() -> auto {";
+    auto sendPos = cpp.find("->send(");
+    if (sendPos == std::string::npos) return false;
+    auto pre = cpp.substr(0, sendPos);
+    auto m = pre.rfind(marker);
+    if (m == std::string::npos) return false;
+    std::string between = pre.substr(m + marker.size());
+    return between.find("}();") == std::string::npos;
+}
+
+TEST(CodeGen, SyncChannelSpawnParamSameNameSendNoCoAwait) {
+    // bug-22 主线：协程 sync 块内 spawn 参数名 = 外层 let 名 ch + sync.ThreadChannel send
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let ch: sync.Channel<int> = sync.Channel(10)"
+        " sync {"
+        "   spawn (ch: sync.Channel<int>) {"
+        "     for i in range(5) { ch.send(i) }"
+        "     ch.close()"
+        "   }(ch)"
+        " }"
+        " io.println(\"sum\")"
+        " io.println(\"done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "->send(");
+    // 修复点：isSyncChannel 主判定改查 inferredType → 裸 send（不生成 co_await 包裹）
+    EXPECT_FALSE(firstSendWrappedInCoAwait(unit.impl));
+}
+
+TEST(CodeGen, CoroChannelSpawnParamSameNameSendCoAwait) {
+    // 对照组：协程 channel<T> 的 spawn 同名参数 send 本就需 co_await（needAwait=true 是
+    // 正确行为），修复 isSyncChannel 判定后不得误伤——仍生成 co_await 包裹。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let ch: channel<int> = channel(10)"
+        " sync {"
+        "   spawn (ch: channel<int>) {"
+        "     for i in range(5) { ch.send(i) }"
+        "     ch.close()"
+        "   }(ch)"
+        " }"
+        " io.println(\"sum\")"
+        " io.println(\"done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "->send(");
+    EXPECT_TRUE(firstSendWrappedInCoAwait(unit.impl));  // 协程 channel send 仍 co_await
+}
+
+TEST(CodeGen, SyncChannelSpawnParamSameNameForInBlockingReceive) {
+    // bug-22 双表现之二：spawn 闭包内 for-in sync.ThreadChannel 须回阻塞 receive 路径
+    // （is_none/unwrap 对 Optional<T>* 合法）；修复后不落入协程 receive 路径（is_done +
+    // co_await receive）。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let ch: sync.Channel<int> = sync.Channel(10)"
+        " sync {"
+        "   spawn (ch: sync.Channel<int>) {"
+        "     for v in ch { io.println(\"v=\" + v) }"
+        "   }(ch)"
+        " }"
+        " io.println(\"done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 阻塞 receive 循环（is_none 终止），非协程 receive 路径（is_done + co_await）
+    EXPECT_CONTAINS(unit.impl, "is_none()) break");
+    EXPECT_NOT_CONTAINS(unit.impl, "is_done()) break");
+    EXPECT_NOT_CONTAINS(unit.impl, "co_await ch->receive");
+    EXPECT_NOT_CONTAINS(unit.impl, "co_await ch.get()->receive");
+}
+
+// ============================================================
+// bug-11（2026-08-31）：for-in channel 识别/生成覆盖不全
+// 根因①：genForStmt channel 分支（StmtControl.cpp）入口只认 Identifier+channelVarNames_
+// （只注册 let 变量）→ channel 作函数/方法参数、record 字段、调用返回、spawn 参数时走默认
+// range-for `for (auto v : *ch)` → Channel<T> 无 begin/end 坏 C++。
+// 根因②（连带）：CoroScanner::visit(ForStmt) 不判 channel → 纯 for-in channel 函数判 Plain
+// → co_await 落非协程函数坏 C++。
+// 根因③：genForStmt inSyncThreadBlock_ 分支对所有 channelVarNames_ 命中变量无条件生成
+// `_opt->is_none()`——协程 channel 的 recv_awaiter 无该方法 → 坏 C++。
+// 修复：方向①入口判定放开（inferredType 为 channel/sync.Channel）+ 非 Identifier 形态
+// 「预求值 + GcRootHandle 保护」（auto _ch_raw = <expr>; + GcRootHandle + 循环 _ch.get()）；
+// 方向② visit(ForStmt) 补协程 channel 挂起判定；方向④ sync thread 内协程 channel 干净报错。
+// ============================================================
+
+TEST(CodeGen, ChannelParamForInCoroReceive) {
+    // bug-11 方向①+②主线：channel 作函数参数 + for-in（参数不在 channelVarNames_）。
+    // 修复后：worker 被标协程（仅 for-in channel 触发，方向②），生成协程 receive 路径
+    // （is_done + co_await receive），不再落默认 range-for。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun worker(ch: channel<int>) {"
+        " let sum: int = 0"
+        " for v in ch { sum = sum + v }"
+        " }"
+        " fun main(io: Io) {"
+        " let ch: channel<int> = channel(10)"
+        " sync {"
+        "   spawn (ch: channel<int>) {"
+        "     for i in range(5) { ch.send(i) }"
+        "     ch.close()"
+        "   }"
+        " }"
+        " worker(ch)"
+        " io.println(\"done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 方向②：worker 仅含 for-in channel → 仍判协程（task<void> + co_await receive）
+    EXPECT_CONTAINS(unit.header, "aura_rt::task<void> worker(");
+    // 方向①：走 channel 分支协程 receive 路径，非默认 range-for
+    EXPECT_CONTAINS(unit.impl, "co_await ch.get()->receive");
+    EXPECT_NOT_CONTAINS(unit.impl, "for (auto v : *");
+}
+
+TEST(CodeGen, PureForInChannelMarksCoroutine) {
+    // bug-11 方向②：函数体内仅 for-in 局部 channel（无其他挂起点）→ 标协程。
+    // 修复前 decideCoro 判 Plain → co_await 落非协程函数坏 C++。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun worker(ch: channel<int>) {"
+        " let sum: int = 0"
+        " for v in ch { sum = sum + v }"
+        " }"
+        " fun main(io: Io) {"
+        " let ch: channel<int> = channel(10)"
+        " sync {"
+        "   spawn (ch: channel<int>) {"
+        "     for i in range(5) { ch.send(i) }"
+        "     ch.close()"
+        "   }"
+        " }"
+        " worker(ch)"
+        " io.println(\"done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 关键：仅 for-in channel 的函数必须被标为协程（生成 task<void> + co_await）
+    EXPECT_CONTAINS(unit.header, "aura_rt::task<void> worker(");
+    EXPECT_CONTAINS(unit.impl, "co_await ch.get()->receive");
+}
+
+TEST(CodeGen, RecordFieldForInPreEvalGcRoot) {
+    // bug-11 方向①非 Identifier 形态（record 字段 b.ch）：预求值 + GcRootHandle 保护，
+    // 循环统一 _ch.get()（防协程 co_await 挂起期间 GC compact 悬垂）。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "type Box2 = { ch: channel<int> }"
+        " fun main(io: Io) {"
+        " let ch: channel<int> = channel(10)"
+        " let b = Box2 { ch = ch }"
+        " sync {"
+        "   spawn (b: Box2) {"
+        "     for i in range(5) { b.ch.send(i) }"
+        "     b.ch.close()"
+        "   }"
+        " }"
+        " let sum: int = 0"
+        " for v in b.ch { sum = sum + v }"
+        " io.println(\"done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 预求值 + GC 根保护
+    EXPECT_CONTAINS(unit.impl, "auto _ch_raw = ");
+    EXPECT_CONTAINS(unit.impl, "GcRootHandle<decltype(_ch_raw)> _ch(_ch_raw);");
+    // 循环体统一引用 _ch.get()（协程 receive 路径）
+    EXPECT_CONTAINS(unit.impl, "co_await _ch.get()->receive");
+    // 不落默认 range-for（坏 C++）
+    EXPECT_NOT_CONTAINS(unit.impl, "for (auto v : *");
+}
+
+TEST(CodeGen, CallReturnForInPreEvalOnce) {
+    // bug-11 方向①非 Identifier 形态（函数调用返回 channel）：预求值一次性求值——
+    // 带副作用表达式（getCh()）仅求值一次（auto _ch_raw = getCh();），循环引用 _ch.get()。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun getCh() -> channel<int> { return channel(10) }"
+        " fun main(io: Io) {"
+        " let ch = getCh()"
+        " sync {"
+        "   spawn (ch: channel<int>) {"
+        "     for i in range(5) { ch.send(i) }"
+        "     ch.close()"
+        "   }"
+        " }"
+        " let sum: int = 0"
+        " for v in getCh() { sum = sum + v }"
+        " io.println(\"done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 预求值：iterable 一次性求值到 _ch_raw（而非循环内每轮重调 getCh()）
+    EXPECT_CONTAINS(unit.impl, "auto _ch_raw = getCh();");
+    EXPECT_CONTAINS(unit.impl, "GcRootHandle<decltype(_ch_raw)> _ch(_ch_raw);");
+    // 循环引用 _ch.get()，不再出现 range-for 重求值
+    EXPECT_CONTAINS(unit.impl, "co_await _ch.get()->receive");
+    EXPECT_NOT_CONTAINS(unit.impl, "for (auto v : *");
+}
+
+TEST(CodeGen, SyncThreadCoroChannelForInCleanError) {
+    // bug-11 方向④：协程 channel 在 sync thread 块体内 for-in → 干净报错
+    // （recv_awaiter 无 is_none/unwrap，生成阻塞 receive 会坏 C++）。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let ch: channel<int> = channel(10)"
+        " sync thread {"
+        "   for v in ch { io.println(\"v=\" + v) }"
+        " }"
+        " io.println(\"done\") }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot iterate coroutine channel in sync thread block"));
+}
+
+TEST(CodeGen, SyncThreadSpawnClosureCoroChannelForInCleanError) {
+    // bug-11 方向④变体：协程 channel 在 sync thread 块内 spawn 闭包体 for-in
+    // （inSyncThreadBlock_ 恒 true，genSpawnAsThread 不改标志）→ 同样干净报错。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let ch: channel<int> = channel(10)"
+        " sync thread {"
+        "   spawn (ch: channel<int>, io: Io) {"
+        "     for v in ch { io.println(\"v=\" + v) }"
+        "   }"
+        " }"
+        " io.println(\"done\") }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot iterate coroutine channel in sync thread block"));
+}
+
+TEST(CodeGen, SyncThreadSyncChannelForInBlockingControl) {
+    // bug-11 方向④对照组：sync.Channel 在 sync thread 块内 for-in → 不报错，
+    // 走阻塞 receive 路径（is_none 终止）——不误伤 sync.ThreadChannel。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun main(io: Io) {"
+        " let ch: sync.Channel<int> = sync.Channel(10)"
+        " sync thread {"
+        "   spawn (ch: sync.Channel<int>) {"
+        "     for i in range(5) { ch.send(i) }"
+        "     ch.close()"
+        "   }"
+        "   spawn (ch: sync.Channel<int>, io: Io) {"
+        "     for v in ch { io.println(\"v=\" + v) }"
+        "   }"
+        " }"
+        " io.println(\"done\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 阻塞 receive 循环（is_none 终止），非协程 receive 路径（is_done + co_await）
+    EXPECT_CONTAINS(unit.impl, "is_none()) break");
+    EXPECT_NOT_CONTAINS(unit.impl, "is_done()) break");
+    EXPECT_NOT_CONTAINS(unit.impl, "co_await ch.get()->receive");
+}
+
+// ============================================================
+// bug-06：跨模块泛型函数默认参数闭包引用函数模板 T（isNs 调用）
+// 同模块 M3（ExprCall.cpp fnDefaultArgs_ 分支）已修；跨模块形态 genMethodCall isNs
+// 分支此前缺 std::function 包装 + 泛型物化（无 fnCallbackParams_/fnParamTypeExprs_，
+// 须经 crossModuleParamSemTypes_ 取得形参 SemType）。
+// ============================================================
+namespace {
+// 创建唯一临时目录 + 写模块文件（与 test_sema_modules.cpp 一致）
+std::string cgModTempDir() {
+    auto base = std::filesystem::temp_directory_path();
+    auto dir = base / ("aura_cg_mod_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    return dir.string();
+}
+std::string writeCgModAura(const std::string& dir, const std::string& name,
+                           const std::string& content) {
+    std::string path = (std::filesystem::path(dir) / name).string();
+    std::ofstream f(path);
+    f << content;
+    return path;
+}
+// 多文件 CodeGen：加载模块图 → 逐模块 Sema（保持 SemAnalyzer 存活到 codegen 之后！
+// Sema 将 AST inferredType 设为 analyzer typeStore_ 的指针，analyzeModuleGraph 返回即
+// 销毁 analyzer → 悬垂；main.cpp 同样以 moduleSemas 存活期间做 codegen）→ 为入口模块
+// 构造 crossDefaults/crossModuleParamSemTypes（与 main.cpp compileMultiFile 的 CodeGen
+// 流程一致）→ generate。返回入口模块 CompileUnit。
+Aura::CompileUnit compileMultiModuleCg(const std::string& entryPath,
+                                       Aura::DiagnosticEngine& diag) {
+    Aura::CompileUnit unit;
+    Aura::ModuleManager mgr(diag);
+    mgr.loadBuiltinAurai();
+    if (!mgr.loadAll(entryPath)) return unit;
+    if (mgr.hasCycle()) return unit;
+    std::map<std::string, std::unique_ptr<Aura::SemAnalyzer>> moduleSemas;
+    auto layers = mgr.topologicalLayers();
+    std::map<std::string, std::unique_ptr<Aura::DiagnosticEngine>> moduleDiags;
+    for (auto& layer : layers) {
+        std::vector<Aura::ModuleInfo*> tasks;
+        for (auto* mod : layer) {
+            if (mod->isBuiltin || !mod->ast) continue;
+            tasks.push_back(mod);
+            auto modDiag = std::make_unique<Aura::DiagnosticEngine>();
+            modDiag->setSourceView(Aura::readFile(mod->sourcePath));
+            modDiag->setFileName(mod->sourcePath);
+            moduleDiags[mod->sourcePath] = std::move(modDiag);
+        }
+        for (auto* mod : tasks) {
+            auto sema = std::make_unique<Aura::SemAnalyzer>(*moduleDiags[mod->sourcePath]);
+            for (auto& depPath : mod->deps) {
+                auto depIt = mgr.modules().find(depPath);
+                if (depIt == mgr.modules().end()) continue;
+                std::string alias;
+                for (auto& imp : mod->imports)
+                    if (imp.path == depPath) { alias = imp.alias; break; }
+                sema->importExports(alias, depIt->second.exports);
+            }
+            (void)sema->analyze(*mod->ast);
+            mod->exports = sema->extractExports();
+            moduleSemas[mod->sourcePath] = std::move(sema);
+        }
+        for (auto* mod : tasks) diag.mergeFrom(*moduleDiags[mod->sourcePath]);
+    }
+    if (diag.hasErrors()) return unit;
+    const Aura::ModuleInfo* entry = nullptr;
+    for (auto& [p, m] : mgr.modules())
+        if (m.hasMain) { entry = &m; break; }
+    if (!entry) return unit;
+    diag.setSourceView(Aura::readFile(entry->sourcePath));
+    diag.setFileName(entry->sourcePath);
+    Aura::CodeGenerator::CrossModuleDefaults crossDefaults;
+    Aura::CodeGenerator::CrossModuleParamSemTypes crossParamSemTypes;
+    std::vector<Aura::CodeGenImport> cgImports;
+    for (auto& imp : entry->imports) {
+        Aura::CodeGenImport ci;
+        ci.path = imp.path; ci.alias = imp.alias; ci.isBuiltin = imp.isBuiltin;
+        if (!imp.isBuiltin) {
+            auto it = mgr.modules().find(imp.path);
+            if (it == mgr.modules().end()) continue;
+            ci.nsName = it->second.nsName; ci.modName = it->second.moduleName;
+        }
+        cgImports.push_back(ci);
+        if (imp.isBuiltin) continue;
+        auto it = mgr.modules().find(imp.path);
+        if (it == mgr.modules().end()) continue;
+        std::string nsKey = imp.alias.empty() ? it->second.moduleName : imp.alias;
+        auto& modDefaults = crossDefaults[nsKey];
+        auto& modSemTypes = crossParamSemTypes[nsKey];
+        for (auto& [fnName, f] : it->second.exports.funcs) {
+            std::vector<const Aura::ASTNode*> defaults(f.params.size(), nullptr);
+            std::vector<const Aura::SemType*> pts(f.params.size(), nullptr);
+            bool any = false;
+            for (size_t i = 0; i < f.params.size(); ++i) {
+                if (f.params[i].defaultExpr) { defaults[i] = f.params[i].defaultExpr.get(); any = true; }
+                pts[i] = f.params[i].type.get();
+            }
+            if (any) modDefaults[fnName] = std::move(defaults);
+            modSemTypes[fnName] = std::move(pts);
+        }
+    }
+    Aura::CodeGenerator cg(diag);
+    // moduleSemas / mgr / moduleDiags 均存活至 generate 返回（AST inferredType 指针安全）
+    return cg.generate(*entry->ast, entry->moduleName, cgImports, entry->nsName,
+                       Aura::CodeGenConfig(), crossDefaults, crossParamSemTypes);
+}
+} // namespace
+
+TEST(CodeGen, CrossModuleGenericDefaultClosureMaterialized) {
+    // bug-06 主线：跨模块泛型函数默认参数闭包引用函数模板 T，缺 cb 调用
+    // m.useT(5,10) → 补默认闭包 fun(x:T)->T：T 物化为 int32_t（普通 lambda）+ std::function 包装
+    auto dir = cgModTempDir();
+    writeCgModAura(dir, "mod_main.aura",
+        "pub fun useT(inc: <T>, v: T, cb: fun(T) -> T = fun(x: T) -> T { return x }) -> T {\n"
+        "    return cb(v)\n"
+        "}\n");
+    std::string entry = writeCgModAura(dir, "main.aura",
+        "import \"mod_main.aura\" as m\n"
+        "fun main(io: Io) { let r = m.useT(5, 10); io.println(\"useT result: \" + str(r)) }\n");
+    Aura::DiagnosticEngine diag;
+    auto unit = compileMultiModuleCg(entry, diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 物化 + std::function 包装：默认闭包生成普通 lambda（T→int32_t）
+    EXPECT_CONTAINS(unit.impl, "std::function<int32_t(int32_t)>([](int32_t x) -> int32_t");
+    // 不得残留模板 lambda（T 应被物化剔除）
+    EXPECT_NOT_CONTAINS(unit.impl, "[]<typename T>");
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CodeGen, CrossModuleGenericExplicitClosureWrapped) {
+    // bug-06 显式全实参：m.useT(5, 10, fun(x:int)->int{...}) → 具体闭包包 std::function
+    auto dir = cgModTempDir();
+    writeCgModAura(dir, "mod_main.aura",
+        "pub fun useT(inc: <T>, v: T, cb: fun(T) -> T = fun(x: T) -> T { return x }) -> T {\n"
+        "    return cb(v)\n"
+        "}\n");
+    std::string entry = writeCgModAura(dir, "main.aura",
+        "import \"mod_main.aura\" as m\n"
+        "fun main(io: Io) { let r = m.useT(5, 10, fun(x: int) -> int { return x * 3 }); io.println(str(r)) }\n");
+    Aura::DiagnosticEngine diag;
+    auto unit = compileMultiModuleCg(entry, diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "std::function<int32_t(int32_t)>([](int32_t x) -> int32_t");
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CodeGen, CrossModuleGenericDefaultClosureString) {
+    // bug-06 string 实例化：m.useT(\"a\", \"b\") → T 物化为 aura_rt::GcString*
+    auto dir = cgModTempDir();
+    writeCgModAura(dir, "mod_main.aura",
+        "pub fun useT(inc: <T>, v: T, cb: fun(T) -> T = fun(x: T) -> T { return x }) -> T {\n"
+        "    return cb(v)\n"
+        "}\n");
+    std::string entry = writeCgModAura(dir, "main.aura",
+        "import \"mod_main.aura\" as m\n"
+        "fun main(io: Io) { let r = m.useT(\"a\", \"b\"); io.println(r) }\n");
+    Aura::DiagnosticEngine diag;
+    auto unit = compileMultiModuleCg(entry, diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "std::function<aura_rt::GcString*(aura_rt::GcString*)>(");
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CodeGen, SameModuleGenericDefaultClosureNotRegressed) {
+    // bug-06 同模块对照（M3 已修）：单模块 compileSource 路径不得被跨模块改动破坏
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "fun useT(inc: <T>, v: T, cb: fun(T) -> T = fun(x: T) -> T { return x }) -> T { return cb(v) }"
+        " fun main(io: Io) { let r = useT(5, 10); io.println(str(r)) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "std::function<int32_t(int32_t)>([](int32_t x) -> int32_t");
+}
+
+TEST(CodeGen, CrossModuleOptionalParamBoxed) {
+    // bug-06 附注 3：跨模块函数 Optional 形参 + 裸值实参（isNs 调用的 mpIt 装箱不命中
+    // methodParamCppTypes_）→ 经 crossModuleParamSemTypes_ 形参 SemType 复用 genParamBoxing
+    // 生成 make_optional<int32_t>(5)，否则裸 int 直传 Optional<int32_t>* 形参坏 C++。
+    auto dir = cgModTempDir();
+    writeCgModAura(dir, "mod_opt.aura",
+        "pub fun retOpt(o: Optional<int>) -> Optional<int> { return o }\n");
+    std::string entry = writeCgModAura(dir, "main.aura",
+        "import \"mod_opt.aura\" as m\n"
+        "fun main(io: Io) { let r = m.retOpt(5); io.println(str(r)) }\n");
+    Aura::DiagnosticEngine diag;
+    auto unit = compileMultiModuleCg(entry, diag);
+    EXPECT_FALSE(diag.hasErrors());
+    EXPECT_CONTAINS(unit.impl, "make_optional<int32_t>(");
+    std::filesystem::remove_all(dir);
 }
 
 

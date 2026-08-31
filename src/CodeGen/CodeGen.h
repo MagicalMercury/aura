@@ -7,6 +7,7 @@
 #include "../ASTWalker.h"
 #include "../Diag/DiagnosticEngine.h"
 #include <map>
+#include <memory>
 #include <ostream>
 #include <set>
 #include <string>
@@ -21,6 +22,7 @@ class SemAnalyzer;
 struct SemType;
 struct UnionSemType;
 struct OptionalSemType;
+struct InterfaceSemType;
 
 // ============================================================
 // PendingMethod — 暂存方法签名，供 genRecordStruct 嵌入 struct
@@ -31,6 +33,12 @@ struct PendingMethod {
     std::string returnTypeStr;
     std::vector<std::string> paramTypes;
     std::vector<std::string> paramNames;
+    // bug-07：方法模板参数中"非 receiver 泛型"部分（collectMethodTParams 去掉
+    // receiverTypeArgs）。struct 内方法声明需要为其生成 `template<...>` 前缀——
+    // receiver 泛型（如 Box<T> 的 T）已在 struct 模板作用域内无需重复声明，而
+    // 方法自身裸泛型（如 apply(f: fun(U)->U) 的 U）在非模板/模板 struct 内均不在
+    // 作用域 → 须声明为类内函数模板。定义侧 genMethodDecl 已按完整 tparams 模板化。
+    std::vector<std::string> templateParams;
 };
 
 // ============================================================
@@ -105,17 +113,28 @@ public:
     using CrossModuleDefaults = std::map<std::string,
         std::map<std::string, std::vector<const ASTNode*>>>;
 
+    // bug-06：跨模块函数形参 SemType：模块命名空间名 → (函数名 → 形参 SemType 指针数组)。
+    // 与 crossDefaults_ 同源（依赖模块 exports.funcs 的 SymParam.type），供 genMethodCall
+    // isNs 分支做 FunctionType 形参 std::function 包装 / 默认参数闭包物化收集。指针与
+    // crossDefaults_ 的 AST 指针同生命周期（依赖模块 exports 常驻内存，多文件 CodeGen
+    // 并行只读），跨模块函数不注册进 fnParamTypeExprs_/fnCallbackParams_（仅本模块）。
+    using CrossModuleParamSemTypes = std::map<std::string,
+        std::map<std::string, std::vector<const SemType*>>>;
+
     CodeGenerator(DiagnosticEngine& diag);
 
     // -- 主入口 --
     // 生成一个编译单元（.aura → .cpp/.h）
     // crossDefaults: 跨模块函数默认参数表（C5.4，多文件模式由 main.cpp 构造）
+    // crossParamSemTypes: 跨模块函数形参 SemType 表（bug-06，main.cpp 与 crossDefaults
+    //   同源构造，供 isNs 分支回调包装/默认参数闭包物化）
     [[nodiscard]] CompileUnit generate(const Program& program,
                                         const std::string& moduleName = "main",
                                         const std::vector<CodeGenImport>& imports = {},
                                         const std::string& nsName = "",
                                         const CodeGenConfig& config = {},
-                                        const CrossModuleDefaults& crossDefaults = {});
+                                        const CrossModuleDefaults& crossDefaults = {},
+                                        const CrossModuleParamSemTypes& crossParamSemTypes = {});
 
     // -- 协程判定入口 --
     [[nodiscard]] CoroDecision decideCoro(const FunDecl& decl);
@@ -263,6 +282,18 @@ private:
     void collectMaterializedFromType(
         const TypeExpr& formal, const SemType& arg,
         std::map<std::string, std::string>& out);
+    // bug-06：跨模块默认参数闭包物化——与 collectMaterializedFromType 对称，但输入为
+    // 形参 SemType（跨模块函数只有 SymParam.type（SemType），无 TypeExpr 可用）。
+    // 从「形参 SemType + 调用点实参 SemType」递归推导泛型绑定（泛型名 → 具体 C++ 类型）。
+    void collectMaterializedFromSemType(
+        const SemType& formal, const SemType& arg,
+        std::map<std::string, std::string>& out);
+    // bug-06：跨模块版本 collectDefaultArgGenericMap——从形参 SemType 数组 + 调用点实参
+    // 推导默认参数闭包的泛型物化映射（collectMaterializedFromSemType 逐对调用）。
+    void collectDefaultArgGenericMapFromSemTypes(
+        const std::vector<const SemType*>& paramSemTypes,
+        const std::vector<std::unique_ptr<ASTNode>>& args,
+        std::map<std::string, std::string>& out);
     // 从函数声明中收集模板参数（params + returnType + receiverTypeArgs）
     [[nodiscard]] std::vector<std::string> collectFunTParams(const FunDecl& decl) const;
     [[nodiscard]] std::vector<std::string> collectMethodTParams(const MethodDecl& decl) const;
@@ -288,6 +319,11 @@ private:
     [[nodiscard]] std::string mapParamType(const TypeExpr& type);
     // SemType → C++ 类型（从 ASTNode::inferredType 读取，替代文本启发式）
     [[nodiscard]] std::string mapSemType(const SemType& semType);
+    // bug-06：mapSemType 的「保留裸泛型名」变体——未解析的 GenericSemType 输出其泛型名
+    // （gs->name，如 "T"）而非 "auto"，用于跨模块函数形参 FuncSemType 在泛型作用域内
+    // 调用时的「保持含 T 原串」回退包装（std::function<T(T)>，与 mapGenericRef 返回模板
+    // 参数名行为统一；T 由外层模板参数提供）。
+    [[nodiscard]] std::string mapSemTypeKeepGeneric(const SemType& semType);
 
     // 从返回类型 TypeExpr 提取 Optional<T> 的 T（C++ 名）；非 Optional 返回空
     [[nodiscard]] std::string optionalElemOf(const TypeExpr* retType);
@@ -331,11 +367,26 @@ private:
     // P3b：识别 none() 调用（Optional 占位构造），联合赋值时特判为 NoneType 值
     [[nodiscard]] static bool isNoneCallExpr(const ASTNode& e);
 
+    // CodeGen 拆分后共享辅助（原各 .cpp 内部 static，因跨文件共享提升为成员）
+    static std::string optionalElemCpp(const std::string& cppType);
+    static bool semTypeIsConcrete(const SemType* t);
+    static std::unique_ptr<InterfaceSemType> makeIfaceViewMarker(const std::string& ifaceName);
+
     // 判断 C++ 类型字符串是否为 GC 指针类型（如 GcString*, User*, Array<T>*）
     [[nodiscard]] bool isGcPointerType(const std::string& cppType) const;
 
     // 判定 C++ 类型名是否为接口视图类型（aura_rt::Iterator<T> / 用户接口名[<...>] / 内置接口名[<...>]）
     [[nodiscard]] bool isIfaceViewTypeName(const std::string& cppType) const;
+
+    // bug-22/bug-11：判定 channel 接收者/迭代对象是否为 sync.Channel（同步 ThreadChannel，
+    // 阻塞调用非协程 awaitable）。主判定查 inferredType 为 GenericSemType{name=="sync.Channel"}
+    // （Sema 填充，不受 IterVarGuard 屏蔽，覆盖 spawn 参数/字段/函数参数形态）；兜底：仅当
+    // inferredType 缺失时按变量名查 gcRootTypes_ C++ 类型含 "ThreadChannel"（兼容旧形态）。
+    // 主判定优先、兜底让位——避免反向误判（嵌套 spawn + 混 channel 类型 + 同名时，协程
+    // channel 同名参数被 gcRootTypes_ 误判为 sync.Channel → send 裸调用丢弃 recv_awaiter
+    // 静默不发送）。ExprMethodCall.cpp 与 StmtControl.cpp 共用，防判定第三次漂移。
+    [[nodiscard]] bool isSyncChannelType(const SemType* inferredType,
+                                         const std::string& varName) const;
 
     // 注册一个用户定义的类型名
     void registerTypeName(const std::string& auraName, bool isHeap);
@@ -362,6 +413,12 @@ private:
 
     // --- 接口声明 (§4.5) ---
     void genInterfaceDecl(std::ostream& h, const InterfaceDecl& decl);
+    // bug-07：接口方法签名是否含"自由裸泛型名"（非接口 typeParams 的裸泛型，如
+    // apply(f: fun(U)->U) 的 U）。C++ 接口视图结构体/适配器为具体类，无法表达
+    // std::function<U(U)> 中未绑定的 U（'U' was not declared）→ CodeGen 跳过该方法的
+    // 视图 Fn 字段/成员函数/适配器 Fn/XFunc 生成（record 直调不受影响）。
+    bool ifaceMethodHasFreeGeneric(const InterfaceDecl& iface,
+                                   const InterfaceMethodSig& m) const;
     // 生成接口视图结构体引用的用户 record C++ 前向声明（接口视图结构体在 record
     // struct 完整定义（第三遍 B）之前生成，引用后置 record 时需先前向声明）
     void emitIfaceRecordForwardDecls(std::ostream& h, const InterfaceDecl& decl);
@@ -479,6 +536,31 @@ private:
     [[nodiscard]] std::string genParamBoxing(const std::string& paramCpp,
                                              const ASTNode& arg,
                                              bool isCoroutine);
+
+    // bug-18：泛型 ctor 形参 C++ 类型名的调用点实例化——形参含 receiver 泛型形参名
+    // （如 Optional<T> 的 paramCpp "aura_rt::Optional<T>*"）时，调用点（非模板作用域）
+    // 裸 T 未定义，装箱会生成 make_optional<T> 坏 C++。用调用点已知的 receiver 具体
+    // 类型实参替换（优先 N2 显式/标注 targValues 位置对应 ctor 模板参数，其次调用点
+    // 推断返回类型 canonicalName 提取），使生成 make_optional<int32_t>(9) 后 CTAD 自动
+    // 推导 Box_ctor<int32_t>。具体类型形参（无裸泛型名）原样返回。
+    [[nodiscard]] std::string instantiateCtorParamCpp(
+        const std::string& recvType,
+        const std::string& paramCpp,
+        const std::vector<std::string>& targValues,
+        const SemType* ctorReturnTy);
+
+    // bug-05：泛型 record 方法形参 C++ 类型名的调用点实例化（仿 instantiateCtorParamCpp
+    // 先例，机制共享）。方法形参含 receiver 泛型形参名（如 Optional<T> 的 paramCpp
+    // "aura_rt::Optional<T>*"）时，调用点（非模板作用域）裸 T 未定义，装箱会生成
+    // make_optional<T> 坏 C++。具体值源 = receiver 实例化 canonicalName（recvTypeKey，
+    // 如 "Box<int32_t>"）中提取的 <...> 实参（splitCppTemplateArgs），按位置匹配
+    // typeAliasTemplateParams_[recvDeclName] 的 receiver 泛型形参名（Box<T> → T→int32_t、
+    // Pair<A,B> → A→a,B→b），逐形参裸词替换（replaceBareToken，防嵌套泛型子串误替换）。
+    // 形参不含任何 receiver 泛型名（如 Optional<Point>）或无法确定实参 → 原样返回。
+    [[nodiscard]] std::string instantiateMethodParamCpp(
+        const std::string& recvDeclName,
+        const std::string& paramCpp,
+        const std::string& recvTypeKey);
 
     // #2：Optional 目标装箱 IIFE——make_optional<elemCpp>(值) 并 GcRootHandle 保护堆值。
     // OptionalSemType（折叠 union）/ GenericSemType{name=="Optional"}（显式注解）共用；
@@ -651,6 +733,23 @@ private:
     // 当前函数的 C++ 返回类型（用于 genReturnStmt 生成正确的 RecordExpr 构造）
     std::string currentReturnCppType_;
 
+    // bug-03/bug-04：正在生成 return 语句的返回表达式（genReturnStmt 内 RAII 置位/恢复）。
+    // genListExpr 空列表兜底仅在此时用 currentReturnCppType_ 提取元素（return 上下文限定，
+    // 非 return 场景——无标注 let/实参/字段初始化——保持 currentTParams_ 兜底，守 A==U 回归）。
+    bool inReturnValueCtx_ = false;
+
+    // 当前闭包体生成深度（genFunExpr 进入闭包体 ++、退出 --）。genReturnStmt 据此
+    // 区分闭包（None 返回 → lambda 签名 `-> aura_rt::NoneType`，裸 return; 须补
+    // `return aura_rt::NoneType{};`）与顶层函数/方法（None 返回 → void 签名，
+    // 裸 `return;` 合法，bug-27 配套 C 的前提）
+    int closureBodyDepth_ = 0;
+
+    // 当前协程闭包 task 的内层返回类型（C++ 名；非协程闭包为空）。genReturnStmt
+    // co_return 特判用：协程闭包显式 `-> None` → task<NoneType>（promise_type 只有
+    // return_value，裸 co_return; 坏 C++，须 `co_return aura_rt::NoneType{};`），
+    // 而推断 None → task<void>（有 return_void，保持 `co_return;`）
+    std::string currentCoroTaskRetCpp_;
+
     // P3b：当前函数返回"含堆联合"时其变体 C++ 类型列表（顺序 = 声明顺序；空 = 非含堆联合返回）
     // 由 funSignature/methodSignature 设置，genReturnStmt 隐式装箱使用
     std::vector<std::string> currentReturnVariantCppTypes_;
@@ -701,11 +800,24 @@ private:
     // 函数名 → 其 FunctionType 参数的位置（用于 genCallExpr 中包装裸 lambda 为 std::function）
     std::map<std::string, std::vector<std::pair<size_t, std::string>>> fnCallbackParams_;
 
+    // bug-07：方法键 "ReceiverType.methodName" → FunctionType 形参位置（idx, ftStr）。
+    // 与 fnCallbackParams_ 同机制（record 方法由 genMethodDecl A 遍注册；构造函数已走
+    // fnCallbackParams_[receiverType]）。仅模板方法 + 参数 FunctionType 含"非 receiver
+    // 泛型名"（方法自身裸泛型 U，receiver 泛型区分信号：T ∈ receiverTypeArgs 不注册/
+    // 不包装，t8 回归）才注册。供 genMethodCall 对闭包实参包装 std::function——U 无 Sema
+    // 实例化点（receiver 代换只替换 receiverTypeArgs 的 T），只能靠 g++ 从其他实参推导。
+    std::map<std::string, std::vector<std::pair<size_t, std::string>>> methodCallbackParams_;
+
     // G1：函数名 → 形参 C++ 类型名列表（长度 = 形参总数）。供 genCallExpr 判定
     // Optional/Union 形参并装箱（make_optional / make_variant）；与 fnInterfaceParams_
     // 同机制，在 genFunDecl A 遍注册（调用点可能先于定义生成）。构造函数形参表也
     // 注册于此（键 = 记录名，genCallExpr isCtor 分支的 calleeName = 记录名）。
     std::map<std::string, std::vector<std::string>> fnParamCppTypes_;
+
+    // bug-18：记录名 → ctor 模板参数名列表（decl.receiverTypeArgs，声明顺序）。
+    // 供 instantiateCtorParamCpp 替换形参 C++ 类型中的裸泛型名（如 Optional<T> 的 T）为
+    // 调用点已知的 receiver 具体类型实参。与 fnParamCppTypes_ 同机制在 A 遍注册。
+    std::map<std::string, std::vector<std::string>> ctorTemplateParams_;
 
     // G1：方法键 "ReceiverType.methodName" → 形参 C++ 类型名列表（与 methodDefaultArgs_
     // 键机制一致，含接口视图方法：接口名.methodName 由 genInterfaceDecl 注册）。
@@ -741,6 +853,10 @@ private:
 
     CrossModuleDefaults crossDefaults_;
 
+    // bug-06：跨模块函数形参 SemType 表（main.cpp 与 crossDefaults_ 同源构造，供
+    // genMethodCall isNs 分支 FunctionType 形参 std::function 包装 + 默认参数闭包物化）
+    CrossModuleParamSemTypes crossModuleParamSemTypes_;
+
     // let/const 声明中类型标注的显式模板参数（如 math.Pair<float, bool> → {"float", "bool"}）
     // genLetStmt 设置，genMethodCall 的 ns-ctor 路径消费后清空
     std::vector<std::string> expectedTemplateArgs_;
@@ -757,6 +873,30 @@ private:
 
     // 错误列表
     DiagnosticEngine& diag_;
+};
+
+// 作用域屏蔽 guard：临时移出 GC 根集合/类型集合，析构时恢复
+// （修复：gcRootVarNames_ 无作用域清理，与其他作用域同名 GcRootHandle 变量
+//   状态残留会导致同名标识符被误判生成 .get()；用于 for 迭代变量、spawn 闭包参数等）
+struct IterVarGuard {
+    std::set<std::string>& roots;
+    std::unordered_map<std::string, std::string>& types;
+    std::string name;
+    bool wasRoot;
+    bool hadType;
+    std::string savedType;
+    IterVarGuard(std::set<std::string>& r,
+                 std::unordered_map<std::string, std::string>& t,
+                 const std::string& n)
+        : roots(r), types(t), name(n),
+          wasRoot(r.erase(n) > 0), hadType(false) {
+        auto it = t.find(n);
+        if (it != t.end()) { savedType = it->second; t.erase(it); hadType = true; }
+    }
+    ~IterVarGuard() {
+        if (wasRoot) roots.insert(name);
+        if (hadType) types[name] = savedType;
+    }
 };
 
 } // namespace Aura

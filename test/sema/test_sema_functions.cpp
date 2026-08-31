@@ -201,3 +201,31 @@ TEST(SemaFunctions, StringMethods) {
     analyzeSource("fun main(io: Io) { let s = \"hello\"; let n = s.len() }", diag);
     EXPECT_FALSE(diag.hasErrors());
 }
+
+// ============================================================
+// bug-28（2026-08-30）：main 返回非 void → Sema 干净报错
+//  BodyChecker 校验 main 返回类型：仅 None（无标注 / -> None）放行，
+//  -> int 等报 `entry function 'main' must not declare a return type`
+//  （修复前 Sema 放行 → genMainEntry run_event_loop 类型不匹配 → g++ 坏 C++）
+// ============================================================
+TEST(SemaFunctions, MainRetNonVoidRejected) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource("fun main(io: Io) -> int { return 42 }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag,
+        "entry function 'main' must not declare a return type"));
+}
+
+TEST(SemaFunctions, MainNoRetTypeAccepted) {
+    // 对照组：无返回标注 main（默认 None）放行
+    Aura::DiagnosticEngine diag;
+    analyzeSource("fun main(io: Io) { io.println(\"x\") }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunctions, MainExplicitNoneAccepted) {
+    // 对照组：显式 -> None main 放行（NoneSemType 不拦截）
+    Aura::DiagnosticEngine diag;
+    analyzeSource("fun main(io: Io) -> None { io.println(\"x\") }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}

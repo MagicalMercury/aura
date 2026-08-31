@@ -86,6 +86,83 @@ TEST(SemaGenerics, GenericConstructorTypeInference) {
 }
 
 // ============================================================
+// 泛型 ctor Optional 形参推断（bug-18）
+// ============================================================
+// bug-18（2026-08-31 修复）：collectGenericMapping 无 Optional 递归分支 → 泛型 record
+// 构造形参 Optional<T>（物化 GenericSemType{Optional, resolvedName 非空}）T 无法从实参
+// 绑定 → 无标注报 cannot infer、有标注返回类型未代换报 type mismatch。修复后新增
+// Optional 剥壳分支，formal/actual 对称剥壳递归：Box(9) 的 (Optional<T>, int) → T=int；
+// Box(some(9)) 的 (Optional<T>, Optional<int>) → T=int（非对称会把 T 误绑为
+// Optional<int>）；嵌套/列表形态多层同步剥壳。
+TEST(SemaGenerics, CtorOptionalParamInferNoAnnot) {
+    // 无标注：Optional<T> 形参 + Box(9) → T=int 推断成功（修复前 cannot infer）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: Optional<T>) { }"
+        " fun main(io: Io) { let b = Box(9) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaGenerics, CtorOptionalParamInferAnnot) {
+    // 有标注：Optional<T> 形参 + Box(9)，let b: Box<int> → 返回类型代换 → 通过
+    // （修复前 genericMap 空 → { val: <T> } 未代换 → type mismatch）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: Optional<T>) { }"
+        " fun main(io: Io) { let b: Box<int> = Box(9) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaGenerics, CtorOptionalParamInferSome) {
+    // some 形态：Optional<T> 形参 + Box(some(9)) → actual 侧对称剥壳 → T=int
+    // （修复前 cannot infer；非对称剥壳会把 T 误绑为 Optional<int>）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: Optional<T>) { }"
+        " fun main(io: Io) { let b = Box(some(9)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaGenerics, CtorOptionalParamInferNested) {
+    // 嵌套：Optional<Optional<T>> 形参 + Box(some(9)) → 多层同步剥壳 → T=int
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: Optional<Optional<T>>) { }"
+        " fun main(io: Io) { let b = Box(some(9)) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaGenerics, CtorOptionalParamInferList) {
+    // 列表：Optional<[T]> 形参 + Box([1,2]) → case 2 List 递归 + Optional 剥壳 → T=int
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { val: [T] }"
+        " fun (self Box<T>) Box(init: Optional<[T]>) { }"
+        " fun main(io: Io) { let b = Box([1, 2]) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaGenerics, CtorPureTParamControl) {
+    // 对照：纯 T 形参 + Box(9) 不受 Optional 剥壳分支影响（case 1 绑定）→ 0 error
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: T) { self.val = init }"
+        " fun main(io: Io) { let b = Box(9) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
 // 泛型接口
 // ============================================================
 TEST(SemaGenerics, GenericInterfaceImpl) {
@@ -539,6 +616,108 @@ TEST(SemaGenerics, GenericCtorExplicitTypeArgsConflictError) {
         " }",
         diag);
     EXPECT_TRUE(hasErrorContaining(diag, "conflicting type arguments for generic parameter(s)"));
+}
+
+// ============================================================
+// bug-19「泛型 record 构造 Union 形参 Sema 干净报错失效 → 静默坏 C++」
+// （2026-08-31 修复）：CallInfer.cpp:208-217 干净报错判定由「形参提及（formalG）」
+// 改为「genericMap 实际绑定」——Union(T|int) 形参变体泛型 T ∈ formalG 但 collectGenericMapping
+// 无 Union 分支绑不上 → 旧判定放行坏 C++；新判定只要未绑定即报 cannot infer。
+// 对照：纯 T / N2 显式实参 / 有标注 / 零参外层泛型栈均不误报。
+// ============================================================
+TEST(SemaGenerics, GenericCtorUnionParamUnboundError) {
+    // Union(T|int) 形参 + Box(9)（无标注）→ 变体泛型 T 未绑定 → 干净报错 cannot infer
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: T | int) { self.val = init }"
+        " fun main(io: Io) throws {"
+        "   let b = Box(9)"
+        " }",
+        diag);
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot infer type parameter(s) 'T' of constructor for record 'Box'"));
+}
+
+TEST(SemaGenerics, GenericCtorUnionRecordUnboundError) {
+    // Union(Point|T) + record 字面量直传（无标注）→ 同源：变体泛型 T 未绑定 → 干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " type Point = { x: int, y: int }"
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: Point | T) {}"
+        " fun main(io: Io) throws {"
+        "   let b = Box({ x = 1, y = 2 })"
+        " }",
+        diag);
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot infer type parameter(s) 'T' of constructor for record 'Box'"));
+}
+
+TEST(SemaGenerics, GenericCtorUnionAnnotTypeMismatchError) {
+    // Union(T|int) + 有标注 Box<int>(9) → 有标注不进 cannot infer 判定；genericMap 空 →
+    // 返回未代换 → type mismatch（与 Optional 形态有标注一致，路径不变）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: T | int) {}"
+        " fun main(io: Io) throws {"
+        "   let b: Box<int> = Box(9)"
+        " }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+}
+
+TEST(SemaGenerics, GenericCtorUnionPureTControlNoError) {
+    // 对照：纯 T 形参 + Box(9)（无标注）→ case 1 绑定 T=int → 放行（不误报）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: T) { self.val = init }"
+        " fun main(io: Io) throws {"
+        "   let b = Box(9)"
+        " }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaGenerics, GenericCtorUnionPureTAnnotControlNoError) {
+    // 对照：纯 T 形参 + 有标注 Box<int>(9) → 放行（不误报）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: T) { self.val = init }"
+        " fun main(io: Io) throws {"
+        "   let b: Box<int> = Box(9)"
+        " }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaGenerics, GenericCtorUnionN2ExplicitNoError) {
+    // 对照：N2 显式实参 Box<int>(9)（无标注）→ L194-199 预绑定 T → 放行（不误报 cannot infer）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: T) { self.val = init }"
+        " fun main(io: Io) throws {"
+        "   let b = Box<int>(9)"
+        " }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaGenerics, GenericCtorUnionZeroArgOuterStackNoError) {
+    // 对照：零参构造 + 外层泛型栈（泛型函数内 Box()）→ 逃生舱 providedByOuterFn 放行
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) Box() { self.val = 1 }"
+        " fun makeBox(seed: T) -> Box<T> {"
+        "   let b = Box()"
+        "   return b"
+        " }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
 }
 
 // ============================================================

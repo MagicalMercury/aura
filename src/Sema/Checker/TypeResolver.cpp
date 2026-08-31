@@ -200,6 +200,19 @@ void SemAnalyzer::resolveInterfaceMethods(const InterfaceDecl& i, bool allowForw
         tpSym.name = tp;
         symtab_.define(std::move(tpSym));
     }
+    // bug-07：接口方法参数/返回直接写泛型函数类型（`f: fun(U)->U` / `-> fun(U)->U`）时，
+    // 裸 U 须在 forEachIfaceNamedRef 前向占位之前注册为 GenericParam——否则
+    // forwardRegisterIfaceType 把 U 占位为 TypeAlias（symtab 查无 → 占位），registerFuncType
+    // Generics 对 TypeAlias 跳过（幂等）→ finalize 检查 ifaceFwdRefs_ 判定 U 为真 undefined
+    // 误报。仅顶层 FunctionType 内部裸泛型；已注册接口泛型 T 跳过（幂等，不遮蔽）。
+    // 非 FunctionType 顶层裸 NamedType（如 `f: U`）不注册 → 仍走前向占位 + finalize 报错
+    //（保持「非 FunctionType 参数 undefined 报错」语义）。
+    for (auto& m : i.methods) {
+        if (m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge) continue;
+        for (auto& p : m.params)
+            if (p.type) registerFuncTypeGenerics(symtab_, *p.type);
+        if (m.returnType) registerFuncTypeGenerics(symtab_, *m.returnType);
+    }
     if (allowForward) {
         // 前向注册：方法签名引用的未注册用户类型名 → TypeAlias 占位 + resolvingTypes_，
         // 使 resolveType 返回 GenericSemType 占位而非 ErrorSemType（不报 undefined type）。
@@ -214,23 +227,41 @@ void SemAnalyzer::resolveInterfaceMethods(const InterfaceDecl& i, bool allowForw
         }
     }
     sym->interfaceMethods.clear();
+    // 第一遍：先 push 占位 sig（仅 name/throws/hasDefault/hasCppImpl，CppBridge 同占位）
+    // → 后续 resolveType 复制到的 interfaceMethods 至少含全部方法名。否则接口自引用方法
+    // 返回自身时（如 next() -> Node），解析返回类型时后续方法尚未 push → resolveNamedType
+    // 复制出空/不完整方法集视图 → 调用点链式 nd.next().val() 报 has no method（bug-20）。
     for (auto& m : i.methods) {
         InterfaceSemType::MethodSig sig;
         sig.name   = m.name;
         sig.throws = m.throws;
         sig.hasDefault = m.defaultBody != nullptr;   // Aura 默认方法豁免结构匹配
         sig.hasCppImpl = m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge;
-        if (m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge) {
-            // C++ 桥接方法（...）：aura 无实现，签名可含接口类型参数之外的
-            // 自由泛型（如 Iterator<T>::map 的 U）。调用点 CodeGen 直转 runtime，
-            // 不需要解析参数/返回类型；仅保留 hasCppImpl 供 verifyImplCompleteness 豁免。
-            sym->interfaceMethods.push_back(std::move(sig));
-            continue;
-        }
-        for (auto& p : m.params)
-            sig.paramTypes.push_back(p.type ? resolveType(*p.type) : ErrorSemType::make());
-        sig.returnType = m.returnType ? resolveType(*m.returnType) : nullptr;
         sym->interfaceMethods.push_back(std::move(sig));
+    }
+    // 第二/三遍：按索引就地覆写 paramTypes/returnType（禁止每轮 clear 后重新 push——
+    // 否则第三遍解析返回类型时后声明方法再次缺失，静默退回原缺陷）。第二遍存储的返回
+    // 类型克隆含占位 sig（returnType 空）属预期中间态，由第三遍消除；第三遍时全部方法
+    // 签名已完整，resolveNamedType 复制到完整视图（含自身与后续方法）。CppBridge 不解析
+    // 参数/返回类型（同原逻辑：调用点 CodeGen 直转 runtime，仅 hasCppImpl 供豁免）。
+    for (int pass = 0; pass < 2; ++pass) {
+        for (size_t idx = 0; idx < i.methods.size(); ++idx) {
+            auto& m = i.methods[idx];
+            if (m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge) continue;
+            auto& sig = sym->interfaceMethods[idx];
+            sig.paramTypes.clear();
+            for (auto& p : m.params) {
+                // bug-07：接口方法参数直接写泛型函数类型（`f: fun(U) -> U`）时 U 是裸
+                // NamedType 未注册（⑥ 缺口）；M5 返回侧同样未覆盖接口路径，一并补齐。
+                // 仅顶层 FunctionType 注册内部裸泛型；对已注册接口泛型 T（本 scope
+                // 已有 i.typeParams）跳过（幂等，不遮蔽）——`fun(T)->T` 复用接口泛型
+                // 形态保持同一 GenericParam 符号，不误报。
+                if (p.type) registerFuncTypeGenerics(symtab_, *p.type);
+                sig.paramTypes.push_back(p.type ? resolveType(*p.type) : ErrorSemType::make());
+            }
+            if (m.returnType) registerFuncTypeGenerics(symtab_, *m.returnType);
+            sig.returnType = m.returnType ? resolveType(*m.returnType) : nullptr;
+        }
     }
     symtab_.exitScope();
 }
