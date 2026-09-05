@@ -2,19 +2,6 @@
 
 namespace Aura {
 
-// P3b 后：Variant<T...> 存储不支持的类型——function（std::function 值）、
-// 嵌套联合（未扁平化）。这些无法安全放入 Variant storage_，
-// 仍由 P0 报错拦截；其余含堆变体（string/record/list/optional/接口视图）
-// 已由 Variant 支持放行（接口视图：P2b 后 descForI 按 self 子偏移扫描 + ViewRoot 保护）。
-static bool variantStorageUnsafe(const SemType& t) {
-    if (dynamic_cast<const FuncSemType*>(&t))     return true;
-    if (dynamic_cast<const UnionSemType*>(&t))    return true;
-    // 内置 Iterator（GenericSemType "Iterator"）联合变体：P0.4 起编译期拦截；
-    // B+W 值视图化后 descForI is_iface_view_v 子偏移 + 装箱/match ViewRoot 保护
-    // 已使其 GC 安全（2026-08-10 评估放开，见 plan/评估放开内置Iterator联合变体拦截实施方案.md）。
-    return false;
-}
-
 // ============================================================
 // AST 类型 → 语义类型
 // ============================================================
@@ -147,6 +134,202 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
 }
 
 // ============================================================
+// bug-09 止血：语句树内 TypeExpr 收集遍历器
+//
+// forEachIfaceNamedRef 是 TypeExpr 树遍历器（只认 NamedType/ListType/RecordType/
+// UnionType/FunctionType/TupleTypeExpr 六种），不接受 BlockStmt——接口默认方法体是
+// 语句/表达式树，类型引用藏在 LetStmt 类型标注等处。止血须先收集语句树内所有
+// TypeExpr 出现点，再逐个调 forEachIfaceNamedRef。
+//
+// 收集点清单（语句/表达式树中 TypeExpr 的出现位置）：
+//   ① LetDecl.type（let b: B = ...）
+//   ② ConstDecl.type（const c: B = ...）
+//   ③ FunExpr.params[i].type / FunExpr.returnType（闭包参数/返回类型标注）
+//   ④ SpawnStmt.params[i].type（spawn 闭包参数标注）
+//   ⑤ CallExpr.typeArgs（调用点显式泛型实参，如 foo<B>(...)）
+//   内嵌块（if/while/for/loop/try/sync/sync-for/lock/match）递归进入其条件与体。
+//
+// 「非类型位置的接口名不拦」边界（防过度拦截）：方法体内接口方法名调用（x.foo() 的
+// foo）、普通标识符、record 字面量字段名等不是类型引用——本遍历器只处理上述类型
+// 位置，表达式中的 Identifier/方法名（callee/member/method 名）不视为类型引用；
+// 接口不能构造，B(...) 构造调用（B 出现在 callee 位置）不在收集点内，可豁免。
+// ============================================================
+namespace {
+
+void collectTypeExprsInStmt(const Stmt& stmt,
+                            const std::function<void(const TypeExpr&)>& fn);
+void collectTypeExprsInExpr(const ASTNode& expr,
+                            const std::function<void(const TypeExpr&)>& fn);
+
+void collectTypeExprsInStmt(const Stmt& stmt,
+                            const std::function<void(const TypeExpr&)>& fn) {
+    if (auto* b = dynamic_cast<const BlockStmt*>(&stmt)) {
+        for (auto& s : b->stmts) if (s) collectTypeExprsInStmt(*s, fn);
+        return;
+    }
+    // ① LetDecl.type / ② ConstDecl.type：类型标注
+    if (auto* l = dynamic_cast<const LetDecl*>(&stmt)) {
+        if (l->type) fn(*l->type);
+        if (l->initializer) collectTypeExprsInExpr(*l->initializer, fn);
+        return;
+    }
+    if (auto* c = dynamic_cast<const ConstDecl*>(&stmt)) {
+        if (c->type) fn(*c->type);
+        if (c->initializer) collectTypeExprsInExpr(*c->initializer, fn);
+        return;
+    }
+    if (auto* r = dynamic_cast<const ReturnStmt*>(&stmt)) {
+        if (r->expr) collectTypeExprsInExpr(*r->expr, fn);
+        return;
+    }
+    if (auto* t = dynamic_cast<const ThrowStmt*>(&stmt)) {
+        if (t->expr) collectTypeExprsInExpr(*t->expr, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<const ExprStmt*>(&stmt)) {
+        if (e->expr) collectTypeExprsInExpr(*e->expr, fn);
+        return;
+    }
+    if (auto* i = dynamic_cast<const IfStmt*>(&stmt)) {
+        if (i->condition) collectTypeExprsInExpr(*i->condition, fn);
+        if (i->thenBranch) collectTypeExprsInStmt(*i->thenBranch, fn);
+        for (auto& ei : i->elseIfs) {
+            if (ei.condition) collectTypeExprsInExpr(*ei.condition, fn);
+            if (ei.body) collectTypeExprsInStmt(*ei.body, fn);
+        }
+        if (i->elseBranch) collectTypeExprsInStmt(*i->elseBranch, fn);
+        return;
+    }
+    if (auto* w = dynamic_cast<const WhileStmt*>(&stmt)) {
+        if (w->condition) collectTypeExprsInExpr(*w->condition, fn);
+        if (w->body) collectTypeExprsInStmt(*w->body, fn);
+        return;
+    }
+    if (auto* f = dynamic_cast<const ForStmt*>(&stmt)) {
+        if (f->iterable) collectTypeExprsInExpr(*f->iterable, fn);
+        if (f->body) collectTypeExprsInStmt(*f->body, fn);
+        return;
+    }
+    if (auto* o = dynamic_cast<const LoopStmt*>(&stmt)) {
+        if (o->body) collectTypeExprsInStmt(*o->body, fn);
+        return;
+    }
+    if (auto* t = dynamic_cast<const TryCatchStmt*>(&stmt)) {
+        if (t->tryBody) collectTypeExprsInStmt(*t->tryBody, fn);
+        if (t->catchBody) collectTypeExprsInStmt(*t->catchBody, fn);
+        return;
+    }
+    if (auto* s = dynamic_cast<const SyncStmt*>(&stmt)) {
+        if (s->body) collectTypeExprsInStmt(*s->body, fn);
+        return;
+    }
+    if (auto* sf = dynamic_cast<const SyncForStmt*>(&stmt)) {
+        if (sf->iterable) collectTypeExprsInExpr(*sf->iterable, fn);
+        if (sf->body) collectTypeExprsInStmt(*sf->body, fn);
+        return;
+    }
+    if (auto* sp = dynamic_cast<const SpawnStmt*>(&stmt)) {
+        // ④ spawn 闭包参数标注
+        for (auto& p : sp->params) if (p.type) fn(*p.type);
+        if (sp->callExpr) collectTypeExprsInExpr(*sp->callExpr, fn);
+        for (auto& sb : sp->body) if (sb) collectTypeExprsInStmt(*sb, fn);
+        return;
+    }
+    if (auto* lk = dynamic_cast<const LockStmt*>(&stmt)) {
+        for (auto& le : lk->lockExprs) if (le) collectTypeExprsInExpr(*le, fn);
+        if (lk->body) collectTypeExprsInStmt(*lk->body, fn);
+        return;
+    }
+    if (auto* m = dynamic_cast<const MatchStmt*>(&stmt)) {
+        if (m->expr) collectTypeExprsInExpr(*m->expr, fn);
+        for (auto& c : m->cases) {
+            if (!c.body) continue;
+            if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get()))
+                collectTypeExprsInStmt(*cb, fn);
+            else
+                collectTypeExprsInExpr(*c.body, fn);
+        }
+        return;
+    }
+    // Break/Continue：无 TypeExpr 出现点
+}
+
+void collectTypeExprsInExpr(const ASTNode& expr,
+                            const std::function<void(const TypeExpr&)>& fn) {
+    // 闭包：参数/返回类型标注 + 体内部语句（递归）
+    if (auto* fe = dynamic_cast<const FunExpr*>(&expr)) {
+        // ③ 闭包参数/返回类型标注
+        for (auto& p : fe->params) if (p.type) fn(*p.type);
+        if (fe->returnType) fn(*fe->returnType);
+        if (fe->body)
+            for (auto& s : fe->body->stmts)
+                if (s) collectTypeExprsInStmt(*s, fn);
+        return;
+    }
+    if (auto* c = dynamic_cast<const CallExpr*>(&expr)) {
+        // ⑤ 调用点显式泛型实参（类型位置；callee 名不视为类型引用——接口不能构造，B(...) 豁免）
+        for (auto& ta : c->typeArgs) if (ta) fn(*ta);
+        if (c->callee) collectTypeExprsInExpr(*c->callee, fn);
+        for (auto& a : c->args) if (a) collectTypeExprsInExpr(*a, fn);
+        return;
+    }
+    if (auto* b = dynamic_cast<const BinaryExpr*>(&expr)) {
+        if (b->left) collectTypeExprsInExpr(*b->left, fn);
+        if (b->right) collectTypeExprsInExpr(*b->right, fn);
+        return;
+    }
+    if (auto* u = dynamic_cast<const UnaryExpr*>(&expr)) {
+        if (u->operand) collectTypeExprsInExpr(*u->operand, fn);
+        return;
+    }
+    if (auto* m = dynamic_cast<const MethodCallExpr*>(&expr)) {
+        if (m->object) collectTypeExprsInExpr(*m->object, fn);
+        for (auto& a : m->args) if (a) collectTypeExprsInExpr(*a, fn);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const MemberAccessExpr*>(&expr)) {
+        if (ma->object) collectTypeExprsInExpr(*ma->object, fn);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const IndexExpr*>(&expr)) {
+        if (ix->object) collectTypeExprsInExpr(*ix->object, fn);
+        if (ix->index) collectTypeExprsInExpr(*ix->index, fn);
+        return;
+    }
+    if (auto* as = dynamic_cast<const AssignExpr*>(&expr)) {
+        if (as->target) collectTypeExprsInExpr(*as->target, fn);
+        if (as->value) collectTypeExprsInExpr(*as->value, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<const ErrorPropagationExpr*>(&expr)) {
+        if (e->expr) collectTypeExprsInExpr(*e->expr, fn);
+        return;
+    }
+    if (auto* p = dynamic_cast<const PipeExpr*>(&expr)) {
+        if (p->left) collectTypeExprsInExpr(*p->left, fn);
+        if (p->right) collectTypeExprsInExpr(*p->right, fn);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ConditionalExpr*>(&expr)) {
+        if (cd->cond) collectTypeExprsInExpr(*cd->cond, fn);
+        if (cd->thenBranch) collectTypeExprsInExpr(*cd->thenBranch, fn);
+        if (cd->elseBranch) collectTypeExprsInExpr(*cd->elseBranch, fn);
+        return;
+    }
+    if (auto* l = dynamic_cast<const ListExpr*>(&expr)) {
+        for (auto& e : l->elements) if (e) collectTypeExprsInExpr(*e, fn);
+        return;
+    }
+    if (auto* r = dynamic_cast<const RecordExpr*>(&expr)) {
+        for (auto& f : r->fields) if (f.value) collectTypeExprsInExpr(*f.value, fn);
+        return;
+    }
+    // 字面量/Identifier：无 TypeExpr 出现点（非类型位置，不拦）
+}
+
+} // namespace
+
+// ============================================================
 // 接口符号注册（用户接口 + 内置 .aurai 接口共用）
 //
 // 声明顺序问题（problem.txt「接口声明中引用后置类型」）：接口方法签名引用声明在
@@ -224,6 +407,16 @@ void SemAnalyzer::resolveInterfaceMethods(const InterfaceDecl& i, bool allowForw
                     forwardRegisterIfaceType(n); });
             if (m.returnType) forEachIfaceNamedRef(*m.returnType, [&](const NamedType& n) {
                 forwardRegisterIfaceType(n); });
+            // bug-09 止血：默认方法体（BlockStmt）是语句/表达式树，须用语句树 TypeExpr
+            // 收集遍历器找出其中所有类型标注位置的 NamedType，再同样前向占位注册 →
+            // finalizeInterfaceSignatures 二次解析残留占位 → 干净报错（含来源方法名）。
+            // 只扫类型位置（LetStmt/ConstDecl/闭包参数等），方法名调用/普通标识符不拦。
+            if (m.defaultBody) {
+                collectTypeExprsInStmt(*m.defaultBody, [&](const TypeExpr& te) {
+                    forEachIfaceNamedRef(te, [&](const NamedType& n) {
+                        forwardRegisterIfaceType(n, m.name); });
+                });
+            }
         }
     }
     sym->interfaceMethods.clear();
@@ -307,7 +500,7 @@ void SemAnalyzer::forEachIfaceNamedRef(const TypeExpr& type,
 // 占位而非 ErrorSemType（resolveType 不报 undefined type）；declareTopLevel 末尾
 // finalizeInterfaceSignatures 二次解析覆盖为完整类型，未被真实声明覆盖的（真
 // undefined）在 finalize 中报错。
-void SemAnalyzer::forwardRegisterIfaceType(const NamedType& n) {
+void SemAnalyzer::forwardRegisterIfaceType(const NamedType& n, const std::string& sourceMethod) {
     std::string full = n.namespacePrefix.empty() ? n.name : n.namespacePrefix[0] + "." + n.name;
     // 内置类型（int/string/Optional/Iterator/...）非用户类型，无需前向
     if (BuiltinRegistry::get().findType(full)) return;
@@ -321,7 +514,7 @@ void SemAnalyzer::forwardRegisterIfaceType(const NamedType& n) {
     fwd.type = std::move(g);
     symtab_.defineGlobal(std::move(fwd));
     resolvingTypes_.insert(full);
-    ifaceFwdRefs_.push_back({full, &n});
+    ifaceFwdRefs_.push_back({full, &n, sourceMethod});
 }
 
 // declareTopLevel 末尾：二次解析所有接口方法签名 + 校验前向引用是否为真 undefined。
@@ -343,12 +536,25 @@ void SemAnalyzer::finalizeInterfaceSignatures(const Program& program) {
         // 错误而非半支持状态（Sema 放行但 g++ 坏 C++）。接口自引用不受影响（自身名
         // 在 declareInterface 先注册，不走前向占位）。
         if (sym && sym->kind == SymKind::Interface) {
-            if (fr.node)
-                error(*fr.node, "interface '" + fr.name + "' is declared after this interface method "
-                      "signature references it; declare it before this interface");
-            else
-                error(0, 0, "interface '" + fr.name + "' is declared after this interface method "
-                      "signature references it; declare it before this interface");
+            if (fr.node) {
+                if (!fr.sourceMethod.empty())
+                    // bug-09：默认方法体引用后置接口——报错注明来源方法名（finalize 在接口
+                    // 声明远处，距方法体较远，注明方法名提升诊断体验）
+                    error(*fr.node, "interface '" + fr.name + "' is declared after this interface method "
+                          "signature references it; default method '" + fr.sourceMethod +
+                          "' references it; declare it before this interface");
+                else
+                    error(*fr.node, "interface '" + fr.name + "' is declared after this interface method "
+                          "signature references it; declare it before this interface");
+            } else {
+                if (!fr.sourceMethod.empty())
+                    error(0, 0, "interface '" + fr.name + "' is declared after this interface method "
+                          "signature references it; default method '" + fr.sourceMethod +
+                          "' references it; declare it before this interface");
+                else
+                    error(0, 0, "interface '" + fr.name + "' is declared after this interface method "
+                          "signature references it; declare it before this interface");
+            }
             resolvingTypes_.erase(fr.name);
             continue;
         }

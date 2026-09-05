@@ -23,6 +23,7 @@ struct SemType;
 struct UnionSemType;
 struct OptionalSemType;
 struct InterfaceSemType;
+struct ListSemType;
 
 // ============================================================
 // PendingMethod — 暂存方法签名，供 genRecordStruct 嵌入 struct
@@ -364,6 +365,19 @@ private:
     //   descForI 按 self 子偏移扫描；与 isHeapSemType 的"传参包装"语义不同，勿混用）
     [[nodiscard]] bool isUnionHeapVariant(const SemType* t) const;
 
+    // bug-14/29/30/55：未绑定泛型判定——GenericSemType 且 resolvedName 空（未实例化
+    // 模板参数，如泛型方法/函数体内的 T），且非内置 Iterator 视图。此类类型实例化前
+    // 无法静态判断是否为 GC 指针（T 可实例化为 int 等值类型或 record/GcString*/
+    // Optional*/Variant* 等 GcObject 子类）→ 需 if constexpr 延迟判定（方案 A，
+    // 仿 runtime\gc\gc.h:720-725 gc_write_barrier_generic 与 ExprAccess.cpp:289-299）。
+    [[nodiscard]] static bool isUnboundGenericSemType(const SemType* type);
+    // 需延迟判定的值：按堆判定 true 但类型为未绑定泛型（组合 = isHeapSemType &&
+    // !isIfaceView && isUnboundGenericSemType）→ 生成 if constexpr 延迟包装。
+    [[nodiscard]] bool isDeferredGcRoot(const SemType* t) const;
+    // #55/#29：递归判定列表元素链是否含未绑定泛型（如 [T]、[[T]]）——元素类型实例化前
+    // 无法静态确定（T 可为值/堆），声明类型与列表元素类型均需 C++ 编译期决定。
+    [[nodiscard]] static bool listContainsUnboundGeneric(const ListSemType* ls);
+
     // P3b：识别 none() 调用（Optional 占位构造），联合赋值时特判为 NoneType 值
     [[nodiscard]] static bool isNoneCallExpr(const ASTNode& e);
 
@@ -409,7 +423,17 @@ private:
     void genTypeDescriptor(std::ostream& cpp,
                            const std::string& structName,
                            const std::vector<std::string>& templateParams,
-                           const std::vector<std::string>& ptrFieldNames);
+                           const std::vector<std::string>& ptrFieldNames,
+                           const std::vector<std::string>& deferredPtrFieldNames = {});
+    // #54（审查后修正，问题 C）：递归生成「第 k 个有效延迟字段偏移」的嵌套条件
+    // 表达式（k 1-based；有效 = is_convertible_v<裸名, GcObject*>）。用于延迟候选
+    // 数组项：使有效字段稳定排前（消费协议「前 cnt 项」恰好是有效偏移），
+    // 多泛型参数时不再按声明顺序错位（Pair2<int,Point*> 读 int 当指针崩溃）。
+    // 不足 k 个有效字段时返回 "0"（占位，位于 cnt 之后不被消费）。
+    [[nodiscard]] std::string genDeferredSelectExpr(
+        const std::string& fullName,
+        const std::vector<std::string>& deferredPtrFieldNames,
+        size_t idx, size_t k) const;
 
     // --- 接口声明 (§4.5) ---
     void genInterfaceDecl(std::ostream& h, const InterfaceDecl& decl);
@@ -499,6 +523,14 @@ private:
     [[nodiscard]] std::string genBoolLiteral(const BoolLiteral& e);
     [[nodiscard]] std::string genNoneLiteral();
     [[nodiscard]] std::string genIdentifier(const Identifier& e);
+    // #56 缺口 3：spawn/sync 手拼 lambda 与语言闭包的 receiver init-capture 源表达式。
+    // 上下文分支（按 receiver 句柄可见性）：
+    //   - 闭包体/spawn 体内（currentClosureThisHandle_ 非空，裸 this 不可见）→ 外层句柄
+    //     ".get()"（如 _this_root.get() / 外层 _sp_this_f.get()）
+    //   - 方法体直引（currentMethodThisHandle_ 非空，裸 this 可能已因方法体内 GC 悬垂）
+    //     → 方法入口句柄 "_this.get()"（GC 更新后的最新地址）
+    //   - 无句柄上下文（接口默认方法/普通函数等）→ "this"
+    [[nodiscard]] std::string receiverThisSourceExpr() const;
     [[nodiscard]] std::string genListExpr(const ListExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genRecordExpr(const RecordExpr& e, bool isCoroutine);
     [[nodiscard]] std::string genBinaryExpr(const BinaryExpr& e, bool isCoroutine);
@@ -702,6 +734,21 @@ private:
     // 用于在 genIdentifier 中将 self/p 映射为 C++ 的 this
     std::string currentReceiverName_;
 
+    // 当前方法接收者的 C++ 类型（如 "Counter<int32_t>" / 泛型 "Counter<T>"）。
+    // 协程方法内闭包捕获 this 时改捕获 GcRootHandle<此类型*>（bug-24 决策 (a)）。
+    std::string currentReceiverCppType_;
+
+    // 当前闭包体内 self 的替代生成名（非空 = 捕获 GcRootHandle 形态，如 "_this_root"）。
+    // genIdentifier 命中 currentReceiverName_ 时返回 "<此名>.get()" 而非 "this"；
+    // 仅在闭包体生成期间置位，退出恢复（嵌套闭包各自独立）。
+    std::string currentClosureThisHandle_;
+
+    // #56：当前方法体的 this 入口句柄名（非空 = 方法体入口已生成 GcRootHandle，
+    // 如 "_this"）。genIdentifier 命中 currentReceiverName_ 且不在闭包句柄上下文时
+    // 返回 "<此名>.get()" 取最新地址（消除方法体内 GC 后 this 悬垂）。仅 genMethodDecl
+    // 方法体生成期间置位（record 方法），接口默认方法/构造函数不置位。
+    std::string currentMethodThisHandle_;
+
     // 当前是否在 spawn 块内生成代码（避免嵌套协程 co_await）
     bool insideSpawn_ = false;
 
@@ -716,6 +763,19 @@ private:
 
     // 当前正在生成的函数的协程状态
     bool currentFunctionIsCoroutine_ = false;
+
+    // #31：genGcRootedArgs 的 outer 前缀语句待落盘缓冲（协程调用/co_await 实参需
+    // 提升到 IIFE 外的声明，如 auto _aX_Y = (实参);）。genGcRootedArgs 返回纯表达式
+    //（单表达式），多语句前缀在此缓冲；writeLine 与语句边界输出点先 flush 再写语句，
+    // 使 outer 变量声明先于其引用（消除 let/return 拼多语句进表达式的坏 C++）。
+    std::string hoistPrefixPending_;
+    // 将缓冲中的 outer 前缀语句写入输出流并清空
+    void flushHoistPrefix(std::ostream& os);
+
+    // #46：当前生成的 C++ 函数/闭包/spawn lambda 作用域是否有名为 io 的变量
+    //（io 形参由 CodeGen 按形参名生成，函数/方法入口置位、退出复位；闭包体/spawn
+    //  lambda 体按捕获/追加结果 save/restore）。供 spawn 需要 io 时兜底干净报错。
+    bool ioInScope_ = false;
 
     // 当前函数的模板参数列表（用于调用泛型构造函数时传递类型参数）
     std::vector<std::string> currentTParams_;

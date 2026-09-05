@@ -679,6 +679,67 @@ TEST(SemaInterfaces, IfaceSelfRefValFirstNoRegression) {
     EXPECT_FALSE(diag.hasErrors());
 }
 
+TEST(SemaInterfaces, IfaceSelfRefChainDefaultMethod) {
+    // bug-20 边缘：接口自引用链 + 默认方法组合——默认方法 dflt 声明在 next 之后，
+    // 修复前 next.returnType 方法集不含 dflt → nd.next().dflt() 报 has no method 'dflt'。
+    // 方法集完备性修复后默认方法同入集合，链式调用可解析。
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface Node {"
+        " next() -> Node"
+        " dflt() -> int { return 7 } }"
+        " type NodeRec = { n: int }"
+        " fun (self NodeRec impl Node) next() -> Node { let self2: Node = self; return self2 }"
+        " fun main(io: Io) { let r: NodeRec = { n = 5 }; let nd: Node = r; let d = nd.next().dflt() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// bug-33（2026-09-04 批次 13）：接口方法返回 None——接口侧签名 None→void 映射 +
+// 值上下文 None 绑定拒绝（checkLetDecl 配套，接口/record 直调统一拒绝）
+// ============================================================
+TEST(SemaInterfaces, IfaceMethodNoneDeclAccepted) {
+    // 接口方法 -> None + record 实现（无 let 值绑定）→ Sema 放行（CodeGen 侧映射 void，
+    // 见 CodeGen.InterfaceMethodNoneMapsToVoid）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface Cleaner { clean() -> None }"
+        " type Room = { name: string }"
+        " fun (self Room impl Cleaner) clean() -> None { let x = 1 }"
+        " fun use(c: Cleaner) { c.clean() }"
+        " fun main(io: Io) { let r: Room = { name = \"h\" }; use(r) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaInterfaces, IfaceMethodNoneLetValueRejected) {
+    // 接口视图调用返回值上下文：let x = c.clean()（接口方法 None→void 后 void 赋 auto
+    // 坏 C++）→ 配套拒绝（干净报错引导 int | None 联合标注）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface Cleaner { clean() -> None }"
+        " type Room = { name: string }"
+        " fun (self Room impl Cleaner) clean() -> None { let x = 1 }"
+        " fun use(c: Cleaner) { let x = c.clean() }"
+        " fun main(io: Io) { let r: Room = { name = \"h\" }; use(r) }",
+        diag);
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot bind 'None' return value to a variable"));
+}
+
+TEST(SemaInterfaces, IfaceMethodNonNoneControlAccepted) {
+    // 对照：接口方法返回非 None → 放行（#33 不误伤）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface Counter { count() -> int }"
+        " type Room = { n: int }"
+        " fun (self Room impl Counter) count() -> int { return self.n }"
+        " fun use(c: Counter) -> int { return c.count() }"
+        " fun main(io: Io) { let r: Room = { n = 7 }; io.println(str(use(r))) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
 TEST(SemaInterfaces, IfaceNoSelfRefChainControl) {
     // 对照组：无自引用接口 + 直接调用 → 不误伤
     Aura::DiagnosticEngine diag;
@@ -703,6 +764,104 @@ TEST(SemaInterfaces, IfaceForwardRefChainControl) {
         " fun main(io: Io) { let b: B = BRec { x = 9 }; let a: A = ARec { b = b };"
         "   let v = a.get().val() }",
         diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// bug-09「接口默认方法体引用后置接口 B → 坏 C++」（2026-09-01 止血）：
+// 签名拦截（finalizeInterfaceSignatures，TypeResolver.cpp）只查 m.params/m.returnType，
+// 默认方法体（BlockStmt）零扫描 → 漏网 → genInterfaceDecl 默认方法体内联于 struct A
+// → B 未声明即使用 → 坏 C++。修复：新增语句树 TypeExpr 收集遍历器（LetDecl/ConstDecl/
+// 闭包参数/内嵌块等类型标注位置），resolveInterfaceMethods 对 m.defaultBody 同样
+// forwardRegisterIfaceType 占位 → finalize 二次解析残留占位 → 干净报错（ifaceFwdRefs_
+// 携带来源方法名，报错注明「默认方法 'helper'」）。record/函数形态本止血不覆盖（方案 D）。
+// ============================================================
+TEST(SemaInterfaces, SignatureLateIfaceCleanError) {
+    // 签名拦截形态（既有行为）保持干净报错；无来源方法名补充（占位来自签名非默认方法体）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface A { get() -> B } interface B { val() -> int }"
+        " fun main(io: Io) { io.println(\"ok\") }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "interface 'B' is declared after this interface method"));
+    EXPECT_FALSE(hasErrorContaining(diag, "default method '"));
+}
+
+TEST(SemaInterfaces, DefaultBodyLateIfaceCleanError) {
+    // 主线：默认方法体 let b: B = makeB()（B 后置）→ 干净报错（含来源方法名 'helper'）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface A { base() -> int helper() -> int { let b: B = makeB();"
+        "   return b.val() + self.base() } }"
+        " interface B { val() -> int }"
+        " type R = { x: int }"
+        " fun (self R impl A) base() -> int { return self.x }"
+        " fun (self R impl B) val() -> int { return self.x + 10 }"
+        " fun makeB() -> B { let r: R = { x = 5 }; return r }"
+        " fun main(io: Io) { io.println(\"ok\") }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "interface 'B' is declared after this interface method"));
+    EXPECT_TRUE(hasErrorContaining(diag, "default method 'helper' references it"));
+}
+
+TEST(SemaInterfaces, DefaultBodyLateIfaceClosureParamCleanError) {
+    // 收集点③：默认方法体内闭包参数类型标注引用后置接口 → 干净报错（含来源方法名）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface A { base() -> int helper() -> int {"
+        "   let f = fun (b: B) -> int { return b.val() };"
+        "   return f(makeB()) + self.base() } }"
+        " interface B { val() -> int }"
+        " type R = { x: int }"
+        " fun (self R impl A) base() -> int { return self.x }"
+        " fun (self R impl B) val() -> int { return self.x + 10 }"
+        " fun makeB() -> B { let r: R = { x = 5 }; return r }"
+        " fun main(io: Io) { io.println(\"ok\") }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "interface 'B' is declared after this interface method"));
+    EXPECT_TRUE(hasErrorContaining(diag, "default method 'helper' references it"));
+}
+
+TEST(SemaInterfaces, DefaultBodyLateIfaceNestedContainerCleanError) {
+    // 收集点：默认方法体内嵌套容器 Optional<B> 类型标注引用后置接口 → 干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "interface A { base() -> int helper() -> int {"
+        "   let ob: Optional<B> = None;"
+        "   return self.base() } }"
+        " interface B { val() -> int }"
+        " type R = { x: int }"
+        " fun (self R impl A) base() -> int { return self.x }"
+        " fun main(io: Io) { io.println(\"ok\") }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "interface 'B' is declared after this interface method"));
+    EXPECT_TRUE(hasErrorContaining(diag, "default method 'helper' references it"));
+}
+
+TEST(SemaInterfaces, DefaultBodyLateIfaceSelfOnlyNoFalsePositive) {
+    // 对照组：后置接口 B 存在但默认方法体只引用 self/自身方法 → 不误伤
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "interface A { base() -> int helper() -> int { let v: int = self.base(); return v + 1 } }"
+        " interface B { val() -> int }"
+        " type R = { x: int }"
+        " fun (self R impl A) base() -> int { return self.x }"
+        " fun main(io: Io) { let r: R = { x = 1 }; let a: A = r; io.println(str(a.helper())) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaInterfaces, DefaultBodyLateIfaceForwardNoFalsePositive) {
+    // 对照组：B 声明在 A 之前 + 默认方法体 let b: B = makeB() → 不误伤
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "interface B { val() -> int }"
+        " fun makeB() -> B { let r: R = { x = 5 }; return r }"
+        " type R = { x: int }"
+        " interface A { base() -> int helper() -> int {"
+        "   let b: B = makeB(); return b.val() + self.base() } }"
+        " fun (self R impl A) base() -> int { return self.x }"
+        " fun (self R impl B) val() -> int { return self.x + 10 }"
+        " fun main(io: Io) { let r: R = { x = 1 }; let a: A = r; io.println(str(a.helper())) }", diag);
     EXPECT_FALSE(diag.hasErrors());
 }
 

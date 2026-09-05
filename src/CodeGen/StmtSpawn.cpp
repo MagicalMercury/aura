@@ -31,22 +31,71 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
         if (p.name == "_tasks") hasTasks = true;
     }
 
+    // bug-24：spawn 绑定列表引用 receiver（self/p）→ 该参数是 this 别名（body 内经
+    // genIdentifier 映射 self→this），不得声明为 lambda 参数（会产出自引用未用参数 +
+    // this 未捕获坏 C++）→ 改为 [this] 捕获、不声明参数、不传实参。
+    bool needsThisCapture = false;
+    for (auto& p : stmt.params)
+        if (!currentReceiverName_.empty() && p.name == currentReceiverName_)
+            needsThisCapture = true;
+
     // 整条 _tasks.push_back(...) 先写入缓冲 out：显式实参需经 genGcRootedArgs 包装
     // （bug-42）保护，须在实参求值前备好完整调用串（占位符 {i}）；同名自动绑定路径
     // 无堆临时值风险，直接透出缓冲。
     std::ostringstream out;
     // 生成 lambda 签名为显式参数
-    out << indentStr() << "_tasks.push_back([](";
+    out << indentStr() << "_tasks.push_back([";
+    // #56 §1.8：方法上下文 spawn lambda 引用 receiver → init-capture 专属句柄
+    //（Global 根：spawn 跨线程/跨挂起逃逸；_sp_this 避免与 _this/_this_root 冲突）。
+    // 缺口 3：capture-init 源不写裸 this——闭包/spawn 体内（this 不可见）取外层句柄
+    // .get()；方法体直引取入口句柄 .get()（裸 this 可能已因方法体内前置 GC 悬垂）。
+    if (needsThisCapture)
+        out << "_sp_this = aura_rt::GcRootHandle<" << currentReceiverCppType_
+            << "*>(" << receiverThisSourceExpr() << ", aura_rt::GcRootScope::Global)";
+    out << "](";
+    bool firstParam = true;
     for (size_t i = 0; i < stmt.params.size(); ++i) {
-        if (i > 0) out << ", ";
+        if (!currentReceiverName_.empty() && stmt.params[i].name == currentReceiverName_)
+            continue;   // receiver 参数 → this 捕获，不声明为参数
+        if (!firstParam) out << ", ";
+        firstParam = false;
         out << (stmt.params[i].type ? mapParamType(*stmt.params[i].type) : "auto")
             << " " << safeName(stmt.params[i].name);
     }
-    // 自动追加 io 和 _tasks（如果用户未声明）
-    if (!hasIo) out << ", aura_rt::Io& io";
+    // #46：body 是否实际引用 io（穿透嵌套 spawn/语言闭包，IdRefCollector 保守收集）。
+    // 用户已显式声明 io 参数（hasIo）时无需收集（body 中 io 即该参数）。
+    bool bodyRefsIo = false;
+    if (!hasIo) {
+        std::set<std::string> refs;
+        IdRefCollector ioCol(refs);
+        for (auto& s : stmt.body) if (s) ioCol.collectStmt(*s);
+        bodyRefsIo = refs.count("io") > 0;
+    }
+    // #46 兜底：调用需要 io（显式声明同名绑定 / body 引用需追加）但外层无 io → 干净报错
+    if ((hasIo || bodyRefsIo) && !ioInScope_) {
+        error(stmt, "spawn requires an 'io' variable in the enclosing scope; "
+                    "add an 'io: Io' parameter to the enclosing function");
+        return;
+    }
+    // 自动追加 io（仅 body 实际引用 io 时，按需）和 _tasks（如果用户未声明）
+    if (!hasIo && bodyRefsIo) out << ", aura_rt::Io& io";
     if (!hasTasks) out << ", std::vector<aura_rt::task<void>>& _tasks";
     out << ") -> aura_rt::task<void> {\n";
     insideSpawn_ = true;
+    // #56 §1.8：spawn lambda 体生成期间隔离外层闭包/方法句柄映射（外层闭包内再
+    // spawn 引用 self 亦映射自身捕获句柄，不依赖外层 _this_root 可见性）；体后恢复。
+    // 缺口 1：协程 lambda init-capture 的 GcRootHandle 存在 g++ 暂存窗口（globalRoots_
+    // 中被 GC 更新的根 ≠ 任务体首段实际读取的句柄）→ task 体首段触发 GC 后句柄不
+    // 重定位 → 悬垂崩溃。修复：body 首语句物化 frame-local 句柄 _sp_this_f（从捕获句柄
+    // 取当前值注册新根；物化先于任何 GC，源值必为对象当前地址），体内 self 恒映射
+    // 物化句柄（frame 内地址固定 + 注册正确 → GC 可重定位，实测对照组）。
+    std::string savedClosureHandle = currentClosureThisHandle_;
+    std::string savedMethodHandle = currentMethodThisHandle_;
+    if (needsThisCapture) currentClosureThisHandle_ = "_sp_this_f";
+    // #46：spawn lambda 签名含 io（用户声明 or 按需追加）→ body 生成期间 io 参数在
+    // lambda 作用域内可见，置 ioInScope_（save/restore）供嵌套 spawn 判定。
+    bool savedIoInScope = ioInScope_;
+    if (hasIo || bodyRefsIo) ioInScope_ = true;
 
     // 屏蔽参数名：闭包参数可能与外层同名 GcRootHandle 变量冲突（gcRootVarNames_ 无
     // 作用域清理），否则参数被误判生成 .get()；块结束（实参生成前）guard 析构恢复外层状态
@@ -60,11 +109,19 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
         for (auto& p : stmt.params)
             guards.emplace_back(gcRootVarNames_, gcRootTypes_, safeName(p.name));
 
+        // 缺口 1：task body 首语句物化 frame-local 句柄（见上注释）
+        if (needsThisCapture)
+            out << "aura_rt::GcRootHandle<" << currentReceiverCppType_
+                << "*> _sp_this_f(_sp_this.get(), aura_rt::GcRootScope::Global);\n";
+
         for (auto& s : stmt.body)
             if (s) genStmt(out, *s, true);
     }
+    ioInScope_ = savedIoInScope;
 
     insideSpawn_ = false;
+    currentClosureThisHandle_ = savedClosureHandle;
+    currentMethodThisHandle_ = savedMethodHandle;
     out << indentStr() << "    co_return;\n";
     out << indentStr() << "}(";
 
@@ -76,15 +133,19 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
             out << "{" << i << "}";
         }
     } else {
+        bool firstArg = true;
         for (size_t i = 0; i < stmt.params.size(); ++i) {
-            if (i > 0) out << ", ";
+            if (!currentReceiverName_.empty() && stmt.params[i].name == currentReceiverName_)
+                continue;   // receiver 参数不传实参（由 [this] 捕获提供）
+            if (!firstArg) out << ", ";
+            firstArg = false;
             // 同名自动绑定：外层 GcRootHandle 变量 → 传 .get() 裸指针（guards 已析构，
             // gcRootVarNames_ 已恢复外层状态）
             std::string pname = safeName(stmt.params[i].name); // 同名自动绑定
             out << (gcRootVarNames_.count(pname) ? pname + ".get()" : pname);
         }
     }
-    if (!hasIo) out << ", io";
+    if (!hasIo && bodyRefsIo) out << ", io";   // #46：仅 body 实际引用 io 时传 io
     if (!hasTasks) out << ", _tasks";
     out << "))";
 
@@ -97,7 +158,9 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
         gcArgs.reserve(stmt.args.size());
         for (size_t i = 0; i < stmt.args.size(); ++i)
             gcArgs.emplace_back(genExpr(*stmt.args[i], true), stmt.args[i]->inferredType);
-        cpp << genGcRootedArgs(gcArgs, out.str(), true) << ";\n";
+        std::string callText = genGcRootedArgs(gcArgs, out.str(), true);
+        flushHoistPrefix(cpp);   // #31：实参协程 outer 前缀先落盘
+        cpp << callText << ";\n";
     } else {
         cpp << out.str() << ";\n";
     }
@@ -111,31 +174,68 @@ void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt)
     std::set<std::string> allRefs;
     IdRefCollector idCol(allRefs);
     idCol.collectExpr(*stmt.callExpr);   // 含 callee + args
+    // #46：callExpr 是否实际引用 io（builtins 排除前记录——io 不进 freeVars）
+    bool refsIo = allRefs.count("io") > 0;
     std::set<std::string> builtins = {"io", "_tasks"};
     std::vector<std::string> freeVars;
+    // bug-24：调用表达式引用 receiver（self/p）→ 不进 freeVars（this 别名），lambda 改 [this] 捕获
+    bool needsThisCapture = false;
     for (auto& name : allRefs) {
+        if (!currentReceiverName_.empty() && name == currentReceiverName_) {
+            needsThisCapture = true;
+            continue;
+        }
         if (builtins.count(name)) continue;
         if (registeredTypes_.count(name)) continue;  // 函数名/类型名不捕获
+        // 内置函数名不捕获（同 StmtSync——关联调研发现 (a)：gc_force 等被当自由变量）
+        if (BuiltinRegistry::get().hasFunctionName(name)) continue;
         freeVars.push_back(name);
     }
+    // #46 兜底：调用需 io（callExpr 引用 io 需追加）但外层无 io → 干净报错
+    if (refsIo && !ioInScope_) {
+        error(stmt, "spawn requires an 'io' variable in the enclosing scope; "
+                    "add an 'io: Io' parameter to the enclosing function");
+        return;
+    }
 
-    // 2. 协程 lambda：[] 空捕获 + 显式参数（复用旧式 spawn 的安全模式）
-    cpp << indentStr() << "_tasks.push_back([](";
+    // 2. 协程 lambda：引用 receiver 时 init-capture 专属句柄 _sp_this（#56 §1.8，
+    //    Global 根跨线程/跨挂起；capture-init 源同 genSpawnStmt——缺口 3 取外层句柄
+    //    .get() / 入口句柄 .get()，不写裸 this）
+    cpp << indentStr() << "_tasks.push_back([";
+    if (needsThisCapture)
+        cpp << "_sp_this = aura_rt::GcRootHandle<" << currentReceiverCppType_
+            << "*>(" << receiverThisSourceExpr() << ", aura_rt::GcRootScope::Global)";
+    cpp << "](";
     for (auto& v : freeVars)
         cpp << "auto " << safeName(v) << ", ";
-    cpp << "aura_rt::Io& io, std::vector<aura_rt::task<void>>& _tasks"
+    if (refsIo) cpp << "aura_rt::Io& io, ";   // #46：callExpr 实际引用 io 才追加
+    cpp << "std::vector<aura_rt::task<void>>& _tasks"
         << ") -> aura_rt::task<void> {\n";
     indentLevel_++;
     insideSpawn_ = true;
+    // #56 §1.8：spawn lambda 体生成期间隔离外层闭包/方法句柄映射；体后恢复
+    std::string savedClosureHandle = currentClosureThisHandle_;
+    std::string savedMethodHandle = currentMethodThisHandle_;
+    if (needsThisCapture) {
+        currentClosureThisHandle_ = "_sp_this_f";
+        // 缺口 1：task body 首语句物化 frame-local 句柄（协程 lambda init-capture 的
+        // GcRootHandle 存在 g++ 暂存窗口 → 首段 GC 后不重定位；物化句柄先于任何 GC
+        // 注册、地址固定 → GC 可重定位），体内 self 恒映射物化句柄
+        writeLine(cpp, "aura_rt::GcRootHandle<" + currentReceiverCppType_
+                      + "*> _sp_this_f(_sp_this.get(), aura_rt::GcRootScope::Global);");
+    }
     // isCoroutine=true：若 callee 为协程函数，genExpr 自动加 co_await；返回值丢弃
     writeLine(cpp, genExpr(*stmt.callExpr, true) + ";");
     insideSpawn_ = false;
+    currentClosureThisHandle_ = savedClosureHandle;
+    currentMethodThisHandle_ = savedMethodHandle;
     writeLine(cpp, "co_return;");
     indentLevel_--;
     cpp << indentStr() << "}(";
     for (auto& v : freeVars)
         cpp << safeName(v) << ", ";
-    cpp << "io, _tasks));\n";
+    if (refsIo) cpp << "io, ";   // #46：追加了 io 参数才传 io
+    cpp << "_tasks));\n";
 }
 
 // 调用形态（sync thread 块内）：spawn func(args)
@@ -153,28 +253,61 @@ void CodeGenerator::genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stm
     std::set<std::string> builtins = {"io", "_tasks"};
     std::vector<std::string> freeVars;
     bool ioUsed = false;
+    // bug-24：调用表达式引用 receiver（self/p）→ 不进 freeVars（this 别名），lambda 改 [this] 捕获
+    bool needsThisCapture = false;
     for (auto& name : allRefs) {
+        if (!currentReceiverName_.empty() && name == currentReceiverName_) {
+            needsThisCapture = true;
+            continue;
+        }
         if (name == "io") { ioUsed = true; continue; }
         if (builtins.count(name)) continue;
         if (registeredTypes_.count(name)) continue;
+        // 内置函数名不捕获（同 StmtSync——关联调研发现 (a)：gc_force 等被当自由变量）
+        if (BuiltinRegistry::get().hasFunctionName(name)) continue;
         freeVars.push_back(name);
     }
+    // #46 兜底：线程形态 callExpr 引用 io（&io 引用捕获）但外层无 io → 干净报错
+    if (ioUsed && !ioInScope_) {
+        error(stmt, "spawn requires an 'io' variable in the enclosing scope; "
+                    "add an 'io: Io' parameter to the enclosing function");
+        ioSync_ = oldIoSync;
+        currentFunctionIsCoroutine_ = oldCoroutine;
+        return;
+    }
 
-    // 2. 捕获列表：freeVars 值捕获 + io 引用捕获
+    // 2. 捕获列表：引用 receiver 时 init-capture 专属句柄 _sp_this（#56 §1.8，
+    //    Global 根跨线程逃逸；capture-init 源同 genSpawnStmt——缺口 3 取外层句柄
+    //    .get() / 入口句柄 .get()，不写裸 this）+ freeVars 值捕获 + io 引用捕获
     cpp << indentStr() << "_stx.submit([";
+    bool firstCapture = true;
+    if (needsThisCapture) {
+        cpp << "_sp_this = aura_rt::GcRootHandle<" << currentReceiverCppType_
+            << "*>(" << receiverThisSourceExpr() << ", aura_rt::GcRootScope::Global)";
+        firstCapture = false;
+    }
     for (size_t i = 0; i < freeVars.size(); ++i) {
-        if (i > 0) cpp << ", ";
+        if (!firstCapture) cpp << ", ";
+        firstCapture = false;
         cpp << safeName(freeVars[i]);
     }
     if (ioUsed) {
-        if (!freeVars.empty()) cpp << ", ";
+        if (!firstCapture) cpp << ", ";
         cpp << "&io";
     }
     cpp << "]() mutable {";
     indentLevel_++;
     insideSpawn_ = true;
+    // #56 §1.8：lambda 体生成期间隔离外层闭包/方法句柄映射（body 内 self → 捕获句柄
+    // .get()）；体后恢复。线程版为普通 lambda（非协程），无缺口 1 的协程暂存窗口，
+    // 直接映射 init-capture 句柄（move 进线程池队列时注册正确迁移）
+    std::string savedClosureHandle = currentClosureThisHandle_;
+    std::string savedMethodHandle = currentMethodThisHandle_;
+    if (needsThisCapture) currentClosureThisHandle_ = "_sp_this";
     writeLine(cpp, genExpr(*stmt.callExpr, false) + ";");
     insideSpawn_ = false;
+    currentClosureThisHandle_ = savedClosureHandle;
+    currentMethodThisHandle_ = savedMethodHandle;
     indentLevel_--;
     cpp << "\n" << indentStr() << "});\n";
 
@@ -341,6 +474,18 @@ void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
     bool hasIo = false;
     bool explicitArgs = !stmt.args.empty();
     std::vector<std::string> captureItems;   // 非 io 参数捕获项（裸名 或 init-capture）
+    // #56 §1.8（线程版同款）：params 中的 receiver 名（self/p）是 this 别名——不声明为
+    // lambda 参数、不捕获裸名（外层无此 C++ 变量），改 init-capture 专属句柄 _sp_this
+    //（Global 根跨线程逃逸；capture-init 源同其余落点——缺口 3 取外层句柄 .get() /
+    // 入口句柄 .get()，不写裸 this）
+    bool needsThisCapture = false;
+    for (auto& p : stmt.params)
+        if (!currentReceiverName_.empty() && p.name == currentReceiverName_)
+            needsThisCapture = true;
+    if (needsThisCapture)
+        captureItems.push_back("_sp_this = aura_rt::GcRootHandle<" + currentReceiverCppType_
+                               + "*>(" + receiverThisSourceExpr()
+                               + ", aura_rt::GcRootScope::Global)");
     // 值类型显式实参参数：body 生成期间屏蔽外层同名 GcRootHandle 残留（否则误生 .get()）
     std::vector<IterVarGuard> valueGuards;
     valueGuards.reserve(stmt.params.size()); // 防扩容拷贝迁移提前析构恢复（同 genSpawnStmt）
@@ -351,6 +496,9 @@ void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
             hasIo = true;
             continue;  // io 单独处理
         }
+        // receiver 参数 → this 别名，由 _sp_this init-capture 提供（同协程版 genSpawnStmt）
+        if (!currentReceiverName_.empty() && stmt.params[i].name == currentReceiverName_)
+            continue;
         std::string pname = safeName(stmt.params[i].name);
         // bug-10：显式实参 init-capture。args[i] 索引与 params[i] 位置对齐（io 在 params
         // 中占位，如 (io,x)(io,3) 中 args[0]=io 对应 params[0]=io），跳过 io 时勿收缩索引。
@@ -377,6 +525,14 @@ void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
             // 同名自动绑定（args 空 或 数量不匹配兜底——bug-21 Sema 已拦截数量不匹配，兜底为死代码）
             captureItems.push_back(pname);
         }
+    }
+    // #46 兜底：线程形态 spawn 显式声明 io 参数（&io 引用捕获）但外层无 io → 干净报错
+    if (hasIo && !ioInScope_) {
+        error(stmt, "spawn requires an 'io' variable in the enclosing scope; "
+                    "add an 'io: Io' parameter to the enclosing function");
+        ioSync_ = oldIoSync;
+        currentFunctionIsCoroutine_ = oldCoroutine;
+        return;
     }
     // 值捕获列表
     for (size_t i = 0; i < captureItems.size(); ++i) {
@@ -410,11 +566,19 @@ void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
     // lambda body
     indentLevel_++;
     insideSpawn_ = true;
+    // #56 §1.8：body 生成期间隔离外层闭包/方法句柄映射（body 内 self → 捕获句柄
+    // .get()）；体后恢复。线程版为普通 lambda（非协程），无缺口 1 协程暂存窗口，
+    // 直接映射 init-capture 句柄（move 进线程池队列时注册正确迁移）
+    std::string savedClosureHandle = currentClosureThisHandle_;
+    std::string savedMethodHandle = currentMethodThisHandle_;
+    if (needsThisCapture) currentClosureThisHandle_ = "_sp_this";
     // 显式参数已在 Sema 中注册为只读符号，此处直接生成体
     for (auto& s : stmt.body) {
         if (s) genStmt(cpp, *s, false);  // 非协程！
     }
     insideSpawn_ = false;
+    currentClosureThisHandle_ = savedClosureHandle;
+    currentMethodThisHandle_ = savedMethodHandle;
     indentLevel_--;
     cpp << "\n";
 

@@ -1,223 +1,344 @@
-# change.md — P2：Optional\<Iterator\<T\>\>（some(it)）GC 安全修复
+# 批次 14 修复实施文档：#49 / #50 / #51（Optional/record 字面量族）
 
-> 依据：[plan/Optional迭代器GC安全修复.md](plan/Optional迭代器GC安全修复.md)（工作流 2 草案，已审查）
-> 阶段：工作流 4 —— 详细实现代码，等待审查
-> 原则：最小化改动——单文件 `runtime/builtin/optional.h`（+1 include +1 分支，约 12 行）
+> **状态**：待审查
+> **日期**：2026-09-05
+> **依据**：`issues/bugs/bug-49-method-optional-T-record-literal-arg.md`、`bug-50-ctor-optional-annot-return-unsubstituted.md`、`bug-51-generic-record-literal-explicit-typeargs.md` + 批次 14 两路 SearchAgent 源码实证（2026-09-05）
 
----
+## 0. 概述
 
-## 0. 实现决策
+| # | 缺陷 | severity | 一句话根因 | 修复要点 |
+|---|------|---------|-----------|---------|
+| #49 | 泛型方法 Optional\<T\> 形参 + record 字面量实参 → gc_alloc\<T\> 坏 C++ | high | inferMethodCall record 方法分支只对**返回面**做 receiver 泛型 substitute（CallInfer.cpp L543-552），**形参面不对称** → record 实参期望 canonicalName 泄漏裸 T | 形参面对称 substitute（与接口分支 L433-445 同构；substitute 产物 ownedFormals 保活） |
+| #50 | 泛型 ctor 形参不含 T + let 标注 → Box\<T\> 未代换 type mismatch | medium | inferCall ctor 分支标注形态泛型实参未反哺 genericMap（N2 L194-199 仅 typeArgs 非空触发）→ applyGenericMap 空转 | expected 反哺 genericMap 补缺（三重守卫防误伤；N2 显式优先不覆写） |
+| #51 | `Box<int> { value = 7 }` record 字面量显式类型实参语法不支持 → 误解析为比较 | medium | lookaheadTypeArgsBeforeCall 只认 `>` 后 `(`；RecordExpr 无 typeArgs 字段；inferNamedRecordExpr 泛型拦截 | Parser 新 lookahead（`{` 形态）+ RecordExpr.typeArgs + inferNamedRecordExpr resolveType 物化（CodeGen 零改动） |
 
-- **trait 引入方式选 A1**（plan §3.1 推荐项）：`optional.h` 顶部 `#include "variant.h"`，直接复用已有的 `is_iface_view_v<T>` trait。循环依赖检查：variant.h 的 include 列表（variant.h:17-23：types.h / gc.h / algorithm / cstring / tuple / type_traits / utility）不含 optional.h → 无环，安全。
-- **否决 A2**（trait 迁移 types.h）：3 文件改动违反最小化原则，收益仅是依赖美观。
-- **无需 dynamicDesc 钩子**：`Optional<T>` 是单值容器，`T` 编译期唯一确定（区别于 Variant 的运行时 index_ 切换），静态三分支即可。
+**执行顺序**：#49 → #50（同涉 CallInfer.cpp 不同区间）→ #51（Parser/AST/Sema，独立全链）。
 
-## 1. 漏洞机制回顾（全部经源码验证）
-
-```
-some(it) ──ExprInfer.cpp:213-225（无 Iterator 拦截，clone 实参类型）──▶ Optional<Iterator<T>>
-       ──ExprGen.cpp:650-652 ──▶ aura_rt::make_optional(it)   ← CTAD 推导 T=Iterator<T>
-       ──optional.h:30-43 desc() ──▶ else 分支（is_pointer_v<Iterator<T>>=false）
-       ──▶ ptrFieldCount=0 ──▶ value_.self（GcObject*）对 GC 不可见
-       ──▶ mark 不追踪 / compact 不重写 ──▶ GC 后 self 悬垂 ──▶ use-after-free
-```
-
-修复后：`value_` 起始 + `offsetof(T, self)` 复合偏移进入 desc 指针字段表，与 `Variant::descForI` 的 `is_iface_view` 分支（variant.h:74-79，2026-08-07 生产验证）和 `MapIter::desc` 链式偏移（iterator.h:131-147）同型。
+**调研关键结论**：
+- #49：接口分支（CallInfer.cpp L418-499）**形参面早已做 receiver substitute**（L433-445）——record 分支只做返回面即 #49 缺口，修复与接口分支同构、风险低。两处「不做 genericMap 代换」注释（GenericSubstitution.cpp L205-208/L229-231）指实参推导 genericMap（checkCallArgs 内部保守策略），**不动**；#49 修的是 checkCallArgs 之前形参来源（receiver canonicalName 实参），来源正交。
+- #50：expected 反哺须三重守卫（RecordSemType + canonicalName 含 `<` + lookup 基名 == callee 符号）防误伤（Optional\<Box\<int\>\>、tuple、别名、外层 Box\<T\> 标注自绑幂等）。**注意既有断言需同步更新**（GenericConstructorTypeInference 零参+标注 hasErrors→no error；GenericCtorUnionAnnotTypeMismatchError Union+标注 type mismatch→无 mismatch——bug-42 已修使该形态 CodeGen 就绪，测试时验证全链路）。
+- #51：Sema 复用 `resolveType(NamedType)`（= let 标注 `Box<int>` 同链物化），**不仿 N2 genericMap**；CodeGen genRecordExpr 只消费 inferredType.canonicalName → **零改动**。歧义裁决：`a < b > { c = 1 }` 恒偏 record 字面量（token 层不可语义区分），但受影响程序修复前 Sema 必报「cannot infer record literal」（匿名 record RHS 无期望）→ 无有效程序翻转（与 N2 `a < b > (c)` 既有偏向同构）。
 
 ---
 
-## 2. 修改：`runtime/builtin/optional.h`（唯一源码修改点）
+## 1. #49 方法形参面对称 substitute（CallInfer.cpp L531-553）
 
-### 2.1 include 区（L17-L20）
+### 1.1 根因链（调研实证）
+
+`b.pick({x=3,y=4})`（b: Box\<Point\>，形参 `o: Optional<T>`，T=Point）：record 分支只对返回类型 substitute（L543-552 提取 rec->canonicalName `<...>` 实参按 recSym->typeParams 代换），形参面 `formalTypes = m.paramTypes` 原样（含裸 T）→ checkCallArgs（GenericSubstitution.cpp L203-209）以未代换 `GenericSemType{Optional, resolvedName="aura_rt::Optional<T>"}` 作 record 实参期望 → propagateCanonicalName（L232-236）→ record inferredType = GenericSemType{Optional} → genRecordExpr（ExprGen.cpp L479-502）提取 `"T"` → `gc_alloc<T>` 坏 C++。接口分支（L418-499）形参面已 substitute（L433-445）——record 分支不对称即缺口。
+
+### 1.2 修改前（CallInfer.cpp L531-553，review 实测行号；文档原 L528-556 为 ±3 行轻偏移）
+
+```cpp
+        std::vector<const SemType*> formalTypes;
+        for (auto& pt : m.paramTypes) formalTypes.push_back(pt.get());
+        std::map<std::string, std::unique_ptr<SemType>> genericMap;
+        checkCallArgs(e, e.method, "method", formalTypes, e.args, genericMap, m.defaultCount);
+        auto result = m.returnType ? m.returnType->clone() : NoneSemType::make();
+        result = applyGenericMap(std::move(result), genericMap);
+        auto lt = rec->canonicalName.find('<');
+        if (lt != std::string::npos) {
+            auto typeArgs = extractTypeArgsFromCanonicalName(rec->canonicalName);
+            auto* recSym = symtab_.lookup(rec->canonicalName.substr(0, lt));
+            if (recSym && !recSym->typeParams.empty()) {
+                for (size_t k = 0; k < recSym->typeParams.size() && k < typeArgs.size(); ++k)
+                    if (typeArgs[k])
+                        result = substitute(*result, recSym->typeParams[k], *typeArgs[k]);
+            }
+        }
+        return result;
+```
+
+### 1.3 修改后（形参面 substitute 先行，recTypeArgs/recSym 提取一次共用）
+
+```cpp
+        // #49：形参面 receiver 泛型实例化（与返回面对称，参照接口分支 L433-445）——
+        // 否则 record 字面量实参的期望 canonicalName 泄漏裸 T（propagateCanonicalName
+        // 用未代换形参）→ genRecordExpr 生成 gc_alloc<T> 坏 C++。
+        std::vector<std::unique_ptr<SemType>> ownedFormals;   // 保活 substitute 产物
+        std::vector<const SemType*> formalTypes;
+        for (auto& pt : m.paramTypes) formalTypes.push_back(pt.get());
+        auto recLt = rec->canonicalName.find('<');
+        std::vector<std::unique_ptr<SemType>> recTypeArgs;
+        Symbol* recSym = nullptr;
+        if (recLt != std::string::npos) {
+            recTypeArgs = extractTypeArgsFromCanonicalName(rec->canonicalName);
+            recSym = symtab_.lookup(rec->canonicalName.substr(0, recLt));
+            if (recSym && !recSym->typeParams.empty()) {
+                for (size_t i = 0; i < formalTypes.size(); ++i) {
+                    if (!formalTypes[i]) continue;
+                    auto inst = formalTypes[i]->clone();
+                    for (size_t k = 0; k < recSym->typeParams.size() && k < recTypeArgs.size(); ++k)
+                        if (recTypeArgs[k])
+                            inst = substitute(*inst, recSym->typeParams[k], *recTypeArgs[k]);
+                    ownedFormals.push_back(std::move(inst));
+                    formalTypes[i] = ownedFormals.back().get();
+                }
+            }
+        }
+        std::map<std::string, std::unique_ptr<SemType>> genericMap;
+        checkCallArgs(e, e.method, "method", formalTypes, e.args, genericMap, m.defaultCount);
+        auto result = m.returnType ? m.returnType->clone() : NoneSemType::make();
+        result = applyGenericMap(std::move(result), genericMap);
+        if (recSym && !recSym->typeParams.empty() && recLt != std::string::npos) {
+            for (size_t k = 0; k < recSym->typeParams.size() && k < recTypeArgs.size(); ++k)
+                if (recTypeArgs[k])
+                    result = substitute(*result, recSym->typeParams[k], *recTypeArgs[k]);
+        }
+        return result;
+```
+
+要点：substitute 产物由局部 ownedFormals 持有，checkCallArgs 调用期内消费（其内部会 clone 保活），无逃逸；canonicalName 无 `<`（匿名/非泛型 receiver）或 recSym 查找失败 → 原样零改动。嵌套 receiver 泛型（Pair\<A,B\>）/跨模块限定名自动受益（与返回面既有机制一致）。
+
+---
+
+## 2. #50 ctor 标注形态 expected 反哺 genericMap（CallInfer.cpp L185-252 区间）
+
+### 2.1 根因链（调研实证）
+
+`let b: Box<int> = Box({x=1,y=2})`（ctor 形参 Optional\<Point\> 不含 T）：N2 预绑定（L194-199）仅 e.typeArgs 非空触发（标注形态不触发）→ checkCallArgs genericMap 空 → L208 `!expected` 为 false 跳过干净报错（合理）→ L250-251 applyGenericMap 空转 → 返回 Box\<T\>（{val:\<T\>}）→ StmtChecker.cpp L133-134 isAssignable(Box\<int\>, Box\<T\>) 失败 → type mismatch。
+
+### 2.2 修改前（CallInfer.cpp L245-251）
+
+```cpp
+        }   // L245：干净报错判定块结束
+        auto result = sym->type ? sym->type->clone() : ErrorSemType::make();
+        return applyGenericMap(std::move(result), genericMap);
+```
+
+### 2.3 修改后（L245 判定块后、applyGenericMap 前插入反哺）
+
+```cpp
+        }   // L245
+        // #50：标注形态 expected 反哺 genericMap——形参不含 receiver 泛型 T 时
+        // checkCallArgs 无绑定、genericMap 空，但 let 标注 expected（Box<int32_t>
+        // 实例化 RecordSemType）已给出泛型实参；反哺后 applyGenericMap 才能代换
+        // 返回类型（否则 {val:<T>} 未代换 → StmtChecker L133 type mismatch）。
+        // N2 显式实参（L194-199 已绑）优先，此处仅补缺不覆写。
+        if (expected && !sym->typeParams.empty() && !diag_.hasErrors()) {
+            bool anyUnbound = false;
+            for (auto& tp : sym->typeParams)
+                if (genericMap.find(tp) == genericMap.end()) { anyUnbound = true; break; }
+            if (anyUnbound) {
+                // 三重守卫防误伤：expected 必须为本 record 实例化形态
+                if (auto* rec = dynamic_cast<const RecordSemType*>(expected)) {
+                    auto lt = rec->canonicalName.find('<');
+                    if (lt != std::string::npos) {
+                        auto* expSym = symtab_.lookup(rec->canonicalName.substr(0, lt));
+                        if (expSym == sym) {
+                            auto typeArgs = extractTypeArgsFromCanonicalName(rec->canonicalName);
+                            for (size_t k = 0; k < sym->typeParams.size() && k < typeArgs.size(); ++k) {
+                                if (!typeArgs[k]) continue;
+                                if (dynamic_cast<const ErrorSemType*>(typeArgs[k].get())) continue;
+                                if (genericMap.find(sym->typeParams[k]) == genericMap.end())
+                                    genericMap[sym->typeParams[k]] = typeArgs[k]->clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        auto result = sym->type ? sym->type->clone() : ErrorSemType::make();
+        return applyGenericMap(std::move(result), genericMap);
+```
+
+要点：反哺仅对缺失 typeParams 补绑定（N2 显式优先）；extractTypeArgsFromCanonicalName("Box\<int32_t\>") → [int] 按 typeParams 位置绑定；外层泛型函数内 Box\<T\> 标注自绑幂等无害；expected 非对应实例化（Optional\<Box\<int\>\>/tuple/别名）→ 不反哺保持现状干净报错。
+
+---
+
+## 3. #51 record 字面量显式类型实参全链（Parser/AST/Sema；CodeGen 零改动）
+
+### 3.1 根因链（调研实证）
+
+`Box<int> { value = 7 }`：lookaheadTypeArgsBeforeCall（ExprParser.cpp L465-481）只认 `>` 后紧跟 `(` → lookahead 失败 → `<` 落 parseComparison → `(Box < int) > { value = 7 }` → Sema 级联 4 错。RecordExpr（Expr.h L93-112）无 typeArgs 字段；inferNamedRecordExpr（ExprInfer.cpp L304-388）L316-321 泛型拦截（`sym->typeParams` 非空 → requires type arguments），有 typeArgs 也无处消费。
+
+**修复架构**：Parser 层新增 lookahead（纯 token 判型 + `{` 后 `Ident =`/`}` 判据）→ parseCall 新分支构造 RecordExpr + typeArgs → Sema inferNamedRecordExpr 四象限（resolveType 物化 = 与 let 标注同链，产出 canonicalName="Box\<int32_t\>"）→ CodeGen genRecordExpr 消费 canonicalName 零改动。
+
+### 3.2 修改点 1：AST（Expr.h RecordExpr 增 typeArgs + clone）
 
 修改前：
 ```cpp
-#include "../types.h"        // GcObject / TypeDescriptor / NoneType
-#include "../gc/gc.h"
-#include "error.h"
-#include <type_traits>       // std::is_pointer_v
+struct RecordExpr : ASTNode {
+    std::string typeName;                       // #5：空 = 匿名
+    std::vector<RecordField> fields;
+    // clone() 只拷贝 typeName + fields
+};
 ```
-
 修改后：
 ```cpp
-#include "../types.h"        // GcObject / TypeDescriptor / NoneType
-#include "../gc/gc.h"
-#include "variant.h"         // is_iface_view_v（P2：接口视图 T 的 self 子偏移注册）
-#include "error.h"
-#include <type_traits>       // std::is_pointer_v
+struct RecordExpr : ASTNode {
+    std::string typeName;                       // #5：空 = 匿名
+    std::vector<RecordField> fields;
+    std::vector<std::unique_ptr<TypeExpr>> typeArgs;   // bug-51：显式类型实参（仿 CallExpr）
+    // clone() 追加：for (auto& t : typeArgs) n->typeArgs.emplace_back(
+    //   t ? std::unique_ptr<TypeExpr>(static_cast<TypeExpr*>(t->clone().release())) : nullptr);
+};
+```
+（ASTPrinter.cpp RecordExpr::print 同步打印 typeArgs 段；RecordExpr 构造点 4 处 typeArgs 恒空无副作用。）
+
+### 3.3 修改点 2：Parser（lookaheadTypeArgsBeforeRecord + parseCall 新分支 + body lambda 抽取）
+
+**Parser.h**：`bool lookaheadTypeArgsBeforeRecord();` 声明（注释说明与 N2 `(` 形态分工、suppress 下恒 false）。
+
+**ExprParser.cpp 新 lookahead**（`lookaheadTypeArgsBeforeCall` 之后）：
+```cpp
+bool Parser::lookaheadTypeArgsBeforeRecord() {
+    // bug-51：`Box<int> { ... }` record 字面量形态（N2 的 lookaheadTypeArgsBeforeCall
+    // 只认 `>` 后 `(`）。语句头抑制下恒 false（{ 属语句体，if/while/for 头），
+    // 与既有具名 record 分支判据一致：`{ Ident =` 或 `{}`。
+    if (suppressNamedRecordLiteral_) return false;
+    size_t i = currentIdx_ + 1;  // 跳过 '<'
+    while (i < tokens_.size()) {
+        if (!skipTypeTokens(i)) return false;
+        if (i >= tokens_.size()) return false;
+        if (tokens_[i].type == TokType::Greater) {
+            ++i;
+            if (i >= tokens_.size() || tokens_[i].type != TokType::LBrace) return false;
+            if (i + 1 < tokens_.size() && tokens_[i + 1].type == TokType::RBrace) return true;
+            if (i + 2 < tokens_.size()
+                && tokens_[i + 1].type == TokType::Identifier
+                && tokens_[i + 2].type == TokType::Assign) return true;
+            return false;
+        }
+        if (tokens_[i].type == TokType::Comma) { ++i; continue; }
+        return false;
+    }
+    return false;
+}
 ```
 
-### 2.2 `Optional<T>::desc()`（L29-L43）— 插入接口视图分支
+**ExprParser.cpp parseCall**：抽取 `parseRecordLiteralBody` lambda（从既有 LBrace 分支内联循环抽出，行为不变去重）；N2 分支（L208-225）与 Dot 分支之间插入新分支：
+```cpp
+    } else if (dynamic_cast<Identifier*>(expr.get()) && check(TokType::Less)
+               && lookaheadTypeArgsBeforeRecord()) {
+        // bug-51：`Box<int> { value = 7 }`——`>` 后跟 `{` 的 record 字面量形态。
+        auto rec = std::make_unique<RecordExpr>();
+        setNodePos(rec.get(), peek());
+        rec->typeName = static_cast<Identifier*>(expr.get())->name;
+        advance(); // <
+        do { rec->typeArgs.push_back(parseType()); } while (match(TokType::Comma));
+        consume(TokType::Greater, "expected '>' after type arguments");
+        parseRecordLiteralBody(rec.get());
+        expr = std::move(rec);
+        continue;   // 支持 Box<int>{...}.x 后缀（与 Point{x=1}.x 同构）
+    }
+```
+（既有 LBrace 纯 Identifier 分支改用 parseRecordLiteralBody——行为不变。）
+
+### 3.4 修改点 3：Sema inferNamedRecordExpr 四象限（ExprInfer.cpp L304-388 (b)/(c) 段）
 
 修改前：
 ```cpp
-    // GC 指针 T 注册 value_ offset；非指针 T 无指针字段
-    static const TypeDescriptor& desc() {
-        if constexpr (std::is_pointer_v<T>) {
-            static const size_t offsets[] = { offsetof(Optional<T>, value_) };
-            static const TypeDescriptor d = {
-                sizeof(Optional<T>), 1, offsets, 0, nullptr, nullptr
-            };
-            return d;
-        } else {
-            static const TypeDescriptor d = {
-                sizeof(Optional<T>), 0, nullptr, 0, nullptr, nullptr
-            };
-            return d;
+    // (b) 泛型拦截
+    if (!sym->typeParams.empty()) { error(e, "generic type 'X' requires type arguments"); return Error; }
+    // (c) rec = dynamic_cast<const RecordSemType*>(sym->type.get());
+```
+修改后（四象限：typeParams 空+args 非空 → expects 0 报错；typeParams 非空+args 空 → requires 保留；typeParams 非空+args 非空 → arity 校验 + resolveType 物化）：
+```cpp
+    // b) 泛型拦截/物化（bug-51）
+    if (sym->typeParams.empty() && !e.typeArgs.empty()) {
+        error(e, "type '" + e.typeName + "' expects 0 type argument(s), got "
+              + std::to_string(e.typeArgs.size()));
+        return ErrorSemType::make();
+    }
+    if (!sym->typeParams.empty() && e.typeArgs.empty()) {
+        error(e, "generic type '" + e.typeName + "' requires type arguments");
+        return ErrorSemType::make();
+    }
+    const RecordSemType* rec = nullptr;
+    std::unique_ptr<SemType> materialized;   // typeArgs 路径保活
+    if (!e.typeArgs.empty()) {
+        if (e.typeArgs.size() != sym->typeParams.size()) {
+            error(e, "type '" + e.typeName + "' expects "
+                  + std::to_string(sym->typeParams.size())
+                  + " type argument(s), got " + std::to_string(e.typeArgs.size()));
+            return ErrorSemType::make();
+        }
+        // 与类型标注 `let b: Box<int>` 同链：applyTypeArgs + materializeCanonicalName，
+        // 产出 RecordSemType{canonicalName="Box<int32_t>", 字段=具体类型}。
+        NamedType nt;
+        nt.name = e.typeName; nt.line = e.line; nt.col = e.col;
+        for (auto& ta : e.typeArgs)
+            nt.typeArgs.emplace_back(std::unique_ptr<TypeExpr>(
+                static_cast<TypeExpr*>(ta->clone().release())));
+        materialized = resolveType(nt);
+        rec = dynamic_cast<const RecordSemType*>(materialized.get());
+        if (!rec) {
+            error(e, "'" + e.typeName + "' is not a record type");
+            return ErrorSemType::make();
+        }
+    } else {
+        rec = dynamic_cast<const RecordSemType*>(sym->type.get());
+        if (!rec) {
+            error(e, "'" + e.typeName + "' is not a record type");
+            return ErrorSemType::make();
         }
     }
+    // (d) 字段校验 / (e) 字段反推 / (f) typeStore push rec->clone + propagateCanonicalName
+    // 不变——rec 现为具体物化副本，字段校验基于实例化后字段类型
 ```
+（不仿 N2 genericMap：record 字面量无形参面/返回类型代换需求；ErrorSemType 静默传播防级联。）
 
-修改后：
-```cpp
-    // GC 指针 T 注册 value_ offset；接口视图 T 注册 self 子偏移；其余无指针字段
-    static const TypeDescriptor& desc() {
-        if constexpr (std::is_pointer_v<T>) {
-            static const size_t offsets[] = { offsetof(Optional<T>, value_) };
-            static const TypeDescriptor d = {
-                sizeof(Optional<T>), 1, offsets, 0, nullptr, nullptr
-            };
-            return d;
-        } else if constexpr (is_iface_view_v<T>) {
-            // P2：接口视图 T（Iterator<T>/Stringer 等值视图，含 GcObject* self）——
-            // value_ 起始 + 视图内 self 子偏移 = 有效 GC 指针（仿 variant.h descForI
-            // is_iface_view 分支的复合偏移模式），mark 追踪 + compact 重写，消除悬垂。
-            // make_none 时 self=nullptr，markFields 的 if (child) 自然跳过，安全
-            static const size_t offsets[] = {
-                offsetof(Optional<T>, value_) + offsetof(T, self)
-            };
-            static const TypeDescriptor d = {
-                sizeof(Optional<T>), 1, offsets, 0, nullptr, nullptr
-            };
-            return d;
-        } else {
-            static const TypeDescriptor d = {
-                sizeof(Optional<T>), 0, nullptr, 0, nullptr, nullptr
-            };
-            return d;
-        }
-    }
+### 3.5 CodeGen：零改动（传递链）
+
 ```
-
-### 2.3 文件头注释更新（L9-L10）
-
-修改前：
-```cpp
-// API：is_none() / unwrap()（is_some 即 !is_none，无需冗余方法）
-// has_value_=false 时 value_ 为 GC 零初始化 nullptr，扫描自动跳过 → 安全
-```
-
-修改后：
-```cpp
-// API：is_none() / unwrap()（is_some 即 !is_none，无需冗余方法）
-// has_value_=false 时 value_ 为 GC 零初始化 nullptr，扫描自动跳过 → 安全
-// GC 指针表：指针 T → value_ 偏移；接口视图 T（Iterator/Stringer 等含 self）→
-//           value_+self 复合子偏移（2026-08-22 P2，修复 some(it) compact 悬垂）
+RecordExpr.typeArgs ─Parser─> RecordExpr{typeName="Box", typeArgs=[int]}
+  ─Sema resolveType─> inferredType = RecordSemType{canonicalName="Box<int32_t>"}
+  ─CodeGen genRecordExpr getCanonical─> gc_alloc<Box<int32_t>>(...)   // 与 N2 Box<int>(9) 同实例
 ```
 
 ---
 
-## 3. 测试：`example/test.aura` — 新增段落（插入 L129 之后，Iterator 联合变体段末尾）
+## 4. 复现文件清单
 
-插入位置：L129 `}`（iv5 match 结束）与 L131 `// ===== 并发 GC P1：并行 STW 标记（2026-08-11）=====` 之间。
+| 文件 | 场景 | 覆盖 | 修复前 | 修复后预期 |
+|---|---|---|---|---|
+| `method_optional_boxing_key\repro_optional_T_record.aura`（已有） | 泛型方法 Optional\<T\> + record 字面量实参（T=Point） | #49 | ❌ g++ `'T' does not name a type`（gc_alloc\<T\>） | ✅ 编译运行输出 done 3；无 gc_alloc\<T\> |
+| `method_optional_boxing_key\repro_optional_record_nontype.aura`（已有） | Optional\<Point\> 不含 T | #49 对照 | ✅ | ✅ 不误伤 |
+| `method_optional_boxing_key\repro_ctor_optional.aura`（已有） | Optional\<Point\>（不含 T）+ 标注 Box\<int\> + record 实参 | #50 | ❌ Sema type mismatch | ✅ 编译运行输出 done |
+| `generic_ctor_optional_infer\control_ctor_optional_record_nontype.aura`（已有） | 同源对照 | #50 | ❌ type mismatch | ✅ 同步通过 |
+| `m5adj_method_param_generic\repro_mixed_receiver_param.aura`（已有） | `Box<int> { value = 7 }` + apply(fun(U,T)->U) | #51 | ❌ 级联 4 错 | ✅ 编译运行输出 8 |
+| `probe51_record_typeargs.aura`（待建） | 嵌套 `Box<Pair<int,string>> {...}` / 多实参 `M<int,string>{...}` / 空 `Box<int> {}` | #51 | ❌ | ✅ 或干净报错（缺字段） |
+| `probe51_record_typeargs_arg_pos.aura`（待建） | 实参位 `take(Box<int> { value = 7 })` | #51 | ❌ | ✅ |
+| `probe51_typeargs_non_generic.aura`（待建） | `Point<int> { x = 1 }` | #51 | ❌ 级联 | ✅ 干净报错 expects 0 type argument(s) |
+| `probe51_arity_mismatch.aura`（待建） | `M<int> {...}`（arity 错） | #51 | ❌ | ✅ 干净报错 |
+| `_tmp51_comparison_guard.aura`（用后删） | `a < b > { c = 1 }` 消歧裁决采样 | #51 | ❌ 4 错级联 | 单错 `undefined type`（裁决固化） |
 
-```aura
-    // ---- Optional<Iterator<T>> GC 安全（2026-08-22 P2）----
-    // U1 核心悬垂：some(iter) 构造 Optional（堆上 value_.self 原不可见）→
-    //    多轮 GC + compact → unwrap 后完整迭代消费，验证输出正确
-    let opt1 = some(range(0, 5))
-    gc_force()                                      // Optional 装箱后 GC（mark 追踪 self）
-    let stress1 = "s" + "t"                         // alloc（触发 compact 的分母）
-    gc_force()                                      // compact 触发（self 重写验证）
-    let it1 = opt1.unwrap()                         // unwrap：视图拷贝到栈
-    gc_force()                                      // unwrap 后再 GC（栈上视图走保守扫描）
-    io.println("U1 len=" + str(it1.collect().length))   // 5
-
-    // U2 none 安全：has_value_=false，self=nullptr，扫描跳过
-    let opt2 = none()
-    gc_force()
-    io.println("U2 is_none=" + str(opt2.is_none()))     // true
-
-    // U3 指针回归：some("hello")（is_pointer_v 分支，行为不变）
-    let opt3 = some("hello")
-    gc_force()
-    io.println("U3 unwrap=" + opt3.unwrap())            // hello
-
-    // U4 值类型回归：some(42)（else 分支，行为不变）
-    let opt4 = some(42)
-    gc_force()
-    io.println("U4 unwrap=" + str(opt4.unwrap()))       // 42
-
-    // U5 多轮压力：100 轮 some(iter)+GC+unwrap+collect
-    let total5 = 0
-    for i5 in range(100) {
-        let o5 = some(range(0, 3))
-        let junk5 = "j" + str(i5)
-        gc_force()
-        total5 = total5 + o5.unwrap().collect().length
-    }
-    io.println("U5 total=" + str(total5))               // 300
-```
-
-**预期输出**：
-```
-U1 len=5
-U2 is_none=true
-U3 unwrap=hello
-U4 unwrap=42
-U5 total=300
-```
-
-**用例设计说明**：
-- U1 覆盖三个窗口：装箱后 GC（mark 是否追踪堆上 self）、compact 后 unwrap（self 是否被重写）、unwrap 后 GC（既有栈扫描回归）
-- U2 验证 [mark_sweep.cpp:226](runtime/gc/mark_sweep.cpp#L226) `if (child)` 对 null self 的跳过
-- U3/U4 守卫既有两分支零行为变化（回归锚点）
-- U5 100 轮压力覆盖多代 GC（young→old→compact 混合）
+对照组：#49 bug-05 全组（repro_main_optional_T_raw / repro_optional_T_list / repro_union_T / repro_iface_param / some() 直传）+ 接口方法分支；#50 bug-18 主线（Box(9) / Box\<int\>(9) / repro_ctor_optional_some/nested/list）+ 零参构造 + N2 显式；#51 N2 调用 `Box<int>(9)` / 标注匿名 record / 非泛型具名 record / 比较 `a < b` / used/5 `for v in ch26 { v26 = v }` 语句块抑制。
 
 ---
 
-## 4. 变更汇总
+## 5. 测试验证方案
 
-| 文件 | 类型 | 变更点 |
-|---|---|---|
-| `runtime/builtin/optional.h` | 修改 | `#include "variant.h"` + desc() 插入 `is_iface_view_v<T>` 分支（复合偏移）+ 头注释 |
-| `example/test.aura` | 修改 | L129 后插入 U1-U5 测试段落（plan §6 用例落地） |
-
-**总计**：修改 2 文件，源码净增约 12 行 + 测试 32 行。无 Sema/CodeGen/GC 核心改动，无新文件，无 CMakeLists 变更。
-
----
-
-## 5. 安全性要点（实现级复核）
-
-1. **分支静态选择**：`if constexpr` 三分支互斥编译期选择——指针 T 无 `.self` 成员（trait 必 false，且分支顺序在前无交集）；iface view T 非指针（指针在首分支截获）；普通值类型两者皆 false → else。任何 `Optional<T>` 实例化只走一个分支。
-2. **null 安全**：`make_none()` 的 `value_ = T{}` → `self = nullptr` → markFields L226 `if (child)` 跳过（源码验证）。
-3. **compact 同构**：markFields 与 compact 侧 updateObjectFields 均先过 `dynamicDesc` 钩子再按同一 offsets 表遍历（mark_sweep.cpp:215-230 同构消费）——Variant 的 iface_view 复合偏移已在此路径生产验证。
-4. **嵌套组合**：`Optional<Optional<X>>`/`Optional<A|B>` 的元素运行时是堆指针 → 首分支覆盖，天然安全。
-5. **既有实例化零影响**：Optional<int>/Optional<GcString*>/Optional<record*> 等生成的静态 desc 逐字节不变（新分支仅对 iface view T 的实例化生效）。
-6. **并发 GC**：`make_optional` 走 `alloc()` → markingInProgress_ 时 born-marked（gc.h:440-443），首次标记即用新 desc，无新增竞态。
+1. **编译**：`cmake --build build` + `cmake --build test/build`。
+2. **逐缺陷验证**（§4 清单 + 对照组）：#49（repro_optional_T_record done 3 + 断言无裸 T）→ #50（repro_ctor_optional done + control 同源 + bug-18 系列不回归）→ #51（主线输出 8 + 各边界 + 消歧不误伤 used/5）。
+3. **全量回归**：`.\test\build\aura_tests.exe` → 0 failed（基线 1233/1233）；`example\used\1-6.aura` + `example\test.aura` ALL TESTS PASSED。
+4. **补单测**（查重后入 test\sema\ + test\codegen\ + test\parser\）：
+   - #49：`GenericMethodOptionalRecordLiteralNoBareTLeak`（断言 impl 含 make_optional\<Point\*\> + gc_alloc\<Point\>、不含 gc_alloc\<T\>/make_optional\<T\>）
+   - #50：Sema `CtorNontypeParamAnnotRecordArg`（形参 Optional\<Point\> + 标注 + record 实参 no error）；**同步更新既有断言**：`GenericConstructorTypeInference`（零参+标注 hasErrors → EXPECT_FALSE）+ `GenericCtorUnionAnnotTypeMismatchError`（Union+标注 → 无 type mismatch，验证 bug-42 后 CodeGen 全链路）
+   - #51：Parser `NamedRecordLiteralWithTypeArgs`（typeName/typeArgs/fields 断言）+ Empty/Chain（.x 后缀）/InCall + `TypeArgsRecordNotParsedUnderSuppress`；Sema 四象限干净报错；CodeGen `GenericRecordLiteralTypeArgsGcAlloc`（gc_alloc\<Box\<int32_t\>\> 断言）
+5. **红线**：used/5（语句块抑制消歧）、used/1（泛型 record 方法/闭包）。
 
 ---
 
-## 6. 验证方案
+## 6. 风险与边界
 
-```powershell
-# 1. 编译 runtime（optional.h 为 header-only，被 builtin 使用者重编）
-cmake --build runtime/build
-
-# 2. 编译测试（compile.cmd 非编译器变更，仅重编 runtime 后链接）
-#    按项目约定：example/test.aura → compile.cmd → test.exe
-cd example; ..\compile.cmd; .\test.exe
-
-# 3. 预期：新增 5 行输出（U1-U5）+ 既有输出不变 + ALL TESTS PASSED
-
-# 4. ASAN 深度验证（可选，验证 UAF 修复）
-#    .\ASAN_Test.ps1 example\test.aura
-#    修复前 U1/U5 应报 heap-use-after-free；修复后干净
-```
+| 风险 | 应对 |
+|---|---|
+| #49 形参 substitute 后 isAssignable 用精确期望（Optional\<Point\>），语义收紧 | 校验链与 bug-05 已修 repro_optional_record_nontype 逐位同构；全量回归确认无「宽松放行」依赖点 |
+| #49 ownedFormals 指针保活 | checkCallArgs 调用期内消费（内部 clone 保活副本），无逃逸——与接口分支局部 substituted 先例一致 |
+| #50 反哺误伤非对应实例化 expected | 三重守卫（RecordSemType + canonicalName 含 `<` + lookup 基名 == callee 符号）；Error 实参跳过 |
+| #50 放行 Union 形参标注形态（GenericCtorUnionAnnotTypeMismatchError 改断言） | bug-42 已修（mapType 保守判堆 + instantiateCtorParamCpp）使 CodeGen 就绪；测试验证全链路；异常则登记 |
+| #51 比较消歧误伤 `a < b > { c = 1 }` | token 层不可语义区分，恒偏 record——受影响程序修复前必报 cannot infer record literal，无有效程序翻转（与 N2 `a<b>(c)` 偏向同构）；单测固化裁决 |
+| #51 语句块 `{` 上下文 | suppressNamedRecordLiteral_ 下新 lookahead 恒 false → used/5 `for v in ch26 { v26 = v }` 不回归；语句头嵌套括号内 record 字面量限制为预存在（与既有非泛型 Point {...} 在条件中一致） |
+| #51 泛型函数体内 `Box<T> {...}`（实参引用作用域泛型形参） | resolveType 对裸 NamedType T → canonicalName="Box\<T\>"（模板体内合法 C++）；显式 `<T>` GenericTypeRef → 保基名（gc_alloc\<Box\> 坏 C++ 风险）——v1 以具体实参为主目标（bug-51 复现形态），该边界单独点验后决定纳入 |
+| #49/#50 均在 CallInfer.cpp | #49 改 record 方法分支（L531-553）、#50 改 ctor 分支（L245-250 区间），区域不同可顺序实施 |
+| #50 语义翻转面（review 预判 A）：反哺使「标注 + 形参不含 T」所有泛型 ctor 形态从 type mismatch → Sema 通过，此前被拦形态涌向 CodeGen | **回归重点**：实施时跑 bug-05 + bug-18 全组负例（含嵌套/列表/some() 形态）确认无新坏 C++；发现则登记独立缺陷（勿回退反哺本体） |
+| #51 泛型函数体内 `Box<T> {...}`（review 预判 D）：typeArgs[0] 为 GenericTypeRef → 裸 GenericSemType → 物化行为未验证（保基名 → gc_alloc\<Box\> 坏 C++ 风险） | **实施优先点验该形态**：若坏 C++ 则 v1 干净报错兜底（四象限可拦）+ 登记后续 |
+| #51 ASTPrinter/构造点同步（review 预判 E） | ASTPrinter::print 同步 typeArgs 段；实施者 grep RecordExpr 全部消费点（print/clone/构造 4 处）自查闭合 |
 
 ---
 
-## 7. 实施后收尾
+## 7. 提交范围
 
-- 更新 TODO.txt：`[ ] P2 Optional<Iterator<T>>（some(it)）GC 安全` 条目标 `[x]` + 证据行号
-- 同步删除 [二] 节 L163 的"下方独立 P2 条目"交叉引用中该条目（若整节收尾则一并清理）
+`src/Sema/Checker/CallInfer.cpp` + `src/AST/Expr.h` + `src/ASTPrinter.cpp` + `src/Parser.h` + `src/Parser/ExprParser.cpp` + `src/Sema/Checker/ExprInfer.cpp` + 复现 .aura（example/ 不入库）+ 新增单测（test\sema\ + test\codegen\ + test\parser\）。排除 `issues/`、`problem.txt`。提交规范见 `.trae/rules/commit_rule.md`。

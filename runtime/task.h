@@ -201,11 +201,19 @@ private:
 // when_all ─ 等待所有 task<void> 完成（聚合异常）
 //
 // plan §4.9:
-//   co_await aura_rt::when_all(std::move(_tasks));
+//   co_await aura_rt::when_all(_tasks);
 //   // 若任一任务抛出异常，when_all 会抛出聚合异常
+//
+// #45：引用收参（非 const）——等待期间任务执行流追加的任务同被本 when_all 等待。
+// 索引循环每次重读 size；元素先 move 出槽位（帧内地址固定），挂起期间 vector
+// 扩容/重分配不影响已取出对象与已保存的 awaiter handle。
+// 前提：单线程协作调度（无并发 push）；调用方容器（sync 块本地 _tasks）生命周期
+// 覆盖 when_all 全程（生成代码保证 when_all 为 sync 块内最后语句，任务无法逃逸）。
+// 调用示例：co_await aura_rt::when_all(_tasks);   // 不再 std::move（旧注释同步更新）
 // ============================================================
-inline task<void> when_all(std::vector<task<void>> tasks) {
-    for (auto& t : tasks) {
+inline task<void> when_all(std::vector<task<void>>& tasks) {
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        task<void> t = std::move(tasks[i]);   // 取出式：容器不残留 done handle
         if (t) co_await t;
     }
     co_return;

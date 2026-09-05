@@ -163,7 +163,9 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     gcRootTypes_.clear();
     viewRootVarNames_.clear();
     viewRootTypes_.clear();
+    ioInScope_ = false;
     for (auto& p : decl.params) {
+        if (p.name == "io") ioInScope_ = true;   // #46：形参名即生成的 C++ 变量名
         registerParamTracking(p);
         registerRawParamTracking(p);
     }
@@ -220,6 +222,7 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     }
     out << "}\n\n";
     clearVarTrackingState();
+    ioInScope_ = false;   // #46：函数级复位（防泄漏到后续函数）
     currentReturnElem_.clear();
 }
 
@@ -501,7 +504,9 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     else
         valueTypeVarNames_.insert(decl.receiverName);
 
+    ioInScope_ = false;
     for (auto& p : decl.params) {
+        if (p.name == "io") ioInScope_ = true;   // #46：形参名即生成的 C++ 变量名
         registerParamTracking(p);
         registerRawParamTracking(p);
     }
@@ -591,6 +596,14 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
 
     out << tprefix << sig << " {\n";
     currentReceiverName_ = decl.receiverName;
+    currentReceiverCppType_ = recvFullType;   // bug-24：协程方法内闭包捕获 this → GcRootHandle<此类型*>
+    // #56：方法体入口 this 保护——this 是隐式 prvalue（无参数位、不能绑 Ref 模式），
+    // 值模式构造。非协程 ThreadLocal（与函数参数同级成本）；协程 Global（帧跨
+    // co_await 挂起、恢复线程可能切换，对齐闭包 _this_root 先例）。体内 self 经
+    // currentMethodThisHandle_ 映射 "_this.get()"（genIdentifier）。
+    currentMethodThisHandle_ = "_this";
+    out << "  aura_rt::GcRootHandle<" << recvFullType << "*> _this(this, aura_rt::GcRootScope::"
+        << (isCoro ? "Global" : "ThreadLocal") << ");\n";
     // C3.2: 跟踪当前方法返回 Optional<T> 的元素类型（none() 直转 make_none<T> 用）
     currentReturnElem_ = optionalElemOf(decl.returnType.get());
     // Bug B 同步修复：方法体入口为堆类型参数生成 GcRootHandle 包装
@@ -625,8 +638,11 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
         out << "  return;\n";
     }
     currentReceiverName_.clear();
+    currentReceiverCppType_.clear();
+    currentMethodThisHandle_.clear();
     out << "}\n\n";
     clearVarTrackingState();
+    ioInScope_ = false;   // #46：方法级复位（防泄漏到后续函数）
     currentReturnElem_.clear();
 }
 
@@ -674,12 +690,30 @@ void CodeGenerator::genConstructor(std::ostream& cpp, const MethodDecl& decl) {
         : *headerStream_;
 
     out << tprefix << sig << " {\n";
-    out << "  " << fullType << "* " << safeName(decl.receiverName) << " = aura_rt::gc_alloc<"
+    // #52：ctor receiver self 包装为 GcRootHandle + gcRootVarNames_ 注册——
+    // (a) ctor 体字段赋值经 self.get()（字段初始化 alloc 触发 GC 不悬垂）；
+    // (b) 闭包捕获 self 自动走 init-capture 分支（GcRootHandle<fullType*>(self.get(),
+    //     Global)，ExprClosure gcRootVarNames_ 分支）——闭包逃逸存字段后 compact 安全；
+    // (c) 嵌套闭包传播自动（gcRootVarNames_ 整个 ctor 生成期存活）。
+    // gcRootTypes_ 用 fullType+"*"（闭包作用域内 decltype(self_raw) 不可见）。
+    // 注意：不设 currentReceiverName_（ctor 是静态工厂 X* X_ctor(...)，无 this，
+    // 设了会把 self 误映射 this 坏 C++——预存在设计，保持）。
+    std::string recvName = safeName(decl.receiverName);
+    out << "  " << fullType << "* " << recvName << "_raw = aura_rt::gc_alloc<"
         << fullType << ">(&" << fullType << "::_desc);\n";
+    out << "  aura_rt::GcRootHandle<" << fullType << "*> " << recvName
+        << "(" << recvName << "_raw);\n";
+    gcRootVarNames_.insert(recvName);
+    gcRootTypes_[recvName] = fullType + "*";
+    // #46：ctor 形参含 io（record 构造带 Io 形参）→ 体生成期间 ioInScope_ = true
+    ioInScope_ = false;
+    for (auto& p : decl.params)
+        if (p.name == "io") ioInScope_ = true;
     if (decl.body) genBlock(out, *decl.body, false);
-    out << "  return " << safeName(decl.receiverName) << ";\n";
+    out << "  return " << recvName << ".get();\n";
     out << "}\n\n";
-    clearVarTrackingState();
+    clearVarTrackingState();   // 清 gcRootVarNames_（既有调用，防 "self" 名泄漏到后续函数）
+    ioInScope_ = false;   // #46：ctor 级复位（防泄漏到后续函数）
     currentTParams_.clear();
 }
 

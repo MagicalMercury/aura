@@ -46,6 +46,7 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     // 视图含 GC 指针 self，compact 不重写栈上裸指针，必须注册 self 为 GcRootHandle
     std::string viewRootType;
     std::string type;
+    bool genericListDecl = false;   // #55：未绑定泛型元素列表声明（走 auto + decltype 包装）
     if (decl.type) {
         type = mapType(*decl.type);
     } else {
@@ -56,8 +57,15 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
             size_t anglePos = baseName.find('<');
             if (anglePos != std::string::npos)
                 baseName = baseName.substr(0, anglePos);
+            // #57：canonicalName 含 '<' = 已是可拼 C++ 类型串（bug-17 后合法）——
+            // 具体实例化 "Tree<aura_rt::GcString*>"（main 内 let 主案）与泛型上下文
+            // "Tree<T>"（模板形参保留，C++ template 上下文合法、实例化后恒 GC 对象）
+            // 均放行 canonicalName + "*" → 命中 isGcPointerType → _raw + GcRootHandle
+            // 包装。typeAliasTemplateParams_ 排除仅防无 '<' 裸名（"Tree*" 缺模板实参
+            // 坏 C++，历史防御保留）。
             if (!baseName.empty()
-                && !typeAliasTemplateParams_.count(baseName))
+                && (rs->canonicalName.find('<') != std::string::npos
+                    || !typeAliasTemplateParams_.count(baseName)))
                 type = rs->canonicalName + "*";
         } else if (auto* gs = dynamic_cast<const GenericSemType*>(decl.inferredType)) {
             if (!gs->resolvedName.empty()) {
@@ -97,6 +105,15 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
             }
         } else if (auto* ls = dynamic_cast<const ListSemType*>(decl.inferredType)) {
             type = mapSemType(*ls);
+            // #55：列表元素链含未绑定泛型（[T]、[[T]]）→ mapSemType 递归产
+            // "Array<auto>*" / "Array<Array<auto>*>*"（auto 非法模板实参 → 坏 C++，
+            // 且与 genListExpr IIFE 实际返回类型不一致）。标记声明类型为 auto，
+            // 由下方 genericListDecl 分支生成 auto + GcRootHandle<decltype>。
+            // 用递归判定（listContainsUnboundGeneric）覆盖嵌套 [[T]] 形态。
+            if (ls->elementType && listContainsUnboundGeneric(ls)) {
+                type = "auto";
+                genericListDecl = true;   // #55：触发下方 auto + GcRootHandle<decltype> 包装分支
+            }
         } else if (auto* ps = dynamic_cast<const PrimSemType*>(decl.inferredType)) {
             type = mapSemType(*ps);
         } else if (auto* os = dynamic_cast<const OptionalSemType*>(decl.inferredType)) {
@@ -179,7 +196,12 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                             : "???";
                         // 堆类型字段值：预求值，防止后续字段求值期间 GC 导致裸指针悬垂
                         // 用 recIdx 后缀避免同一作用域内多个 RecordExpr 的 _fv_ 变量名冲突
-                        if (f.value && isHeapSemType(f.value->inferredType) && !isViewField) {
+                        // #30：未绑定泛型字段值 → if constexpr 延迟判定（T=值不包装 /
+                        // T=堆仍保护），消除 GcRootHandle<int> 假根
+                        bool isHeapF = f.value && isHeapSemType(f.value->inferredType) && !isViewField;
+                        bool deferredF = isHeapF && f.value
+                            && isDeferredGcRoot(f.value->inferredType);
+                        if (isHeapF && !deferredF) {
                             std::string fv = "_fv_" + std::to_string(recIdx) + "_" + safeName(f.name);
                             std::string fh = "_fh_" + std::to_string(recIdx) + "_" + safeName(f.name);
                             writeLine(cpp, "auto " + fv + " = (" + fval + ");");
@@ -187,6 +209,20 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                                       + ")> " + fh + "(" + fv + ");");
                             writeLine(cpp, var + ".get()->" + safeName(f.name)
                                       + " = " + fh + ".get();");
+                        } else if (deferredF) {
+                            std::string fv = "_fv_" + std::to_string(recIdx) + "_" + safeName(f.name);
+                            std::string fh = "_fh_" + std::to_string(recIdx) + "_" + safeName(f.name);
+                            writeLine(cpp, "auto " + fv + " = (" + fval + ");");
+                            writeLine(cpp, "if constexpr (std::is_convertible_v<decltype(" + fv
+                                      + "), aura_rt::GcObject*>) {");
+                            writeLine(cpp, "    aura_rt::GcRootHandle<decltype(" + fv + ")> "
+                                      + fh + "(" + fv + ");");
+                            writeLine(cpp, "    " + var + ".get()->" + safeName(f.name)
+                                      + " = " + fh + ".get();");
+                            writeLine(cpp, "} else {");
+                            writeLine(cpp, "    " + var + ".get()->" + safeName(f.name)
+                                      + " = " + fv + ";");
+                            writeLine(cpp, "}");
                         } else {
                             writeLine(cpp, var + ".get()->" + safeName(f.name) + " = " + fval + ";");
                         }
@@ -361,6 +397,15 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
         writeLine(cpp, "aura_rt::ViewRoot<" + viewRootType + "> " + varName + "(" + varName + "_raw);");
         viewRootVarNames_.insert(varName);
         viewRootTypes_[varName] = viewRootType;   // P2b：闭包捕获转 Global ViewRoot 用
+    } else if (genericListDecl && !init.empty()) {
+        // #55：未绑定泛型元素列表 → auto 声明 + GcRootHandle<decltype> 包装。
+        // decltype(arr_raw) 在 T 实例化后为 Array<X>*（继承 GcObject），模板实参合法、
+        // 无假根；gcRootTypes_ 用 decltype 形态与 DeclFun.cpp:55 / StmtMatch.cpp:186 先例一致。
+        writeLine(cpp, "auto " + varName + "_raw = " + init + ";");
+        writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + varName + "_raw)> " + varName
+                  + "(" + varName + "_raw);");
+        gcRootVarNames_.insert(varName);
+        gcRootTypes_[varName] = "decltype(" + varName + "_raw)";
     } else if (isGcPointerType(type) && !init.empty()) {
         writeLine(cpp, type + " " + varName + "_raw = " + init + ";");
         writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + varName + "(" + varName + "_raw);");

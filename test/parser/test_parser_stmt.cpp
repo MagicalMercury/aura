@@ -73,6 +73,24 @@ TEST(ParserStmt, WhileBasic) {
     ASSERT_TRUE(ws->body != nullptr);
 }
 
+TEST(ParserStmt, TypeArgsRecordNotParsedUnderSuppress) {
+    // bug-51：语句头抑制（suppressNamedRecordLiteral_ 在 if/while 条件置位）下，
+    // 条件表达式中的 `<`/`>` 不触发 lookaheadTypeArgsBeforeRecord → `a < b > { c = 1 }`
+    // 解析为普通比较链（(a<b) > {c=1} 的比较表达式），不得解析为 typeName="a" 的
+    // 显式类型实参 record 字面量（对照 used/5 `for v in ch26 { v26 = v }` 语句块不回归）
+    DiagnosticEngine diag;
+    auto prog = parseSource("fun f() { while a < b > { c = 1 } { } }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* ws = as<WhileStmt>(firstStmt(*prog));
+    ASSERT_TRUE(ws != nullptr);
+    ASSERT_TRUE(ws->condition != nullptr);
+    // 条件为比较表达式（BinaryExpr）而非 RecordExpr
+    auto* bin = as<BinaryExpr>(ws->condition.get());
+    ASSERT_TRUE(bin != nullptr);
+    EXPECT_TRUE(bin->op == ">" || bin->op == "<");
+}
+
 TEST(ParserStmt, LoopBasic) {
     DiagnosticEngine diag;
     auto prog = parseSource("fun f() { loop { break } }", diag);

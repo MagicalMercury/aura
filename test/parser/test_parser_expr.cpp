@@ -518,6 +518,89 @@ TEST(ParserExpr, NamedRecordLiteralInCall) {
 }
 
 // ============================================================
+// bug-51：泛型 record 字面量显式类型实参 `Box<int> { ... }`（2026-09-05）
+// lookaheadTypeArgsBeforeRecord（`>` 后 `{` 形态）→ RecordExpr.typeArgs 挂载
+// ============================================================
+TEST(ParserExpr, NamedRecordLiteralWithTypeArgs) {
+    // Box<int> { value = 7 } → typeName="Box" + typeArgs=[int] + fields=[value]
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("let r = Box<int> { value = 7 }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* rec = as<RecordExpr>(letInitOf(*prog));
+    ASSERT_TRUE(rec != nullptr);
+    EXPECT_EQ(rec->typeName, "Box");
+    ASSERT_EQ(rec->typeArgs.size(), (size_t)1);
+    auto* nt = as<NamedType>(rec->typeArgs[0].get());
+    ASSERT_TRUE(nt != nullptr);
+    EXPECT_EQ(nt->name, "int");
+    EXPECT_EQ(rec->fields.size(), (size_t)1);
+    EXPECT_EQ(rec->fields[0].name, "value");
+}
+
+TEST(ParserExpr, NamedRecordLiteralWithTypeArgsMulti) {
+    // M<int, string> { a = 1, b = 2 } → 多类型实参
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("let r = M<int, string> { a = 1, b = \"s\" }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* rec = as<RecordExpr>(letInitOf(*prog));
+    ASSERT_TRUE(rec != nullptr);
+    EXPECT_EQ(rec->typeName, "M");
+    ASSERT_EQ(rec->typeArgs.size(), (size_t)2);
+    auto* nt0 = as<NamedType>(rec->typeArgs[0].get());
+    auto* nt1 = as<NamedType>(rec->typeArgs[1].get());
+    ASSERT_TRUE(nt0 != nullptr);
+    ASSERT_TRUE(nt1 != nullptr);
+    EXPECT_EQ(nt0->name, "int");
+    EXPECT_EQ(nt1->name, "string");
+    EXPECT_EQ(rec->fields.size(), (size_t)2);
+}
+
+TEST(ParserExpr, NamedRecordLiteralWithTypeArgsEmpty) {
+    // Box<int> {} → typeArgs=[int] + 空字段（Sema 报缺失字段）
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("let r = Box<int> {}", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* rec = as<RecordExpr>(letInitOf(*prog));
+    ASSERT_TRUE(rec != nullptr);
+    EXPECT_EQ(rec->typeName, "Box");
+    ASSERT_EQ(rec->typeArgs.size(), (size_t)1);
+    EXPECT_EQ(rec->fields.size(), (size_t)0);
+}
+
+TEST(ParserExpr, NamedRecordLiteralWithTypeArgsChain) {
+    // Box<int> { value = 1 }.value → 后缀 member access（parseCall 循环继续）
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("let v = Box<int> { value = 7 }.value", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* ma = as<MemberAccessExpr>(letInitOf(*prog));
+    ASSERT_TRUE(ma != nullptr);
+    EXPECT_EQ(ma->member, "value");
+    auto* rec = as<RecordExpr>(ma->object.get());
+    ASSERT_TRUE(rec != nullptr);
+    EXPECT_EQ(rec->typeName, "Box");
+    ASSERT_EQ(rec->typeArgs.size(), (size_t)1);
+}
+
+TEST(ParserExpr, NamedRecordLiteralWithTypeArgsInCall) {
+    // take(Box<int> { value = 7 }) → 实参位置显式类型实参 record
+    DiagnosticEngine diag;
+    auto prog = parseExprSource("let r = take(Box<int> { value = 7 })", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* call = as<CallExpr>(letInitOf(*prog));
+    ASSERT_TRUE(call != nullptr);
+    ASSERT_EQ(call->args.size(), (size_t)1);
+    auto* rec = as<RecordExpr>(call->args[0].get());
+    ASSERT_TRUE(rec != nullptr);
+    EXPECT_EQ(rec->typeName, "Box");
+    ASSERT_EQ(rec->typeArgs.size(), (size_t)1);
+}
+
+// ============================================================
 // 闭包
 // ============================================================
 TEST(ParserExpr, ClosureBasic) {

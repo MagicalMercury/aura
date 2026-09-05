@@ -191,6 +191,21 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
             }
         }
         // P3b：含堆变体 → aura_rt::Variant<...>*（GC 堆封装）；全值 → std::variant<...>
+        // #42（bug-60 修正）：保守判堆的"未注册裸泛型名"检测——判据对象是 TypeExpr
+        // 的 Aura 名而非 mapType 的 C++ 产物（"int32_t" 等内置 C++ 名不在以 Aura 名
+        // 为 key 的 BuiltinRegistry 中：int→"int32_t" 查 findType("int32_t") 落空 →
+        // 误判未注册 → 全值 Union（int|None）被误判堆 Variant → 声明/装箱形态分裂
+        // 坏 C++）。Aura 名已注册（BuiltinRegistry / registeredTypes_ / interfaceNames_
+        // / aurai 接口）即具体类型不判裸；错误类型名同样保守判堆（无害）。
+        auto isBareAuraName = [this](const std::string& nm) -> bool {
+            if (nm.empty()) return false;
+            if (registeredTypes_.count(nm)) return false;
+            if (interfaceNames_.contains(nm)) return false;
+            if (BuiltinRegistry::get().findType(nm)) return false;
+            for (auto& ai : BuiltinRegistry::get().auraiInterfaces())
+                if (ai->name == nm) return false;
+            return true;
+        };
         bool hasHeap = false;
         for (auto& v : u->types) {
             if (!v) continue;
@@ -202,6 +217,25 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
                 // 无 SemType（如类型声明处）：按 C++ 名回退判断（指针类型 = 堆）
                 std::string cpp = mapType(*v);
                 heap = !cpp.empty() && cpp.back() == '*';
+                // #42（bug-60 修正）：未绑定泛型变体（mapType 对未注册 Aura 名原样返回
+                // 裸标识符的 <T>/T）→ 保守判堆（与 mapSemType 的 isHeapSemType
+                // (GenericSemType)=true 对齐，split-brain 消除）。否则生成 by-value
+                // std::variant<int32_t,T> → genParamBoxing 不命中（不认 std::variant）→
+                // 调用点不装箱坏 C++；且 T 实例化为堆类型时 std::variant 内指针不可被
+                // GC 追踪。判据用 TypeExpr 的 Aura 名（NamedType.name / GenericTypeRef），
+                // 不用 mapType 的 C++ 产物——具体值类型变体（int→"int32_t"）Aura 名已
+                // 注册不判裸（bug-60：此前 C++ 名查 Aura 注册表落空误伤全值 Union）。
+                if (!heap && v) {
+                    bool bareGeneric = false;
+                    if (dynamic_cast<const GenericTypeRef*>(v.get())) {
+                        bareGeneric = true;   // <T> 泛型引用即未绑定形态
+                    } else if (auto* n = dynamic_cast<const NamedType*>(v.get())) {
+                        bareGeneric = n->typeArgs.empty()
+                                     && n->namespacePrefix.empty()
+                                     && isBareAuraName(n->name);
+                    }
+                    if (bareGeneric) heap = true;
+                }
                 // 接口视图变体（值视图含 GC 指针 self，C++ 名非 * 结尾）→ 需
                 // Variant 堆封装供 descForI 扫描（与 isUnionHeapVariant 对齐）。
                 // 含内置 Iterator：其值视图含 self，B+W 后由 descForI is_iface_view_v
@@ -552,7 +586,8 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
 void CodeGenerator::genTypeDescriptor(std::ostream& cpp,
                                        const std::string& structName,
                                        const std::vector<std::string>& templateParams,
-                                       const std::vector<std::string>& ptrFieldNames) {
+                                       const std::vector<std::string>& ptrFieldNames,
+                                       const std::vector<std::string>& deferredPtrFieldNames) {
     // 构建 C++ 模板前缀: template<typename A, typename B>
     std::string tprefix, tparamsStr;
     if (!templateParams.empty()) {
@@ -571,32 +606,117 @@ void CodeGenerator::genTypeDescriptor(std::ostream& cpp,
     // 非模板类型不需要 prefix
     bool isTemplate = !templateParams.empty();
 
-    if (ptrFieldNames.empty()) {
-        if (isTemplate) cpp << tprefix;
-        cpp << "const aura_rt::TypeDescriptor " << fullName
-            << "::_desc = { sizeof(" << fullName << "), 0, nullptr };\n";
-    } else {
-        if (isTemplate) cpp << tprefix;
-        cpp << "static const size_t _" << structName << "_ptrs[] = {";
-        for (size_t i = 0; i < ptrFieldNames.size(); ++i) {
-            if (i > 0) cpp << ", ";
-            auto& pf = ptrFieldNames[i];
-            // 视图字段条目格式 "field+ViewType" → offsetof(Self, field) + offsetof(ViewType, self)
-            auto plus = pf.find('+');
-            if (plus != std::string::npos) {
-                cpp << "offsetof(" << fullName << ", " << pf.substr(0, plus)
-                    << ") + offsetof(" << pf.substr(plus + 1) << ", self)";
-            } else {
-                cpp << "offsetof(" << fullName << ", " << pf << ")";
+    if (!isTemplate) {
+        // 非模板类型：cpp 中直接定义（现状不变）
+        if (ptrFieldNames.empty()) {
+            cpp << "const aura_rt::TypeDescriptor " << fullName
+                << "::_desc = { sizeof(" << fullName << "), 0, nullptr };\n";
+        } else {
+            cpp << "static const size_t _" << structName << "_ptrs[] = {";
+            for (size_t i = 0; i < ptrFieldNames.size(); ++i) {
+                if (i > 0) cpp << ", ";
+                auto& pf = ptrFieldNames[i];
+                // 视图字段条目格式 "field+ViewType" → offsetof(Self, field) + offsetof(ViewType, self)
+                auto plus = pf.find('+');
+                if (plus != std::string::npos) {
+                    cpp << "offsetof(" << fullName << ", " << pf.substr(0, plus)
+                        << ") + offsetof(" << pf.substr(plus + 1) << ", self)";
+                } else {
+                    cpp << "offsetof(" << fullName << ", " << pf << ")";
+                }
             }
+            cpp << "};\n";
+            cpp << "const aura_rt::TypeDescriptor " << fullName
+                << "::_desc = { sizeof(" << fullName << "), "
+                << ptrFieldNames.size() << ", _"
+                << structName << "_ptrs };\n";
         }
-        cpp << "};\n";
-        if (isTemplate) cpp << tprefix;
-        cpp << "const aura_rt::TypeDescriptor " << fullName
-            << "::_desc = { sizeof(" << fullName << "), "
-            << ptrFieldNames.size() << ", _"
-            << structName << "_ptrs" << tparamsStr << " };\n";
+        return;
     }
+
+    // 模板类型：若既无确定指针字段也无延迟字段 → 原快速路径（现状不变）
+    if (ptrFieldNames.empty() && deferredPtrFieldNames.empty()) {
+        cpp << tprefix << "const aura_rt::TypeDescriptor " << fullName
+            << "::_desc = { sizeof(" << fullName << "), 0, nullptr };\n";
+        return;
+    }
+
+    // #54：per-instantiation desc——全量数组 + constexpr 计数变量模板，_desc 保持常量初始化。
+    // 数组布局「确定字段在前、延迟候选在后」；_cnt<T> = N确定 + Σ(延迟字段
+    // is_convertible_v<裸名, GcObject*> ? 1 : 0)，GC 只消费前 _cnt 项。
+    // 变量模板每实例化独立（现状 _X_ptrs<T> 同机制）；_desc 仍为聚合常量初始化
+    // （无动态初始化时序风险，区别于 make_desc 函数方案）；消费点 &X::_desc 零改动。
+    // T=值类型 → is_convertible false → 不计数不消费（desc 层不误追踪假根）；
+    // T=堆（string/record/列表等 GcObject 派生指针）→ 计数消费（不漏追踪）。
+    // 审查后修正（问题 C）：延迟候选数组项不能按声明顺序全量排列 + 前缀计数——
+    // Pair2<A,B>{a:A,b:B} 在 A=int、B=Point* 时 _cnt=1 却消费 offsetof(a)
+    // （int 值 1 被 mark 当指针读 → 0xC0000005，gdb 实证 parallel_mark.cpp:33）。
+    // 每项改为「第 i+1 个有效延迟字段（is_convertible 为 true）的偏移」的嵌套
+    // 条件表达式：有效字段稳定排前（前 _cnt 项恰好是有效偏移），无效字段落在
+    // cnt 之后不被消费；数组仍为裸数组常量初始化。不足 i+1 个有效字段时项值
+    // 0（仅占位，不被消费）。
+    cpp << tprefix << "static const size_t _" << structName << "_ptrs[] = {\n";
+    for (size_t i = 0; i < ptrFieldNames.size(); ++i) {
+        auto& pf = ptrFieldNames[i];
+        auto plus = pf.find('+');
+        // 审查后修正（问题 A）：模板分支用 __builtin_offsetof（非宏，模板实参列表
+        // 逗号不被分裂；offsetof 是宏，多模板参数 Pair2<A, B> 时 g++ 报
+        // "macro 'offsetof' passed 3 arguments"）。视图子偏移同样替换。
+        cpp << "    __builtin_offsetof(" << fullName << ", " << pf.substr(0, plus) << ")";
+        if (plus != std::string::npos)
+            cpp << " + __builtin_offsetof(" << pf.substr(plus + 1) << ", self)";
+        cpp << ",\n";
+    }
+    for (size_t i = 0; i < deferredPtrFieldNames.size(); ++i) {
+        cpp << "    " << genDeferredSelectExpr(fullName, deferredPtrFieldNames, 0, i + 1) << ",\n";
+    }
+    cpp << "};\n";
+    cpp << tprefix << "constexpr size_t _" << structName << "_cnt = " << ptrFieldNames.size();
+    for (auto& df : deferredPtrFieldNames) {
+        auto bar = df.find('|');
+        cpp << "\n    + (std::is_convertible_v<" << df.substr(bar + 1)
+            << ", aura_rt::GcObject*> ? 1 : 0)";
+    }
+    cpp << ";\n";
+    cpp << tprefix << "const aura_rt::TypeDescriptor " << fullName
+        << "::_desc = { sizeof(" << fullName << "), _" << structName << "_cnt<";
+    for (size_t i = 0; i < templateParams.size(); ++i) {
+        if (i > 0) cpp << ", ";
+        cpp << templateParams[i];
+    }
+    cpp << ">, _" << structName << "_ptrs<";
+    for (size_t i = 0; i < templateParams.size(); ++i) {
+        if (i > 0) cpp << ", ";
+        cpp << templateParams[i];
+    }
+    cpp << "> };\n";
+}
+
+// #54（审查后修正，问题 C）：递归生成「第 k 个有效延迟字段偏移」嵌套条件表达式。
+// deferred 条目格式 "name|cppType"；有效 = std::is_convertible_v<cppType, GcObject*>。
+// 语义：从 idx 起扫描，第 k 个有效字段（1-based）的 __builtin_offsetof；不足返回 "0"。
+// 生成示例（Pair2 a:A,b:B，位置 1 = 第 2 个有效字段）：
+//   (A可转 ? (B可转 ? off(b) : 0) : 0)
+// 递归终止：idx 越界 → "0"（每次递归 idx+1，字段数有限，无死循环）。
+std::string CodeGenerator::genDeferredSelectExpr(
+    const std::string& fullName,
+    const std::vector<std::string>& deferredPtrFieldNames,
+    size_t idx, size_t k) const {
+    if (idx >= deferredPtrFieldNames.size()) return "0";
+    auto bar = deferredPtrFieldNames[idx].find('|');
+    std::string name = deferredPtrFieldNames[idx].substr(0, bar);
+    std::string cppType = deferredPtrFieldNames[idx].substr(bar + 1);
+    std::string cond = "(std::is_convertible_v<" + cppType + ", aura_rt::GcObject*>)";
+    std::string off = "__builtin_offsetof(" + fullName + ", " + name + ")";
+    if (k == 1) {
+        // 本字段有效 → 本字段偏移；否则递归下一个字段
+        return "(" + cond + " ? " + off + " : "
+            + genDeferredSelectExpr(fullName, deferredPtrFieldNames, idx + 1, k) + ")";
+    }
+    // 本字段有效 → 从下一个起选第 k-1 个；否则从下一个起选第 k 个
+    return "(" + cond + " ? "
+        + genDeferredSelectExpr(fullName, deferredPtrFieldNames, idx + 1, k - 1) + " : "
+        + genDeferredSelectExpr(fullName, deferredPtrFieldNames, idx + 1, k) + ")";
 }
 
 } // namespace Aura

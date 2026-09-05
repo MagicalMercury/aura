@@ -243,6 +243,35 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e,
                 }
             }
         }
+        // #50：标注形态 expected 反哺 genericMap——形参不含 receiver 泛型 T 时
+        // checkCallArgs 无绑定、genericMap 空，但 let 标注 expected（Box<int32_t>
+        // 实例化 RecordSemType）已给出泛型实参；反哺后 applyGenericMap 才能代换
+        // 返回类型（否则 {val:<T>} 未代换 → StmtChecker L133 type mismatch）。
+        // N2 显式实参（上方已绑）优先，此处仅补缺不覆写。
+        if (expected && !sym->typeParams.empty() && !diag_.hasErrors()) {
+            bool anyUnbound = false;
+            for (auto& tp : sym->typeParams)
+                if (genericMap.find(tp) == genericMap.end()) { anyUnbound = true; break; }
+            if (anyUnbound) {
+                // 三重守卫防误伤：expected 必须为本 record 实例化形态
+                // （RecordSemType + canonicalName 含 '<' + lookup 基名 == callee 符号）
+                if (auto* rec = dynamic_cast<const RecordSemType*>(expected)) {
+                    auto lt = rec->canonicalName.find('<');
+                    if (lt != std::string::npos) {
+                        auto* expSym = symtab_.lookup(rec->canonicalName.substr(0, lt));
+                        if (expSym == sym) {
+                            auto typeArgs = extractTypeArgsFromCanonicalName(rec->canonicalName);
+                            for (size_t k = 0; k < sym->typeParams.size() && k < typeArgs.size(); ++k) {
+                                if (!typeArgs[k]) continue;
+                                if (dynamic_cast<const ErrorSemType*>(typeArgs[k].get())) continue;
+                                if (genericMap.find(sym->typeParams[k]) == genericMap.end())
+                                    genericMap[sym->typeParams[k]] = typeArgs[k]->clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // 与 Function 分支对称：构造调用点用 checkCallArgs 填充的 genericMap 代换返回
         // 类型（泛型 ctor 形参含 T 时 T→int），否则标注 let 的返回类型字段仍含未绑定 T
         // → Sema 误报 cannot assign。非泛型 record 与形参不含 T 的泛型 ctor（genericMap
@@ -528,8 +557,31 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
             for (auto& m : *methods) {
                 if (m.name == e.method) {
                     checkThrowsContext(e, e.method, m.throws);
+                    // #49：形参面 receiver 泛型实例化（与返回面对称，参照接口分支
+                    // L433-445）——否则 record 字面量实参的期望 canonicalName 泄漏裸 T
+                    // （propagateCanonicalName 用未代换形参）→ genRecordExpr 生成
+                    // gc_alloc<T> 坏 C++。recTypeArgs/recSym 提取一次，形参面与返回面共用。
+                    std::vector<std::unique_ptr<SemType>> ownedFormals;   // 保活 substitute 产物
                     std::vector<const SemType*> formalTypes;
                     for (auto& pt : m.paramTypes) formalTypes.push_back(pt.get());
+                    auto recLt = rec->canonicalName.find('<');
+                    std::vector<std::unique_ptr<SemType>> recTypeArgs;
+                    Symbol* recSym = nullptr;
+                    if (recLt != std::string::npos) {
+                        recTypeArgs = extractTypeArgsFromCanonicalName(rec->canonicalName);
+                        recSym = symtab_.lookup(rec->canonicalName.substr(0, recLt));
+                        if (recSym && !recSym->typeParams.empty()) {
+                            for (size_t i = 0; i < formalTypes.size(); ++i) {
+                                if (!formalTypes[i]) continue;
+                                auto inst = formalTypes[i]->clone();
+                                for (size_t k = 0; k < recSym->typeParams.size() && k < recTypeArgs.size(); ++k)
+                                    if (recTypeArgs[k])
+                                        inst = substitute(*inst, recSym->typeParams[k], *recTypeArgs[k]);
+                                ownedFormals.push_back(std::move(inst));
+                                formalTypes[i] = ownedFormals.back().get();
+                            }
+                        }
+                    }
                     std::map<std::string, std::unique_ptr<SemType>> genericMap;
                     checkCallArgs(e, e.method, "method", formalTypes, e.args, genericMap, m.defaultCount);
                     auto result = m.returnType ? m.returnType->clone() : NoneSemType::make();
@@ -540,15 +592,10 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
                     // 已物化（"Runner<int32_t>"），提取 <...> 内实参按符号表 typeParams
                     // 逐个 substitute（参照接口视图分支形参面模式），否则 T 泄漏 →
                     // 有标注 isAssignable 误报 / 无标注 G4 兜底 auto → 坏 C++。
-                    auto lt = rec->canonicalName.find('<');
-                    if (lt != std::string::npos) {
-                        auto typeArgs = extractTypeArgsFromCanonicalName(rec->canonicalName);
-                        auto* recSym = symtab_.lookup(rec->canonicalName.substr(0, lt));
-                        if (recSym && !recSym->typeParams.empty()) {
-                            for (size_t k = 0; k < recSym->typeParams.size() && k < typeArgs.size(); ++k)
-                                if (typeArgs[k])
-                                    result = substitute(*result, recSym->typeParams[k], *typeArgs[k]);
-                        }
+                    if (recSym && !recSym->typeParams.empty() && recLt != std::string::npos) {
+                        for (size_t k = 0; k < recSym->typeParams.size() && k < recTypeArgs.size(); ++k)
+                            if (recTypeArgs[k])
+                                result = substitute(*result, recSym->typeParams[k], *recTypeArgs[k]);
                     }
                     return result;
                 }

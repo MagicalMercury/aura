@@ -102,17 +102,22 @@ std::unique_ptr<SemType> SemAnalyzer::substitute(
         auto n = std::make_unique<UnionSemType>();
         for (auto& v : u->variants)
             n->variants.push_back(v ? substitute(*v, genericName, concrete) : nullptr);
-        // P3c：泛型实例化二次检查——替换后无 GenericSemType 残留时，若任一变体
-        // GC 不安全（如 T→string 后得 string | int）→ 报错（P0 对未实例化 Generic 放行）。
+        // P3c：泛型实例化二次检查——替换后无 GenericSemType 残留时，与声明期 P0
+        // 同判定（variantStorageUnsafe，TypeResolver.cpp UnionType 分支 / DeclChecker.cpp）：
+        // 仅 function / 嵌套 union 变体无法存入 Variant storage_ 而报错；其余含堆变体
+        // （record/string/list/optional/接口视图）已由 aura_rt::Variant descForI 按
+        // 运行时 index 追踪（variant.h L57-74）GC 安全 → 放行。
+        // 不得复用折叠判定 unionVariantGcUnsafe（凡堆变体判 unsafe，bug-65 误伤
+        // Union(Point|T) 实例化——非泛型等价形态声明期 P0 放行，行为须一致）。
         bool hasGeneric = false;
         for (auto& v : n->variants)
             if (v && dynamic_cast<const GenericSemType*>(v.get())) { hasGeneric = true; break; }
         if (!hasGeneric) {
             for (auto& v : n->variants)
-                if (v && unionVariantGcUnsafe(*v)) {
-                    error(0, 0, "generic instantiation: union contains GC heap variant '" +
-                          v->toString() + "' which is not GC-safe yet; "
-                          "use Optional<T> for 'T | None'");
+                if (v && variantStorageUnsafe(*v)) {
+                    error(0, 0, "generic instantiation: union variant '" +
+                          v->toString() + "' is not supported in a union; "
+                          "function/interface/nested-union variants cannot be stored safely");
                     break;
                 }
         }

@@ -26,6 +26,7 @@
 #include "los.h"    // LargeObjectSpace
 #include "pages.h"  // Page / MediumPage / LargePage / PageClass / kPageSize 等
 #include <atomic>
+#include <chrono>   // bug-47 诊断：ThreadRootList 心跳时间戳
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -256,6 +257,17 @@ public:
     // GC 遍历在 STW 期间聚合所有线程链表，无需锁
     struct ThreadRootList {
         GcRootHandleBase* head;
+        // bug-47 诊断（纯观测，不参与任何协议）：拥有者线程 OS TID + 最近一次
+        // 到达 safepoint() 检查点的心跳时刻。超时 dump 时据此回答"差的那几个
+        // 线程是谁、多久没到任何检查点"。diag_last_safepoint 为并发读写（mutator
+        // 线程写在先、initiator 线程超时 dump 读在后）——8 字节对齐单写实践中
+        // 原子，撕裂风险仅影响诊断数值，可接受（诊断专用，非协议状态）。
+        unsigned diag_tid = 0;
+        std::chrono::steady_clock::time_point diag_last_safepoint{};
+        // bug-47 诊断第二轮：本线程当前是否停靠在 safepoint 等待（else/Finalize 分支）。
+        // dump 时区分「心跳新鲜且已停靠（正常，已计数）」vs「心跳新鲜但未停靠
+        // （反复早退/循环别处——未计数真凶之一）」。
+        std::atomic<bool> diag_parked{false};
         ThreadRootList() : head(nullptr) {}
     };
 
@@ -421,6 +433,9 @@ public:
     void  scanRootsOnly(bool youngOnly);
     // P0-B：单个栈候选指针的保守扫描（小页/中页/大页/LOS 四路校验 + 入栈）
     void  scanStackCandidate(GcObject* obj);
+    // bug-47 诊断：dump 所有注册线程/root list 状态（owner TID、心跳距今、根句柄数）
+    // 到 stderr。仅在 STW 超时 abort 前调用——回答"差的线程是谁、卡了多久"。
+    void dumpThreadStates(const char* where);
     // 完整停靠：等所有"有根链表的线程"停止（threadRootLists_ 精确反映需停线程，
     // 含启动窗口期新注册——registered_threads_ 快照可能落后，循环确认 size 稳定）
     void  waitForRootThreadsStopped();

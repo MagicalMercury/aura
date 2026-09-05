@@ -248,10 +248,48 @@ std::string SemAnalyzer::semTypeToCppName(const SemType& t) const {
     if (dynamic_cast<const NoneSemType*>(&t)) return "aura_rt::NoneType";
     if (auto* l = dynamic_cast<const ListSemType*>(&t))
         return "aura_rt::Array<" + semTypeToCppName(*l->elementType) + ">*";
+    // 函数值（std::function 值类型，无尾 *）：与 CodeGen mapSemType 的 FuncSemType
+    // 分支一致。bug-17 引入 semTypeToCppName 作为 materializeCanonicalName 的实参
+    // 拼接函数后，函数实参（Optional<fun(int) -> int> 的 fun(int) -> int）必须返回
+    // std::function 名而非兜底 "auto"。
+    if (auto* f = dynamic_cast<const FuncSemType*>(&t)) {
+        std::string sig = "std::function<";
+        sig += f->returnType ? semTypeToCppName(*f->returnType) : "void";
+        sig += "(";
+        for (size_t i = 0; i < f->paramTypes.size(); ++i) {
+            if (i > 0) sig += ", ";
+            sig += f->paramTypes[i] ? semTypeToCppName(*f->paramTypes[i]) : "auto";
+        }
+        sig += ")>";
+        return sig;
+    }
     if (auto* r = dynamic_cast<const RecordSemType*>(&t))
         return r->canonicalName + "*";
+    // 接口视图（值类型，无尾 *）：与 CodeGen mapSemType 的 InterfaceSemType 分支一致。
+    // bug-17 引入 semTypeToCppName 作为 materializeCanonicalName 的实参拼接函数后，
+    // 接口实参（Optional<Stringer> 的 Stringer）必须返回视图名而非兜底 "auto"。
+    if (auto* is = dynamic_cast<const InterfaceSemType*>(&t)) {
+        if (is->typeArgs.empty()) return is->name;
+        std::string result = is->name + "<";
+        for (size_t i = 0; i < is->typeArgs.size(); ++i) {
+            if (i > 0) result += ", ";
+            result += is->typeArgs[i] ? semTypeToCppName(*is->typeArgs[i]) : "void";
+        }
+        return result + ">";
+    }
     if (auto* g = dynamic_cast<const GenericSemType*>(&t)) {
-        if (!g->resolvedName.empty()) return g->resolvedName;
+        if (!g->resolvedName.empty()) {
+            // bug-17：resolvedName（如 "aura_rt::Optional<int32_t>"）是堆泛型去尾 * 的
+            // 基型。作为类型实参嵌入 canonicalName（Box2<Optional<int>> → 完整 C++
+            // 名须为 Box2<aura_rt::Optional<int32_t>*>）时须补回堆指针 *，与声明侧
+            // mapType（aura_rt::Optional<int32_t>*）及 CodeGen mapSemType
+            // （TypeMap.cpp:527-531 finalizeCppElem + 尾 * 补全）一致。值视图
+            // （Iterator，aura_rt::Iterator<...> 无尾 *）与已带 * 的 resolvedName 不追加。
+            if (g->resolvedName.rfind("aura_rt::Iterator<", 0) == 0
+                || (!g->resolvedName.empty() && g->resolvedName.back() == '*'))
+                return g->resolvedName;
+            return g->resolvedName + "*";
+        }
         return cppNameOf(g->name);
     }
     if (auto* o = dynamic_cast<const OptionalSemType*>(&t)) {

@@ -62,7 +62,7 @@ TEST(Examples, MathUtils) {
 
 TEST(Examples, TestGcMutex) {
     // Mutex GC 稳定性
-    expectExampleCompiles("TestGcMutex", "test_gc_mutex.aura");
+    expectExampleCompiles("TestGcMutex", "used/test_gc_mutex.aura");
 }
 
 // ============================================================

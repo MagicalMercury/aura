@@ -32,19 +32,8 @@ bool CodeGenerator::semTypeIsConcrete(const SemType* t) {
 // genGcRootedArgs — 为 GC 堆类型参数生成 IIFE + GcRootHandle 包装
 // 所有参数都不是堆类型时，直接返回 callExpr（避免无意义 IIFE）
 // ============================================================
-// 未绑定泛型判定：GenericSemType 且 resolvedName 空（未实例化的模板参数，如泛型
-// 方法/函数体内的 T）。此类实参在模板实例化前无法静态判断是否为 GC 指针——T 可实例化
-// 为 int/float 等值类型，也可实例化为 record/GcString*/Optional*/Variant* 等继承
-// GcObject 的堆类型。若按 isHeapSemType 默认堆直接包装，会生成 GcRootHandle<int>
-// 假根（GC mark 扫描读 int 当根指针 → 0xC0000005），故必须延迟到 C++ 编译期判定
-// （方案 A：if constexpr，仿 runtime\gc\gc.h:716-725 gc_write_barrier_generic 与
-// src\CodeGen\ExprAccess.cpp 字段赋值写屏障未绑定泛型分支的既有先例）。
-static bool isUnboundGenericSemType(const SemType* type) {
-    if (auto* g = dynamic_cast<const GenericSemType*>(type))
-        return g->resolvedName.empty() && g->name != "Iterator";
-    return false;
-}
-
+// 未绑定泛型判定（isUnboundGenericSemType）已提升为 CodeGenerator 成员
+//（ExprGen.cpp 定义，见 CodeGen.h 声明），调用点 genGcRootedArgs 直接复用。
 std::string CodeGenerator::genGcRootedArgs(
     const std::vector<std::pair<std::string, const SemType*>>& args,
     const std::string& callExpr, bool /*isCoroutine*/)
@@ -215,8 +204,14 @@ std::string CodeGenerator::genGcRootedArgs(
     inner << genRegion(0, prot);
     inner << "  }()";
 
-    std::string result = outer.str() + awaitPrefix + inner.str();
-    return result;
+    // #31：outer 前缀语句改入待落盘缓冲（返回纯表达式），由语句边界 writeLine/flush
+    // 统一落盘——消除 let/return 把多语句串拼入表达式的坏 C++，且覆盖全部嵌套深度
+    //（实参链/if 条件/二元操作数等任何最终落到语句输出的位置）。outer 变量作用域
+    // 从「表达式内」提升为「所在语句前的协程函数体局部」（生命周期等价或更强），
+    // 变量名由 argHandleCounter_ 保证唯一，无遮蔽。GcRootHandle/ViewRoot 前缀同样
+    // 落盘后位于协程函数体内、跨挂起存于协程帧，符合原跨 co_await 保护设计。
+    if (!outer.str().empty()) hoistPrefixPending_ += outer.str();
+    return awaitPrefix + inner.str();
 }
 
 // ============================================================
@@ -236,6 +231,19 @@ void CodeGenerator::collectMaterializedFromType(
         for (auto& tp : currentTParams_)
             if (tp == name) return false;
         return true;
+    };
+    // 是否为已注册 Aura 类型名（内置/用户 record/接口）。bug-61：Stringer/Comparable
+    // 等内置接口仅存于 BuiltinRegistry::auraiInterfaces()（不在 registeredTypes_/
+    // interfaceNames_/findType 中）——漏查会把具体 Optional<Stringer> 形参元素误判为
+    // 待绑定泛型形参名 → fnCallMat 裸词替换坏 C++（用户接口 Greeter 命中 interfaceNames_
+    // 不受影响，实证根因）。与 collectMaterializedFromSemType 的 isRegisteredName 对齐。
+    auto isRegisteredAuraName = [this](const std::string& nm) -> bool {
+        if (registeredTypes_.count(nm)) return true;
+        if (interfaceNames_.contains(nm)) return true;
+        if (BuiltinRegistry::get().findType(nm)) return true;
+        for (auto& ai : BuiltinRegistry::get().auraiInterfaces())
+            if (ai->name == nm) return true;
+        return false;
     };
     // 实参 → 可物化的 C++ 类型串；返回空表示不可物化（Error / 未绑定泛型且非外层
     // 模板参数）。未绑定泛型实参仅当它是外层模板参数（如泛型函数体内调用
@@ -262,11 +270,41 @@ void CodeGenerator::collectMaterializedFromType(
     if (auto* n = dynamic_cast<const NamedType*>(&formal)) {
         // 裸名泛型形参（v: T，TypeParser 解析为 NamedType）→ 绑定
         if (n->typeArgs.empty() && notInOuter(n->name)
-            && !registeredTypes_.count(n->name)
-            && !interfaceNames_.count(n->name)
-            && !BuiltinRegistry::get().findType(n->name)) {
+            && !isRegisteredAuraName(n->name)) {
             std::string cpp = argCpp(arg);
             if (!cpp.empty()) out[n->name] = cpp;
+            return;
+        }
+        // #48 镜像：显式 Optional<T> 形参（NamedType{name=="Optional", [T]}）——实参与
+        // 声明对称剥 Optional 层后把 T 绑到元素 C++ 名（T 经 TypeParser 解析为裸
+        // NamedType/GenericTypeRef，无函数类型可走下方 Transform<T> 递归）。防误绑：
+        // T 须为未注册裸泛型名（具体 Optional<Point> 不落入绑定）。
+        if (n->name == "Optional" && n->typeArgs.size() == 1 && n->typeArgs[0]) {
+            const TypeExpr* ta = n->typeArgs[0].get();
+            std::string tpName;
+            if (auto* tg = dynamic_cast<const GenericTypeRef*>(ta)) tpName = tg->name;
+            else if (auto* tn = dynamic_cast<const NamedType*>(ta))
+                if (tn->typeArgs.empty()) tpName = tn->name;
+            if (!tpName.empty() && notInOuter(tpName)
+                && !isRegisteredAuraName(tpName)) {
+                // 剥实参 Optional 层取元素 C++ 名：GenericSemType 物化经 mapSemType 内层
+                //（finalizeCppElem 已补 record '*'）/ OptionalSemType 元素 / 无层裸值取自身
+                std::string elemCpp;
+                static const std::string optPrefix = "aura_rt::Optional<";
+                if (auto* gs = dynamic_cast<const GenericSemType*>(&arg)) {
+                    if (gs->name == "Optional" && !gs->resolvedName.empty()) {
+                        std::string m = mapSemType(arg);   // "aura_rt::Optional<X...>*"
+                        size_t rt = m.rfind('>');
+                        if (m.rfind(optPrefix, 0) == 0 && rt != std::string::npos
+                            && rt > optPrefix.size())
+                            elemCpp = m.substr(optPrefix.size(), rt - optPrefix.size());
+                    }
+                } else if (auto* os = dynamic_cast<const OptionalSemType*>(&arg)) {
+                    if (os->elementType) elemCpp = argCpp(*os->elementType);
+                }
+                if (elemCpp.empty()) elemCpp = argCpp(arg);
+                if (!elemCpp.empty()) out[tpName] = elemCpp;
+            }
             return;
         }
         // 泛型类型别名/record 实例化（Transform<T>）：从函数类型实参递归匹配 typeArgs
@@ -336,8 +374,63 @@ void CodeGenerator::collectMaterializedFromSemType(
         }
         return mapSemType(a);
     };
+    // #48：物化 GenericSemType{Optional, resolvedName 非空}（显式 `o: Optional<T>` 注解
+    // 经 Sema materialize）剥壳分支。若把 g->name("Optional") 当裸形参名绑定，调用点裸词
+    // 替换会把 "aura_rt::Optional<T>" 中的 Optional 替换成实参 C++ 名 → 灾难。
+    // 镜像 Sema collectGenericMapping case 0：actual 对称剥 Optional 层取元素 C++ 名。
+    auto templateInner = [](const std::string& s) -> std::string {
+        static const std::string prefix = "aura_rt::Optional<";
+        if (s.rfind(prefix, 0) != 0) return "";
+        size_t rt = s.rfind('>');
+        if (rt == std::string::npos || rt <= prefix.size()) return "";
+        return s.substr(prefix.size(), rt - prefix.size());
+    };
+    // 是否为已注册类型名（内置/用户/接口）——元素为具体注册名时无需绑定（防误替换）
+    auto isRegisteredName = [this](const std::string& name) {
+        if (registeredTypes_.count(name)) return true;
+        if (interfaceNames_.count(name)) return true;
+        if (BuiltinRegistry::get().findType(name)) return true;
+        for (auto& ai : BuiltinRegistry::get().auraiInterfaces())
+            if (ai->name == name) return true;
+        return false;
+    };
+    // 实参剥 Optional 层后取元素 C++ 名；无 Optional 层（Sema 隐式装箱的裸值）取自身
+    auto argElemCpp = [&](const SemType& a) -> std::string {
+        if (auto* gs = dynamic_cast<const GenericSemType*>(&a))
+            if (gs->name == "Optional" && !gs->resolvedName.empty()) {
+                // 经 mapSemType + 内层提取：finalizeCppElem 对 record 元素补 '*'、嵌套
+                // 容器递归补全，与声明侧一致（mapSemType 输出含尾 '*'，末 '>' 定位兼容）
+                return templateInner(mapSemType(a));
+            }
+        if (auto* os = dynamic_cast<const OptionalSemType*>(&a))
+            if (os->elementType) return argCpp(*os->elementType);
+        return argCpp(a);
+    };
     // 裸泛型形参（v: T / inc: <T> → GenericSemType）→ 实参可物化时绑定
     if (auto* g = dynamic_cast<const GenericSemType*>(&formal)) {
+        if (g->name == "Optional" && !g->resolvedName.empty()) {
+            // formal 元素（resolvedName <...> 内层）为裸泛型词（如 "T"）、非外层模板参数
+            //（外层模板参数由声明提供，闭包直接引用即可）且未注册 → 待绑
+            std::string elem = templateInner(g->resolvedName);
+            bool bareId = !elem.empty();
+            for (char c : elem)
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                      || (c >= '0' && c <= '9') || c == '_')) { bareId = false; break; }
+            if (bareId && notInOuter(elem) && !isRegisteredName(elem)) {
+                std::string cpp = argElemCpp(arg);
+                // bug-62：resolvedName 是 C++ 形态——具体元素（跨模块 Optional<int> 的
+                // "int32_t"，Aura 名 "int" 不在注册表故 isRegisteredName 落空）会被误判
+                // 为裸泛型词。绑定 elem→cpp 只对「真·待实例化泛型形参」有意义：elem 是
+                // 泛型形参名时恒 ≠ 具体实参元素 C++ 名；elem==cpp（具体元素与实参元素
+                // 同型，如 int32_t→int32_t）时裸词替换恒等，徒令 cmMat 非空触发装箱点
+                // 「替换后仍含 mat 键裸词 → 不装箱」防御 → 具体 Optional 实参不装箱坏
+                // C++。故仅 elem≠cpp 才绑定（具体 C++ 内置名永不等于泛型形参名）。
+                if (!cpp.empty() && cpp != elem) out[elem] = cpp;
+            }
+            return;
+        }
+        // #48：其余物化 GenericSemType（resolvedName 非空）非裸形参名——不在此绑定
+        if (!g->resolvedName.empty()) return;
         if (notInOuter(g->name)) {
             std::string cpp = argCpp(arg);
             if (!cpp.empty()) out[g->name] = cpp;
@@ -461,7 +554,16 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
 
     std::set<std::string> builtins = {"_tasks"};
     std::vector<std::string> captures;
+    // bug-24：方法体内闭包引用 receiver（self）→ 不按普通变量捕获；receiver 由
+    // genIdentifier 映射为 this / GcRootHandle（协程形态），捕获列表显式输出 [this]。
+    bool needsThisCapture = false;
     for (auto& name : allRefs) {
+        // 与 genIdentifier（ExprGen.cpp:151）同款判定信号：方法/接口默认方法体内
+        // 的 receiver 名（self/p）是 this 的别名，不是方法作用域变量，不得收进 captures
+        if (!currentReceiverName_.empty() && name == currentReceiverName_) {
+            needsThisCapture = true;
+            continue;
+        }
         if (declared.count(name))     continue;
         if (paramNames.count(name))   continue;
         if (builtins.count(name))     continue;
@@ -594,9 +696,42 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     std::ostringstream oss;
 
     // 捕获 + 模板参数
+    // bug-24：闭包引用 receiver（self）→ 捕获列表显式输出 this，置于最前（[this, ...]；
+    // 空 captures 时 [this]）。方法内闭包若引用 receiver 且 receiver C++ 类型已知
+    //（#56 统一：协程/非协程皆然）→ 决策 (a)：改捕获 GcRootHandle<RecType*> init-capture
+    //（仿跨线程先例），body 内经 .get() 解引用（currentClosureThisHandle_ 配合
+    // genIdentifier 映射 self → "_this_root.get()"）。
+    // #56 统一：闭包引用 receiver 一律句柄捕获（原 bug-24 仅协程）。非协程闭包
+    // 逃逸（存字段/返回）后 GC compact 同样悬垂（bug-52 的方法版兄弟）；且 #56
+    // 方法体 self 映射 "_this.get()" 后，非协程闭包若仍 [this] 捕获则 _this 在
+    // 闭包内不可见 → 坏 C++。接口默认方法（currentReceiverCppType_ 空）不触发，
+    // 保持 [this]（视图 this 值语义，预存在行为）。
+    bool thisAsHandle = needsThisCapture && !currentReceiverCppType_.empty();
+    if (needsThisCapture && currentFunctionIsCoroutine_ && currentReceiverCppType_.empty()) {
+        // 防御兜底（理论不可达：record 方法恒有 receiver C++ 类型，接口默认方法恒非
+        // 协程）：干净报错而非产出可编译的悬垂炸弹（决策 (b) 语义）
+        error(e, "closure referencing receiver '" + currentReceiverName_
+                 + "' inside a coroutine method is not supported yet "
+                   "(receiver C++ type unknown)");
+    }
     oss << "[";
+    size_t emittedCaptures = 0;
+    if (needsThisCapture) {
+        if (thisAsHandle) {
+            // #56 缺口 3：capture-init 的 receiver 源不写裸 this——嵌套闭包（外层闭包/
+            // spawn 体内，裸 this 不可见）取外层句柄 .get()；方法体直引取入口句柄 .get()
+            //（裸 this 可能已因方法体内 GC 悬垂），消除「闭包定义前已 GC」的捕获悬垂隐患
+            oss << "_this_root = aura_rt::GcRootHandle<" << currentReceiverCppType_
+                << "*>(" << receiverThisSourceExpr()
+                << ", aura_rt::GcRootScope::Global)";
+        } else {
+            oss << "this";
+        }
+        emittedCaptures = 1;
+    }
     for (size_t i = 0; i < captures.size(); ++i) {
-        if (i > 0) oss << ", ";
+        if (emittedCaptures > 0) oss << ", ";
+        emittedCaptures++;
         auto cn = safeName(captures[i]);
         // 递归闭包：let 声明的变量被自身闭包引用 → 按引用捕获
         if (!currentLetName_.empty() && captures[i] == currentLetName_) {
@@ -641,6 +776,14 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     }
 
     // 参数列表
+    // #32：闭包参数 C++ 类型推导（参数列表与入口包裹共用，避免双份推导漂移）
+    auto paramCppType = [&](size_t pi) -> std::string {
+        if (e.params[pi].type) return mapType(*e.params[pi].type);
+        if (auto* fst = dynamic_cast<const FuncSemType*>(e.inferredType);
+            fst && pi < fst->paramTypes.size() && fst->paramTypes[pi])
+            return mapSemType(*fst->paramTypes[pi]);
+        return "auto";
+    };
     oss << "(";
     for (size_t i = 0; i < e.params.size(); ++i) {
         if (i > 0) oss << ", ";
@@ -654,14 +797,14 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
         } else {
             // 参数类型：有显式标注用 mapType（多态闭包 [T] 正确映射 C++ 模板参数）；
             // 无标注用 Sema 反推结果（双向推断：闭包参数从期望类型推断）
-            std::string paramType = "auto";
-            if (e.params[i].type) {
-                paramType = mapType(*e.params[i].type);
-            } else if (auto* fst = dynamic_cast<const FuncSemType*>(e.inferredType);
-                       fst && i < fst->paramTypes.size() && fst->paramTypes[i]) {
-                paramType = mapSemType(*fst->paramTypes[i]);
-            }
-            oss << paramType << " " << safeName(e.params[i].name);
+            std::string paramType = paramCppType(i);
+            // #32：GC 指针参数加 _raw 后缀（仿普通函数 funSignature DeclFun.cpp L291-299）
+            // + 体入口 GcRootHandle 包裹——消除闭包体内 gc_force/alloc 触发 GC 时参数
+            // 悬垂（std::function 调用帧不在保守栈扫描范围，compact 不重写裸栈指针）
+            if (isGcPointerType(paramType))
+                oss << paramType << " " << safeName(e.params[i].name) << "_raw";
+            else
+                oss << paramType << " " << safeName(e.params[i].name);
         }
     }
     oss << ")";
@@ -712,13 +855,34 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     oss << " {\n";
     indentLevel_++;
 
+    // bug-24：闭包体生成期间置位 self 的替代生成名（协程形态 "_this_root" → genIdentifier
+    // 返回 "_this_root.get()"；非协程形态清空 → 返回 "this"）。嵌套闭包各自 save/restore：
+    // 内层 genFunExpr 退出后恢复外层值，互不污染。
+    auto savedClosureThisHandle = currentClosureThisHandle_;
+    currentClosureThisHandle_ = thisAsHandle ? "_this_root" : std::string();
+
     // Bug 2 修复：闭包参数注册到 stringVarNames_ / valueTypeVarNames_
     // 否则 isStringExprInChain 漏判闭包内的 string 参数，用 GcString::from() 包装
     // 已是 GcString* 的变量 → 匹配 from(bool) 隐式转换 → 输出 "true"
     auto savedStringVars = stringVarNames_;
     auto savedValueVars  = valueTypeVarNames_;
-    for (auto& p : e.params) {
-        registerParamTracking(p);   // 填充临时集合；lambda 结束时由 restore 恢复外层
+    // #32：保存外层 GC 根集合（闭包退出时恢复，防作用域污染——与 savedStringVars 同模式）
+    auto savedClosureRootVars = gcRootVarNames_;
+    auto savedClosureRootTypes = gcRootTypes_;
+    for (size_t pi = 0; pi < e.params.size(); ++pi) {
+        registerParamTracking(e.params[pi]);   // 填充临时集合；lambda 结束时由 restore 恢复外层
+        // #32：GC 指针参数 → 体入口 GcRootHandle 包裹（先于体内任何 GC 触发点）+ 注册根。
+        // 注册后体内引用自动 .get()（genIdentifier），嵌套闭包捕获自动 init-capture
+        // （GcRootHandle<gcRootTypes_> 分支）。注意只注册 GC 指针参数、不碰视图
+        // 参数（视图参数本次不覆盖；registerRawParamTracking 会误注册 viewRootVarNames_）。
+        std::string ptype = paramCppType(pi);
+        if (isGcPointerType(ptype)) {
+            std::string vn = safeName(e.params[pi].name);
+            oss << indentStr() << "aura_rt::GcRootHandle<decltype(" << vn
+                << "_raw)> " << vn << "(" << vn << "_raw);\n";
+            gcRootVarNames_.insert(vn);
+            gcRootTypes_[vn] = "decltype(" + vn + "_raw)";
+        }
     }
 
     // invoke_result_t 推导声明（使用 F&& 完美转发）
@@ -886,6 +1050,8 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     // Bug 2 修复：恢复 stringVarNames_ / valueTypeVarNames_，避免污染外层作用域
     stringVarNames_ = savedStringVars;
     valueTypeVarNames_ = savedValueVars;
+    gcRootVarNames_ = savedClosureRootVars;   // #32：恢复外层 GC 根集合
+    gcRootTypes_ = savedClosureRootTypes;
     currentReturnElem_ = savedReturnElem;
     currentReturnCppType_ = savedReturnCppType;
     currentReturnVariantCppTypes_ = std::move(savedRetVariantTypes);
@@ -893,6 +1059,7 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
     currentCoroTaskRetCpp_ = savedCoroTaskRet;   // 恢复外层协程闭包 task 返回类型
     declaredReturnOnlyGenerics_ = savedDeclaredROG;   // M4：恢复外层闭包链声明状态
     currentTParams_ = savedClosureTParams;            // M4/M5：恢复外层模板参数栈
+    currentClosureThisHandle_ = savedClosureThisHandle; // bug-24：恢复外层闭包 self 生成名
 
     lastClosureIsCoro_ = closureIsCoro;
     return oss.str();

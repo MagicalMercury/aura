@@ -96,6 +96,9 @@ struct RecordExpr : ASTNode {
     // canonicalName 的 RecordSemType（CodeGen 走 gc_alloc 而非 designated init）。
     std::string typeName;
     std::vector<RecordField> fields;
+    // bug-51：record 字面量显式类型实参（仿 CallExpr）——`Box<int> { value = 7 }`，
+    // 空 = 未使用（与 N2 调用 `B<int>(...)` 的 typeArgs 分工：`{` 形态归本字段）
+    std::vector<std::unique_ptr<TypeExpr>> typeArgs;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<RecordExpr>();
@@ -106,6 +109,8 @@ struct RecordExpr : ASTNode {
             rf.value = f.value ? f.value->clone() : nullptr;
             n->fields.push_back(std::move(rf));
         }
+        for (auto& t : typeArgs)
+            n->typeArgs.emplace_back(t ? std::unique_ptr<TypeExpr>(static_cast<TypeExpr*>(t->clone().release())) : nullptr);
         n->line = line; n->col = col;
         return n;
     }

@@ -134,7 +134,9 @@ void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
                 bool isViewField = false;
                 std::string fval = f.value
                     ? genRecordFieldValue(rs, *f.value, f.name, isCoroutine, &isViewField) : "???";
-                if (f.value && isHeapSemType(f.value->inferredType) && !isViewField) {
+                bool isHeapF = f.value && isHeapSemType(f.value->inferredType) && !isViewField;
+                bool deferredF = isHeapF && f.value && isDeferredGcRoot(f.value->inferredType);
+                if (isHeapF && !deferredF) {
                     std::string fv = "_fv_" + std::to_string(recIdx) + "_" + safeName(f.name);
                     std::string fh = "_fh_" + std::to_string(recIdx) + "_" + safeName(f.name);
                     writeLine(cpp, "auto " + fv + " = (" + fval + ");");
@@ -142,6 +144,20 @@ void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
                               + ")> " + fh + "(" + fv + ");");
                     writeLine(cpp, var + ".get()->" + safeName(f.name)
                               + " = " + fh + ".get();");
+                } else if (deferredF) {
+                    std::string fv = "_fv_" + std::to_string(recIdx) + "_" + safeName(f.name);
+                    std::string fh = "_fh_" + std::to_string(recIdx) + "_" + safeName(f.name);
+                    writeLine(cpp, "auto " + fv + " = (" + fval + ");");
+                    writeLine(cpp, "if constexpr (std::is_convertible_v<decltype(" + fv
+                              + "), aura_rt::GcObject*>) {");
+                    writeLine(cpp, "    aura_rt::GcRootHandle<decltype(" + fv + ")> "
+                              + fh + "(" + fv + ");");
+                    writeLine(cpp, "    " + var + ".get()->" + safeName(f.name)
+                              + " = " + fh + ".get();");
+                    writeLine(cpp, "} else {");
+                    writeLine(cpp, "    " + var + ".get()->" + safeName(f.name)
+                              + " = " + fv + ";");
+                    writeLine(cpp, "}");
                 } else {
                     writeLine(cpp, var + ".get()->" + safeName(f.name) + " = " + fval + ";");
                 }
@@ -202,12 +218,24 @@ void CodeGenerator::genThrowStmt(std::ostream& cpp, const ThrowStmt& stmt) {
 
 void CodeGenerator::genIfStmt(std::ostream& cpp, const IfStmt& stmt,
                                bool isCoroutine) {
-    cpp << indentStr() << "if (" << genExpr(*stmt.condition, isCoroutine) << ") {\n";
+    // #31（bug-59 补修，change.md §1.5 顺序）：if / else-if 条件内协程调用的 outer
+    // 前缀（auto _aX_Y = (实参);）必须在 if 链输出【之前】落盘为函数体内独立语句。
+    // 因此先求值 if 条件与全部 else-if 条件文本（outer 依次累积进缓冲）→ flush →
+    // 再输出 if 链。若 flush 在 "if (" 之后执行 → outer 被拼入条件头（if-init / 坏
+    // C++）；若在 "else if (" 之前就地落盘 → 声明语句插入 `}` 与 else 之间 →
+    // g++ 'else' without a previous 'if'。统一提前到 if 链前落盘两者皆免。
+    std::string cond0 = genExpr(*stmt.condition, isCoroutine);
+    std::vector<std::string> condN;
+    condN.reserve(stmt.elseIfs.size());
+    for (auto& ei : stmt.elseIfs)
+        condN.push_back(genExpr(*ei.condition, isCoroutine));
+    flushHoistPrefix(cpp);
+    cpp << indentStr() << "if (" << cond0 << ") {\n";
     if (stmt.thenBranch) genBlock(cpp, *stmt.thenBranch, isCoroutine);
     cpp << indentStr() << "}";
-    for (auto& ei : stmt.elseIfs) {
-        cpp << " else if (" << genExpr(*ei.condition, isCoroutine) << ") {\n";
-        if (ei.body) genBlock(cpp, *ei.body, isCoroutine);
+    for (size_t i = 0; i < stmt.elseIfs.size(); ++i) {
+        cpp << " else if (" << condN[i] << ") {\n";
+        if (stmt.elseIfs[i].body) genBlock(cpp, *stmt.elseIfs[i].body, isCoroutine);
         cpp << indentStr() << "}";
     }
     if (stmt.elseBranch) {
@@ -220,7 +248,12 @@ void CodeGenerator::genIfStmt(std::ostream& cpp, const IfStmt& stmt,
 
 void CodeGenerator::genWhileStmt(std::ostream& cpp, const WhileStmt& stmt,
                                   bool isCoroutine) {
-    cpp << indentStr() << "while (" << genExpr(*stmt.condition, isCoroutine) << ") {\n";
+    // #31（bug-59 补修）：同 if 条件——先求值 → flush 落盘 → 再输出 "while ("（原
+    // 顺序 flush 在 "while (" 之后 → outer 声明被拼入条件头 → while 无 init-statement
+    // 支持 → g++ 坏 C++ '_aX' was not declared）
+    std::string condW = genExpr(*stmt.condition, isCoroutine);
+    flushHoistPrefix(cpp);   // #31：while 条件内协程调用的 outer 前缀先落盘
+    cpp << indentStr() << "while (" << condW << ") {\n";
     if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
     writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint：长循环可被 GC 暂停
     cpp << indentStr() << "}\n";

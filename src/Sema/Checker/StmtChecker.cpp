@@ -52,6 +52,19 @@ bool SemAnalyzer::rejectStandaloneNone(const Decl& decl, const TypeExpr* type) {
     return false;
 }
 
+// bug-63：初始值是否为"显式 None 值"（none() 调用 / none 字面量）——仅这类表达式有
+// 可绑定的 NoneType 值。函数/方法返回 None（`-> None`）是 void 语义、无运行时可绑定
+// 值，出现在值上下文应拒绝；同一 NoneSemType 推断来源不同，需按 initializer 形态区分。
+static bool isNoneValueInitializer(const ASTNode* init) {
+    if (!init) return false;
+    if (dynamic_cast<const NoneLiteral*>(init)) return true;
+    if (auto* ce = dynamic_cast<const CallExpr*>(init)) {
+        if (auto* id = dynamic_cast<const Identifier*>(ce->callee.get()))
+            return id->name == "none";
+    }
+    return false;
+}
+
 // sync 系 max 表达式类型检查（"sync" / "sync thread" / "sync for" 复用）
 void SemAnalyzer::checkSyncMax(const ASTNode& maxExpr, const std::string& kindName) {
     auto maxTy = inferExpr(maxExpr);
@@ -110,7 +123,14 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
         ? inferExpr(*decl.initializer, declaredType ? declaredType.get() : nullptr)
         : ErrorSemType::make();
     if (decl.type) {
-        if (!isAssignable(*declaredType, *inferredType)) {
+        // bug-63：有标注但初始推断为纯 None（`let z: int | None = r.clean()`，方法/函数
+        // 返回 None = void 语义无值可绑）→ 拒绝。显式 none()/none 是 NoneType 值语义，
+        // 在含 None 联合标注下可绑（放行）；真正返回 int|None 的调用推断为 UnionSemType
+        // 不落入。None 返回与 `= none()` 同为 NoneSemType 推断，须按 initializer 形态区分。
+        if (!isNoneValueInitializer(decl.initializer.get())
+            && dynamic_cast<const NoneSemType*>(inferredType.get())) {
+            error(decl, "cannot bind 'None' return value to a variable; use a union annotation like 'int | None'");
+        } else if (!isAssignable(*declaredType, *inferredType)) {
             error(decl, "type mismatch: cannot assign '" + inferredType->toString() + "' to '" + declaredType->toString() + "'");
         } else if (!diag_.hasErrors()
                    && decl.initializer
@@ -138,6 +158,16 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
                       + "'; add explicit type annotation (e.g. " + g->name + "<int>)");
             }
         }
+    }
+    // #33 配套：无标注绑定推断为纯 None（如 `let x = f()`，f 返回 None——接口/record
+    // 方法 None 返回值出现在值上下文）。None 是 void 语义的类型标记，绑定到变量无意义，
+    // 且修复 #33 后 CodeGen 侧 void 赋 auto 会坏 C++ → 干净报错引导联合标注
+    // （int | None）。不区分来源：普通函数/方法返回 None 同被拒（行为统一）；
+    // 无标注的显式 none() 推断为 Optional<error> 走上方 containsErrorElement 拦截。
+    // 有标注的 None 返回拒绝在标注分支内（bug-63，见上）。
+    if (!decl.type && !diag_.hasErrors()
+        && dynamic_cast<const NoneSemType*>(inferredType.get())) {
+        error(decl, "cannot bind 'None' return value to a variable; use a union annotation like 'int | None'");
     }
     // 存入 typeStore_ 保持稳定（decl.inferredType 不能指向 sym->type.get()，
     // 否则后续若 sym->type 被替换会成为悬垂指针）
@@ -194,7 +224,12 @@ void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
         ? inferExpr(*decl.initializer, declaredType ? declaredType.get() : nullptr)
         : ErrorSemType::make();
     if (decl.type) {
-        if (!isAssignable(*declaredType, *inferredType)) {
+        // bug-63：与 checkLetDecl 同——有标注但初始推断为纯 None（None 返回的调用 =
+        // void 语义无值可绑）→ 拒绝；显式 none()/none 值在联合标注下放行。
+        if (!isNoneValueInitializer(decl.initializer.get())
+            && dynamic_cast<const NoneSemType*>(inferredType.get())) {
+            error(decl, "cannot bind 'None' return value to a variable; use a union annotation like 'int | None'");
+        } else if (!isAssignable(*declaredType, *inferredType)) {
             error(decl, "type mismatch in const: expected '" + declaredType->toString() + "', got '" + inferredType->toString() + "'");
         } else if (!diag_.hasErrors()
                    && decl.initializer
@@ -216,6 +251,12 @@ void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
                       + "'; add explicit type annotation (e.g. " + g->name + "<int>)");
             }
         }
+    }
+    // #33 配套：与 checkLetDecl 同——无标注 const 绑定推断为纯 None → 干净报错
+    // 引导联合标注（int | None），防 void 值绑定泄漏坏 C++。
+    if (!decl.type && !diag_.hasErrors()
+        && dynamic_cast<const NoneSemType*>(inferredType.get())) {
+        error(decl, "cannot bind 'None' return value to a variable; use a union annotation like 'int | None'");
     }
     Symbol sym;
     sym.kind = SymKind::Variable;

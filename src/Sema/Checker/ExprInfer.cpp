@@ -313,17 +313,49 @@ std::unique_ptr<SemType> SemAnalyzer::inferNamedRecordExpr(const RecordExpr& e,
             error(e, "undefined type '" + e.typeName + "'");
         return ErrorSemType::make();
     }
-    // b) 泛型拦截：v1 不支持 `Box<Point>{..}`（Parser 侧 `<` 到不了 `{`；裸 Box 无
-    // typeArgs 走此干净报错，与「类型名当值」拦截互补）
-    if (!sym->typeParams.empty()) {
+    // b) 泛型拦截/物化（bug-51 四象限：typeParams 空+args 非空 → expects 0 报错；
+    // typeParams 非空+args 空 → requires 保留（裸 Box 无 typeArgs 的干净报错）；
+    // typeParams 非空+args 非空 → arity 校验 + resolveType 物化）
+    if (sym->typeParams.empty() && !e.typeArgs.empty()) {
+        error(e, "type '" + e.typeName + "' expects 0 type argument(s), got "
+              + std::to_string(e.typeArgs.size()));
+        return ErrorSemType::make();
+    }
+    if (!sym->typeParams.empty() && e.typeArgs.empty()) {
         error(e, "generic type '" + e.typeName + "' requires type arguments");
         return ErrorSemType::make();
     }
-    // c) sym->type 必须 RecordSemType（声明侧已写 canonicalName）
-    auto* rec = dynamic_cast<const RecordSemType*>(sym->type.get());
-    if (!rec) {
-        error(e, "'" + e.typeName + "' is not a record type");
-        return ErrorSemType::make();
+    // c) sym->type 必须 RecordSemType（声明侧已写 canonicalName）；typeArgs 形态走
+    // resolveType 物化（与类型标注 `let b: Box<int>` 同链：applyTypeArgs +
+    // materializeCanonicalName），产出 RecordSemType{canonicalName="Box<int32_t>",
+    // 字段=具体类型}——rec 现为具体物化副本，下方 (d) 字段校验 / (e) 字段反推 /
+    // (f) typeStore push rec->clone + propagateCanonicalName 均基于实例化后字段类型。
+    const RecordSemType* rec = nullptr;
+    std::unique_ptr<SemType> materialized;   // typeArgs 路径保活（rec 指向其内部）
+    if (!e.typeArgs.empty()) {
+        if (e.typeArgs.size() != sym->typeParams.size()) {
+            error(e, "type '" + e.typeName + "' expects "
+                  + std::to_string(sym->typeParams.size())
+                  + " type argument(s), got " + std::to_string(e.typeArgs.size()));
+            return ErrorSemType::make();
+        }
+        NamedType nt;
+        nt.name = e.typeName; nt.line = e.line; nt.col = e.col;
+        for (auto& ta : e.typeArgs)
+            nt.typeArgs.emplace_back(std::unique_ptr<TypeExpr>(
+                static_cast<TypeExpr*>(ta->clone().release())));
+        materialized = resolveType(nt);
+        rec = dynamic_cast<const RecordSemType*>(materialized.get());
+        if (!rec) {
+            error(e, "'" + e.typeName + "' is not a record type");
+            return ErrorSemType::make();
+        }
+    } else {
+        rec = dynamic_cast<const RecordSemType*>(sym->type.get());
+        if (!rec) {
+            error(e, "'" + e.typeName + "' is not a record type");
+            return ErrorSemType::make();
+        }
     }
     // d) 字段校验：未知 / 重复 / 缺失（一次收集完；任一错误即不继续推断，避免级联）
     bool fieldError = false;
@@ -432,6 +464,11 @@ std::unique_ptr<SemType> SemAnalyzer::inferBinaryExpr(const BinaryExpr& e) {
         auto* ltRec = dynamic_cast<const RecordSemType*>(lt.get());
         auto* rtRec = dynamic_cast<const RecordSemType*>(rt.get());
         if (ltRec && rtRec) {
+            // bug-17 后：canonicalName 两生产路径（materializeCanonicalName /
+            // substitute）形态统一（record 实参/内置堆泛型实参均带 *），故
+            // substitute×materialize 混合来源的比较由「恒不等」翻转为「相等」——
+            // 行为改善（修复潜在的不一致比较误判）；依赖「不等」的既有测试已由
+            // used 全量回归确认。
             if (ltRec->canonicalName == rtRec->canonicalName) {
                 auto it = recordImplIfaces_.find(ltRec->canonicalName);
                 bool hasCmp = it != recordImplIfaces_.end()

@@ -198,6 +198,24 @@ std::unique_ptr<ASTNode> Parser::parseCall() {
         consume(TokType::RParen, "expected ')' after arguments");
     };
 
+    // bug-51：record 字面量体 `{ field = val, ... }` 解析——具名 record（LBrace 分支）
+    // 与显式类型实参形态（`Box<int> { ... }` 新分支）共用，从既有 LBrace 分支内联循环
+    // 抽出（行为不变去重）。调用方已确认 peek() 是 '{'。
+    auto parseRecordLiteralBody = [this](RecordExpr* rec) {
+        advance(); // {
+        if (!check(TokType::RBrace)) {
+            do {
+                RecordField f;
+                auto& nameTok = consume(TokType::Identifier, "expected field name");
+                f.name = nameTok.lexeme;
+                consume(TokType::Assign, "expected '=' in record field");
+                f.value = parseExpr();
+                rec->fields.push_back(std::move(f));
+            } while (match(TokType::Comma));
+        }
+        consume(TokType::RBrace, "expected '}' after record literal");
+    };
+
     while (true) {
         if (check(TokType::LParen)) {
             auto call = std::make_unique<CallExpr>();
@@ -223,6 +241,23 @@ std::unique_ptr<ASTNode> Parser::parseCall() {
             // lookahead 已确认 '>' 后紧跟 '(' → 实参解析与普通调用共用
             parseCallArgs(call.get());
             expr = std::move(call);
+        } else if (dynamic_cast<Identifier*>(expr.get()) && check(TokType::Less)
+                   && lookaheadTypeArgsBeforeRecord()) {
+            // bug-51：`Box<int> { value = 7 }`——`>` 后跟 `{` 的 record 字面量形态
+            //（N2 的 lookaheadTypeArgsBeforeCall 只认 `>` 后 `(`，此处按 record 字面量
+            // 解析：typeName + typeArgs + body）。
+            auto rec = std::make_unique<RecordExpr>();
+            setNodePos(rec.get(), peek());
+            rec->typeName = static_cast<Identifier*>(expr.get())->name;
+            advance(); // <
+            do {
+                rec->typeArgs.push_back(parseType());
+            } while (match(TokType::Comma));
+            consume(TokType::Greater, "expected '>' after type arguments");
+            parseRecordLiteralBody(rec.get());
+            expr = std::move(rec);
+            // 循环继续：支持 Box<int>{...}.x / take(Box<int>{...}) 等后缀（与 Point{x=1}.x 同构）
+            continue;
         } else if (match(TokType::Dot)) {
             auto& memberTok = consume(TokType::Identifier, "expected member name after '.'");
 
@@ -271,18 +306,7 @@ std::unique_ptr<ASTNode> Parser::parseCall() {
                         auto rec = std::make_unique<RecordExpr>();
                         setNodePos(rec.get(), peek());
                         rec->typeName = id->name;
-                        advance(); // {
-                        if (!check(TokType::RBrace)) {
-                            do {
-                                RecordField f;
-                                auto& nameTok = consume(TokType::Identifier, "expected field name");
-                                f.name = nameTok.lexeme;
-                                consume(TokType::Assign, "expected '=' in record field");
-                                f.value = parseExpr();
-                                rec->fields.push_back(std::move(f));
-                            } while (match(TokType::Comma));
-                        }
-                        consume(TokType::RBrace, "expected '}' after record literal");
+                        parseRecordLiteralBody(rec.get());
                         expr = std::move(rec);
                         // 循环继续：天然支持 Point{x=1}.x / take(Point{x=1}) 等后缀
                         continue;
@@ -474,6 +498,32 @@ bool Parser::lookaheadTypeArgsBeforeCall() {
         if (tokens_[i].type == TokType::Greater) {
             ++i;
             return i < tokens_.size() && tokens_[i].type == TokType::LParen;
+        }
+        if (tokens_[i].type == TokType::Comma) { ++i; continue; }
+        return false;
+    }
+    return false;
+}
+
+bool Parser::lookaheadTypeArgsBeforeRecord() {
+    // bug-51：`Box<int> { value = 7 }` record 字面量形态（N2 的 lookaheadTypeArgsBeforeCall
+    // 只认 `>` 后 `(`）。调用方已确认 peek() 是 '<'（currentIdx_ 指向 '<'）。跳过 '<'
+    // 后逐个类型实参，必须以 '>' 收尾且紧跟 `{ Ident =` / `{}` 才判定为 record 字面量
+    // 显式类型实参；任何其他 token 都判定为比较运算（交给 parseComparison）。语句头
+    // 抑制下恒 false（`{` 属语句体，与既有具名 record 分支判据一致）。
+    if (suppressNamedRecordLiteral_) return false;
+    size_t i = currentIdx_ + 1;  // 跳过 '<'
+    while (i < tokens_.size()) {
+        if (!skipTypeTokens(i)) return false;
+        if (i >= tokens_.size()) return false;
+        if (tokens_[i].type == TokType::Greater) {
+            ++i;
+            if (i >= tokens_.size() || tokens_[i].type != TokType::LBrace) return false;
+            if (i + 1 < tokens_.size() && tokens_[i + 1].type == TokType::RBrace) return true;
+            if (i + 2 < tokens_.size()
+                && tokens_[i + 1].type == TokType::Identifier
+                && tokens_[i + 2].type == TokType::Assign) return true;
+            return false;
         }
         if (tokens_[i].type == TokType::Comma) { ++i; continue; }
         return false;

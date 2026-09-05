@@ -33,6 +33,25 @@ bool SemAnalyzer::unionVariantGcUnsafe(const SemType& t) {
 }
 
 // ============================================================
+// 变体能否安全存入 aura_rt::Variant<T...> storage_（P3b 收窄后的声明期 P0 判定，
+// 2026-09-05 bug-65 从 TypeResolver.cpp 匿名 static 提升为公共成员——P3c
+// （substitute 泛型实例化二次检查，GenericSubstitution.cpp）须与声明期 P0 复用
+// 同一判定，避免泛型/非泛型形态行为分叉）：
+// 仅 function（std::function 值对象非指针，descForI 不可追踪）、嵌套 union
+// （未扁平化）不可存；其余含堆变体（string/record/list/optional/接口视图）已由
+// aura_rt::Variant 支持——descForI 按 is_pointer_v 扫描激活变体指针、
+// is_iface_view_v 按 self 子偏移扫描 + ViewRoot 保护（variant.h L57-74）。
+// ============================================================
+bool SemAnalyzer::variantStorageUnsafe(const SemType& t) {
+    if (dynamic_cast<const FuncSemType*>(&t))     return true;
+    if (dynamic_cast<const UnionSemType*>(&t))    return true;
+    // 内置 Iterator（GenericSemType "Iterator"）联合变体：P0.4 起编译期拦截；
+    // B+W 值视图化后 descForI is_iface_view_v 子偏移 + 装箱/match ViewRoot 保护
+    // 已使其 GC 安全（2026-08-10 评估放开，见 plan/评估放开内置Iterator联合变体拦截实施方案.md）。
+    return false;
+}
+
+// ============================================================
 // 辅助：遍历 TypeExpr 树，对每个泛型类型引用回调 fn(name)
 // （统一 collectGenericRefs / registerGenericParams 的 6 分支遍历）
 // ============================================================

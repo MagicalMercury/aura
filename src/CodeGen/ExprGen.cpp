@@ -2,6 +2,7 @@
 #include "../Sema/BuiltinRegistry.h"
 #include "../Sema/SemType.h"
 #include <cctype>
+#include <functional>
 #include <sstream>
 
 namespace Aura {
@@ -53,6 +54,32 @@ bool CodeGenerator::isHeapSemType(const SemType* type) const {
         return false;
     }
     return true;
+}
+
+// 未绑定泛型判定：GenericSemType 且 resolvedName 空（未实例化的模板参数，如泛型
+// 方法/函数体内的 T）。此类类型实例化前无法静态判断是否为 GC 指针——T 可实例化
+// 为 int/float 等值类型，也可实例化为 record/GcString*/Optional*/Variant* 等继承
+// GcObject 的堆类型。若按 isHeapSemType 默认堆直接包装，会生成 GcRootHandle<int>
+// 假根（GC mark 扫描读 int 当根指针 → 0xC0000005），故必须延迟到 C++ 编译期判定
+// （方案 A：if constexpr，仿 runtime\gc\gc.h:716-725 gc_write_barrier_generic 与
+// src\CodeGen\ExprAccess.cpp 字段赋值写屏障未绑定泛型分支的既有先例）。
+bool CodeGenerator::isUnboundGenericSemType(const SemType* type) {
+    if (auto* g = dynamic_cast<const GenericSemType*>(type))
+        return g->resolvedName.empty() && g->name != "Iterator";
+    return false;
+}
+
+bool CodeGenerator::isDeferredGcRoot(const SemType* t) const {
+    return isHeapSemType(t) && !isIfaceView(t) && isUnboundGenericSemType(t);
+}
+
+bool CodeGenerator::listContainsUnboundGeneric(const ListSemType* ls) {
+    if (!ls || !ls->elementType) return false;
+    if (auto* g = dynamic_cast<const GenericSemType*>(ls->elementType.get()))
+        return g->resolvedName.empty() && g->name != "Iterator";
+    if (auto* inner = dynamic_cast<const ListSemType*>(ls->elementType.get()))
+        return listContainsUnboundGeneric(inner);
+    return false;
 }
 
 // P1：视图类型判定（值视图 { 函数指针, self }，非 GC 堆对象）
@@ -148,8 +175,17 @@ std::string CodeGenerator::genNoneLiteral() {
 
 std::string CodeGenerator::genIdentifier(const Identifier& e) {
     // 方法/构造函数体内的接收者名（如 self, p）映射为 C++ 的 this
-    if (!currentReceiverName_.empty() && e.name == currentReceiverName_)
+    if (!currentReceiverName_.empty() && e.name == currentReceiverName_) {
+        // bug-24：闭包体引用 receiver → 经闭包句柄 "_this_root.get()" 解引用
+        //（#56 统一后协程/非协程闭包均句柄捕获，此分支恒先于方法体分支）
+        if (!currentClosureThisHandle_.empty())
+            return currentClosureThisHandle_ + ".get()";
+        // #56：方法体直引 self → 入口句柄 "_this.get()"（GC 后取最新地址）。
+        // 不设句柄的上下文（接口默认方法）保持 "this"（视图 this 值语义，预存在行为）
+        if (!currentMethodThisHandle_.empty())
+            return currentMethodThisHandle_ + ".get()";
         return "this";
+    }
 
     std::string name = safeName(e.name);
 
@@ -165,6 +201,20 @@ std::string CodeGenerator::genIdentifier(const Identifier& e) {
     }
 
     return name;
+}
+
+std::string CodeGenerator::receiverThisSourceExpr() const {
+    // 闭包体/spawn 体上下文：裸 this 不可见（lambda 只 init-capture 句柄），
+    // 取外层闭包/物化句柄的最新地址作为内层句柄的源值
+    if (!currentClosureThisHandle_.empty())
+        return currentClosureThisHandle_ + ".get()";
+    // 方法体直引：裸 this 可能已因方法体内前置 GC compact 悬垂（#56 主修复动机），
+    // 取方法入口句柄（GC 会更新其内部值）为源——顺带消除「spawn/闭包定义前已 GC」
+    // 的捕获悬垂隐患
+    if (!currentMethodThisHandle_.empty())
+        return currentMethodThisHandle_ + ".get()";
+    // 无句柄上下文（接口默认方法 / 视图 this）：C++ 成员函数内 this 直接可见
+    return "this";
 }
 
 // ============================================================
@@ -276,6 +326,17 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
         }
     }
 
+    // #55/#29：递归计算列表元素 C++ 类型串（未绑定泛型 → 裸名，模板上下文合法），
+    // 供嵌套泛型列表（[[T]]）的元素类型推导使用
+    std::function<std::string(const SemType*)> listElemCppOf;
+    listElemCppOf = [&](const SemType* t) -> std::string {
+        if (auto* ls = dynamic_cast<const ListSemType*>(t))
+            return "aura_rt::Array<" + listElemCppOf(ls->elementType.get()) + ">*";
+        if (auto* g = dynamic_cast<const GenericSemType*>(t))
+            return g->name;
+        return mapSemType(*t);
+    };
+
     // 从第一个元素推断列表元素类型
     std::string elemType = "int32_t";  // 默认 int
 
@@ -288,7 +349,24 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
             std::string semElemType = !listElemCpp.empty()
                 ? "aura_rt::Optional<" + listElemCpp + ">*"
                 : mapSemType(*listTy->elementType);
-            // 无效时（GenericSemType → "auto"），回退到第一个元素的 inferredType
+            // #55/#29：元素为未绑定泛型（T）或嵌套泛型列表（[[T]]）→ mapSemType 产
+            // "auto"/"Array<auto>*" 不可用。改用泛型名（模板上下文合法）：IIFE 返回
+            // Array<T>*，append(T 值)，T=string 实例化即 Array<GcString*>*（不再默认
+            // int32_t 兜底坏 C++）；与 #29 元素 if constexpr 保护兼容。
+            // 审查后修正（问题 B）：嵌套 [[T]] 时 mapSemType 产 "Array<auto>*"
+            // （含 auto 但不等于 "auto"）→ 精确匹配漏判 → IIFE 返回 Array<int32_t>*
+            // 坏 C++。改为包含判定；内部回退逻辑不变。G4 拦截（下方 find("auto")
+            // 报错分支）仍会拦截残留 "Array<auto>*"。
+            if (semElemType.find("auto") != std::string::npos) {
+                if (auto* g = dynamic_cast<const GenericSemType*>(listTy->elementType.get())) {
+                    if (g->name != "Iterator") semElemType = g->name;
+                } else if (auto* ls2 = dynamic_cast<const ListSemType*>(listTy->elementType.get())) {
+                    if (listContainsUnboundGeneric(ls2))
+                        semElemType = "aura_rt::Array<"
+                            + listElemCppOf(ls2->elementType.get()) + ">*";
+                }
+            }
+            // 无效时回退到第一个元素的 inferredType（现状保留）
             if (semElemType == "auto" && e.elements.size() > 0 && e.elements[0]) {
                 if (auto* rs = dynamic_cast<const RecordSemType*>(e.elements[0]->inferredType)) {
                     if (!rs->canonicalName.empty())
@@ -368,12 +446,25 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
         // 子偏移（mark+compact）与保守栈扫描保护
         bool isHeap = e.elements[i] && (!listElemCpp.empty()
             || (!elemIsIfaceView && isHeapSemType(e.elements[i]->inferredType)));
+        // #29：元素为未绑定泛型（isHeap 判 true 但类型是裸 T）→ if constexpr 延迟判定：
+        // T=值类型 → is_convertible false → 不包装（消除 GcRootHandle<int> 假根）；
+        // T=堆（record/GcString*/Optional*/Variant* 继承 GcObject）→ 仍保护（不漏保护）。
+        bool deferred = isHeap && e.elements[i]
+            && isDeferredGcRoot(e.elements[i]->inferredType);
         std::string vi = "_e" + std::to_string(idx) + "_" + std::to_string(i);
         oss << "    auto " << vi << " = (" << elemExprs[i] << ");\n";
-        if (isHeap) {
+        if (isHeap && !deferred) {
             oss << "    aura_rt::GcRootHandle<decltype(" << vi << ")> _eh"
                 << idx << "_" << i << "(" << vi << ");\n";
             oss << "    " << var << ".get()->append(_eh" << idx << "_" << i << ".get());\n";
+        } else if (deferred) {
+            std::string hi = "_eh" + std::to_string(idx) + "_" + std::to_string(i);
+            oss << "    if constexpr (std::is_convertible_v<decltype(" << vi << "), aura_rt::GcObject*>) {\n";
+            oss << "        aura_rt::GcRootHandle<decltype(" << vi << ")> " << hi << "(" << vi << ");\n";
+            oss << "        " << var << ".get()->append(" << hi << ".get());\n";
+            oss << "    } else {\n";
+            oss << "        " << var << ".get()->append(" << vi << ");\n";
+            oss << "    }\n";
         } else {
             oss << "    " << var << ".get()->append(" << vi << ");\n";
         }
@@ -425,12 +516,28 @@ std::string CodeGenerator::genRecordExpr(const RecordExpr& e, bool isCoroutine) 
             bool isViewField = false;
             std::string fval = f.value
                 ? genRecordFieldValue(e.inferredType, *f.value, f.name, isCoroutine, &isViewField) : "???";
-            if (f.value && isHeapSemType(f.value->inferredType) && !isViewField) {
+            bool isHeapF = f.value && isHeapSemType(f.value->inferredType) && !isViewField;
+            bool deferredF = isHeapF && f.value && isDeferredGcRoot(f.value->inferredType);
+            if (isHeapF && !deferredF) {
                 oss << "    auto _fv_" << safeName(f.name) << " = (" << fval << ");\n";
                 oss << "    aura_rt::GcRootHandle<decltype(_fv_" << safeName(f.name)
                     << ")> _fh_" << safeName(f.name) << "(_fv_" << safeName(f.name) << ");\n";
                 oss << "    " << var << ".get()->" << safeName(f.name)
                     << " = _fh_" << safeName(f.name) << ".get();\n";
+            } else if (deferredF) {
+                std::string fv = "_fv_" + safeName(f.name);
+                std::string fh = "_fh_" + safeName(f.name);
+                oss << "    auto " << fv << " = (" << fval << ");\n";
+                oss << "    if constexpr (std::is_convertible_v<decltype(" << fv
+                    << "), aura_rt::GcObject*>) {\n";
+                oss << "        aura_rt::GcRootHandle<decltype(" << fv << ")> " << fh
+                    << "(" << fv << ");\n";
+                oss << "        " << var << ".get()->" << safeName(f.name)
+                    << " = " << fh << ".get();\n";
+                oss << "    } else {\n";
+                oss << "        " << var << ".get()->" << safeName(f.name)
+                    << " = " << fv << ";\n";
+                oss << "    }\n";
             } else {
                 oss << "    " << var << ".get()->" << safeName(f.name)
                     << " = " << fval << ";\n";

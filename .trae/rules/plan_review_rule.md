@@ -9,7 +9,7 @@ description: 在审查 plan 文件时，必须执行以下规则：
 
 # Plan 文件审查规则（Plan Review Rule）
 
-> 适用对象：`plan/` 文件夹下的所有草案文件（含 `change.md` 合并实施文档）
+> 适用对象：`plan/`和`issues/` 文件夹下的所有草案文件（含 `change.md` 合并实施文档）
 > 触发时机：任何 plan 文件进入“待审查”状态时，必须执行本规则
 
 ## 1. 审查流程总览

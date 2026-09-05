@@ -230,10 +230,10 @@ std::string CodeGenerator::instantiateMethodParamCpp(
         if (containsBareToken(paramCpp, n)) { hasBare = true; break; }
     if (!hasBare) return paramCpp;
     // 从 recvTypeKey canonicalName 提取 <...> 实参（首 '<' 定位，末 '>' 定位兼容嵌套）。
-    // 注意：canonicalName 的 record 实参为 Aura 名（无 '*'，如 "Box<Point>" 的 "Point"，
-    // 由 materializeCanonicalName 的 cppNameOfTypeExpr 顶层不补 '*' 所致），须补 C++
-    // 堆指针 '*'（"Point" → "Point*"）才能正确拼进形参 C++ 类型；嵌套泛型实参
-    // （"Pair<Point*, Point*>*"）已是 C++ 形态（cppNameOfTypeExpr 递归补 '*'）跳过。
+    // bug-17 后：canonicalName 的 record 实参已统一带 C++ 堆指针 '*'（"Box<Point*>"
+    // 的 "Point*"，materializeCanonicalName 现经 semTypeToCppName 补 *），故下方
+    // find_first_of("<>*:,") 命中 '*' → 跳过补 *（防双重）；本分支仅作防御保留——
+    // 任何仍无 * 的裸 record 名（理论残留路径）补 * 兜底。
     size_t lt = recvTypeKey.find('<');
     if (lt == std::string::npos) return paramCpp;
     size_t rt = recvTypeKey.rfind('>');
@@ -444,6 +444,14 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
     // G3：被 record→view / XFunc 转换的实参 idx → 视图类型标记（genGcRootedArgs
     // 据此走视图值分支，不生成 GcRootHandle<视图> 坏根；见 makeIfaceViewMarker）
     std::map<size_t, std::unique_ptr<SemType>> viewArgTypes;
+    // #48：非 ctor 调用的泛型形参物化映射（{T:"int32_t"}）——A 遍 fnParamCppTypes_
+    // 预存的泛型形参 C++ 类型（如 "aura_rt::Optional<T>*"）在调用点（非模板作用域）
+    // 裸 T 未定义，装箱会生成 make_optional<T> 坏 C++；装箱前按实参物化为具体类型
+    //（与 bug-18 ctor 侧 instantiateCtorParamCpp 对称；非 ctor 无 targValues 值源，
+    // 只能从实参推断，故此处统一惰性收集一次）。
+    std::map<std::string, std::string> fnCallMat;
+    if (!isCtor && !calleeName.empty())
+        collectDefaultArgGenericMap(calleeName, e.args, fnCallMat);
     // 先收集实参（保持参数顺序：前面的实参 + 尾部的默认参数）
     for (size_t i = 0; i < e.args.size(); ++i) {
         std::string arg = genExpr(*e.args[i], isCoroutine);
@@ -525,8 +533,22 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
                 ? instantiateCtorParamCpp(calleeName, ppIt->second[i], targValues,
                                           e.args[i]->inferredType)
                 : ppIt->second[i];
-            std::string boxed = genParamBoxing(pCpp, *e.args[i], isCoroutine);
-            if (!boxed.empty()) arg = boxed;
+            // #48：非 ctor 泛型形参装箱前裸词物化替换（T → int32_t），否则
+            // make_optional<T> 泄漏坏 C++（bug-18 ctor 分支已由上方实例化处理）。
+            bool boxable = true;
+            if (!isCtor && !fnCallMat.empty()) {
+                for (auto& [g, cpp] : fnCallMat)
+                    if (containsBareToken(pCpp, g))
+                        pCpp = replaceBareToken(std::move(pCpp), g, cpp);
+                // 防御：替换后仍含 mat 键裸词（物化不全，如实参 inferredType 缺失）
+                // → 不装箱（该路径 Sema 已报 cannot infer，driver 不调 g++）
+                for (auto& [g, cpp] : fnCallMat)
+                    if (containsBareToken(pCpp, g)) { boxable = false; break; }
+            }
+            if (boxable) {
+                std::string boxed = genParamBoxing(pCpp, *e.args[i], isCoroutine);
+                if (!boxed.empty()) arg = boxed;
+            }
         }
         argExprs.push_back(arg);
     }

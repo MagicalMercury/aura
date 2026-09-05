@@ -81,6 +81,7 @@ void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
     h << tprefix << "struct " << name << " : aura_rt::GcObject {\n";
 
     std::vector<std::string> ptrFields;
+    std::vector<std::string> deferredPtrFields;   // #54：未绑定泛型字段（val: T），desc 延迟判定
     std::set<std::string> fieldNames;
 
     for (auto& f : body.fields) {
@@ -97,6 +98,16 @@ void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
             // 格式 "field+ViewType"，genTypeDescriptor 展开为
             // offsetof(Self, field) + offsetof(ViewType, self)
             ptrFields.push_back(safeName(f.name) + "+" + cppType);
+        } else if (std::find(tparams.begin(), tparams.end(), cppType) != tparams.end()) {
+            // #54：未绑定泛型字段（val: T / val: <T>）→ mapType 产物为裸名（genRecordStruct
+            // 上下文 ifaceTypeMap_/defaultArgMaterializedTypes_ 为空，mapType 对泛型字段
+            // 无论 NamedType 裸 T 还是 GenericTypeRef <T> 均返回裸名 T）。判定用
+            // 「cppType ∈ tparams」而非 dynamic_cast<GenericTypeRef*>——TypeParser.cpp:29-39
+            // 实证仅 `<T>` 语法产 GenericTypeRef，裸 T 是 NamedType，AST 判定恒 false。
+            // 此类字段实例化后可能是 GC 指针（string/record/列表）——desc 生成时必须
+            // if constexpr 延迟判定（per-instantiation），否则 Box<T>::_desc ptrFieldCount=0
+            // → GC mark 不追踪/compact 不更新 → 悬垂 0xC0000005。条目格式 "name|cppType"。
+            deferredPtrFields.push_back(safeName(f.name) + "|" + cppType);
         }
     }
 
@@ -133,7 +144,7 @@ void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
     h << "};\n\n";
 
     // 模板类型的 _desc 必须在头文件中实例化（跨模块链接需要）
-    genTypeDescriptor(tparams.empty() ? cpp : h, name, tparams, ptrFields);
+    genTypeDescriptor(tparams.empty() ? cpp : h, name, tparams, ptrFields, deferredPtrFields);
 }
 
 // ============================================================
@@ -223,6 +234,7 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
         if (m.defaultBody || m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge
             || ifaceMethodHasFreeGeneric(decl, m)) continue;
         std::string retType = m.returnType ? mapType(*m.returnType) : "void";
+        if (retType == "aura_rt::NoneType") retType = "void";   // #33：接口方法 None→void（对齐 genMethodDecl M1）
         h << "  " << retType << " (*" << m.name << "Fn)(aura_rt::GcObject* self";
         for (size_t i = 0; i < m.params.size(); ++i) {
             h << ", " << (m.params[i].type ? mapType(*m.params[i].type) : "auto");
@@ -236,6 +248,7 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
         if (m.bodyKind == InterfaceMethodSig::BodyKind::CppBridge
             || ifaceMethodHasFreeGeneric(decl, m)) continue;
         std::string retType = m.returnType ? mapType(*m.returnType) : "void";
+        if (retType == "aura_rt::NoneType") retType = "void";   // #33：接口方法 None→void（对齐 genMethodDecl M1）
         if (m.defaultBody) {
             // 默认方法：体内 Aura 代码（self.xxx(...)）经 genBlock 翻译为 this->xxx(...)
             h << "  " << retType << " " << m.name << "(";
@@ -276,6 +289,7 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
         && !ifaceMethodHasFreeGeneric(decl, decl.methods[0])) {
         auto& m = decl.methods[0];
         std::string retType = m.returnType ? mapType(*m.returnType) : "void";
+        if (retType == "aura_rt::NoneType") retType = "void";   // #33：接口方法 None→void（对齐 genMethodDecl M1）
         std::string params, argNames;
         for (size_t i = 0; i < m.params.size(); ++i) {
             if (i > 0) { params += ", "; argNames += ", "; }
@@ -425,7 +439,9 @@ void CodeGenerator::genIfaceAdapter(std::ostream& h,
             auto it = tmap.find(n->name);
             if (it != tmap.end()) return it->second;
         }
-        return t ? mapType(*t) : "auto";
+        std::string r = t ? mapType(*t) : "auto";
+        if (r == "aura_rt::NoneType") r = "void";   // #33：适配器签名 None→void（覆盖返回类型）
+        return r;
     };
     // 将 tmap 挂到全局类型映射上下文：mapType/mapGenericRef 递归代换泛型形参名，
     // 使容器/复合类型内嵌 T（Optional<T> / [T] / Iterator<T> / Transform<T> / Box2<T>）

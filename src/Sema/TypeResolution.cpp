@@ -292,8 +292,13 @@ void SemAnalyzer::materializeCanonicalName(
             if (dynamic_cast<const GenericTypeRef*>(n.typeArgs[i].get())) {
                 allConcrete = false; break;
             }
-            // 嵌套泛型参数递归展开（Tree<Tree<int>> 内层也完整拼接，修复丢 <int>）
-            fullName += cppNameOfTypeExpr(n.typeArgs[i].get());
+            // bug-17：实参统一走 semTypeToCppName(resolveType(...))——与 substitute
+            // 实例化路径（GenericSubstitution.cpp:95 semTypeToCppName 补 *）及 CodeGen
+            // mapType（递归补 *）三方对齐。cppNameOfTypeExpr 对 record 实参（Rec5）不补
+            // *、对内置堆泛型实参（Optional<int>）剥 * 不补回 → 物化 canonicalName
+            // 缺 * 与声明侧 Box2<Rec5*>* / Box2<Optional<int>*>* 不一致 → 坏 C++。
+            // resolveType 递归解析嵌套泛型（Tree<Tree<int>> 内层也完整拼接），逐层正确。
+            fullName += semTypeToCppName(*resolveType(*n.typeArgs[i]));
         }
         fullName += ">";
         if (allConcrete) {
@@ -317,7 +322,8 @@ void SemAnalyzer::materializeCanonicalName(
         base = ti->cppType;
         if (!base.empty() && base.back() == '*') base.pop_back();
     }
-    // 模板参数统一走 cppNameOfTypeExpr 递归展开：
+    // 模板参数统一走 semTypeToCppName(resolveType(...)) 递归展开（bug-17，同
+    // RecordSemType 分支）：实参为 record/内置堆泛型时补 *，与声明侧 mapType 一致
     //   - 嵌套泛型（Optional<Iterator<int>>）逐层拼接，修复丢内层参数 + 旧 * 后缀
     //   - ListType（Optional<[int]>）→ aura_rt::Array<E>*
     //   - 泛型形参（T）保留裸名
@@ -325,7 +331,7 @@ void SemAnalyzer::materializeCanonicalName(
     fullName.reserve(fullName.size() + n.typeArgs.size() * 16);
     for (size_t i = 0; i < n.typeArgs.size(); ++i) {
         if (i > 0) fullName += ", ";
-        fullName += cppNameOfTypeExpr(n.typeArgs[i].get());
+        fullName += semTypeToCppName(*resolveType(*n.typeArgs[i]));
     }
     fullName += ">";
     gs->resolvedName = fullName;

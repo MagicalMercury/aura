@@ -72,17 +72,16 @@ TEST(SemaGenerics, GenericMethod) {
 
 TEST(SemaGenerics, GenericConstructorTypeInference) {
     // 泛型构造函数：标注类型后 T 应推断为 int
-    // 注：当前实现下 Stack() 返回 { items: [<T>] }，与 Stack<int> 不等价，
-    //     记录当前行为（见 test_generic_ctor_limitation）
+    // 注：零参 ctor（形参不含 T）genericMap 空，但 bug-50 修复后 let 标注 expected
+    //     反哺 genericMap（Box<int> → T=int）→ 返回类型代换为 Stack<int32_t> 与标注
+    //     匹配 → 不再报 type mismatch（修复前：返回 { items: [<T>] } 未代换 → mismatch）
     Aura::DiagnosticEngine diag;
     analyzeSource(
         "type Stack<T> = { items: [T] }"
         " fun (self Stack<T>) Stack() { self.items = [] }"
         " fun main(io: Io) { let s: Stack<int> = Stack() }",
         diag);
-    // 当前编译器对泛型构造函数返回类型不做实参代换 → 报类型不匹配
-    EXPECT_TRUE(diag.hasErrors());
-    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+    EXPECT_FALSE(diag.hasErrors());
 }
 
 // ============================================================
@@ -626,7 +625,12 @@ TEST(SemaGenerics, GenericCtorExplicitTypeArgsConflictError) {
 // 对照：纯 T / N2 显式实参 / 有标注 / 零参外层泛型栈均不误报。
 // ============================================================
 TEST(SemaGenerics, GenericCtorUnionParamUnboundError) {
-    // Union(T|int) 形参 + Box(9)（无标注）→ 变体泛型 T 未绑定 → 干净报错 cannot infer
+    // Union(T|int) 形参 + ctor 体 self.val = init（val: T 裸字段）+ Box(9)（无标注）
+    // → #42/#53（2026-09-04 批次 13）语义纠正：Union 赋裸 T 字段在任意实例化下恒非法
+    // （Aura 无隐式 Union 解包）→ isAssignable 窄拦截（Assignability.cpp）在 ctor 定义
+    // 期即报 assignment type mismatch（先于调用点 cannot infer，错误更早更准）。
+    // 修复前该形态泄漏坏 C++（v_n2_union2 域）或报 cannot infer（无 body 赋值时，
+    // 见 GenericCtorUnionUnboundEmptyBodyError——bug-19 路径保留）。
     Aura::DiagnosticEngine diag;
     analyzeSource(
         " type Box<T> = { val: T }"
@@ -635,7 +639,51 @@ TEST(SemaGenerics, GenericCtorUnionParamUnboundError) {
         "   let b = Box(9)"
         " }",
         diag);
+    EXPECT_TRUE(hasErrorContaining(diag, "assignment type mismatch"));
+}
+
+TEST(SemaGenerics, GenericCtorUnionUnboundEmptyBodyError) {
+    // bug-19 路径保留：Union(T|int) 形参 + 空 ctor 体 + Box(9)（无标注）→
+    // ctor 体无赋值错误可报 → 调用点变体泛型 T 未绑定 → cannot infer 干净报错
+    //（与 GenericCtorUnionRecordUnboundError 同源，标量实参形态）。
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: T | int) {}"
+        " fun main(io: Io) throws {"
+        "   let b = Box(9)"
+        " }",
+        diag);
     EXPECT_TRUE(hasErrorContaining(diag, "cannot infer type parameter(s) 'T' of constructor for record 'Box'"));
+}
+
+TEST(SemaGenerics, GenericCtorOptionalBodyAssignTypeMismatchError) {
+    // bug-53：#53 主线——Optional<T> 形参（物化装箱指针）赋裸 T 值字段，任意实例化
+    // 恒非法（Aura 无隐式解箱）→ isAssignable 窄拦截 → 干净报错（修复前坏 C++）。
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(init: Optional<T>) { self.val = init }"
+        " fun main(io: Io) throws {"
+        "   let b: Box<int> = Box(9)"
+        " }",
+        diag);
+    EXPECT_TRUE(hasErrorContaining(diag, "assignment type mismatch"));
+}
+
+TEST(SemaGenerics, GenericCtorUnionToUnionFieldNoError) {
+    // #42 合法形态：val: int|T（Union 字段）← init: int|T（Union 形参）同型赋值
+    // → 不落入窄拦截（target 非裸 T）→ Sema 放行（codegen 装箱见
+    // CodeGen.UnionCtorUnionFieldBoxedNoBareT）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " type Box<T> = { val: int | T }"
+        " fun (self Box<T>) Box(init: int | T) { self.val = init }"
+        " fun main(io: Io) throws {"
+        "   let b = Box<int>(9)"
+        " }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
 }
 
 TEST(SemaGenerics, GenericCtorUnionRecordUnboundError) {
@@ -653,8 +701,11 @@ TEST(SemaGenerics, GenericCtorUnionRecordUnboundError) {
 }
 
 TEST(SemaGenerics, GenericCtorUnionAnnotTypeMismatchError) {
-    // Union(T|int) + 有标注 Box<int>(9) → 有标注不进 cannot infer 判定；genericMap 空 →
-    // 返回未代换 → type mismatch（与 Optional 形态有标注一致，路径不变）
+    // Union(T|int) + 有标注 Box<int>(9)：Union 变体含 T 使 collectGenericMapping 不绑
+    // → genericMap 空，但 bug-50 修复后 let 标注 expected 反哺 genericMap（Box<int> →
+    // T=int）→ 返回类型代换 Box<int32_t> 与标注匹配 → 不再报 type mismatch
+    // （修复前：返回 { val: <T> } 未代换 → mismatch）；CodeGen 全链路（Union 装箱）由
+    // bug-42 落地，编译运行级见 _repro/generic_ctor_optional_infer/repro_ctor_union_annot
     Aura::DiagnosticEngine diag;
     analyzeSource(
         " type Box<T> = { val: T }"
@@ -663,8 +714,7 @@ TEST(SemaGenerics, GenericCtorUnionAnnotTypeMismatchError) {
         "   let b: Box<int> = Box(9)"
         " }",
         diag);
-    EXPECT_TRUE(diag.hasErrors());
-    EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
+    EXPECT_FALSE(diag.hasErrors());
 }
 
 TEST(SemaGenerics, GenericCtorUnionPureTControlNoError) {
@@ -871,4 +921,75 @@ TEST(SemaGenerics, OptionalGenericRecordSomeDeepMismatchError) {
         "     value = 1, children = [{ value = \"x\", children = [] }] })"
         " }", diag);
     EXPECT_TRUE(diag.hasErrors());
+}
+
+// ============================================================
+// bug-50：泛型 ctor 形参不含 T + let 标注 expected 反哺（CallInfer.cpp ctor 分支）
+// （2026-09-05 修复）：形参 Optional<Point>（与 receiver 泛型 T 无关）时 genericMap 空，
+// 标注 Box<int> 的 <int> 反哺 genericMap → applyGenericMap 代换返回类型 → 不再 type
+// mismatch。近邻 CtorOptionalParamInferAnnot（形参含 T + 实参 9）分工：本用例形参不含 T
+// + record 字面量实参。
+// ============================================================
+TEST(SemaGenerics, CtorNontypeParamAnnotRecordArg) {
+    // bug-50 主线：形参 Optional<Point>（不含 T）+ 标注 Box<int> + record 字面量实参
+    // → expected 反哺 genericMap[T]=int → 返回 Box<int32_t> 匹配 → no error
+    // （修复前：genericMap 空 → 返回 { val: <T> } → type mismatch）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        " type Point = { x: int, y: int }"
+        " type Box<T> = { val: T }"
+        " fun (self Box<T>) Box(o: Optional<Point>) { }"
+        " fun main(io: Io) { let b: Box<int> = Box({ x = 1, y = 2 }) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// bug-51：record 字面量显式类型实参（ExprInfer.cpp inferNamedRecordExpr 四象限）
+// （2026-09-05 修复）：`Box<int> { value = 7 }` → typeArgs 非空 + typeParams 非空 →
+// arity 校验 + resolveType(NamedType) 物化（canonicalName="Box<int32_t>"）。
+// 四象限：① typeParams 空+args 非空 → expects 0 报错；② typeParams 非空+args 空 →
+// requires（裸 Box）；③ 非空+非空 arity 错 → expects N 报错；④ 匹配 → 物化放行。
+// ============================================================
+TEST(SemaGenerics, GenericRecordLiteralTypeArgsOk) {
+    // 象限 ④：Box<int> { value = 7 } 物化放行
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { value: T }"
+        " fun main(io: Io) { let b = Box<int> { value = 7 } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaGenerics, NonGenericRecordLiteralTypeArgsError) {
+    // 象限 ①：非泛型 Point<int> { x = 1 } → 干净单错 expects 0 type argument(s)
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int }"
+        " fun main(io: Io) { let p = Point<int> { x = 1 } }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type 'Point' expects 0 type argument(s), got 1"));
+}
+
+TEST(SemaGenerics, GenericRecordLiteralTypeArgsArityError) {
+    // 象限 ③：M<int> { ... }（M 需 2 实参）→ arity 干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type M<A, B> = { a: A, b: B }"
+        " fun main(io: Io) { let m = M<int> { a = 1, b = 2 } }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "type 'M' expects 2 type argument(s), got 1"));
+}
+
+TEST(SemaGenerics, GenericRecordLiteralNoTypeArgsError) {
+    // 象限 ②：裸 Box { value = 7 }（无 typeArgs）→ requires type arguments（保留既有干净报错）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { value: T }"
+        " fun main(io: Io) { let b = Box { value = 7 } }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "generic type 'Box' requires type arguments"));
 }

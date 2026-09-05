@@ -14,6 +14,10 @@
 #include <cstdarg>  // va_list（appendFmt）
 #include <thread>
 #include <chrono>   // steady_clock（P3：GC 事件计时）
+#include <functional>  // bug-47 诊断：std::hash<thread::id>（非 Windows TID 回退）
+#ifdef _WIN32
+#include <windows.h>   // bug-47 诊断：GetCurrentThreadId（dump initiator 标识）
+#endif
 
 namespace aura_rt {
 
@@ -40,6 +44,12 @@ void GcHeap::writeBarrier(GcObject* parent, void* fieldAddr, GcObject* newVal) {
 // 安全点（多线程 STW）
 // ============================================================
 void GcHeap::safepoint() {
+    // bug-47 诊断心跳（纯观测，不参与协议）：任何线程到达本检查点即刷新时间戳。
+    // 超时 dump 时 last_safepoint 距今大 = 该线程长时间未到任何检查点（真凶）；
+    // 距今小 = 活跃（Marking 期早退路径也会经过此处）。位于 in_gc_internal_ 检查
+    // 之前——mark worker 恒不参与 STW，其心跳语义为"到过入口"，无害。
+    if (tl_roots_) tl_roots_->diag_last_safepoint = std::chrono::steady_clock::now();
+
     if (in_gc_internal_) return;  // P1：GC 内部线程（mark worker）不参与 STW/alloc
 
     // P2：并发标记协作（phase 分派优先于 gcPending_ 判定）
@@ -62,17 +72,31 @@ void GcHeap::safepoint() {
         uint64_t my_epoch = gc_epoch_.load();
         stopped_threads_++;
         all_stopped_cv_.notify_all();
+        if (tl_roots_) tl_roots_->diag_parked.store(true, std::memory_order_relaxed);  // bug-47 诊断
         while (gc_epoch_.load() == my_epoch &&
                phase_.load(std::memory_order_acquire) == GcPhase::Finalize) {
             // P2：兜底 50ms→5ms（notify 先于 wait 的竞态窗口：最坏 5ms；
             //     此处为无谓词 cv wait，中断不提前返回，缩短兜底即主改善）
             all_stopped_cv_.wait_for(lk, std::chrono::milliseconds(5));
+            // bug-47 诊断心跳：已停靠等待中——保持心跳新鲜，与"从未到达检查点"
+            // 的真凶区分（否则停靠线程 2s 等待后心跳陈旧被误标 SUSPECT）
+            if (tl_roots_) tl_roots_->diag_last_safepoint = std::chrono::steady_clock::now();
         }
+        if (tl_roots_) tl_roots_->diag_parked.store(false, std::memory_order_relaxed);  // bug-47 诊断
         return;
     }
 
     // Idle：现有逻辑
-    if (!gcPending_.load()) return;
+    // bug-47 修复：gc_in_progress_ 补入早退条件——并发 GC 的根扫描停靠段
+    // （startConcurrentGc → waitForRootThreadsStopped #1）期间 phase 仍为 Idle 且
+    // initiator 已在 safepoint() L178 清 gcPending_ → 旧条件下自由线程（空闲池
+    // worker 的 workerLoop gc_safepoint 等）在 L86 早退、永不停靠 → stopped 永差
+    // target 数 → 2s（实测 ~6.4s，Windows 定时器量子）ROOT STOP TIMEOUT abort。
+    // 补查 gc_in_progress_ 后：#1 期间到达的线程落入下方 else 分支正常停靠计数
+    //（else 分支 L246 双检 gc_in_progress_，GC 恰好完成的窗口安全返回）；
+    // Marking 期由上方 phase 检查先行放行（不受影响）；GC 完成后两标志皆
+    // false → 稳态零行为变化（仅多一次 atomic load）。
+    if (!gcPending_.load() && !gc_in_progress_.load()) return;
 
     // 关键：flush 本线程 TLAB 到全局
     // 必须在任何 GC 操作前执行，确保：
@@ -163,6 +187,7 @@ void GcHeap::safepoint() {
                             "[GC] *** STW DEADLOCK ***: %d/%d thread(s) cannot reach safepoint.\n",
                             static_cast<int>(threadCount) - 1 - stopped_threads_.load(),
                             static_cast<int>(threadCount) - 1);
+                        dumpThreadStates("STW DEADLOCK");   // bug-47 诊断：abort 前回答"差的是谁"
                         std::abort();
                     }
                     if (stalls % 4 == 0) {  // P2：每 20ms（4×5ms）重发中断 + 空闲唤醒
@@ -235,9 +260,13 @@ void GcHeap::safepoint() {
         uint64_t my_epoch = gc_epoch_.load();
         stopped_threads_++;
         all_stopped_cv_.notify_all();
+        if (tl_roots_) tl_roots_->diag_parked.store(true, std::memory_order_relaxed);  // bug-47 诊断
         while (gc_epoch_.load() == my_epoch) {
             all_stopped_cv_.wait_for(lk, std::chrono::milliseconds(5));
+            // bug-47 诊断心跳：已停靠等待中（同 Finalize 分支，防误标 SUSPECT）
+            if (tl_roots_) tl_roots_->diag_last_safepoint = std::chrono::steady_clock::now();
         }
+        if (tl_roots_) tl_roots_->diag_parked.store(false, std::memory_order_relaxed);  // bug-47 诊断
     }
 }
 
@@ -595,6 +624,60 @@ void GcHeap::broadcastInterrupt() {
 //       根扫描会遍历 → 若活跃则并发增删节点 → use-after-free。
 // 方案：以 threadRootLists_ 为准（精确反映"需停线程"），等 stopped 到位后二次确认
 //       size 稳定（等待期间新线程注册会 push_back → 重新等）。
+// bug-47 诊断：dump 全部线程状态（STW 超时 abort 前调用）。
+// 输出解读：
+//   - root[tid] last_safepoint=XXXms ago 大（>1000ms 标 <<<< SUSPECT）：
+//     该线程长时间未到达任何 safepoint 检查点 → 阻塞在无检查点的代码段
+//   - 全部线程心跳新鲜但 stopped 仍差数：线程到了 safepoint 却未计入停靠
+//     （状态机分支问题，如 phase 观察错序）
+//   - registered 与 rootLists 数量差：registered_threads_ 快照与懒分配
+//     root list 的差集（启动窗口新注册线程）
+void GcHeap::dumpThreadStates(const char* where) {
+    auto now = std::chrono::steady_clock::now();
+    size_t registered = 0;
+    {
+        std::lock_guard<std::mutex> lk(threads_m_);
+        registered = registered_threads_.size();
+    }
+    int phaseInt = static_cast<int>(phase_.load(std::memory_order_acquire));
+#ifdef _WIN32
+    unsigned selfTid = static_cast<unsigned>(GetCurrentThreadId());
+#else
+    unsigned selfTid = static_cast<unsigned>(
+        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+    std::fprintf(stderr,
+        "[GC][diag] === %s: phase=%d(0=Idle,1=Marking,2=Finalize) epoch=%llu "
+        "gcPending=%d registered=%zu stopped=%d initiator_tid=%u ===\n",
+        where, phaseInt,
+        static_cast<unsigned long long>(gc_epoch_.load()),
+        static_cast<int>(gcPending_.load()),
+        registered, stopped_threads_.load(), selfTid);
+    std::lock_guard<std::mutex> lk(threadRootLists_m_);
+    std::fprintf(stderr, "[GC][diag] rootLists=%zu\n", threadRootLists_.size());
+    size_t parkedCount = 0;
+    for (size_t i = 0; i < threadRootLists_.size(); ++i) {
+        auto* rl = threadRootLists_[i];
+        double sinceMs = std::chrono::duration<double, std::milli>(
+            now - rl->diag_last_safepoint).count();
+        bool parked = rl->diag_parked.load(std::memory_order_relaxed);
+        if (parked) parkedCount++;
+        size_t handleCount = 0;
+        for (GcRootHandleBase* n = rl->head; n; n = n->next_) handleCount++;
+        // SUSPECT 判据（第二轮）：未停靠（不在 else/Finalize 等待）且非 initiator
+        // ——心跳新鲜却未停靠 = 反复早退/循环别处；心跳陈旧未停靠 = 卡死无检查点
+        const char* tag = "";
+        if (!parked && rl->diag_tid != selfTid) {
+            tag = (sinceMs > 1000.0) ? "  <<<< SUSPECT(stuck)" : "  <<<< SUSPECT(cycling)";
+        }
+        std::fprintf(stderr,
+            "[GC][diag]   root[%zu] tid=%u parked=%d last_safepoint=%.1fms ago handles=%zu%s\n",
+            i, rl->diag_tid, static_cast<int>(parked), sinceMs, handleCount, tag);
+    }
+    std::fprintf(stderr, "[GC][diag] parked=%zu / rootLists=%zu (stopped=%d)\n",
+        parkedCount, threadRootLists_.size(), stopped_threads_.load());
+}
+
 void GcHeap::waitForRootThreadsStopped() {
     for (;;) {
         // 二次审查修正（退出时序）：shutdown_ 早退——gcThread_ 若已进入本函数且进程退出
@@ -621,6 +704,7 @@ void GcHeap::waitForRootThreadsStopped() {
                         std::fprintf(stderr,
                             "[GC] *** ROOT STOP TIMEOUT *** stopped=%d target=%d interrupts=%u\n",
                             stopped, target - 1, interruptSentCount_.load());
+                        dumpThreadStates("ROOT STOP TIMEOUT");   // bug-47 诊断：abort 前回答"差的是谁"
                         std::abort();
                     }
                     if (stalls % 4 == 0) {  // P2：每 20ms（4×5ms）重发中断 + 空闲唤醒

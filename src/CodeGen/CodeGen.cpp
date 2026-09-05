@@ -355,8 +355,24 @@ void CodeGenerator::indent(std::ostream& os) {
 void CodeGenerator::dedent(std::ostream&) { /* no-op */ }
 
 void CodeGenerator::writeLine(std::ostream& os, const std::string& line) {
+    // #31：语句写出前先落盘待写 outer 前缀（保证 auto _aX_Y 声明先于引用它的语句）。
+    // C++ 参数求值先序于函数体：调用 writeLine(genExpr(...)) 时实参 genExpr 先执行
+    //（outer 进缓冲）→ 进入函数体 flush 先落盘 → 语句后输出——机制性保证顺序。
+    flushHoistPrefix(os);
     indent(os);
     os << line << '\n';
+}
+
+void CodeGenerator::flushHoistPrefix(std::ostream& os) {
+    if (hoistPrefixPending_.empty()) return;
+    // 逐行补缩进落盘（outer 语句生成时未带 indent，保持与函数体缩进风格一致）
+    std::istringstream iss(hoistPrefixPending_);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (!line.empty()) indent(os);
+        os << line << '\n';
+    }
+    hoistPrefixPending_.clear();
 }
 
 std::string CodeGenerator::indentStr() const {

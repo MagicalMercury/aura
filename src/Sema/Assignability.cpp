@@ -8,14 +8,26 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
     if (dynamic_cast<const ErrorSemType*>(&target) || dynamic_cast<const ErrorSemType*>(&source))
         return true;
 
-    // 泛型形参（未解析，resolvedName 为空，如泛型函数体内的 T）接受一切（实例化时再检查）
+    // 泛型形参（未解析，resolvedName 为空，如泛型函数体内的 T）——模板体/构造体内
+    // 字段类型为未绑定 T，实例化时再检查；但容器型 source（Optional/物化 Optional<T>/
+    // Union）在任意实例化下均 ≠ T（Aura 无隐式解箱/解包）→ 恒非法，直接拒绝，
+    // 防泄漏坏 C++（原无条件放行吞掉错配，#42/#53，见下方 gt->resolvedName.empty() 分支）
     // 已解析的泛型类型（如 Iterator<string>）与同为泛型的 source 必须精确比较
     // （P0.5：equals 比较 resolvedName，防止 Iterator<int> ≡ Iterator<string> 混淆）；
     // source 为结构化推断类型（如 some() 的 OptionalSemType）时保持旧放行语义——
     // 类型标注 Optional<int> 物化为 GenericSemType 而工厂推断为 OptionalSemType，
     // 二者同义，直接比较会误报（历史表示不一致，不在本次修复范围）
     if (auto* gt = dynamic_cast<const GenericSemType*>(&target)) {
-        if (gt->resolvedName.empty()) return true;
+        if (gt->resolvedName.empty()) {
+            // #42/#53：模板体（含 ctor 体）内 self.field 的字段类型为未绑定 T。容器型
+            // source（Optional / 物化 Optional<T> / Union）在任意实例化下均 ≠ T（Aura
+            // 无隐式解箱/解包）→ 干净报错，防泄漏坏 C++（原无条件放行吞掉错配）。
+            if (dynamic_cast<const OptionalSemType*>(&source)) return false;
+            if (auto* sg = dynamic_cast<const GenericSemType*>(&source))
+                if (sg->name == "Optional" && !sg->resolvedName.empty()) return false;
+            if (dynamic_cast<const UnionSemType*>(&source)) return false;
+            return true;   // 纯 T→T、具体类型→T 等模板体合法形态原样放行
+        }
         if (auto* gs = dynamic_cast<const GenericSemType*>(&source)) {
             if (gt->equals(*gs)) return true;
             // gap7 兜底：同名容器泛型（Optional/Iterator/用户泛型实例）两侧 resolvedName

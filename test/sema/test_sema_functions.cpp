@@ -229,3 +229,41 @@ TEST(SemaFunctions, MainExplicitNoneAccepted) {
     analyzeSource("fun main(io: Io) -> None { io.println(\"x\") }", diag);
     EXPECT_FALSE(diag.hasErrors());
 }
+
+// ============================================================
+// bug-33 配套（2026-09-04 批次 13）：值上下文 None 绑定拒绝——
+// checkLetDecl/checkConstDecl 无标注且推断为纯 None → 干净报错（引导 int | None
+// 联合标注）。修复 #33 接口侧 None→void 后，void 值绑定坏 C++（record 直调同源，
+// 不区分来源统一拒绝）。语句上下文（f();）不受影响。
+// ============================================================
+TEST(SemaFunctions, LetBindNoneReturnRejected) {
+    // 普通函数返回 None + 无标注 let x = f() → 拒绝（review 预判 A 影响面确认）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun doNothing() -> None { let x = 1 }"
+        " fun main(io: Io) { let x = doNothing() }",
+        diag);
+    EXPECT_TRUE(hasErrorContaining(diag,
+        "cannot bind 'None' return value to a variable; use a union annotation like 'int | None'"));
+}
+
+TEST(SemaFunctions, LetBindNoneRecordMethodRejected) {
+    // record 方法返回 None + 无标注 let x = r.clean() → 同拒（record 直调同源）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Room = { name: string }"
+        " fun (self Room) clean() -> None { let x = 1 }"
+        " fun main(io: Io) { let r: Room = { name = \"h\" }; let x = r.clean() }",
+        diag);
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot bind 'None' return value to a variable"));
+}
+
+TEST(SemaFunctions, NoneReturnStatementContextAccepted) {
+    // 对照：语句上下文调用返回 None 函数（f();）→ 放行（不误伤）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun doNothing() -> None { let x = 1 }"
+        " fun main(io: Io) { doNothing(); io.println(\"x\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}

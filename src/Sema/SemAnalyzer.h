@@ -77,6 +77,13 @@ private:
     // 本函数判"该值放 std::variant 内部是否 GC 可达"（对 function/接口结论相反是正确）。
     [[nodiscard]] static bool unionVariantGcUnsafe(const SemType& t);
 
+    // 变体能否安全存入 aura_rt::Variant<T...> storage_（P3b 收窄后的声明期 P0 判定）：
+    // 仅 function（std::function 值）/嵌套 union（未扁平化）不可存；其余含堆变体
+    // （string/record/list/optional/接口视图）由 descForI 指针/视图追踪放行（variant.h）。
+    // substitute 泛型实例化二次检查（P3c）必须复用本判定而非 unionVariantGcUnsafe，
+    // 保证泛型实例化形态与非泛型声明形态行为一致（bug-65）。
+    [[nodiscard]] static bool variantStorageUnsafe(const SemType& t);
+
     // P4：在单个变体类型上推断方法调用返回类型（联合动态分派用）；
     // 该变体不支持该调用时返回 nullptr
     [[nodiscard]] std::unique_ptr<SemType> inferMethodCallOnVariant(
@@ -173,7 +180,8 @@ private:
     static void forEachIfaceNamedRef(const TypeExpr& type,
                                      const std::function<void(const NamedType&)>& fn);
     // 前向注册接口方法签名引用的未注册用户类型名（仿 TypeDecl 前向占位，DeclChecker.cpp）
-    void forwardRegisterIfaceType(const NamedType& n);
+    // sourceMethod 非空 = 引用来自该接口默认方法体（bug-09 止血），报错注明来源方法名
+    void forwardRegisterIfaceType(const NamedType& n, const std::string& sourceMethod = "");
     // declareTopLevel 末尾：二次解析接口方法签名 + 校验前向引用是否为真 undefined
     void finalizeInterfaceSignatures(const Program& program);
 
@@ -387,6 +395,7 @@ private:
     struct InterfaceFwdRef {
         std::string name;
         const TypeExpr* node;
+        std::string sourceMethod;   // bug-09：引用来源方法名（非空 = 默认方法体引用），报错定位
     };
     std::vector<InterfaceFwdRef> ifaceFwdRefs_;
 

@@ -119,6 +119,11 @@ private:
     // 成功推进 i 返回 true。参照 C++17 模板实参优先规则。
     bool lookaheadTypeArgsBeforeCall();
     bool skipTypeTokens(size_t& i) const;
+    // bug-51：record 字面量显式类型实参 `Box<int> { value = 7 }` 的前瞻判型——
+    // 与 N2 的 lookaheadTypeArgsBeforeCall（只认 `>` 后 `(`）分工：本函数认 `>` 后
+    // `{ Ident =` / `{}`（record 字面量体）。语句头抑制（suppressNamedRecordLiteral_）
+    // 下恒 false（`{` 属语句体，与既有具名 record 分支判据一致）。只读不消费 token。
+    bool lookaheadTypeArgsBeforeRecord();
 
     // --- 解析闭包 ---
     std::unique_ptr<ASTNode> parseFunExpr();

@@ -147,6 +147,14 @@ void RecordExpr::print(std::ostream& os, int indent) const {
     os << "RecordExpr";
     if (!typeName.empty()) os << "[" << typeName << "]";
     os << '\n';
+    // bug-51：显式类型实参 `Box<int> { ... }`（仿 CallExpr::print typeArgs 段）
+    if (!typeArgs.empty()) {
+        printIndent(os, indent + 1);
+        os << "typeArgs:" << '\n';
+        for (auto& t : typeArgs) {
+            if (t) t->print(os, indent + 2);
+        }
+    }
     for (auto& f : fields) {
         printIndent(os, indent + 1);
         os << f.name << " =" << '\n';

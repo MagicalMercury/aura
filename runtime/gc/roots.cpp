@@ -9,8 +9,11 @@
 
 #include "gc.h"
 #include <algorithm>
+#include <chrono>
+#include <functional>  // bug-47 诊断：std::hash<thread::id>（非 Windows TID 回退）
+#include <thread>
 #ifdef _WIN32
-#include <windows.h>   // OpenThread/CloseHandle（P2 中断句柄）
+#include <windows.h>   // OpenThread/CloseHandle/GetCurrentThreadId（P2 中断 + bug-47 诊断）
 #else
 #include <pthread.h>   // pthread_self（P2 中断句柄）
 #endif
@@ -64,6 +67,14 @@ void GcHeap::moveRootNode(GcRootHandleBase* newNode, GcRootHandleBase* oldNode) 
 GcHeap::ThreadRootList* GcHeap::ensureThreadRootList() {
     if (tl_roots_) return tl_roots_;
     auto* list = new ThreadRootList();  // 堆分配，避免 thread_local 析构顺序问题
+    // bug-47 诊断：记录拥有者 TID + 初始心跳（此后 safepoint() 入口持续刷新）
+#ifdef _WIN32
+    list->diag_tid = static_cast<unsigned>(GetCurrentThreadId());
+#else
+    list->diag_tid = static_cast<unsigned>(
+        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+    list->diag_last_safepoint = std::chrono::steady_clock::now();
     tl_roots_ = list;
     {
         std::lock_guard<std::mutex> lk(threadRootLists_m_);

@@ -6,6 +6,49 @@
 
 namespace Aura {
 
+// #48：跨模块（isNs）装箱点裸词物化替换所需的本地副本（ExprCall.cpp 同名 file-static
+// 工具不可跨编译单元引用；本文件仅在下方 isNs 装箱分支使用）。
+// 判定 s 中是否含"裸词" token（两侧为字母/数字/_ 之外的独立标识符，如 "aura_rt::
+// Optional<T>*" 的 T）。
+static bool containsBareToken(const std::string& s, const std::string& token) {
+    if (token.empty() || s.size() < token.size()) return false;
+    auto isIdChar = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '_';
+    };
+    for (size_t i = 0; i + token.size() <= s.size(); ++i) {
+        if (s.compare(i, token.size(), token) == 0
+            && (i == 0 || !isIdChar(s[i - 1]))
+            && (i + token.size() >= s.size() || !isIdChar(s[i + token.size()])))
+            return true;
+    }
+    return false;
+}
+
+// 将 s 中所有"裸词" token 整体替换为 repl（如 "aura_rt::Optional<T>*" 中 T → int32_t）。
+static std::string replaceBareToken(std::string s, const std::string& token,
+                                    const std::string& repl) {
+    if (token.empty()) return s;
+    auto isIdChar = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '_';
+    };
+    std::string out;
+    out.reserve(s.size() + repl.size() * 2);
+    size_t i = 0;
+    while (i < s.size()) {
+        if (s.compare(i, token.size(), token) == 0
+            && (i == 0 || !isIdChar(s[i - 1]))
+            && (i + token.size() >= s.size() || !isIdChar(s[i + token.size()]))) {
+            out += repl;
+            i += token.size();
+        } else {
+            out += s[i++];
+        }
+    }
+    return out;
+}
+
 // bug-22：sync.ThreadChannel 判定共享辅助（ExprMethodCall.cpp / StmtControl.cpp 共用）。
 // 主判定查 inferredType 为 GenericSemType{name=="sync.Channel"}（Sema 填充，不受 IterVarGuard
 // 屏蔽，覆盖 spawn 参数/字段/函数参数等未进 gcRootTypes_ 的形态）；gcRootTypes_ 查
@@ -365,6 +408,21 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
     // G3：被 record→view 转换的实参 idx → 视图类型标记（genGcRootedArgs 据此走
     // 视图值分支，不生成 GcRootHandle<视图> 坏根；见 makeIfaceViewMarker）。
     std::map<size_t, std::unique_ptr<SemType>> viewArgTypes;
+    // #48：跨模块（isNs）调用的泛型形参物化映射（{T:"int32_t"}）——依赖模块 exports
+    // 的形参 SemType 若为物化 GenericSemType{Optional, resolvedName="aura_rt::Optional<T>"}，
+    // mapSemType 直接输出含裸 T 的 C++ 串 → 装箱 make_optional<T> 坏 C++（跨模块无
+    // fnParamCppTypes_/targValues 值源，只能从实参剥壳物化）。惰性收集一次供全循环使用。
+    std::map<std::string, std::string> cmMat;
+    if (isNs) {
+        if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+            auto cmPIt = crossModuleParamSemTypes_.find(id->name);
+            if (cmPIt != crossModuleParamSemTypes_.end()) {
+                auto fnPIt = cmPIt->second.find(e.method);
+                if (fnPIt != cmPIt->second.end())
+                    collectDefaultArgGenericMapFromSemTypes(fnPIt->second, e.args, cmMat);
+            }
+        }
+    }
     for (size_t i = 0; i < e.args.size(); ++i) {
         std::string marg = genExpr(*e.args[i], isCoroutine);
         // G3：接口参数转换——record 实参直传接口视图形参 → genRecordToViewIIFE
@@ -434,16 +492,33 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
                                 wrapType = mapSemType(*argFst);
                             }
                             marg = wrapType + "(" + marg + ")";
-                        } else if (semTypeIsConcrete(formal)) {
+                        } else if (semTypeIsConcrete(formal) || !cmMat.empty()) {
                             // bug-06 附注 3：跨模块 Optional/Union 形参装箱（mArgExprs 装箱
                             // 的 mpIt 查 methodParamCppTypes_ 对 isNs 调用不命中 → 跨模块函数
                             // Optional 形参 + 裸值实参坏 C++）。用形参 SemType（依赖模块 exports
                             // 的 SymParam.type）mapSemType 得 C++ 类型后复用 genParamBoxing。
-                            // 仅具体形参装箱（semTypeIsConcrete 排除含未绑定泛型 T 的
-                            // Optional<T>——物化需额外作用域化机制，属独立缺口另案登记）。
-                            std::string boxed = genParamBoxing(
-                                mapSemType(*formal), *e.args[i], isCoroutine);
-                            if (!boxed.empty()) marg = boxed;
+                            // #48：物化 GenericSemType{Optional}（显式 `o: Optional<T>` 注解，
+                            // resolvedName="aura_rt::Optional<T>"）被 semTypeIsConcrete 判 true
+                            // → mapSemType 输出含裸 T 串 → make_optional<T> 坏 C++ → 装箱前
+                            // 按 cmMat（实参剥壳物化结果）裸词替换（T→int32_t）。mapSemType
+                            // 兜底 "auto" 时 containsBareToken 不命中 → genParamBoxing 返回空
+                            // → marg 不变（review 预判 B 防御链闭合）。
+                            std::string paramCpp = mapSemType(*formal);
+                            bool boxable = true;
+                            if (!cmMat.empty()) {
+                                for (auto& [g, cpp] : cmMat)
+                                    if (containsBareToken(paramCpp, g))
+                                        paramCpp = replaceBareToken(std::move(paramCpp), g, cpp);
+                                // 防御：替换后仍含 cmMat 键裸词（物化不全）→ 不装箱
+                                // （该路径 Sema 已报 cannot infer，driver 不调 g++）
+                                for (auto& [g, cpp] : cmMat)
+                                    if (containsBareToken(paramCpp, g)) { boxable = false; break; }
+                            }
+                            if (boxable) {
+                                std::string boxed = genParamBoxing(
+                                    paramCpp, *e.args[i], isCoroutine);
+                                if (!boxed.empty()) marg = boxed;
+                            }
                         }
                     }
                 }
