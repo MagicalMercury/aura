@@ -19,6 +19,7 @@
 // ============================================================
 
 #include "../gc.h"
+#include "../gc/gc_interrupt.h"  // gc_interruptible_sleep（P2 可中断 sleep）
 #include "../types.h"        // GcObject / TypeDescriptor
 #include "error.h"           // make_runtime_error
 #include "optional.h"        // Optional<T> / make_optional / make_none
@@ -54,7 +55,7 @@ struct ThreadChannel : GcObject {
             // 不用 cv.wait_for（避免 STW 期间锁重获死锁）
             lk.unlock();
             gc_safepoint();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            gc_interruptible_sleep(std::chrono::microseconds(100));  // P2：1ms→100μs 可中断
             lk.lock();
         }
         if (self->inner_->closed) {
@@ -73,7 +74,7 @@ struct ThreadChannel : GcObject {
         while (self->inner_->buffer.empty() && !self->inner_->closed) {
             lk.unlock();
             gc_safepoint();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            gc_interruptible_sleep(std::chrono::microseconds(100));  // P2：1ms→100μs 可中断
             lk.lock();
         }
         if (self->inner_->buffer.empty()) {

@@ -64,6 +64,18 @@ struct WildcardPattern : Pattern {
     }
 };
 
+// P5：`|` 分组模式（Rust 风格，C++ switch 多 case 合并语义）
+// 仅常量模式允许分组（Parser 拦截类型模式分组），语义 = 任一 alt 匹配即命中
+struct GroupPattern : Pattern {
+    std::vector<std::unique_ptr<Pattern>> alts;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<Pattern> clone() const override {
+        auto n = std::make_unique<GroupPattern>();
+        for (auto& a : alts) n->alts.push_back(a ? a->clone() : nullptr);
+        return n;
+    }
+};
+
 // ============================================================
 // Stmt ─ 语句节点
 // ============================================================
@@ -332,6 +344,7 @@ struct FunDecl : Decl {
     bool throws = false;
     std::unique_ptr<TypeExpr> returnType;
     std::unique_ptr<BlockStmt> body;
+    bool hasCppImpl = false;    // '...'：aura 无实现，c++ 有实现（.aurai 声明文件用）
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<FunDecl>();
@@ -340,6 +353,7 @@ struct FunDecl : Decl {
         n->throws = throws;
         if (returnType) n->returnType.reset(static_cast<TypeExpr*>(returnType->clone().release()));
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
+        n->hasCppImpl = hasCppImpl;
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
@@ -348,12 +362,14 @@ struct FunDecl : Decl {
 
 struct LetDecl : Decl {
     std::string name;
+    std::vector<std::string> names;   // 解构多名字（names.size()>1 时有效；单名保持 name 字段）
     std::unique_ptr<TypeExpr> type;
     std::unique_ptr<ASTNode> initializer;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<LetDecl>();
         n->name = name;
+        n->names = names;
         if (type) n->type.reset(static_cast<TypeExpr*>(type->clone().release()));
         n->initializer = initializer ? initializer->clone() : nullptr;
         n->isPublic = isPublic;
@@ -364,12 +380,14 @@ struct LetDecl : Decl {
 
 struct ConstDecl : Decl {
     std::string name;
+    std::vector<std::string> names;   // 解构多名字（names.size()>1 时有效；单名保持 name 字段）
     std::unique_ptr<TypeExpr> type;
     std::unique_ptr<ASTNode> initializer;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<ConstDecl>();
         n->name = name;
+        n->names = names;
         if (type) n->type.reset(static_cast<TypeExpr*>(type->clone().release()));
         n->initializer = initializer ? initializer->clone() : nullptr;
         n->isPublic = isPublic;
@@ -395,25 +413,35 @@ struct TypeDecl : Decl {
 };
 
 struct InterfaceMethodSig {
+    // 接口方法三种形态（声明时确定）
+    enum class BodyKind { Pure,          // 纯虚：record 必须实现
+                          DefaultAura,   // Aura 默认实现（{ body }，如 Comparable 六符号）
+                          CppBridge };   // C++ 桥接（...，aura 无实现 c++ 有实现）
     std::string name;
     std::vector<Param> params;
     bool throws = false;
     std::unique_ptr<TypeExpr> returnType;
+    std::unique_ptr<BlockStmt> defaultBody;   // 非空 = DefaultAura
+    BodyKind bodyKind = BodyKind::Pure;       // CppBridge 时 defaultBody 为空
 };
 
 struct InterfaceDecl : Decl {
     std::string name;
+    std::vector<std::string> typeParams;          // 泛型参数（如 Iterator<T> 的 T）
     std::vector<InterfaceMethodSig> methods;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<InterfaceDecl>();
         n->name = name;
+        n->typeParams = typeParams;
         for (auto& m : methods) {
             InterfaceMethodSig sig;
             sig.name   = m.name;
             for (auto& p : m.params) sig.params.push_back(cloneParam(p));
             sig.throws = m.throws;
+            sig.bodyKind = m.bodyKind;   // 必须复制：CppBridge（...）标记决定 Sema 豁免
             if (m.returnType) sig.returnType.reset(static_cast<TypeExpr*>(m.returnType->clone().release()));
+            if (m.defaultBody) sig.defaultBody.reset(static_cast<BlockStmt*>(m.defaultBody->clone().release()));
             n->methods.push_back(std::move(sig));
         }
         n->isPublic = isPublic;
@@ -459,13 +487,15 @@ struct MethodDecl : Decl {
     std::string receiverName;
     std::string receiverType;
     std::vector<std::string> receiverTypeArgs; // 接收者泛型参数（如 Stack<T> 中的 T）
-    std::string implInterface;
+    std::string implInterface;                              // 接口名（如 "Comparable"）
+    std::vector<std::unique_ptr<TypeExpr>> implTypeArgs;    // 接口类型实参（如 <Point>），可空
     std::string name;
     bool isConstructor = false;
     std::vector<Param> params;
     bool throws = false;
     std::unique_ptr<TypeExpr> returnType;
     std::unique_ptr<BlockStmt> body;
+    bool hasCppImpl = false;    // '...'：aura 无实现，c++ 有实现（.aurai 声明文件用）
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<MethodDecl>();
@@ -473,12 +503,15 @@ struct MethodDecl : Decl {
         n->receiverType  = receiverType;
         n->receiverTypeArgs = receiverTypeArgs;
         n->implInterface = implInterface;
+        for (auto& ta : implTypeArgs)
+            n->implTypeArgs.emplace_back(static_cast<TypeExpr*>(ta->clone().release()));
         n->name          = name;
         n->isConstructor = isConstructor;
         for (auto& p : params) n->params.push_back(cloneParam(p));
         n->throws = throws;
         if (returnType) n->returnType.reset(static_cast<TypeExpr*>(returnType->clone().release()));
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
+        n->hasCppImpl = hasCppImpl;
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;

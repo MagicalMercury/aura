@@ -10,22 +10,24 @@
 //   - for val in ch { ... } 迭代接收，直到通道关闭且缓冲为空
 //
 // C++: template<typename T> struct aura_rt::Channel
+//
+// 声明中的 '...' = C++ 桥接标记：aura 层无实现，c++ 层有实现
 // ============================================================
 
 type channel<T>
 
-fun (self channel<T>) send(value: T)
-fun (self channel<T>) receive() -> T
-fun (self channel<T>) close()
+fun (self channel<T>) send(value: T) ...
+fun (self channel<T>) receive() -> T ...
+fun (self channel<T>) close() ...
 
 // ──────────────────────────────────────────────────────────
 // sync.Channel<T>：sync thread 跨线程通信通道
 // 本段为文档性质（不加载），权威注册见 BuiltinRegistry.h
 // ──────────────────────────────────────────────────────────
 type sync.Channel<T>
-fun sync.Channel(cap: int) -> sync.Channel<T>
-fun sync.Channel() -> sync.Channel<T>
-fun (self sync.Channel<T>) send(value: T)
-fun (self sync.Channel<T>) receive() -> Optional<T>
-fun (self sync.Channel<T>) close()
-fun (self sync.Channel<T>) is_done() -> bool
+fun sync.Channel(cap: int) -> sync.Channel<T> ...
+fun sync.Channel() -> sync.Channel<T> ...
+fun (self sync.Channel<T>) send(value: T) ...
+fun (self sync.Channel<T>) receive() -> Optional<T> ...
+fun (self sync.Channel<T>) close() ...
+fun (self sync.Channel<T>) is_done() -> bool ...

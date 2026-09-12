@@ -1,5 +1,6 @@
 #include "CodeGen.h"
 #include "../Sema/BuiltinRegistry.h"
+#include "../Sema/SemType.h"
 
 namespace Aura {
 
@@ -8,8 +9,12 @@ namespace Aura {
 // ============================================================
 class CodeGenerator::CoroScanner {
 public:
-    explicit CoroScanner(const std::set<std::string>& coroFns, bool ioSync = false)
-        : coroFns_(coroFns), ioSync_(ioSync) {}
+    explicit CoroScanner(const std::set<std::string>& coroFns, bool ioSync = false,
+                         bool skipClosureBody = false,
+                         const std::set<std::string>* closureTaskVars = nullptr,
+                         const std::set<std::string>* coroClosureNames = nullptr)
+        : coroFns_(coroFns), ioSync_(ioSync), skipClosureBody_(skipClosureBody),
+          closureTaskVars_(closureTaskVars), coroClosureNames_(coroClosureNames) {}
 
     // 统一入口：自动区分 Stmt/Expr
     bool scan(const ASTNode& node) {
@@ -41,6 +46,15 @@ public:
     }
     bool visit(const ForStmt& n, CoroScanner& self) {
         if (n.iterable && self.scanExpr(*n.iterable)) return true;
+        // bug-11 方向②：for-in 协程 channel（iterable 推断类型 GenericSemType{name=="channel"}）
+        // 循环体内 co_await ch->receive() → 函数须标协程，否则 co_await 落非协程函数坏 C++
+        // （repro_pure_forin_plain_fn：纯 for-in channel 的普通函数被判 Plain）。仿 isSuspending
+        // （L183-188）同构判定；sync.Channel 的 inferredType 为 "sync.Channel"，不匹配不误判
+        // （其 receive 阻塞、不需 co_await）。
+        if (n.iterable && n.iterable->inferredType) {
+            if (auto* g = dynamic_cast<const GenericSemType*>(n.iterable->inferredType))
+                if (g->name == "channel") return true;
+        }
         if (n.body && self.scanStmt(*n.body)) return true;
         return false;
     }
@@ -91,12 +105,14 @@ public:
     // --- Expr visit ---
     bool visit(const CallExpr& n, CoroScanner& self) {
         if (isSuspending(n)) return true;
+        if (n.callee && self.scanExpr(*n.callee)) return true;
         for (auto& a : n.args)
             if (a && self.scanExpr(*a)) return true;
         return false;
     }
     bool visit(const MethodCallExpr& n, CoroScanner& self) {
         if (isSuspending(n)) return true;
+        if (n.object && self.scanExpr(*n.object)) return true;
         for (auto& a : n.args)
             if (a && self.scanExpr(*a)) return true;
         return false;
@@ -118,6 +134,11 @@ public:
     bool visit(const PipeExpr& n, CoroScanner& self) {
         return (n.left  && self.scanExpr(*n.left)) ||
                (n.right && self.scanExpr(*n.right));
+    }
+    bool visit(const ConditionalExpr& n, CoroScanner& self) {
+        if (n.cond       && self.scanExpr(*n.cond)) return true;
+        if (n.thenBranch && self.scanExpr(*n.thenBranch)) return true;
+        return n.elseBranch && self.scanExpr(*n.elseBranch);
     }
     bool visit(const ListExpr& n, CoroScanner& self) {
         for (auto& el : n.elements)
@@ -145,8 +166,10 @@ public:
     bool visit(const Identifier&,       CoroScanner&) { return false; }
 
     // 闭包 — 穿透扫描闭包体：闭包内的 io.xxx / 协程函数调用会传播到外层函数
+    // Bug 2-A: 外层函数返回函数类型（fun -> T）时，闭包作为返回值不执行，
+    // 闭包体生成普通 lambda（io 走 _sync 路径），其体内挂起点不传播到外层
     bool visit(const FunExpr& n, CoroScanner& self) {
-        if (n.body)
+        if (!self.skipClosureBody_ && n.body)
             for (auto& s : n.body->stmts)
                 if (s && self.scanStmt(*s)) return true;
         return false;
@@ -167,11 +190,40 @@ private:
                         return false;  // file_exists / cwd 等无异步版本
                     }
                 }
+                // 协程 channel send/receive：receiver 推断类型为 GenericSemType "channel"
+                // → 需挂起（同步 ThreadChannel 的 inferredType 是 "sync.Channel"，不匹配，
+                // 且其 send/receive 是阻塞调用，不在协程判定内）。
+                if (mc->object->inferredType) {
+                    if (auto* g = dynamic_cast<const GenericSemType*>(mc->object->inferredType)) {
+                        if (g->name == "channel"
+                            && (mc->method == "send" || mc->method == "receive"))
+                            return true;
+                    }
+                }
+                // 用户自定义协程方法调用传播（self.foo() / p.foo()）：receiver 类型
+                // （RecordSemType.canonicalName 截取 '<' 前，对齐声明侧 receiverType）+
+                // 方法名查 coroFns_（键 = "ReceiverType.methodName"）。与函数侧 CallExpr
+                // 传播对称：调用协程方法的方法也被标为协程（否则方法内 co_await 落普通
+                // 方法 → 坏 C++）。ioSync_ 不豁免（与 CallExpr 分支一致）。
+                if (mc->object->inferredType) {
+                    if (auto* r = dynamic_cast<const RecordSemType*>(mc->object->inferredType)) {
+                        std::string recvKey = r->canonicalName;
+                        size_t lt = recvKey.find('<');
+                        if (lt != std::string::npos) recvKey = recvKey.substr(0, lt);
+                        if (!recvKey.empty() && coroFns_.count(recvKey + "." + mc->method))
+                            return true;
+                    }
+                }
             }
         }
         if (auto* call = dynamic_cast<const CallExpr*>(&expr)) {
             if (auto* id = dynamic_cast<const Identifier*>(call->callee.get())) {
                 if (coroFns_.count(id->name)) return true;
+                // bug-78：调用协程闭包变量（task 形态 closureTaskVars_ / 旧路径
+                // coroClosureNames_）同样是挂起点——闭包体内 d(...) 会生成 co_await
+                // invoke，外层闭包须判为协程，否则 co_await 落非协程 __invoke → 坏 C++。
+                if (closureTaskVars_ && closureTaskVars_->count(id->name)) return true;
+                if (coroClosureNames_ && coroClosureNames_->count(id->name)) return true;
             }
         }
         return false;
@@ -179,6 +231,9 @@ private:
 
     const std::set<std::string>& coroFns_;
     bool ioSync_ = false;
+    bool skipClosureBody_ = false;
+    const std::set<std::string>* closureTaskVars_ = nullptr;   // bug-78（可空）
+    const std::set<std::string>* coroClosureNames_ = nullptr;  // bug-78（可空）
 };
 
 // ============================================================
@@ -194,7 +249,12 @@ private:
 
 CoroDecision CodeGenerator::decideCoro(const FunDecl& decl) {
     if (!decl.body) return CoroDecision::Plain;
-    CoroScanner scanner(coroutineFunctions_, ioSync_);
+    // Bug 2-A: 外层函数返回函数类型（fun -> T，映射为 std::function）时，
+    // 闭包作为返回值生成普通 lambda，闭包体内挂起点不传播（否则外层被误判为协程，
+    // 生成 task<std::function<...>>，与 std::function 无法容纳协程 lambda 冲突）
+    bool skipClosure = decl.returnType
+        && dynamic_cast<const FunctionType*>(decl.returnType.get()) != nullptr;
+    CoroScanner scanner(coroutineFunctions_, ioSync_, skipClosure);
     if (scanner.scan(*decl.body))
         return CoroDecision::Coroutine;
     return CoroDecision::Plain;
@@ -202,10 +262,25 @@ CoroDecision CodeGenerator::decideCoro(const FunDecl& decl) {
 
 CoroDecision CodeGenerator::decideCoro(const MethodDecl& decl) {
     if (!decl.body) return CoroDecision::Plain;
-    CoroScanner scanner(coroutineFunctions_, ioSync_);
+    bool skipClosure = decl.returnType
+        && dynamic_cast<const FunctionType*>(decl.returnType.get()) != nullptr;
+    CoroScanner scanner(coroutineFunctions_, ioSync_, skipClosure);
     if (scanner.scan(*decl.body))
         return CoroDecision::Coroutine;
     return CoroDecision::Plain;
+}
+
+// bug-78：闭包体「是否含挂起点」判定（genFunExpr 的 closureIsCoro 用）。
+// 复用 CoroScanner（与具名函数/方法同源判据），并注入闭包侧信号集：
+//   - closureTaskVars_ / coroClosureNames_：调用其它协程闭包（co_await d(...)）
+//   - channel send/receive、io.async 方法：纯挂起表达式（体内无 io.xxx 语句）
+//   - 嵌套 FunExpr 穿透：外层闭包体内定义的协程闭包，其挂起点传播至外层
+//     （CoroScanner::visit(FunExpr) 已递归扫描闭包体）
+// 与旧 IoDetector（仅识别语句级 io.xxx MethodCallExpr）相比，消除全部漏判面。
+bool CodeGenerator::closureBodyIsCoro(const BlockStmt& body) {
+    CoroScanner scanner(coroutineFunctions_, ioSync_, /*skipClosureBody=*/false,
+                        &closureTaskVars_, &coroClosureNames_);
+    return scanner.scan(body);
 }
 
 } // namespace Aura

@@ -66,6 +66,10 @@ private:
     std::condition_variable cv_;
     // atomic：shutdown 写、workerLoop 读（消除 TSan 数据竞争告警）
     std::atomic<bool> stop_{false};
+    // 阶段 2.1：GC 空闲唤醒广播——代次计数（🔴 修复共享复位竞态：
+    //   布尔标志被首个唤醒 worker 复位 → 其余 N-1 个谓词 false 回睡等 50ms 超时；
+    //   计数方案每个 worker 独立消费自己的代次，互不干扰）
+    std::atomic<uint64_t> gcWakeupGen_{0};
     std::once_flag ensureStartedOnce_;  // 保证 ensureStarted 只执行一次（多线程首次 submit 并发安全）
 
     // group 等待机制

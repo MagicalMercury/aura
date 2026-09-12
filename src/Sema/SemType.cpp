@@ -46,6 +46,7 @@ std::unique_ptr<SemType> NoneSemType::clone() const { return make(); }
 bool RecordSemType::equals(const SemType& other) const {
     auto* o = dynamic_cast<const RecordSemType*>(&other);
     if (!o) return false;
+    if (isTuple != o->isTuple) return false;
     if (fields.size() != o->fields.size()) return false;
     // 结构等价：字段名和类型匹配，忽略顺序
     for (auto& f : fields) {
@@ -59,6 +60,16 @@ bool RecordSemType::equals(const SemType& other) const {
 }
 std::string RecordSemType::toString() const {
     std::ostringstream oss;
+    if (isTuple) {
+        // 元组：(t0, t1, ...)（位置字段无字段名）
+        oss << "(";
+        for (size_t i = 0; i < fields.size(); ++i) {
+            if (i > 0) oss << ", ";
+            oss << (fields[i].type ? fields[i].type->toString() : "?");
+        }
+        oss << ")";
+        return oss.str();
+    }
     oss << "{ ";
     for (size_t i = 0; i < fields.size(); ++i) {
         if (i > 0) oss << ", ";
@@ -70,6 +81,7 @@ std::string RecordSemType::toString() const {
 std::unique_ptr<SemType> RecordSemType::clone() const {
     auto n = std::make_unique<RecordSemType>();
     n->canonicalName = canonicalName;
+    n->isTuple = isTuple;
     for (auto& f : fields) {
         n->fields.push_back({f.name, f.type ? f.type->clone() : nullptr});
     }
@@ -178,11 +190,22 @@ bool InterfaceSemType::equals(const SemType& other) const {
     return true;
 }
 std::string InterfaceSemType::toString() const {
-    return "interface " + name;
+    std::string s = "interface " + name;
+    if (!typeArgs.empty()) {
+        s += "<";
+        for (size_t i = 0; i < typeArgs.size(); ++i) {
+            if (i > 0) s += ", ";
+            s += typeArgs[i] ? typeArgs[i]->toString() : "?";
+        }
+        s += ">";
+    }
+    return s;
 }
 std::unique_ptr<SemType> InterfaceSemType::clone() const {
     auto n = std::make_unique<InterfaceSemType>();
     n->name = name;
+    for (auto& a : typeArgs)
+        n->typeArgs.push_back(a ? a->clone() : nullptr);
     for (auto& m : methods) {
         MethodSig ms;
         ms.name = m.name;
@@ -201,7 +224,13 @@ std::unique_ptr<SemType> InterfaceSemType::clone() const {
 // ============================================================
 bool GenericSemType::equals(const SemType& other) const {
     auto* o = dynamic_cast<const GenericSemType*>(&other);
-    return o && o->name == name;
+    if (!o || o->name != name) return false;
+    // P0.5 精确化：两者均解析出具体 C++ 名时（Iterator<int32_t> vs Iterator<std::string>）
+    // 必须比较 resolvedName，防止同名不同实参的类型混淆；
+    // 任一未解析（泛型形参 T）时退化为只比 name（泛型函数体内行为不变）
+    if (!resolvedName.empty() && !o->resolvedName.empty())
+        return resolvedName == o->resolvedName;
+    return true;
 }
 std::string GenericSemType::toString() const {
     if (!resolvedName.empty()) return resolvedName;

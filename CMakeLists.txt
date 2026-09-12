@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.1)
+﻿cmake_minimum_required(VERSION 4.1)
 
 # 深度调试选项：开启后切换到 MSYS2 CLANG64 的 clang 并启用 AddressSanitizer
 # 默认关闭，使用环境变量配置的 g++（UCRT64 GCC，即当前常规模式）
@@ -60,15 +60,44 @@ set(AURA_SOURCES
     src/Sema/SemType.cpp
     src/Sema/SymbolTable.cpp
     src/Sema/SemAnalyzer.cpp
+    src/Sema/SemTypeUtils.cpp
+    src/Sema/Assignability.cpp
+    src/Sema/GenericSubstitution.cpp
+    src/Sema/TypeResolution.cpp
+    src/Sema/CanonicalPropagation.cpp
     src/Sema/Checker/DeclChecker.cpp
+    src/Sema/Checker/TypeResolver.cpp
+    src/Sema/Checker/BodyChecker.cpp
     src/Sema/Checker/StmtChecker.cpp
+    src/Sema/Checker/StmtFlow.cpp
+    src/Sema/Checker/StmtSync.cpp
     src/Sema/Checker/ExprInfer.cpp
+    src/Sema/Checker/CallInfer.cpp
+    src/Sema/Checker/ExprInferMisc.cpp
     src/CodeGen/CodeGen.cpp
     src/CodeGen/TypeMap.cpp
     src/CodeGen/DeclGen.cpp
+    src/CodeGen/DeclFun.cpp
+    src/CodeGen/DeclTParams.cpp
     src/CodeGen/StmtGen.cpp
     src/CodeGen/ExprGen.cpp
+    src/CodeGen/ExprBinary.cpp
+    src/CodeGen/ExprCall.cpp
+    src/CodeGen/ExprMethodCall.cpp
+    src/CodeGen/ExprAccess.cpp
+    src/CodeGen/ExprClosure.cpp
+    src/CodeGen/ExprClosureArgs.cpp
+    src/CodeGen/ExprClosureCallableObj.cpp
+    src/CodeGen/ExprClosureCaptures.cpp
+    src/CodeGen/ExprClosureOldPath.cpp
     src/CodeGen/CoroDecide.cpp
+    src/CodeGen/StmtLet.cpp
+    src/CodeGen/UnionBoxing.cpp
+    src/CodeGen/StmtControl.cpp
+    src/CodeGen/StmtTry.cpp
+    src/CodeGen/StmtSync.cpp
+    src/CodeGen/StmtSpawn.cpp
+    src/CodeGen/StmtMatch.cpp
     src/Module/ModuleManager.cpp
     src/Diag/DiagnosticEngine.cpp
 )

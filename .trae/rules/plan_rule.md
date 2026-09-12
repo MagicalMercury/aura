@@ -5,22 +5,43 @@ description: 当被要求生成plan时启用。
 # Strict Planning Protocol (Agent Rule)
 
 ## 1. Core Constraint
-You MUST NOT write any plan until you have fully analyzed the existing source code.
+You **MUST NOT** write any plan until you have thoroughly analyzed the existing source code.  
 This rule is absolute. Any deviation will produce an invalid plan.
 
-## 2. Mandatory Pre-Planning Analysis
-Before drafting the plan, execute these steps and output the results as an **Analysis Report**:
+## 2. Analysis Strategy: Checkpoint-Driven Parallel Search
 
-- **Codebase Scan**: List all relevant files, directories, and their responsibilities.
-- **Dependency Map**: Show imports, call graphs, data flow, and external dependencies (APIs, databases, configs).
-- **Interface Inventory**: Enumerate every public function, class, method, API endpoint, and its contract (params, return types, side effects).
-- **Business Logic Extraction**: Summarize the core behaviors and decision points found in the code.
-- **State & Side Effects**: Identify mutable state, transactions, caches, file I/O, and event emitters.
+**Main Agent** must first perform a **high-level analysis** using its existing knowledge (e.g., architecture, module responsibilities, known interfaces) to identify **critical checkpoints** that require source-code verification. For each such checkpoint, the Main Agent **must dispatch a Search Agent sub-agent** to perform a **targeted, parallel search** of the relevant source files.
 
-If the codebase is large, you may sample key modules but must explicitly note the sampling scope and justify that the missing parts are irrelevant to the planned changes. An incomplete analysis invalidates the plan.
+### 2.1 What constitutes a “checkpoint”?
+- A public interface or function signature that the planned change will rely on.
+- A call graph or dependency that must be confirmed (e.g., who calls this function?).
+- The exact handling of a boundary condition (e.g., how does the code treat empty input?).
+- The location and implementation of a specific class, method, or macro.
+- Any statement in the plan that asserts “the current code does X” – that assertion must be verified by a Search Agent.
+
+### 2.2 Search Agent responsibilities
+Each Search Agent sub‑agent shall:
+- Retrieve the **exact content** of the specified file(s) and relevant surrounding context (e.g., enclosing class, function body).
+- Return a **compact citation** with file path, line range, and a short code snippet that supports the analysis.
+- For dependencies, locate the definition of called functions and their signatures.
+
+### 2.3 Parallelism & Coordination
+- Multiple Search Agents **may run in parallel** for different checkpoints (e.g., verifying several separate interfaces at once).
+- The Main Agent **must not** block the entire analysis on one search; it can continue with non-conflicting parts, but **must wait** for all search results before finalising the **Analysis Report**.
+
+### 2.4 Prohibited behaviours
+- **Do not** perform a full‑code‑base scan unless specifically required (e.g., for global refactoring impact analysis).
+- **Do not** rely on memory or training data to describe current source code – always dispatch a Search Agent to verify.
+- **Do not** skip a checkpoint because you assume it is trivial; if it affects the plan, it must be verified.
+
+### 2.5 Output of the analysis phase
+The Main Agent shall produce a structured **Analysis Report** that:
+- Lists all checkpoints and the Search Agent findings for each (with citations).
+- Summarises the current state of the relevant codebase (architecture, pain points, technical debt) based on these validated findings.
+- Identifies any missing information that still requires further searching – if so, dispatch additional Search Agents before finalising.
 
 ## 3. Boundary Condition Coverage
-After the analysis, explicitly list all identified boundary conditions. This list is mandatory and must cover:
+After completing the checkpoint‑based analysis, explicitly list all identified boundary conditions. This list is mandatory and must cover:
 
 - **Input Boundaries**: null, empty, oversized, malformed, injection attempts, type mismatches, unicode/special chars.
 - **State Boundaries**: uninitialized state, disconnected, expired sessions, cold caches, race conditions (concurrency/reentrancy).
@@ -29,10 +50,10 @@ After the analysis, explicitly list all identified boundary conditions. This lis
 - **Authorization Boundaries**: missing permissions, revoked tokens, cross-tenant access.
 - **Business Logic Boundaries**: impossible timestamps, negative quantities, circular references, conflicting updates.
 
-You MUST explain how the current code handles (or fails to handle) each boundary condition found. If a condition is not relevant, justify its omission.
+You **MUST** explain how the current code handles (or fails to handle) each boundary condition, and **every such statement must be backed by a Search Agent citation** from the analysis phase. If a condition is not relevant, justify its omission.
 
 ## 4. Plan Document Template
-Once analysis is complete, produce the plan using **exactly this structure**:
+Once the Analysis Report is complete, produce the plan using **exactly this structure**:
 
 ### 4.1 Title & Metadata
 - Plan Title
@@ -41,11 +62,11 @@ Once analysis is complete, produce the plan using **exactly this structure**:
 - Related modules/packages
 
 ### 4.2 Objectives
-- 1–3 sentences summarizing what the plan achieves and why.
+- 1–3 sentences summarising what the plan achieves and why.
 
-### 4.3 Current State Summary (from analysis)
+### 4.3 Current State Summary (from validated analysis)
 - Key findings (architecture, pain points, technical debt).
-- Link to the detailed Analysis Report section.
+- Reference to the Analysis Report and relevant Search Agent citations.
 
 ### 4.4 Proposed Changes
 - For each change: **What** (precise description), **Where** (file/path + line ranges if possible), **Why** (reason linked to objective or boundary condition).
@@ -81,7 +102,7 @@ A table that maps each boundary condition from §3 to the planned mitigation:
 - Code references must use `file.ts:42` style.
 - Complex flows can be illustrated with Mermaid.js diagrams (optional but encouraged).
 - The document must be self-contained; a human and another agent should be able to understand it without external context.
-- No placeholder text like "TODO" or "will be filled later"—all sections must be complete.
+- No placeholder text like “TODO” or “will be filled later”—all sections must be complete.
 
 ## 6. Enforcement
 If the analysis or plan fails to meet any requirement above, you MUST flag it as a **Non-Compliant Plan** and request a revision. Never proceed to implementation with a non-compliant plan.

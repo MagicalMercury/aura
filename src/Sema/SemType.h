@@ -56,6 +56,7 @@ struct RecordFieldSem {
 struct RecordSemType : SemType {
     std::vector<RecordFieldSem> fields; // 字段按定义顺序，但等价性检查忽略顺序
     std::string canonicalName;          // 类型别名名（如 "Tree"），用于 CodeGen 映射 C++ 类型
+    bool isTuple = false;               // 元组（匿名 record 语法糖）：位置字段 _0/_1/...；canonicalName 留空，C++ 类型名由 CodeGen 现场合成
     [[nodiscard]] bool equals(const SemType& other) const override;
     [[nodiscard]] std::string toString() const override;
     [[nodiscard]] std::unique_ptr<SemType> clone() const override;
@@ -84,14 +85,47 @@ struct FuncSemType : SemType {
     [[nodiscard]] std::unique_ptr<SemType> clone() const override;
 };
 
+// feature-06（阶段 C）：裸 Callable 类型（origins 溯源签名集）
+// 溯源签名集：空 = erased（裸 Callable 形参 / 跨模块 opaque / 传播丢失）
+// 运行时 C++ 表示 = aura_rt::CallableErased*（GC 堆包装，desc 追踪 target 槽）
+struct CallableSemType : SemType {
+    // 溯源签名集（shared_ptr 共享不可变签名——clone 只拷贝句柄）
+    std::vector<std::shared_ptr<const FuncSemType>> origins;
+    bool erased() const { return origins.empty(); }
+    // equals：同为 Callable 即等（origins 不参与相等性——赋值兼容性由
+    // Assignability 按 origins 判定，避免传播精度差异影响类型等同）
+    [[nodiscard]] bool equals(const SemType& o) const override {
+        return dynamic_cast<const CallableSemType*>(&o) != nullptr;
+    }
+    [[nodiscard]] std::string toString() const override {
+        if (erased()) return "Callable";
+        std::string s = "Callable<";
+        for (size_t i = 0; i < origins.size(); ++i)
+            s += (i ? " | " : "") + origins[i]->toString();
+        return s + ">";
+    }
+    [[nodiscard]] std::unique_ptr<SemType> clone() const override {
+        auto n = std::make_unique<CallableSemType>();
+        n->origins = origins;   // shared_ptr 共享签名（不可变）
+        return n;
+    }
+};
+
 struct InterfaceSemType : SemType {
     std::string name;
+    // 泛型接口实例化实参（如 Comparable<Point> 的 [Point]）；非泛型接口为空。
+    // P2b：union 变体为泛型接口视图时，mapSemType 需要实参生成完整 C++ 类型名
+    // （Comparable<Point*>），否则生成裸模板名 "Comparable" 无法编译。
+    std::vector<std::unique_ptr<SemType>> typeArgs;
     // 方法签名列表（在定义接口时填充）
     struct MethodSig {
         std::string name;
         std::vector<std::unique_ptr<SemType>> paramTypes;
         std::unique_ptr<SemType> returnType;
         bool throws = false;
+        bool hasDefault = false;   // 接口默认方法（结构匹配时豁免，实现者无需提供）
+        bool hasCppImpl = false;   // C++ 桥接方法（CppBridge，record 无需实现，同豁免）
+        size_t defaultCount = 0;   // 尾部默认参数个数（record 方法由 buildTypeMethods 填充）
     };
     std::vector<MethodSig> methods;
     [[nodiscard]] bool equals(const SemType& other) const override;

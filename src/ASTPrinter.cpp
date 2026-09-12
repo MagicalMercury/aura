@@ -67,6 +67,14 @@ void RecordType::print(std::ostream& os, int indent) const {
     }
 }
 
+void TupleTypeExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "TupleTypeExpr" << '\n';
+    for (auto& e : elementTypes) {
+        if (e) e->print(os, indent + 1);
+    }
+}
+
 void UnionType::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << "UnionType" << '\n';
@@ -135,7 +143,18 @@ void ListExpr::print(std::ostream& os, int indent) const {
 
 void RecordExpr::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "RecordExpr" << '\n';
+    // #5：具名 record 字面量带类型名（RecordExpr[Point]），匿名保持 RecordExpr
+    os << "RecordExpr";
+    if (!typeName.empty()) os << "[" << typeName << "]";
+    os << '\n';
+    // bug-51：显式类型实参 `Box<int> { ... }`（仿 CallExpr::print typeArgs 段）
+    if (!typeArgs.empty()) {
+        printIndent(os, indent + 1);
+        os << "typeArgs:" << '\n';
+        for (auto& t : typeArgs) {
+            if (t) t->print(os, indent + 2);
+        }
+    }
     for (auto& f : fields) {
         printIndent(os, indent + 1);
         os << f.name << " =" << '\n';
@@ -156,12 +175,33 @@ void UnaryExpr::print(std::ostream& os, int indent) const {
     if (operand) operand->print(os, indent + 1);
 }
 
+void ConditionalExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "ConditionalExpr" << '\n';
+    printIndent(os, indent + 1);
+    os << "cond:" << '\n';
+    if (cond) cond->print(os, indent + 2);
+    printIndent(os, indent + 1);
+    os << "then:" << '\n';
+    if (thenBranch) thenBranch->print(os, indent + 2);
+    printIndent(os, indent + 1);
+    os << "else:" << '\n';
+    if (elseBranch) elseBranch->print(os, indent + 2);
+}
+
 void CallExpr::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << "CallExpr" << '\n';
     printIndent(os, indent + 1);
     os << "callee:" << '\n';
     if (callee) callee->print(os, indent + 2);
+    if (!typeArgs.empty()) {
+        printIndent(os, indent + 1);
+        os << "typeArgs:" << '\n';
+        for (auto& t : typeArgs) {
+            if (t) t->print(os, indent + 2);
+        }
+    }
     printIndent(os, indent + 1);
     os << "args:" << '\n';
     for (auto& a : args) {
@@ -241,6 +281,14 @@ void ConstantPattern::print(std::ostream& os, int indent) const {
 void WildcardPattern::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << "WildcardPattern: _" << '\n';
+}
+
+void GroupPattern::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "GroupPattern" << '\n';
+    for (auto& a : alts) {
+        if (a) a->print(os, indent + 1);
+    }
 }
 
 // ---- Stmt 实现 ----
@@ -431,7 +479,13 @@ void FunDecl::print(std::ostream& os, int indent) const {
 
 void LetDecl::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "LetDecl: " << name << '\n';
+    os << "LetDecl: " << name;
+    if (!names.empty()) {
+        os << " <destructure:";
+        for (auto& nm : names) os << " " << nm;
+        os << ">";
+    }
+    os << '\n';
     if (type) {
         printIndent(os, indent + 1);
         os << "type:" << '\n';
@@ -446,7 +500,13 @@ void LetDecl::print(std::ostream& os, int indent) const {
 
 void ConstDecl::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "ConstDecl: " << name << '\n';
+    os << "ConstDecl: " << name;
+    if (!names.empty()) {
+        os << " <destructure:";
+        for (auto& nm : names) os << " " << nm;
+        os << ">";
+    }
+    os << '\n';
     if (type) {
         printIndent(os, indent + 1);
         os << "type:" << '\n';

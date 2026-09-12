@@ -98,7 +98,8 @@ bool ModuleManager::isKnownBuiltin(const std::string& name) const {
     // 初始内置模块：path（运行时已提供 aura_rt::path）
     // 未来可扩展：json, http, ...
     static const std::unordered_set<std::string> builtins = {
-        "path"
+        "path",
+        "math"
     };
     return builtins.count(name) > 0;
 }
@@ -226,6 +227,7 @@ void ModuleManager::loadAuraiFile(const std::string& baseName) {
 void ModuleManager::loadBuiltinAurai() {
     loadAuraiFile("io.aurai");
     loadAuraiFile("builtin.aurai");  // 基础内置全局函数（int/float/str/gc_*）
+    loadAuraiFile("interfaces.aurai");  // 内置接口（Stringer/Comparable/Iterator）
     // path.aurai 不在此加载——由 import path 时按需加载
 }
 
@@ -302,29 +304,25 @@ bool ModuleManager::hasCycle() {
 // 拓扑分层（Kahn BFS）
 // ============================================================
 std::vector<std::vector<ModuleInfo*>> ModuleManager::topologicalLayers() {
-    // 计算入度（只计用户模块依赖）
+    // 入度：A depends on B → B 应先编译，A 的入度+1（修正方向：被依赖者先编译，
+    // 依赖者入度 +1，入度为 0 者无未编译依赖，可入队）
     std::unordered_map<std::string, int> inDegree;
-    for (auto& [path, info] : modules_) {
-        if (!inDegree.count(path)) inDegree[path] = 0;
-        for (auto& dep : info.deps) {
-            if (modules_.count(dep)) inDegree[dep]++;  // dep 被 path 依赖 → dep 的入度+1
-            if (!inDegree.count(path)) inDegree[path] = 0;
-        }
-    }
-
-    // 修正入度计算方向：如果 A depends on B，B 应先编译，A 的入度+1
-    // 重新计算
-    inDegree.clear();
+    inDegree.reserve(modules_.size());
+    // 反向邻接（dependents）：dep → 依赖 dep 的模块列表，供 O(1) 后继查找，
+    // 替代原先对每个 path 全量扫描 modules_ 找依赖者的 O(n^2) 实现
+    std::unordered_map<std::string, std::vector<std::string>> dependents;
+    dependents.reserve(modules_.size());
     for (auto& [path, _] : modules_) inDegree[path] = 0;
     for (auto& [path, info] : modules_) {
         for (auto& dep : info.deps) {
             if (modules_.count(dep)) {
-                inDegree[path]++; // path 依赖 dep → path 的入度+1
+                inDegree[path]++;                 // path 依赖 dep → path 入度+1
+                dependents[dep].push_back(path);  // dep 的依赖者集合含 path
             }
         }
     }
 
-    // BFS 分层
+    // Kahn BFS 分层：入度为 0 的模块入队，处理后将依赖者入度-1
     std::deque<std::string> queue;
     for (auto& [path, deg] : inDegree) {
         if (deg == 0) queue.push_back(path);
@@ -347,17 +345,13 @@ std::vector<std::vector<ModuleInfo*>> ModuleManager::topologicalLayers() {
             currentLayer.push_back(&it->second);
             it->second.layer = static_cast<int>(layers.size());
 
-            // path 被编译后，依赖 path 的模块入度-1
-            for (auto& [otherPath, otherInfo] : modules_) {
-                if (processed.count(otherPath)) continue;
-                bool dependsOnPath = false;
-                for (auto& dep : otherInfo.deps) {
-                    if (dep == path) { dependsOnPath = true; break; }
-                }
-                if (dependsOnPath) {
-                    inDegree[otherPath]--;
-                    if (inDegree[otherPath] == 0 && !processed.count(otherPath)) {
-                        queue.push_back(otherPath);
+            // path 编译后，依赖 path 的模块入度-1；用 dependents 反向表 O(1) 查后继
+            auto dit = dependents.find(path);
+            if (dit != dependents.end()) {
+                for (auto& dependent : dit->second) {
+                    if (processed.count(dependent)) continue;
+                    if (--inDegree[dependent] == 0) {
+                        queue.push_back(dependent);
                     }
                 }
             }

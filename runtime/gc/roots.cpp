@@ -9,6 +9,14 @@
 
 #include "gc.h"
 #include <algorithm>
+#include <chrono>
+#include <functional>  // bug-47 诊断：std::hash<thread::id>（非 Windows TID 回退）
+#include <thread>
+#ifdef _WIN32
+#include <windows.h>   // OpenThread/CloseHandle/GetCurrentThreadId（P2 中断 + bug-47 诊断）
+#else
+#include <pthread.h>   // pthread_self（P2 中断句柄）
+#endif
 
 namespace aura_rt {
 
@@ -43,16 +51,55 @@ void GcHeap::unregisterRootThreadLocal(GcRootHandleBase* root) {
     if (root->next_) root->next_->prev_ = root->prev_;
 }
 
+// 原位替换：newNode 接管 oldNode 在链表中的位置（O(1)，移动构造用）
+// 前置：oldNode 已在当前线程链表（ThreadLocal 模式移动）；同线程操作无锁
+void GcHeap::moveRootNode(GcRootHandleBase* newNode, GcRootHandleBase* oldNode) {
+    ThreadRootList* list = tl_roots_;
+    if (!list) return;                               // 防御：oldNode 理应已注册
+    newNode->prev_ = oldNode->prev_;
+    newNode->next_ = oldNode->next_;
+    if (oldNode->prev_) oldNode->prev_->next_ = newNode;
+    else                list->head = newNode;
+    if (oldNode->next_) oldNode->next_->prev_ = newNode;
+    oldNode->next_ = oldNode->prev_ = nullptr;       // 源脱离链表
+}
+
 GcHeap::ThreadRootList* GcHeap::ensureThreadRootList() {
     if (tl_roots_) return tl_roots_;
     auto* list = new ThreadRootList();  // 堆分配，避免 thread_local 析构顺序问题
+    // bug-47 诊断：记录拥有者 TID + 初始心跳（此后 safepoint() 入口持续刷新）
+#ifdef _WIN32
+    list->diag_tid = static_cast<unsigned>(GetCurrentThreadId());
+#else
+    list->diag_tid = static_cast<unsigned>(
+        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+    list->diag_last_safepoint = std::chrono::steady_clock::now();
     tl_roots_ = list;
     {
         std::lock_guard<std::mutex> lk(threadRootLists_m_);
         threadRootLists_.push_back(list);
     }
+    // P2：懒注册中断句柄。此处覆盖所有产生根链表的路径：
+    //   worker（registerThread→本函数）/ EventLoop 主线程（同）/ 任意线程
+    //   首建 GcRootHandle（懒调用）。入口 tl_roots_ 早退保证每线程仅注册一次。
+    //   句柄生命周期与 tl_roots_ 绑定（releaseThreadRootList 同步移除）。
+    {
+        auto tid = std::this_thread::get_id();
+        std::lock_guard<std::mutex> lk(threadHandlesM_);
+#ifdef _WIN32
+        // THREAD_SET_CONTEXT 是 QueueUserAPC 的必需权限（自身线程，OpenThread 不会失败；
+        // 防御：失败得 NULL 入表，投递时 QueueUserAPC 返回 0 静默忽略）
+        HANDLE h = OpenThread(THREAD_SET_CONTEXT, FALSE, GetCurrentThreadId());
+        threadHandles_.push_back({tid, h});
+#else
+        threadHandles_.push_back({tid, static_cast<unsigned long>(pthread_self())});
+#endif
+    }
     return list;
 }
+
+
 
 void GcHeap::releaseThreadRootList() {
     if (!tl_roots_) return;
@@ -61,6 +108,21 @@ void GcHeap::releaseThreadRootList() {
         std::lock_guard<std::mutex> lk(threadRootLists_m_);
         auto it = std::find(threadRootLists_.begin(), threadRootLists_.end(), tl_roots_);
         if (it != threadRootLists_.end()) threadRootLists_.erase(it);
+    }
+    // P2：同步移除中断句柄（与根链表生命周期对齐）。
+    // 竞态说明：broadcastInterrupt 可能已快照到本句柄——Linux pthread_kill 得
+    // ESRCH、Win QueueUserAPC 得失效句柄返回 0，均静默忽略，停靠靠轮询兜底
+    {
+        auto tid = std::this_thread::get_id();
+        std::lock_guard<std::mutex> lk(threadHandlesM_);
+        auto it = std::find_if(threadHandles_.begin(), threadHandles_.end(),
+            [tid](const ThreadHandle& th) { return th.id == tid; });
+        if (it != threadHandles_.end()) {
+#ifdef _WIN32
+            if (it->native) CloseHandle(static_cast<HANDLE>(it->native));
+#endif
+            threadHandles_.erase(it);
+        }
     }
     delete tl_roots_;
     tl_roots_ = nullptr;

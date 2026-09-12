@@ -159,8 +159,11 @@ std::unique_ptr<TypeExpr> Parser::parsePrimaryType() {
             error("expected type in parentheses");
             return nullptr;
         }
-        error("expected '->' for function type");
-        return nullptr;
+        // 多参数无箭头 → 元组类型 (T1, T2, ...)（匿名 record 语法糖，位置字段 _0/_1/...）
+        auto tp = std::make_unique<TupleTypeExpr>();
+        setNodePos(tp.get(), tok);
+        tp->elementTypes = std::move(paramTypes);
+        return tp;
     }
 
     error("expected type");
@@ -172,6 +175,29 @@ std::unique_ptr<TypeExpr> Parser::parsePrimaryType() {
 // ============================================================
 
 std::unique_ptr<Pattern> Parser::parsePattern() {
+    // P5：Rust 风格 `|` 分组——仅常量模式允许分组
+    //   match x { 1 | 2 | 3 => A, _ => B }
+    // 类型模式分组报错引导分开写（如 User | string）。
+    auto first = parseSinglePattern();
+
+    if (!match(TokType::Bar)) return first;
+
+    auto group = std::make_unique<GroupPattern>();
+    if (!dynamic_cast<ConstantPattern*>(first.get())) {
+        error("type pattern cannot be grouped; write separate cases or use a union type");
+    }
+    group->alts.push_back(std::move(first));
+    do {
+        auto alt = parseSinglePattern();
+        if (!dynamic_cast<ConstantPattern*>(alt.get())) {
+            error("type pattern cannot be grouped; write separate cases or use a union type");
+        }
+        group->alts.push_back(std::move(alt));
+    } while (match(TokType::Bar));
+    return group;
+}
+
+std::unique_ptr<Pattern> Parser::parseSinglePattern() {
     // 通配符 _
     if (check(TokType::Identifier) && peek().lexeme == "_") {
         advance();
@@ -243,6 +269,17 @@ InterfaceMethodSig Parser::parseInterfaceMethodSig() {
 
     if (match(TokType::Arrow)) {
         sig.returnType = parseType();
+    }
+
+    // 接口方法签名后三选一：
+    //   { body } → Aura 默认方法（DefaultAura）
+    //   ...      → C++ 桥接方法（CppBridge，aura 无实现 c++ 有实现）
+    //   无       → 纯虚（record 必须实现）
+    if (check(TokType::LBrace)) {
+        sig.bodyKind = InterfaceMethodSig::BodyKind::DefaultAura;
+        sig.defaultBody = parseBlock();
+    } else if (match(TokType::Ellipsis)) {
+        sig.bodyKind = InterfaceMethodSig::BodyKind::CppBridge;
     }
 
     return sig;

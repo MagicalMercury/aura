@@ -1,15 +1,62 @@
 #include "Sema/SemAnalyzer.h"
-
 #include <functional>
 
 namespace Aura {
 
 // ============================================================
+// 联合变体 GC 安全性判定（P0 防崩，见 plan/联合类型GC安全问题.md §4.1）
+// 返回 true → 该变体不能放进 std::variant（内部 GC 指针对 GC 不可见）。
+// 注意：与 CodeGen isHeapSemType（ExprGen.cpp）判定目的不同——
+// isHeapSemType 判"该值是否为 GC 堆对象、需要 GcRootHandle 包装"（function/接口为 false）；
+// 本函数判"该值放 std::variant 内部是否 GC 可达"（闭包可捕获 GC 指针、接口对象可持
+// 堆字段，而 variant 内部存储对 GC 不可见）→ function/接口返回 true。结论相反是正确的。
+// 当前仅用于 P3a 折叠判定（`T | None` 中另一变体为堆类型才折叠为 Optional）。
+// ============================================================
+bool SemAnalyzer::unionVariantGcUnsafe(const SemType& t) {
+    if (auto* p = dynamic_cast<const PrimSemType*>(&t))
+        return p->kind == PrimSemType::String;
+    if (dynamic_cast<const NoneSemType*>(&t))  return false;
+    if (dynamic_cast<const ErrorSemType*>(&t)) return false;
+    if (dynamic_cast<const ListSemType*>(&t))  return true;    // Array<T>* 堆
+    if (dynamic_cast<const OptionalSemType*>(&t)) return true; // Optional<T>* 堆
+    if (dynamic_cast<const RecordSemType*>(&t))   return true; // 用户 record → Name* 堆对象
+    if (dynamic_cast<const FuncSemType*>(&t))     return true; // std::function 捕获 GC 指针，GC 不可见
+    // 接口视图（值视图 { 方法Fn, self }）：P1-2 Option B 不折叠，走 Variant 路径
+    // （与 Iterator<T>|None 一致）。Variant 对接口视图变体由 descForI is_iface_view_v
+    // 子偏移（storage_ + offsetof(T,self)）+ ViewRoot 保护，GC 安全（见 variant.h:74-78）。
+    if (dynamic_cast<const InterfaceSemType*>(&t)) return false;
+    if (auto* u = dynamic_cast<const UnionSemType*>(&t))
+        for (auto& v : u->variants)
+            if (v && unionVariantGcUnsafe(*v)) return true;
+    if (dynamic_cast<const GenericSemType*>(&t)) return false; // 未实例化放行，实例化时二次检查（P3c）
+    return true;
+}
+
+// ============================================================
+// 变体能否安全存入 aura_rt::Variant<T...> storage_（P3b 收窄后的声明期 P0 判定，
+// 2026-09-05 bug-65 从 TypeResolver.cpp 匿名 static 提升为公共成员——P3c
+// （substitute 泛型实例化二次检查，GenericSubstitution.cpp）须与声明期 P0 复用
+// 同一判定，避免泛型/非泛型形态行为分叉）：
+// 仅 function（std::function 值对象非指针，descForI 不可追踪）、嵌套 union
+// （未扁平化）不可存；其余含堆变体（string/record/list/optional/接口视图）已由
+// aura_rt::Variant 支持——descForI 按 is_pointer_v 扫描激活变体指针、
+// is_iface_view_v 按 self 子偏移扫描 + ViewRoot 保护（variant.h L57-74）。
+// ============================================================
+bool SemAnalyzer::variantStorageUnsafe(const SemType& t) {
+    if (dynamic_cast<const FuncSemType*>(&t))     return true;
+    if (dynamic_cast<const UnionSemType*>(&t))    return true;
+    // 内置 Iterator（GenericSemType "Iterator"）联合变体：P0.4 起编译期拦截；
+    // B+W 值视图化后 descForI is_iface_view_v 子偏移 + 装箱/match ViewRoot 保护
+    // 已使其 GC 安全（2026-08-10 评估放开，见 plan/评估放开内置Iterator联合变体拦截实施方案.md）。
+    return false;
+}
+
+// ============================================================
 // 辅助：遍历 TypeExpr 树，对每个泛型类型引用回调 fn(name)
 // （统一 collectGenericRefs / registerGenericParams 的 6 分支遍历）
 // ============================================================
-static void forEachGenericRef(const TypeExpr& type,
-                              const std::function<void(const std::string&)>& fn) {
+void SemAnalyzer::forEachGenericRef(const TypeExpr& type,
+                                    const std::function<void(const std::string&)>& fn) {
     if (auto* g = dynamic_cast<const GenericTypeRef*>(&type)) { fn(g->name); return; }
     if (auto* n = dynamic_cast<const NamedType*>(&type)) {
         for (auto& arg : n->typeArgs)
@@ -35,10 +82,14 @@ static void forEachGenericRef(const TypeExpr& type,
             if (p) forEachGenericRef(*p, fn);
         if (fnT->returnType) forEachGenericRef(*fnT->returnType, fn);
     }
+    if (auto* tp = dynamic_cast<const TupleTypeExpr*>(&type)) {
+        for (auto& e : tp->elementTypes)
+            if (e) forEachGenericRef(*e, fn);
+    }
 }
 
 // 注册 TypeExpr 中所有泛型引用为 GenericParam 符号（checkFunBody/checkMethodBody 复用）
-static void registerTypeGenerics(SymbolTable& symtab, const TypeExpr& type) {
+void SemAnalyzer::registerTypeGenerics(SymbolTable& symtab, const TypeExpr& type) {
     forEachGenericRef(type, [&](const std::string& g) {
         Symbol sym;
         sym.kind = SymKind::GenericParam;
@@ -47,13 +98,219 @@ static void registerTypeGenerics(SymbolTable& symtab, const TypeExpr& type) {
     });
 }
 
+// M5 + bug-07：注册 FunctionType 中的"裸泛型名"（未声明的 NamedType）为 GenericParam。
+// 直接写泛型函数类型（`fun makeU() -> fun(U) -> U` 返回 / `f: fun(U) -> U` 参数）时，
+// T/U 是裸 NamedType（解析器仅将 <T> 尖括号形式解析为 GenericTypeRef）；forEachGenericRef
+// 对 NamedType 只遍历 typeArgs、不收集裸名 → resolveType 报 undefined type 'U'。此处仿
+// registerTypeGenerics 在类型解析前注册：仅注册"未声明（非 builtin、非 TypeAlias/Interface/
+// GenericParam）且无实参的裸类型名"，已声明类型名（如 Point）不受影响。对已注册的
+// GenericParam（接口泛型 T）跳过（幂等，防遮蔽）。
+void SemAnalyzer::registerFuncTypeGenerics(SymbolTable& symtab, const TypeExpr& type) {
+    auto visit = [&](const TypeExpr* t, auto&& self) -> void {
+        if (!t) return;
+        if (auto* fn = dynamic_cast<const FunctionType*>(t)) {
+            for (auto& p : fn->paramTypes)
+                if (p) self(p.get(), self);
+            self(fn->returnType.get(), self);
+            return;
+        }
+        if (auto* n = dynamic_cast<const NamedType*>(t)) {
+            // 带实参的命名类型（Mapper<T,U>/Tree<int>）→ 递归实参中的裸泛型
+            if (!n->typeArgs.empty()) {
+                for (auto& a : n->typeArgs)
+                    if (a) self(a.get(), self);
+                return;
+            }
+            // 命名空间限定（sync.Mutex 等）不可能是隐式泛型
+            if (!n->namespacePrefix.empty()) return;
+            // 内置类型名（int/float/string/None/Io/...）非泛型
+            if (BuiltinRegistry::get().findType(n->name)) return;
+            // 已声明为类型/接口/泛型参数 → 不重复注册（已声明类型按原样解析）
+            auto* sym = symtab.lookup(n->name);
+            if (sym && (sym->kind == SymKind::TypeAlias || sym->kind == SymKind::Interface
+                        || sym->kind == SymKind::GenericParam))
+                return;
+            Symbol tp;
+            tp.kind = SymKind::GenericParam;
+            tp.name = n->name;
+            symtab.define(std::move(tp));
+            return;
+        }
+        if (auto* l = dynamic_cast<const ListType*>(t)) {
+            self(l->elementType.get(), self);
+            return;
+        }
+        if (auto* u = dynamic_cast<const UnionType*>(t)) {
+            for (auto& v : u->types)
+                if (v) self(v.get(), self);
+            return;
+        }
+        if (auto* r = dynamic_cast<const RecordType*>(t)) {
+            for (auto& f : r->fields)
+                if (f.type) self(f.type.get(), self);
+            return;
+        }
+        if (auto* tp = dynamic_cast<const TupleTypeExpr*>(t)) {
+            for (auto& e : tp->elementTypes)
+                if (e) self(e.get(), self);
+            return;
+        }
+    };
+    // 仅当返回类型是 FunctionType（泛型函数类型）时才遍历其内部裸泛型并隐式注册；
+    // 裸 NamedType 顶层返回（`fun bad() -> T`）不隐式引入（UnintroducedTInReturnRejected
+    // 回归：未引入的 T 必须保持 undefined 报错）
+    if (dynamic_cast<const FunctionType*>(&type))
+        visit(&type, visit);
+}
+
 // ============================================================
 // 第 1 遍：声明顶层符号
 // ============================================================
 
+// receiverType 规范名：查符号表 RecordSemType.canonicalName（与 isAssignable 查询一致）
+std::string SemAnalyzer::recordTypeKey(const std::string& receiverType) const {
+    auto* sym = symtab_.lookup(receiverType);
+    if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
+        if (auto* rec = dynamic_cast<const RecordSemType*>(sym->type.get()))
+            return rec->canonicalName;   // 空 = 匿名 record（无法实现接口）
+    }
+    return "";   // 非 record 接收者（v1 接口仅支持 record 实现）
+}
+
+// 构建 receiverType → 方法签名映射（接口结构匹配数据源）
+void SemAnalyzer::buildTypeMethods(const Program& program) {
+    typeMethods_.clear();
+    for (auto& d : program.decls) {
+        if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
+            if (m->isConstructor || m->receiverType.empty()) continue;
+            std::string key = recordTypeKey(m->receiverType);
+            if (key.empty()) continue;
+            InterfaceSemType::MethodSig sig;
+            sig.name = m->name;
+            // 签名直接 resolveType 解析（第 1 遍末尾所有类型已声明，resolveType 安全）
+            // 注：不从符号表 lookup(m->name) 取——不同 record 的同名方法会取错符号
+            // M5：方法返回类型直接写泛型函数类型（`-> fun(U,T) throws -> U`）时，U/T 是
+            // 裸 NamedType 全局未注册，需临时 Function scope 提前注册再解析，否则报 undefined
+            symtab_.enterScope(ScopeKind::Function);
+            if (m->returnType) registerFuncTypeGenerics(symtab_, *m->returnType);
+            for (auto& p : m->params) {
+                // bug-07：方法参数直接写泛型函数类型（`f: fun(U) -> U`）时 U 是裸
+                // NamedType，registerTypeGenerics 不收集；此处仿返回侧提前注册
+                if (p.type) registerFuncTypeGenerics(symtab_, *p.type);
+                if (p.type) sig.paramTypes.push_back(resolveType(*p.type));
+                else        sig.paramTypes.push_back(ErrorSemType::make());
+            }
+            if (m->returnType) sig.returnType = resolveType(*m->returnType);
+            symtab_.exitScope();
+            sig.throws = m->throws;
+            // 尾部默认参数个数（checkCallArgs 参数数量检查用，C3.1 保证连续）
+            for (auto& p : m->params)
+                if (p.defaultExpr) ++sig.defaultCount;
+            typeMethods_[key].push_back(std::move(sig));
+        }
+    }
+}
+
 void SemAnalyzer::declareTopLevel(const Program& program) {
+    // 内置接口先注册（interfaces.aurai：Stringer/Comparable/Iterator），
+    // 用户 decls 可引用内置接口（如 impl Comparable<Point>）
+    for (auto& i : BuiltinRegistry::get().auraiInterfaces())
+        declareInterface(*i);
     for (auto& d : program.decls) {
         if (d) declareDecl(*d);
+    }
+    // 接口方法签名二次解析 + 前向引用校验（problem.txt「接口声明中引用后置类型」）：
+    // 接口方法签名引用后置 record/别名/泛型 record 时第一遍做前向占位注册，此处
+    // 所有类型已声明 → 占位覆盖为完整类型；真 undefined 在此报错。须在
+    // buildTypeMethods / verifyImplCompleteness（依赖完整接口方法集）之前。
+    finalizeInterfaceSignatures(program);
+    // 第 1 遍末尾统一构建 typeMethods_：此时所有 record/interface/方法符号已注册，
+    // recordTypeKey 的 resolveType 安全（declareDecl 阶段前向/自引用类型可能未注册）
+    buildTypeMethods(program);
+    // 显式 impl 收集（第 1 遍末尾，record 类型已全部注册，recordTypeKey 安全）
+    recordImplIfaces_.clear();
+    for (auto& d : program.decls) {
+        if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
+            if (m->implInterface.empty() || m->receiverType.empty()) continue;
+            std::string key = recordTypeKey(m->receiverType);
+            if (!key.empty())
+                recordImplIfaces_[key].insert(m->implInterface);
+        }
+    }
+    // 显式 impl 完整性验证：record 声明 impl 接口 → 接口所有非默认方法必须已实现
+    verifyImplCompleteness(program);
+}
+
+// ============================================================
+// 显式 impl 完整性验证（第 1 遍末尾）
+// ============================================================
+void SemAnalyzer::verifyImplCompleteness(const Program& program) {
+    for (auto& [recKey, ifaces] : recordImplIfaces_) {
+        for (auto& ifaceName : ifaces) {
+            auto* sym = symtab_.lookup(ifaceName);
+            if (!sym || sym->kind != SymKind::Interface) continue;  // 未找到接口 → 已报错
+            auto tmIt = typeMethods_.find(recKey);
+            for (auto& m : sym->interfaceMethods) {
+                if (m.hasDefault || m.hasCppImpl) continue;  // 默认方法 / C++ 桥接豁免
+                bool found = false;
+                if (tmIt != typeMethods_.end()) {
+                    // 泛型接口签名代换（与 checkInterfaceImpl 一致）：用 impl 的类型实参
+                    // 替换接口签名中的形参（如 Iterator<T> 的 next() -> Optional<T> → int），
+                    // 否则 Optional<T> 与 Optional<int32_t> 经 P0.5 equals 精确比较不等 → 误报"未实现"
+                    const MethodDecl* argAnchor = nullptr;
+                    for (auto& d : program.decls) {
+                        if (auto* md = dynamic_cast<const MethodDecl*>(d.get())) {
+                            if (md->implInterface == ifaceName && !md->receiverType.empty()
+                                && recordTypeKey(md->receiverType) == recKey) {
+                                argAnchor = md;
+                                break;
+                            }
+                        }
+                    }
+                    auto substIface = [&](const SemType& t) -> std::unique_ptr<SemType> {
+                        std::unique_ptr<SemType> cur = t.clone();
+                        if (!argAnchor) return cur;
+                        for (size_t k = 0; k < sym->typeParams.size()
+                                          && k < argAnchor->implTypeArgs.size(); ++k) {
+                            auto concrete = resolveType(*argAnchor->implTypeArgs[k]);
+                            cur = substitute(*cur, sym->typeParams[k], *concrete);
+                        }
+                        return cur;
+                    };
+                    for (auto& rm : tmIt->second) {
+                        if (rm.name != m.name) continue;
+                        std::vector<std::unique_ptr<SemType>> ifaceParams;
+                        for (auto& p : m.paramTypes)
+                            ifaceParams.push_back(p ? substIface(*p) : nullptr);
+                        auto ifaceRet = m.returnType ? substIface(*m.returnType) : nullptr;
+                        found = matchFuncSig(ifaceParams, ifaceRet.get(), m.throws,
+                                             rm.paramTypes, rm.returnType.get(), rm.throws);
+                        break;
+                    }
+                }
+                if (!found) {
+                    // 定位报错节点：该 record 任意一个带 impl 的方法声明
+                    const MethodDecl* anchor = nullptr;
+                    for (auto& d : program.decls) {
+                        if (auto* md = dynamic_cast<const MethodDecl*>(d.get())) {
+                            if (md->implInterface == ifaceName && !md->receiverType.empty()
+                                && recordTypeKey(md->receiverType) == recKey) {
+                                anchor = md;
+                                break;
+                            }
+                        }
+                    }
+                    if (anchor) {
+                        error(*anchor,
+                              "type '" + recKey + "' implements interface '" + ifaceName +
+                              "' but does not implement required method '" + m.name + "'");
+                    } else {
+                        error(0, 0, "type '" + recKey + "' implements interface '" + ifaceName +
+                              "' but does not implement required method '" + m.name + "'");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -99,9 +356,16 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
             }
 
             auto resolved = resolveType(*t->type);
-            // 记录类型的规范名（如 "Tree"），供 CodeGen 映射 C++ 类型
+            // 记录类型的规范名（如 "Tree"），供 CodeGen 映射 C++ 类型。
+            // #5：仅直接 record 定义（type Point = { ... }，t->type 为 RecordType）
+            // 用自身名作 canonicalName；别名指向 record（type MyPoint = Point，
+            // t->type 为 NamedType）保持 resolveType 返回的底层 record 名——C++
+            // 层只有底层 record 类（struct Point），用别名名会生成
+            // gc_alloc<MyPoint> 坏 C++（problem.txt「type 别名（指向 record）作
+            // let 类型标注」独立缺陷 + #5 具名 record 字面量别名形态）
             if (auto* rec = dynamic_cast<RecordSemType*>(resolved.get())) {
-                rec->canonicalName = t->name;
+                if (dynamic_cast<const RecordType*>(t->type.get()))
+                    rec->canonicalName = t->name;
                 // 非泛型自引用类型（如 type IntTree = { children: [IntTree] }）：
                 // resolveType 在解析自引用字段时返回 GenericSemType(name="IntTree")
                 // 但 resolvedName 为空。sealSelfRefs 将 resolvedName 设为类型名，
@@ -109,31 +373,27 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
                 // 泛型类型的 sealSelfRefs 在 materializeCanonicalName 中调用
                 if (t->typeParams.empty()) {
                     sealSelfRefs(resolved, t->name, t->name);
+                    // #4：自引用 `Node | None` 字段解析期为 GenericSemType 占位不折叠，
+                    // 与 mapType 声明侧折叠（Optional）不一致 → 在此补折叠对齐
+                    foldSelfRefOptionalUnions(resolved);
                 }
             }
             // 用完整类型更新占位符
             auto* existing = symtab_.lookupGlobal(t->name);
-            if (existing) existing->type = std::move(resolved);
+            if (existing) {
+                existing->type = std::move(resolved);
+                // 泛型参数列表同步：接口方法签名前向占位注册的同名 TypeAlias（见
+                // TypeResolver.cpp forwardRegisterIfaceType）无 typeParams，此处补全，
+                // 否则 Box2<T> 等后置泛型 record 的实例化（applyTypeArgs）失效。
+                existing->typeParams = t->typeParams;
+            }
         }
 
         resolvingTypes_.erase(t->name);
         return;
     }
     if (auto* i = dynamic_cast<const InterfaceDecl*>(&decl)) {
-        Symbol sym;
-        sym.kind = SymKind::Interface;
-        sym.name = i->name;
-        sym.isPublic = i->isPublic;  // Phase B
-        for (auto& m : i->methods) {
-            InterfaceSemType::MethodSig sig;
-            sig.name   = m.name;
-            for (auto& p : m.params)
-                sig.paramTypes.push_back(p.type ? resolveType(*p.type) : ErrorSemType::make());
-            sig.returnType = m.returnType ? resolveType(*m.returnType) : nullptr;
-            sig.throws = m.throws;
-            sym.interfaceMethods.push_back(std::move(sig));
-        }
-        symtab_.defineGlobal(std::move(sym));
+        declareInterface(*i);
         return;
     }
     if (auto* f = dynamic_cast<const FunDecl*>(&decl)) {
@@ -148,8 +408,14 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         symtab_.enterScope(ScopeKind::Function);
         for (auto& p : f->params) {
             if (p.type) registerTypeGenerics(symtab_, *p.type);
+            // bug-07：参数直接写泛型函数类型（`f: fun(U) -> U`）时 U 是裸 NamedType，
+            // registerTypeGenerics 不收集；仿返回侧 M5 提前注册（仅顶层 FunctionType）
+            if (p.type) registerFuncTypeGenerics(symtab_, *p.type);
         }
         if (f->returnType) registerTypeGenerics(symtab_, *f->returnType);
+        // M5：返回类型直接写泛型函数类型（`-> fun(U) -> U`）时，U 是裸 NamedType，
+        // registerTypeGenerics 不收集；第 1 遍声明阶段也要解析返回类型，需同样提前注册
+        if (f->returnType) registerFuncTypeGenerics(symtab_, *f->returnType);
 
         for (auto& p : f->params) {
             SymParam sp;
@@ -170,7 +436,15 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         sym.name   = m->name;
         sym.throws = m->throws;
         sym.isPublic = m->isPublic;  // Phase B
+        // M5：方法返回类型直接写泛型函数类型（`-> fun(U,T) throws -> U`）时，U/T 是
+        // 裸 NamedType（非 receiver 泛型，全局未注册），需临时 Function scope 提前注册，
+        // 使第 1 遍参数/返回类型解析不报 undefined type
+        symtab_.enterScope(ScopeKind::Function);
+        if (m->returnType) registerFuncTypeGenerics(symtab_, *m->returnType);
         for (auto& p : m->params) {
+            // bug-07：方法参数直接写泛型函数类型（`f: fun(U) -> U`）时 U 是裸 NamedType，
+            // registerTypeGenerics 不收集；仿返回侧提前注册（仅顶层 FunctionType）
+            if (p.type) registerFuncTypeGenerics(symtab_, *p.type);
             SymParam sp;
             sp.name = p.name;
             sp.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
@@ -178,328 +452,9 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
             sym.params.push_back(std::move(sp));
         }
         sym.type = m->returnType ? resolveType(*m->returnType) : nullptr;
+        symtab_.exitScope();
         symtab_.defineGlobal(std::move(sym));
         return;
-    }
-}
-
-// ============================================================
-// AST 类型 → 语义类型
-// ============================================================
-
-std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
-    if (auto* n = dynamic_cast<const NamedType*>(&astType)) {
-        std::string fullName = n->name;
-        if (!n->namespacePrefix.empty())
-            fullName = n->namespacePrefix[0] + "." + n->name;
-        auto result = resolveNamedType(fullName);
-        // sync 命名空间限定的内置类型（如 sync.Mutex）：
-        // BuiltinRegistry 中只注册 "Mutex"，需用 n->name 再查一次
-        if (dynamic_cast<const ErrorSemType*>(result.get()) &&
-            n->namespacePrefix.size() == 1 && n->namespacePrefix[0] == "sync") {
-            result = resolveNamedType(n->name);
-        }
-        // 未找到类型 → 报错（Io/Path 为内置能力类型，由 CodeGen 注册）
-        if (dynamic_cast<const ErrorSemType*>(result.get()) &&
-            fullName != "None" && fullName != "int" && fullName != "float" &&
-            fullName != "bool" && fullName != "string" && fullName != "Io" && fullName != "Path") {
-            error(n->line, n->col, "undefined type '" + fullName + "'");
-        }
-        // 若有名称类型且有泛型实参（如 Tree<int>），用 substitute 将泛型形参替换为实参
-        if (!n->typeArgs.empty()) {
-            auto* sym = symtab_.lookup(fullName);
-            if (sym && sym->kind == SymKind::TypeAlias && !sym->typeParams.empty()) {
-                // 泛型实参数必须与声明一致（缺省/多余均报错，D4）
-                if (n->typeArgs.size() != sym->typeParams.size()) {
-                    error(*n, "type '" + n->name + "' expects "
-                          + std::to_string(sym->typeParams.size())
-                          + " type argument(s), got " + std::to_string(n->typeArgs.size()));
-                }
-                // 用户自定义泛型：applyTypeArgs 替换形参为实参 + materializeCanonicalName
-                result = applyTypeArgs(std::move(result), *sym, n->typeArgs);
-                materializeCanonicalName(result, *n);
-            } else {
-                // 内置泛型（如 sync.Channel<int> / channel<int>）：result 为 GenericSemType
-                // 无 typeParams 可替换，仅设置 resolvedName 供 CodeGen / for-in 提取元素类型
-                materializeCanonicalName(result, *n);
-            }
-        }
-        return result;
-    }
-    if (auto* l = dynamic_cast<const ListType*>(&astType)) {
-        auto t = std::make_unique<ListSemType>();
-        t->elementType = l->elementType ? resolveType(*l->elementType) : ErrorSemType::make();
-        return t;
-    }
-    if (auto* r = dynamic_cast<const RecordType*>(&astType)) {
-        auto t = std::make_unique<RecordSemType>();
-        for (auto& f : r->fields) {
-            t->fields.push_back({f.name, f.type ? resolveType(*f.type) : ErrorSemType::make()});
-        }
-        return t;
-    }
-    if (auto* u = dynamic_cast<const UnionType*>(&astType)) {
-        auto t = std::make_unique<UnionSemType>();
-        for (auto& v : u->types) {
-            t->variants.push_back(v ? resolveType(*v) : ErrorSemType::make());
-        }
-        return t;
-    }
-    if (auto* fn = dynamic_cast<const FunctionType*>(&astType)) {
-        auto t = std::make_unique<FuncSemType>();
-        for (auto& p : fn->paramTypes) {
-            t->paramTypes.push_back(p ? resolveType(*p) : ErrorSemType::make());
-        }
-        t->returnType = fn->returnType ? resolveType(*fn->returnType) : nullptr;
-        t->throws = fn->throws;
-        return t;
-    }
-    if (auto* g = dynamic_cast<const GenericTypeRef*>(&astType)) {
-        auto t = std::make_unique<GenericSemType>();
-        t->name = g->name;
-        return t;
-    }
-    return ErrorSemType::make();
-}
-
-// ============================================================
-// 函数体/方法体检查入口
-// ============================================================
-
-// 默认参数声明规则：尾部连续、类型可赋值、泛型参数拒绝（C3.1）
-void SemAnalyzer::checkDefaultArgRules(const ASTNode& declNode,
-                                       const std::vector<Param>& params) {
-    bool seenDefault = false;
-    for (auto& p : params) {
-        if (!p.defaultExpr) {
-            if (seenDefault)
-                error(declNode, "parameter '" + p.name
-                      + "': default argument must be trailing");
-            continue;
-        }
-        seenDefault = true;
-        // v1 限制：泛型参数不支持默认值（isAssignable 对未绑定 T 语义未定义）
-        if (p.type && dynamic_cast<const GenericTypeRef*>(p.type.get())) {
-            error(declNode, "parameter '" + p.name
-                  + "': default argument not supported on generic parameter");
-        }
-        // 默认值表达式声明处求值检查（inferExpr 写入 defaultExpr->inferredType，C5 复用）
-        auto dt = inferExpr(*p.defaultExpr);
-        if (dynamic_cast<const ErrorSemType*>(dt.get())) {
-            error(*p.defaultExpr, "invalid default argument for parameter '" + p.name + "'");
-            continue;
-        }
-        if (p.type) {
-            auto pt = resolveType(*p.type);
-            if (!isAssignable(*pt, *dt))
-                error(*p.defaultExpr, "default argument type mismatch for parameter '"
-                      + p.name + "': expected '" + pt->toString() + "', got '"
-                      + dt->toString() + "'");
-        }
-    }
-}
-
-// ============================================================
-// 辅助：漏 return 检查（非 None 返回类型函数必须所有路径显式 return）
-// 递归判断语句是否在所有路径上以 return/throw 终结（终结后语句不可达）
-// ============================================================
-static bool stmtAllPathsReturn(const Stmt& stmt);
-
-static bool blockAllPathsReturn(const BlockStmt& block) {
-    for (auto& s : block.stmts) {
-        if (!s) continue;
-        // 一旦遇到终结语句（return/throw），其后的语句不可达
-        if (stmtAllPathsReturn(*s)) return true;
-    }
-    return false;
-}
-
-static bool stmtAllPathsReturn(const Stmt& stmt) {
-    // return / throw 均为终结语句
-    if (dynamic_cast<const ReturnStmt*>(&stmt)) return true;
-    if (dynamic_cast<const ThrowStmt*>(&stmt)) return true;
-    if (auto* blk = dynamic_cast<const BlockStmt*>(&stmt))
-        return blockAllPathsReturn(*blk);
-    if (auto* iff = dynamic_cast<const IfStmt*>(&stmt)) {
-        if (!iff->elseBranch) return false;   // 无 else：条件为假时落入函数尾
-        if (!blockAllPathsReturn(*iff->thenBranch)) return false;
-        for (auto& ei : iff->elseIfs) {
-            if (!blockAllPathsReturn(*ei.body)) return false;
-        }
-        return blockAllPathsReturn(*iff->elseBranch);
-    }
-    if (auto* tc = dynamic_cast<const TryCatchStmt*>(&stmt)) {
-        // try 全路径 return → 安全；否则 try 落入函数尾的路径必须被 catch 兜住
-        return tc->tryBody && tc->catchBody
-            && blockAllPathsReturn(*tc->tryBody)
-            && blockAllPathsReturn(*tc->catchBody);
-    }
-    if (auto* m = dynamic_cast<const MatchStmt*>(&stmt)) {
-        if (m->cases.empty()) return false;
-        for (auto& c : m->cases) {
-            if (!c.body) return false;
-            // case body 可为 BlockStmt 或表达式
-            if (auto* blk = dynamic_cast<const BlockStmt*>(c.body.get())) {
-                if (!blockAllPathsReturn(*blk)) return false;
-            } else {
-                return false;  // 表达式体不可能含 return
-            }
-        }
-        return true;
-    }
-    // 循环（while/loop/for/sync for）可能执行 0 次 → 视为可落入函数尾
-    // lock/sync/spawn/表达式/声明等 → 保守不返回
-    return false;
-}
-
-void SemAnalyzer::checkFunBody(const FunDecl& decl) {
-    loopDepth_ = 0;
-    syncBoundaryStack_.clear();
-
-    symtab_.enterScope(ScopeKind::Function);
-
-    // 1. 先注册泛型参数（后续类型解析需要能查到 T）
-    for (auto& p : decl.params) {
-        if (p.type) registerTypeGenerics(symtab_, *p.type);
-    }
-    if (decl.returnType) registerTypeGenerics(symtab_, *decl.returnType);
-
-    // 2. 注册参数（此时泛型已可解析）
-    for (auto& p : decl.params) {
-        Symbol sym;
-        sym.kind = SymKind::Parameter;
-        sym.name = p.name;
-        sym.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
-        symtab_.define(std::move(sym));
-    }
-
-    // 3. 解析返回类型（泛型已注册，T 可正确解析为 GenericSemType）
-    //    用 FnCtxGuard 保存/恢复外层上下文（支持闭包体嵌套检查）
-    auto retType = decl.returnType ? resolveType(*decl.returnType) : nullptr;
-    FnCtxGuard fc(*this, retType ? retType->clone() : nullptr, decl.throws);
-
-    // 默认参数声明规则检查（尾部连续、类型可赋值、泛型参数拒绝）
-    checkDefaultArgRules(decl, decl.params);
-
-    if (decl.body) {
-        checkBlock(*decl.body);
-        // 漏 return 检查：非 None 返回类型必须所有路径显式 return
-        // 避免 CodeGen 生成缺 return 的 C++ 函数导致 g++ 编译错误
-        if (retType && !dynamic_cast<const NoneSemType*>(retType.get())
-            && !dynamic_cast<const ErrorSemType*>(retType.get())
-            && !blockAllPathsReturn(*decl.body)) {
-            error(decl, "function '" + decl.name
-                  + "' must return a value on all paths (missing explicit return)");
-        }
-    }
-    symtab_.exitScope();
-}
-
-void SemAnalyzer::checkMethodBody(const MethodDecl& decl) {
-    loopDepth_ = 0;
-    syncBoundaryStack_.clear();
-
-    symtab_.enterScope(ScopeKind::Function);
-
-    // 1. 先注册接收者泛型参数
-    for (auto& ta : decl.receiverTypeArgs) {
-        Symbol tpSym;
-        tpSym.kind = SymKind::GenericParam;
-        tpSym.name = ta;
-        symtab_.define(std::move(tpSym));
-    }
-
-    // 2. 注册参数泛型 + 返回类型泛型
-    for (auto& p : decl.params) {
-        if (p.type) registerTypeGenerics(symtab_, *p.type);
-    }
-    if (decl.returnType) registerTypeGenerics(symtab_, *decl.returnType);
-
-    // 3. 注册接收者 self
-    {
-        Symbol sym;
-        sym.kind = SymKind::Parameter;
-        sym.name = decl.receiverName;
-        sym.type = resolveNamedType(decl.receiverType);
-        symtab_.define(std::move(sym));
-    }
-
-    // 4. 注册参数（泛型已就绪）
-    for (auto& p : decl.params) {
-        Symbol sym;
-        sym.kind = SymKind::Parameter;
-        sym.name = p.name;
-        sym.type = p.type ? resolveType(*p.type) : ErrorSemType::make();
-        symtab_.define(std::move(sym));
-    }
-
-    // 5. 解析返回类型（用 FnCtxGuard 保存/恢复外层上下文）
-    auto retType = decl.returnType ? resolveType(*decl.returnType) : nullptr;
-    FnCtxGuard fc(*this, retType ? retType->clone() : nullptr, decl.throws);
-
-    // 默认参数声明规则检查（尾部连续、类型可赋值、泛型参数拒绝）
-    checkDefaultArgRules(decl, decl.params);
-
-    if (decl.body) {
-        checkBlock(*decl.body);
-        // 漏 return 检查：非 None 返回类型方法必须所有路径显式 return
-        if (retType && !dynamic_cast<const NoneSemType*>(retType.get())
-            && !dynamic_cast<const ErrorSemType*>(retType.get())
-            && !blockAllPathsReturn(*decl.body)) {
-            error(decl, "method '" + decl.name
-                  + "' must return a value on all paths (missing explicit return)");
-        }
-    }
-    symtab_.exitScope();
-
-    // impl 接口一致性验证
-    if (!decl.implInterface.empty()) {
-        auto* ifaceSym = symtab_.lookup(decl.implInterface);
-        if (!ifaceSym || ifaceSym->kind != SymKind::Interface) {
-            error(decl, "interface '" + decl.implInterface + "' not found");
-        } else {
-            bool found = false;
-            for (auto& m : ifaceSym->interfaceMethods) {
-                if (m.name == decl.name) {
-                    found = true;
-                    if (decl.params.size() != m.paramTypes.size()) {
-                        error(decl, "impl method '" + decl.name + "' expects " +
-                              std::to_string(m.paramTypes.size()) + " parameter(s), got " +
-                              std::to_string(decl.params.size()));
-                    }
-                    for (size_t i = 0; i < decl.params.size() && i < m.paramTypes.size(); ++i) {
-                        if (decl.params[i].type && m.paramTypes[i]) {
-                            auto implParamTy = resolveType(*decl.params[i].type);
-                            if (!isAssignable(*m.paramTypes[i], *implParamTy)) {
-                                error(*decl.params[i].type,
-                                      "impl method '" + decl.name + "' parameter " +
-                                      std::to_string(i + 1) + " type mismatch: expected '" +
-                                      m.paramTypes[i]->toString() + "', got '" +
-                                      implParamTy->toString() + "'");
-                            }
-                        }
-                    }
-                    if (decl.returnType && m.returnType) {
-                        auto implRetTy = resolveType(*decl.returnType);
-                        if (!isAssignable(*m.returnType, *implRetTy)) {
-                            error(*decl.returnType,
-                                  "impl method '" + decl.name + "' return type mismatch: expected '" +
-                                  m.returnType->toString() + "', got '" +
-                                  implRetTy->toString() + "'");
-                        }
-                    }
-                    if (decl.throws != m.throws) {
-                        error(decl, "impl method '" + decl.name + "' throws mismatch: interface " +
-                              (m.throws ? "requires" : "does not require") + " 'throws'");
-                    }
-                    break;
-                }
-            }
-            if (!found) {
-                error(decl, "interface '" + decl.implInterface +
-                      "' has no method '" + decl.name + "'");
-            }
-        }
     }
 }
 

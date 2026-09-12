@@ -38,6 +38,10 @@ struct ModuleExports {
     std::unordered_map<std::string, std::unique_ptr<SemType>> types; // 类型名 → SemType
     std::unordered_map<std::string, FuncExport> funcs;             // 函数名 → 签名
     std::unordered_map<std::string, FuncExport> ctors;             // 构造函数名 → 签名
+    // record 方法导出：record canonicalName（本地未限定）→ 方法签名。
+    // 供导入模块合入方法表（importedMethods_），否则跨模块 record 方法调用在
+    // Sema 查不到方法 → 被 bug-01 的 E013 误伤（跨模块已注册方法调用必须放行）。
+    std::unordered_map<std::string, std::vector<InterfaceSemType::MethodSig>> methods;
 };
 
 // ============================================================

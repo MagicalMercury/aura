@@ -59,6 +59,21 @@ struct RecordType : TypeExpr {
     }
 };
 
+// 元组类型 (T1, T2, ...)：匿名 record 语法糖（位置字段 _0/_1/...）
+struct TupleTypeExpr : TypeExpr {
+    std::vector<std::unique_ptr<TypeExpr>> elementTypes;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<TupleTypeExpr>();
+        for (auto& e : elementTypes) {
+            if (e) n->elementTypes.emplace_back(static_cast<TypeExpr*>(e->clone().release()));
+            else n->elementTypes.push_back(nullptr);
+        }
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
 struct UnionType : TypeExpr {
     std::vector<std::unique_ptr<TypeExpr>> types;
     void print(std::ostream& os, int indent) const override;

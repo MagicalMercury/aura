@@ -1,4 +1,6 @@
 #include "../Parser.h"
+#include <algorithm>
+#include <array>
 #include <sstream>
 
 namespace Aura {
@@ -68,19 +70,16 @@ void Parser::synchronize() {
 
     while (!atEnd()) {
         // 如果下一个 token 是语句/声明起始关键字，停止
-        if (check(TokType::Fun) || check(TokType::Let) ||
-            check(TokType::Const) || check(TokType::Type) ||
-            check(TokType::Interface) || check(TokType::Import) ||
-            check(TokType::If) || check(TokType::While) ||
-            check(TokType::For) || check(TokType::Loop) ||
-            check(TokType::Return) || check(TokType::Throw) ||
-            check(TokType::Match) || check(TokType::Try) ||
-            check(TokType::Sync) || check(TokType::Spawn) ||
-            check(TokType::Break) || check(TokType::Continue) ||
-            check(TokType::LBrace) ||
-            check(TokType::RBrace)) {
+        static constexpr std::array<TokType, 20> recoveryTokens = {
+            TokType::Fun, TokType::Let, TokType::Const, TokType::Type,
+            TokType::Interface, TokType::Import, TokType::If, TokType::While,
+            TokType::For, TokType::Loop, TokType::Return, TokType::Throw,
+            TokType::Match, TokType::Try, TokType::Sync, TokType::Spawn,
+            TokType::Break, TokType::Continue, TokType::LBrace, TokType::RBrace
+        };
+        TokType cur = peek().type;
+        if (std::find(recoveryTokens.begin(), recoveryTokens.end(), cur) != recoveryTokens.end())
             return;
-        }
 
         // 如果在分号处，跳过并停止
         if (check(TokType::Semicolon)) {

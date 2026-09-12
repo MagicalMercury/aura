@@ -1,0 +1,6 @@
+fun main(io: Io) {
+    let f: fun(int) -> int = fun(n: int) -> int { return n + 2 }
+    let arr: [fun(int) -> int] = [f]
+    let g = arr[0]
+    io.println(str(g(9)))
+}

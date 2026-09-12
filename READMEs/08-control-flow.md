@@ -57,6 +57,14 @@ for val in ch {
     io.println(val)
 }
 
+// for-in — Iterator 接口（含 record impl）
+for v in fib {                 // fib: Fib impl Iterator<int>
+    io.println(v)
+}
+for v in range(5).map(process) {   // 惰性链式迭代器
+    io.println(v)
+}
+
 // for-in — 字符串遍历（字符级）
 let s = "Aura"
 for ch in s {
@@ -64,4 +72,4 @@ for ch in s {
 }
 ```
 
-`range()` 返回 `Iter<int>` 泛型迭代器类型，支持 1/2/3 参数形式。`channel<T>` 支持 `for val in ch` 迭代接收。
+`range()` 返回 `Iterator<int>` 泛型迭代器类型，支持 1/2/3 参数形式。`channel<T>` 支持 `for val in ch` 迭代接收。任何显式 `impl Iterator<T>` 的 record（实现 `next()`）及 `map`/`filter`/`from` 产生的迭代器都支持 `for-in` 遍历。

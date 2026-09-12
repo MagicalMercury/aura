@@ -8,7 +8,7 @@
 | 传播符 `!` | 可选，视觉标记，表示此处异常向上传播 |
 | 联合类型 | `T1 \| T2`；`match` 穷尽匹配 |
 | 方法 | `fun (self Type) name(...)` |
-| 接口 | 结构类型，自动实现；可用 `impl` 做编译检查 |
+| 接口 | 必须显式 `impl` 声明；方法三形态：纯虚 / 默认方法 / C++ 桥接 `...` |
 | 泛型类型别名 | `type Name<T> = { ... }`，字段内直接用 `T` |
 | 泛型函数 | **泛型变量必须在参数类型中用 `<T>` 引入**；返回类型直接使用已引入的变量名 |
 | 返回泛型闭包的工厂函数 | 泛型变量从返回类型的**上下文推断**（如 `Mapper<T, U>`），无需显式参数引入 |
@@ -24,3 +24,9 @@
 | `path` 模块 | 纯路径操作，`import path`（无引号） |
 | `Error` 类型 | `{ kind: string, message: string, ... }` 可附加自定义字段 |
 | Path / string 转换 | 字符串字面量和变量可隐式转换为 `Path` |
+| 接口三形态 | 纯虚 `m() -> T` / 默认方法 `m() { ... }` / C++ 桥接 `m() ...` |
+| `range` | `range(n)` / `range(a, b)` / `range(a, b, step)` → `Iterator<int>` |
+| `Iterator<T>` | record `impl Iterator<T>` 实现 `next() -> Optional<T>` 即可 `for-in` |
+| Iterator 惰性链 | `it.map(f)` / `it.filter(p)` 返回新迭代器；`it.collect()` → `[T]` |
+| `Iterator.from` | `Iterator.from(fun () -> Optional<T>)` 函数生成器 |
+| `Optional` | `some(v)` 构造 / `none()` 结束；`.is_none()` 判空 / `.unwrap()` 取值 |

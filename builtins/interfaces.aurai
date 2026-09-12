@@ -1,0 +1,31 @@
+// ============================================================
+// builtins/interfaces.aurai — 内置常见接口（始终加载）
+//
+// Stringer：to_string() 为 str(obj) 提供字符串化
+// Comparable<T>：实现 cmp() 三路比较后，==/!=/</<=/>/>= 全部自动获得
+// Iterator<T>：实现 next() 后，map/filter/collect 等默认方法自动获得
+//
+// 默认方法体内 self 类型 = 接口自身，方法调用用 self.method(...) 形式
+// （虚调用，运行时分发到具体实现）
+// ============================================================
+
+interface Stringer {
+    to_string() -> string
+}
+
+interface Comparable<T> {
+    cmp(other: T) -> int                 // 三路比较核心（<0 / =0 / >0）：实现它 → 全部符号自动
+    equal(other: T) -> bool { return self.cmp(other) == 0 }   // ==
+    ne(other: T) -> bool { return not self.equal(other) }     // !=
+    less(other: T) -> bool { return self.cmp(other) < 0 }     // <
+    greater(other: T) -> bool { return self.cmp(other) > 0 }  // >
+    le(other: T) -> bool { return not self.greater(other) }   // <=
+    ge(other: T) -> bool { return not self.less(other) }      // >=
+}
+
+interface Iterator<T> {
+    next() -> Optional<T>                      // 纯虚：record 必须实现
+    map(f: fun(T) -> U) -> Iterator<U> ...     // C++ 桥接：runtime make_map（惰性链）
+    filter(p: fun(T) -> bool) -> Iterator<T> ... // C++ 桥接：runtime make_filter（惰性链）
+    collect() -> [T] ...                       // C++ 桥接：runtime collect_all
+}

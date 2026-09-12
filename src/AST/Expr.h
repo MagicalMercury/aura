@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ASTNode.h"
+#include "Type.h"
 #include <cstdint>
 #include <memory>
 #include <ostream>
@@ -90,16 +91,26 @@ struct RecordField {
 };
 
 struct RecordExpr : ASTNode {
+    // #5：具名 record 字面量 `Point { x = 1, y = 2 }` 的类型名；空 = 匿名
+    // （`{ x = 1 }`）。类型身份由 typeName 显式给出，Sema 据此查符号表构造带
+    // canonicalName 的 RecordSemType（CodeGen 走 gc_alloc 而非 designated init）。
+    std::string typeName;
     std::vector<RecordField> fields;
+    // bug-51：record 字面量显式类型实参（仿 CallExpr）——`Box<int> { value = 7 }`，
+    // 空 = 未使用（与 N2 调用 `B<int>(...)` 的 typeArgs 分工：`{` 形态归本字段）
+    std::vector<std::unique_ptr<TypeExpr>> typeArgs;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<RecordExpr>();
+        n->typeName = typeName;
         for (auto& f : fields) {
             RecordField rf;
             rf.name = f.name;
             rf.value = f.value ? f.value->clone() : nullptr;
             n->fields.push_back(std::move(rf));
         }
+        for (auto& t : typeArgs)
+            n->typeArgs.emplace_back(t ? std::unique_ptr<TypeExpr>(static_cast<TypeExpr*>(t->clone().release())) : nullptr);
         n->line = line; n->col = col;
         return n;
     }
@@ -115,6 +126,21 @@ struct BinaryExpr : ASTNode {
         n->op = op;
         n->left  = left  ? left->clone()  : nullptr;
         n->right = right ? right->clone() : nullptr;
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
+struct ConditionalExpr : ASTNode {
+    std::unique_ptr<ASTNode> cond;
+    std::unique_ptr<ASTNode> thenBranch;
+    std::unique_ptr<ASTNode> elseBranch;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ConditionalExpr>();
+        n->cond       = cond       ? cond->clone()       : nullptr;
+        n->thenBranch = thenBranch ? thenBranch->clone() : nullptr;
+        n->elseBranch = elseBranch ? elseBranch->clone() : nullptr;
         n->line = line; n->col = col;
         return n;
     }
@@ -136,11 +162,16 @@ struct UnaryExpr : ASTNode {
 struct CallExpr : ASTNode {
     std::unique_ptr<ASTNode> callee;
     std::vector<std::unique_ptr<ASTNode>> args;
+    // 调用点显式类型实参（N2）：B<int>(...) / M<int, string>(...) — 显式给泛型实参，
+    // 空 = 未使用显式类型实参（普通调用，泛型由实参推导 / 期望类型绑定）
+    std::vector<std::unique_ptr<TypeExpr>> typeArgs;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<CallExpr>();
         n->callee = callee ? callee->clone() : nullptr;
         for (auto& a : args) n->args.push_back(a ? a->clone() : nullptr);
+        for (auto& t : typeArgs)
+            n->typeArgs.emplace_back(t ? std::unique_ptr<TypeExpr>(static_cast<TypeExpr*>(t->clone().release())) : nullptr);
         n->line = line; n->col = col;
         return n;
     }

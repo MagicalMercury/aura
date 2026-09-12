@@ -168,6 +168,8 @@ int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
             diag.print(std::cerr);
             return 1;
         }
+        // 成功路径：输出警告（不阻塞编译）
+        if (diag.hasWarnings()) diag.print(std::cerr);
 
         // 确定 cpp 输出路径
         std::string cppPath = opts.cppOutput;
@@ -370,25 +372,34 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
         // C5.4: 收集跨模块函数默认参数（导出表携带默认值表达式 AST，常驻内存只读）
         // 键 = 导入命名空间在 Aura 源码中的访问名（alias 优先，与 CodeGen importNsNames_ 一致）
         Aura::CodeGenerator::CrossModuleDefaults crossDefaults;
+        // bug-06: 跨模块函数形参 SemType 表（与 crossDefaults_ 同源构造，供 genMethodCall
+        // isNs 分支 FunctionType 形参 std::function 包装 / 默认参数闭包物化。SymParam.type
+        // 指针与 defaultExpr 的 AST 指针同生命周期（依赖模块 exports 常驻内存，只读安全））
+        Aura::CodeGenerator::CrossModuleParamSemTypes crossParamSemTypes;
         for (auto& imp : mod->imports) {
             if (imp.isBuiltin) continue;
             auto it = mgr.modules().find(imp.path);
             if (it == mgr.modules().end()) continue;
             std::string nsKey = imp.alias.empty() ? it->second.moduleName : imp.alias;
             auto& modDefaults = crossDefaults[nsKey];
+            auto& modSemTypes = crossParamSemTypes[nsKey];
             for (auto& [fnName, f] : it->second.exports.funcs) {
                 std::vector<const Aura::ASTNode*> defaults(f.params.size(), nullptr);
+                std::vector<const Aura::SemType*> pts(f.params.size(), nullptr);
                 bool any = false;
-                for (size_t i = 0; i < f.params.size(); ++i)
+                for (size_t i = 0; i < f.params.size(); ++i) {
                     if (f.params[i].defaultExpr) { defaults[i] = f.params[i].defaultExpr.get(); any = true; }
+                    pts[i] = f.params[i].type.get();
+                }
                 if (any) modDefaults[fnName] = std::move(defaults);
+                modSemTypes[fnName] = std::move(pts);
             }
         }
 
         // 代码生成
         Aura::CodeGenerator cg(*modDiag);
         auto unit = cg.generate(*mod->ast, mod->moduleName, cgImports, mod->nsName,
-                                Aura::CodeGenConfig(), crossDefaults);
+                                Aura::CodeGenConfig(), crossDefaults, crossParamSemTypes);
 
         // 写出头文件
         std::string hdrPath = outDir + "/" + mod->moduleName + ".aura.h";

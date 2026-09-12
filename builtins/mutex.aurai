@@ -1,6 +1,8 @@
 // ============================================================
 // builtins/mutex.aurai — 锁原语（文档性质，不加载）
 // 权威注册见 BuiltinRegistry.h types_/functions_
+//
+// 声明中的 '...' = C++ 桥接标记：aura 层无实现，c++ 层有实现
 // ============================================================
 
 type Mutex
@@ -9,9 +11,9 @@ type Once
 type RWMutexReadView
 type RWMutexWriteView
 
-fun sync.Mutex() -> Mutex
-fun sync.RWMutex() -> RWMutex
-fun sync.Once() -> Once
+fun sync.Mutex() -> Mutex ...
+fun sync.RWMutex() -> RWMutex ...
+fun sync.Once() -> Once ...
 
-fun (self RWMutex) r() -> RWMutexReadView
-fun (self RWMutex) w() -> RWMutexWriteView
+fun (self RWMutex) r() -> RWMutexReadView ...
+fun (self RWMutex) w() -> RWMutexWriteView ...

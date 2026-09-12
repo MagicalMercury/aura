@@ -4,6 +4,7 @@
 
 #include "thread_pool.h"
 #include "gc.h"
+#include "gc/gc_interrupt.h"  // gc_interruptible_sleep（P2 可中断 sleep）
 #include <chrono>
 
 namespace aura_rt {
@@ -27,6 +28,12 @@ void ThreadPool::ensureStarted(size_t workerCount) {
         for (size_t i = 0; i < wc; ++i) {
             workers_.emplace_back([this, i]{ workerLoop(i); });
         }
+        // 阶段 2.1：向 GcHeap 注册空闲唤醒广播（GC 停靠时唤醒空闲 worker 及时到 safepoint）
+        // 回调仅递增代次 + notify_all（不持 m_ 再调 GcHeap 锁——广播持 idleWakeupsM_，无锁序）
+        GcHeap::instance().registerIdleWakeup([this] {
+            gcWakeupGen_.fetch_add(1, std::memory_order_release);
+            cv_.notify_all();
+        });
     });
 }
 
@@ -36,7 +43,7 @@ void ThreadPool::submit(std::function<void()> task) {
         std::lock_guard<std::mutex> lk(m_);
         tasks_.emplace_back(0, std::move(task));  // groupId=0：无 group
     }
-    cv_.notify_one();
+    cv_.notify_all();  // 阶段 2.1：notify_one → notify_all（多个空闲 worker 竞争唤醒不串行；空闲 ≤4 开销可忽略）
 }
 
 uint64_t ThreadPool::beginGroup() {
@@ -62,7 +69,7 @@ void ThreadPool::submitInGroup(uint64_t groupId, std::function<void()> task) {
         std::lock_guard<std::mutex> lk(m_);
         tasks_.emplace_back(groupId, std::move(task));
     }
-    cv_.notify_one();
+    cv_.notify_all();  // 阶段 2.1：notify_one → notify_all
 }
 
 void ThreadPool::waitGroup(uint64_t groupId) {
@@ -88,7 +95,9 @@ void ThreadPool::waitGroup(uint64_t groupId) {
     // 原子轮询 pending — 无锁，期间可安全调用 gc_safepoint()
     while (state->pending.load() > 0) {
         gc_safepoint();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // P2：1ms→100μs 可中断 sleep（Linux SIGURG→EINTR 即返；Win APC 打断 alertable SleepEx；
+        //     Win 无中断时向上取整 1ms，与原行为等价）
+        gc_interruptible_sleep(std::chrono::microseconds(100));
     }
 
     // 提取 group 状态用于异常处理
@@ -116,24 +125,33 @@ void ThreadPool::workerLoop(size_t /*idx*/) {
     while (true) {
         std::pair<uint64_t, std::function<void()>> task;
         bool got_task = false;
+        // 本地广播代次（修复共享复位竞态：每个 worker 独立消费，互不干扰）
+        uint64_t myWakeupGen = gcWakeupGen_.load(std::memory_order_acquire);
         {
-            std::unique_lock<std::mutex> lk(m_);
-            // 空闲 worker 也需响应 GC STW
-            // 注：不用 cv_.wait_for — GCC 11 TSan 对 pthread_cond_timedwait 的
-            // mutex 释放/重获追踪有 bug，会误报 "double lock of a mutex"。
-            // 改用 unlock + sleep_for + lock 轮询模式，功能等价但 TSan 兼容。
-            if (tasks_.empty() && !stop_.load()) {
-                lk.unlock();
-                gc_safepoint();
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
+                std::unique_lock<std::mutex> lk(m_);
+                // 空闲 worker 也需响应 GC STW：
+                // cv 化（阶段 2.1）——任务/停止/GC 广播唤醒；P2 兜底 5ms（丢失唤醒窗口）
+                // 醒来后必须 gc_safepoint()（响应 STW 停靠），再复查条件
+                // 注：历史 GCC 11 TSan 对 pthread_cond_timedwait 的 mutex 释放/重获追踪有 bug，
+                //     当年弃 cv 改轮询；当前 GCC 16 无 TSan 构建路径，若未来启用 TSan 需重新验证。
+                if (tasks_.empty() && !stop_.load()) {
+                    // P2：兜底 50ms→5ms。谓词含 gcWakeupGen：Linux 上 SIGURG 的 EINTR
+                    // 会使谓词版 wait 重检查谓词（代次已变→立即返回），中断有直接收益
+                    cv_.wait_for(lk, std::chrono::milliseconds(5),
+                                 [&] { return !tasks_.empty() || stop_.load()
+                                            || gcWakeupGen_.load(std::memory_order_acquire) != myWakeupGen; });
+                    if (tasks_.empty() && !stop_.load()) {
+                        lk.unlock();
+                        gc_safepoint();
+                        continue;
+                    }
+                }
+                if (stop_.load() && tasks_.empty()) break;
+                if (tasks_.empty()) continue;
+                task = std::move(tasks_.front());
+                tasks_.pop_front();
+                got_task = true;
             }
-            if (stop_.load() && tasks_.empty()) break;
-            if (tasks_.empty()) continue;
-            task = std::move(tasks_.front());
-            tasks_.pop_front();
-            got_task = true;
-        }
 
         if (!got_task) continue;
 
@@ -207,9 +225,11 @@ void sync_thread_context::submit(std::function<void()> task) {
     // 原因：调用方（通常是已向 GC 注册的主线程）在信号量上阻塞时，若 worker
     //   触发 GC stop-the-world，执行者会等待主线程到达 safepoint，但主线程
     //   卡在信号量上无法响应 → 死锁。
-    // 改用 try_acquire_for 轮询：阻塞最多 1ms，超时主动调用 gc_safepoint()
-    //   响应 STW 请求，将 STW 延迟控制在 ~1ms 内。
-    while (!sem_.try_acquire_for(std::chrono::milliseconds(1))) {
+    // 改用 try_acquire_for 轮询：阻塞最多 100μs，超时主动调用 gc_safepoint()
+    //   响应 STW 请求，将 STW 延迟控制在 ~100μs 内。
+    //   P2：1ms→100μs（Linux 可被 SIGURG 的 EINTR 提前打断；Windows WaitOnAddress
+    //   非 alertable，仅靠缩短轮询兜底）
+    while (!sem_.try_acquire_for(std::chrono::microseconds(100))) {
         gc_safepoint();
     }
     // 包装 task：用 RAII 保证 sem_.release() 总是执行（即使 task 抛异常）

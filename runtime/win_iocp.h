@@ -21,6 +21,12 @@ public:
     bool associate(HANDLE hFile, ULONG_PTR key);
     void stop();
 
+    // P2：GC 中断唤醒——broadcastInterrupt 投递伪完成包（key=kGcWakeupKey），
+    // 强制 EventLoop 的 GetQueuedCompletionStatus 提前返回以响应 STW。
+    // 全 1 值不与真实 I/O 的 CompletionKey（句柄/对象指针）冲突
+    static constexpr ULONG_PTR kGcWakeupKey = ~static_cast<ULONG_PTR>(0);
+    void postWakeup();
+
     struct Completion {
         ULONG_PTR  key;
         DWORD      bytes;

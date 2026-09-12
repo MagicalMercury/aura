@@ -1,110 +1,79 @@
-# sync thread 多线程测试调试状态（2026-07-24）
+# Plan 审查报告：P2_signal_driven_safepoint_plan.md
 
-## 当前测试
-example/test.aura 包含 3 个 sync thread 测试：
-1. 基本多线程（无界）：2 个 spawn 输出 "hello from thread N"
-2. 有界并发 max=4：10 个 spawn 输出 "task N"
-3. GC 压力 max=2：100 个 spawn 输出 "string N"
+## Search Agent 检索摘要
 
-## 已完成的修复
-### TLAB 实现（已完成，ASAN 验证通过）
-- gc.h/gc.cpp: Tlab 结构、tryAlloc 双路径、flushTlab/refillTlab
-- thread_pool.cpp: workerLoop 用 wait_for 响应 GC safepoint
+- **检索文件**：`runtime/gc/safepoint.cpp`（584 行）、`runtime/gc/gc.h`、`runtime/gc/gc.cpp`、`runtime/gc/tlab.cpp`、`runtime/gc/roots.cpp`、`runtime/gc/alloc.cpp`、`runtime/thread_pool.cpp`、`runtime/builtin/mutex.h`、`runtime/builtin/thread_channel.h`
+- **关键发现（决定性）**：当前磁盘代码**已落地 cv 化方案**——safepoint.cpp 全部等待点已是 `cv_.wait_for(50ms)`（[L66](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L66)、[L153](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L153)、[L575](file:///d:/you/Aura/runtime/gc/safepoint.cpp#L575)），`notifyIdleWakeups()` 已存在（gc.cpp L41-44），空闲 worker 由 `gcWakeupGen_` 代次 + `cv.notify_all` 广播唤醒（thread_pool.cpp L32-35）。**`broadcastInterrupt` / `ThreadHandle` / `threadHandles_` 全库不存在**。
 
-### GC 并发数据竞争修复（已完成）
-- gc.h: compactSuspendedCount_ → atomic<int>
-- gc.h: gcPending_ → atomic<bool>
-- gc.h: oomInit_ → atomic<bool>（call_once 不可行，递归调用自死锁）
-- gc.h: 新增 stackRootsM_ 保护 stackRoots_
-- gc.h: 新增 rememberedSetM_ 保护 rememberedSet_
-- gc.cpp: ensureOomError 用 atomic<bool> 替代 call_once
-- gc.cpp: register/unregisterStackRoots 加锁
-- gc.cpp: writeBarrier 加锁
-- gc.cpp: gcPending_ 全部改 load/store
-- gc.cpp: compactSuspendedCount_ 读取改 load
+## 源码映射审查
 
-## ✅ 已解决：shared_mutex 断言 __ret == 0
-根因：MinGW 下 std::shared_mutex 实现有 bug
-  - 参考：https://github.com/msys2/MINGW-packages/issues/25193
-  - 现象：lock_shared() 抛 "__ret == 0" 断言，多线程测试第一行即崩溃
-修复：runtime/builtin/string.cpp:527-561
-  - 将 g_internMutex 类型从 std::shared_mutex 改为 std::mutex
-  - intern_string 读路径由 std::shared_lock 改为 std::lock_guard（独占锁）
-  - unordered_map::find() 耗时极小，独占锁对并发性能影响可忽略
-  - 移除 #include <shared_mutex>，改为 #include <mutex>
-验证：test.aura 全部 3 个测试通过，退出码 0
-  - 测试 1：2 行 "hello from thread N"
-  - 测试 2：10 行 "task N"（0-9）
-  - 测试 3：100 行 "string N"（0-99）
-  - 最后输出 "done"
-  - 输出顺序有少量交错（如 string 5 在 string 4 前），属多线程并发正常现象
+| plan 引用 | 实际源码 | 比对结果 | 备注 |
+| ---- | ---- | ---- | ---- |
+| §2.1 Finalize 分支 L66 sleep 轮询 | safepoint.cpp L51-69 已 `cv.wait_for(50ms)` | ❌ 过时 | L66 恰好是 wait_for 行，歪打正着 |
+| §2.1 initiator L153 sleep(10ms) | safepoint.cpp L149-164 已 `cv.wait_for(50ms)` | ❌ 过时 | L153 恰为 wait_for 行 |
+| §2.1 waitForRootThreadsStopped L564 | 实际 L547-582，已 cv 化 + 二次确认 | ❌ 行号错 | plan 行号超旧版范围 |
+| §2.1 空闲 worker cv.wait_for(50ms) + gcWakeupGen 谓词 | thread_pool.cpp L135 一致 | ✅ | 谓词含 gcWakeupGen |
+| §8.2 workerLoop 50ms→5ms | thread_pool.cpp L135 `wait_for(50ms)` | ✅ 修改目标成立 | — |
+| §8.3 waitGroup sleep_for(1ms) | thread_pool.cpp L97 一致 | ✅ | — |
+| §8.4 submit try_acquire_for(1ms) | thread_pool.cpp L225 一致 | ✅ | — |
+| §8.5 mutex.h 4 处 L81/L187/L245/L324 | 逐行一致 | ✅ | — |
+| §8.6 thread_channel.h L57/L76 | 一致 | ✅ | — |
+| §8.7 alloc.cpp L148 | 一致 | ✅ | — |
+| §8.8 safepoint 3 处 50ms→5ms | 3 处 wait_for(50ms) 存在 | ⚠️ 行号错（L564），修改目标成立 | abort 计数需同步改（当前 `40×50ms=2s`，plan 写 400×5ms ✅ 正确） |
+| §9 STW DEADLOCK L154 | 实际 L156-159 | ⚠️ 行号偏移 | — |
+| ROOT STOP TIMEOUT L530 | 实际 L576 附近 | ❌ 行号错 | — |
+| notifyIdleWakeups 链路 | gc.cpp L41-44 已存在（gc.h L299 声明） | ⚠️ plan 未指出其已落地 | — |
 
-## 此前尝试的相关修复（保留）
-### #1 intern_string 持锁 alloc（已修复）
-- 文件：runtime/builtin/string.cpp:536-561
-- 修改：改为"不持锁 alloc"模式（读锁查找 → 解锁 alloc → 写锁 double-check insert）
+**结论**：plan 基于 cv 化前的旧版代码编写。§8 的 sleep_for 替换点（mutex/channel/alloc/waitGroup/submit）仍准确有效，但 §8.8 行号、§2 现状描述已过时，需按当前版本重写。
 
-### #6 cout 无锁并发（已修复）
-- 文件：runtime/builtin/io.cpp:22-48
-- 修改：新增 g_coutM mutex 保护 println/println_sync
+## Go 语言使用 APC 的对比（核心问题）
 
-### #7 ensureStarted 无锁初始化（已修复）
-- 文件：runtime/thread_pool.h:68, thread_pool.cpp:20-31
-- 修改：用 std::call_once + ensureStartedOnce_ 保护
+**答案是：是。Go 在 Windows 上正是用 `QueueUserAPC` 做线程异步抢占**，Unix 上用信号（`tgkill` + SIGURG）。但 Go 的用法与本 plan 有**四个本质差异**：
 
-## 审计报告发现但未修复的问题（P0-P3）
-来源：search agent 完整审计 runtime/ 目录
+| 维度 | Go（1.14+ 异步抢占） | 本 plan |
+| ---- | ---- | ---- |
+| **Windows 中断** | `preemptM` → `QueueUserAPC(apc_preempt, mp.thread, 0)`，callback 执行**实际抢占** | `QueueUserAPC(空操作)` 仅打断 alertable wait |
+| **Unix 中断** | `signalM` → `tgkill(getpid(), tid, SIGURG)` | `pthread_kill(SIGUSR1)` |
+| **handler 行为** | `doSigPreempt`：检查安全点 → **改写信号上下文 PC/SP** → 重定向到 `asyncPreempt`（保存寄存器、进入调度器） | 空 handler，只靠 EINTR 打断阻塞 |
+| **能否中断 CPU 密集** | ✅ 能（`asyncPreempt` 由编译器在函数序言/回边注入，信号把执行流硬切到安全点） | ❌ 明确放弃（plan §1.4 承认需 P3+ 编译器支持） |
+| **信号选择** | SIGURG——**特意避开 SIGUSR1/SIGUSR2**（用户库常用，避免冲突） | SIGUSR1，未讨论与用户信号冲突 |
+| **信号风暴防护** | `atomic.Cas(&mp.signalPending, 0, 1)` 合并——同线程只发一次信号 | 每 20ms 无合并重发 |
 
-### P0（严重，可能导致崩溃）
-- #1 intern_string 持锁 alloc → STW 死锁【已修复未解决】
-- #2 GcString::from(int32_t) _cache 数组无锁
-  - 文件：runtime/builtin/string.cpp:61-76
-  - 问题：static GcGlobalRoot<GcString>* _cache[2048] 多线程并发读写
-  - 风险：globalRoots_ 悬垂指针，GC 读野指针崩溃
-- #3 GcRopeNode::flat_cache_ 并发访问无锁
-  - 文件：runtime/builtin/string.cpp:473-488
-  - 问题：mutable GcString* flat_cache_ 多线程并发读写
-- #4 GcString::append 就地修改 GC 共享对象
-  - 文件：runtime/builtin/string.cpp:280-365
-  - 问题：就地 memcpy 修改 length/data，破坏共享不变式
+**结论**：方向一致（用 OS 原语打断线程缩短 STW 等待），但 Go 的机制更完整——空操作 handler 只能打断"阻塞等待中的线程"，Go 能打断"运行中的 goroutine"。plan 的 P3+ 规划（编译器注入 poll 点）正是 Go 的 `asyncPreempt` 路线，两者可衔接。
 
-### P1（中等）
-- #5 ensureOomError 中 oomError_ 并发读写
-  - 文件：runtime/gc.cpp:274-284
-  - 问题：atomic<bool> oomInit_ 只挡同线程递归，不挡多线程并发
-- #6 cout/cin 无锁【已修复未解决】
-- #7 ensureStarted 无锁【已修复未解决】
+## 全链路风险分析
 
-### P2（低风险）
-- #8 compactPending_ 非 atomic
-  - 文件：runtime/gc.h:317
-- #9 youngBytes_/oldBytes_/allocatedBytes_/gcCount_/minorGcCount_ 非 atomic
-  - 文件：runtime/gc.h:325-329
-- #10 EventLoop::ready_.empty() 无锁读
-  - 文件：runtime/task.cpp:62
-- #11 ThreadPool::workerCount() 无锁读 workers_
-  - 文件：runtime/thread_pool.h:51
+- **构建系统**：需新增 2 个源文件 + 2 个平台文件进 CMakeLists（plan §13 Step 6 已给出，✅ 正确），无其他问题。
+- **Runtime 兼容性**：⚠️ 有细节问题，需修正后再合入：
+  1. **无谓词 wait_for 下信号收益被高估**（plan §4.3）：当前 `all_stopped_cv_.wait_for(lk, 50ms)` 是**无谓词版**——被 EINTR 打断后 glibc/libstdc++ 内部重试**继续等**，外层 while 才查 `stopped_threads_`。信号对 cv wait 实际无帮助（真正唤醒靠 notify_all）。plan 表格"✅ EINTR → 重检查谓词"不成立。
+  2. **SIGUSR1 冲突**：用户代码/库可能占用 SIGUSR1。建议改用 SIGURG（Go 同款选择）。
+  3. **alloc.cpp L148 Marking 期等待**：该处等待的是"Marking 结束"，非"STW 通知"——中断后立即重试仍 Marking，无意义，还增加忙轮询。建议排除在替换清单外。
+  4. **Windows 上收益主要来自 100μs 轮询而非 APC**（plan §11 自己承认）——需明确定位：APC 只解决 sleep 类阻塞，cv/sem 仍靠轮询。
+  5. **EventLoop 缺口未覆盖**：plan 未提 task.cpp 主线程 10ms IOCP 轮询不响应 STW（cv 化 plan 阶段 2.2 内容）。
+  6. 线程句柄生命周期（§6.3/§10.3）：ESRCH/无效句柄忽略处理 ✅ 正确。
+- **测试覆盖**：§15 覆盖功能/性能/安全三类，但测试路径为外部 Linux 环境（§13 Step 7），需改写为本仓库流程（compile.cmd + test.aura + verify_gc_log.ps1），并补充"中断风暴"（高频 broadcastInterrupt）与"信号与用户 SIGUSR1 共存"用例。
+- **异常与回退**：`AURA_INTERRUPT_SAFEPOINT` 编译宏回退 ✅ 合理，但建议改为运行时开关（编译宏需重编）。
 
-## 下一步建议
-1. 修复 #2 from(int) _cache 无锁（加 mutex 或 call_once）
-2. 修复 #3 GcRopeNode::flat_cache_ 无锁（加 mutex，注意 alloc 期间不持锁）
-3. 修复 #4 GcString::append 就地修改（删除就地修改分支，总是返回新对象）
-4. 若仍崩溃，用 ASAN 模式重新编译 runtime 获取精确栈追踪：
-   - Remove-Item -Recurse -Force build, runtime/build
-   - cmake -S . -B build -DENABLE_ASAN=ON
-   - cmake -S runtime -B runtime/build -DENABLE_ASAN=ON
-   - cmake --build build
-   - cmake --build runtime/build
-   - 手动编译 test.cpp 用 ASAN
-5. 检查是否还有其他持锁触发 GC 的路径（如 GcGlobalRoot 构造时 registerGlobalRoot）
+## 已知限制评估
 
-## 关键文件
-- runtime/gc.h / runtime/gc.cpp
-- runtime/thread_pool.h / runtime/thread_pool.cpp
-- runtime/builtin/string.cpp
-- runtime/builtin/io.cpp
-- example/test.aura / example/test.cpp
-- change.md（当前修复记录）
-- change.md.bak.20260724（sync thread 原始 plan）
-- plan/TLAB_implementation.md（TLAB 完整方案）
-- plan/sync_thread_plan.md（sync thread 完整方案）
+1. CPU 密集不可中断（P3+ 编译器 poll 点）→ **可接受**，但需明确该 plan 定位为"缩短阻塞线程停靠延迟"，性能预期（§12.1 表格"1 线程 CPU 密集 10ms → ~10ms"）已如实标注 ✅。
+2. Windows cv/sem 不可打断 → **可接受**，plan 如实标注 ✅。
+
+## 最终裁决
+
+- [ ] 通过（Approve）
+- [x] **需修改（Changes Requested）** — 具体修改点：
+  1. **以当前版本为基础重写 §2 现状**（cv 化已落地）：3 处 wait_for(50ms) 现状 + 行号修正（waitForRootThreadsStopped L547-582、DEADLOCK L156-159、TIMEOUT L576 附近）；`notifyIdleWakeups` 已存在需注明。
+  2. **修正 §4.3 对无谓词 wait_for 的 EINTR 分析**——信号对 cv wait 无实际收益，删除该行"✅ 重检查谓词"或改为有谓词版后重新评估。
+  3. **信号改用 SIGURG**（对齐 Go 选择，避免用户信号冲突）；如坚持 SIGUSR1，需补充冲突评估。
+  4. **alloc.cpp L148 移出替换清单**（Marking 等待语义不符）。
+  5. **补 EventLoop 停靠缺口**（task.cpp）。
+  6. **测试路径改写为本仓库流程** + 中断风暴用例。
+  7. 说明 Windows 端主要收益来自 100μs 轮询缩短（APC 为辅助），并给出二者解耦的回退方案。
+
+Sources:
+- [Go async preemption (preempt.go)](https://go.dev/src/runtime/preempt.go)
+- [Go runtime os_windows.go (preemptM → QueueUserAPC)](https://github.com/golang/go/blob/master/src/runtime/os_windows.go)
+- [Go 语言实现——异步抢占调度](https://chanfung032.github.io/go/asynchronous-preemption.html)
+- [Go 是如何做抢占式调度的？](https://blog.csdn.net/Guzarish/article/details/157868118)
+- [Preemption in Go: an introduction](https://www.recentic.net/introduction-to-golang-preemption-mechanisms/)

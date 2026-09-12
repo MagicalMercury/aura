@@ -46,6 +46,9 @@ struct Symbol {
     // 构造函数信息（当 fun (self T) T(...) 与 type T = ... 同名时填充）
     std::vector<SymParam> ctorParams;
     std::unique_ptr<SemType> ctorReturnType;
+    // 已声明构造函数（与 ctorParams 非空解耦：无参构造函数的 params 为空，
+    // 不能依赖 ctorParams 非空判断"是否有构造函数"）
+    bool ctorDeclared = false;
 
     // ——— 仅 Interface ———
     std::vector<InterfaceSemType::MethodSig> interfaceMethods;
@@ -53,7 +56,7 @@ struct Symbol {
     // ——— 导入符号 ———
     std::string belongsToModule;  // 非空 = 来自此模块的导入
     bool isImported = false;      // 来自 import 注入（永远不透传 re-export）
-    bool isPublic = true;  // 实际由 DeclChecker 显式赋值；Global 自有符号默认公开，模块级策略在 extractExports 判定
+    bool isPublic = true;  // Phase B: 默认公开（向后兼容：无 pub 时暂不破坏现有行为）
 };
 
 } // namespace Aura

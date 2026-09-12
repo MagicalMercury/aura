@@ -7,8 +7,11 @@
 // 自动生成对应的 struct 和 TypeDescriptor 实例。
 // ============================================================
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>       // is_pointer_v / void_t / enable_if_t / is_convertible_v
+#include <utility>           // declval（GcViewSlot 视图槽 traits）
 
 namespace aura_rt {
 
@@ -53,6 +56,21 @@ struct NoneType {
 };
 inline constexpr NoneType None{};
 
+// 检测 T 是否为接口视图（含 GcObject* self 字段的值类型视图，如 Stringer / Iterator<T>）
+// 原定义于 builtin/variant.h（P2b：Variant 变体为接口视图时，storage_ 起始 + 视图内
+// self 子偏移 = 有效 GC 指针）；#7 上移到 types.h 供 ArrayChunk<T>::desc()（array.tcc）
+// 复用——视图元素列表的 GC 追踪需要编译期检测 T 内含 self 子字段。
+template <typename T, typename = void>
+struct is_iface_view : std::false_type {};
+template <typename T>
+struct is_iface_view<T, std::void_t<
+    decltype(std::declval<T&>().self),
+    std::enable_if_t<std::is_convertible_v<
+        decltype(std::declval<T&>().self), GcObject*>>
+>> : std::true_type {};
+template <typename T>
+inline constexpr bool is_iface_view_v = is_iface_view<T>::value;
+
 // ============================================================
 // TypeDescriptor — GC 类型描述符
 //
@@ -73,24 +91,35 @@ inline constexpr NoneType None{};
 
 // 内联数组字段描述符（如 ArrayChunk<GcString*> 的数据区在 this + 1 处）
 // 当 chunk 的 T 是指针类型时，data() 区域包含 GC 需要扫描的指针。
+// #7 扩展：除指针数组（isPtrArray=true，元素本身就是 GC 指针）外，还支持
+// 接口视图元素（isPtrArray=false，元素是 { 方法Fn..., GcObject* self } 值视图）——
+// 元素内 self 子偏移经 elemGCOffset 注册，GC 按 base+offset+j*elemStride+elemGCOffset
+// 扫描/重写 self（与 Optional/Variant 的 value_+self 复合子偏移同模式）。
 struct InlineArrayField {
-    size_t offset;        // 数据区起始偏移（相对于对象基址）
-    size_t lengthOffset;  // 长度字段偏移（GC 读取它知道数组有多少有效元素）
-    bool   isPtrArray;    // 元素是否是指针（int 不用扫，GcString* 要扫）
-};
+    uint32_t offset;        // 数据区起始偏移（相对于对象基址）
+    uint32_t lengthOffset;  // 长度字段偏移（GC 读取它知道数组有多少有效元素）
+    bool   isPtrArray;      // 元素是否是指针（int 不用扫，GcString* 要扫）
+    uint32_t elemStride;    // 元素步长（字节）：指针数组=sizeof(void*)，视图=sizeof(T)
+    int32_t  elemGCOffset;  // 元素内 GC 子偏移；-1=元素本身就是指针（isPtrArray 快路径），
+                            //   >=0=元素内 self 子偏移（接口视图，如 offsetof(T, self)）
+};                          // 20B（原 12B + elemStride 4B + elemGCOffset 4B）
 
 struct TypeDescriptor {
-    size_t        size;               // 对象总大小（字节），含内联数据
-    size_t        ptrFieldCount;      // 普通指针字段数量
-    const size_t* ptrFieldOffsets;    // 普通指针字段偏移数组
+    uint32_t        size;               // 对象总大小（字节），含内联数据（对象 ≤4GB）
+    uint32_t        ptrFieldCount;      // 普通指针字段数量
+    const size_t* ptrFieldOffsets;      // 普通指针字段偏移数组
 
     // 内联数组字段 — 用于 ArrayChunk 等将数据紧跟在对象体之后的类型
-    size_t              inlineArrayFieldCount = 0;
+    uint32_t              inlineArrayFieldCount = 0;
     const InlineArrayField* inlineArrayFields = nullptr;
 
     // Finalizer：对象被 GC 回收前调用（nullptr 表示无 finalizer）
     void (*finalizer)(GcObject* self) = nullptr;
-};
+
+    // P2b：动态 desc 钩子。对象扫描时先调 dynamicDesc(obj) 取真实 desc
+    // （如 Variant<T...> 按运行时 index_ 返回 per-变体 desc），nullptr = 静态 desc。
+    const TypeDescriptor* (*dynamicDesc)(GcObject* self) = nullptr;
+};                          // 48B → 48B（P2a 压缩 40B + P2b 钩子 8B，净持平）
 
 // ============================================================
 // GcObject — 所有 GC 托管堆对象的基类
@@ -106,15 +135,41 @@ struct TypeDescriptor {
 struct GcObject {
     const TypeDescriptor* desc = nullptr;  // 8  offset 0
     uint32_t allocSize_ = 0;               // 4  offset 8
-    uint8_t  flags_ = 0;                   // 1  offset 12  bit-packed 标记
-    // padding: 3 bytes                    //    offset 13-15
-    // 总计 16 字节
+    std::atomic<uint8_t> mark_flags_{0};   // 1  offset 12  bit0=marked（并行标记 CAS）
+    uint8_t  flags_ = 0;                   // 1  offset 13  generation/finalized/age/forwarded
+    // padding: 2 bytes                    //    offset 14-15
+    // 总计 16 字节（与拆分前一致）
 
     ~GcObject() = default;  // 非虚：GC 不通过基类 delete，finalizer 走 desc->finalizer
 
-    // ---- marked (bit 0) ----
-    bool marked() const         { return flags_ & kMarkedBit; }
-    void setMarked(bool v)      { flags_ = (flags_ & ~kMarkedBit) | (v ? kMarkedBit : 0); }
+    // atomic 成员使默认拷贝被删除（Error 的 throw 拷贝需要）；
+    // 值语义拷贝：mark_flags_ 按值 load/store（GC 对象拷贝发生在 STW/构造期，无并发）
+    GcObject(const GcObject& o)
+        : desc(o.desc), allocSize_(o.allocSize_),
+          mark_flags_(o.mark_flags_.load(std::memory_order_relaxed)), flags_(o.flags_) {}
+    GcObject& operator=(const GcObject& o) {
+        desc = o.desc;
+        allocSize_ = o.allocSize_;
+        mark_flags_.store(o.mark_flags_.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+        flags_ = o.flags_;
+        return *this;
+    }
+    GcObject() = default;
+
+    // ---- marked (bit 0, 原子字节) ----
+    bool marked() const {
+        return (mark_flags_.load(std::memory_order_acquire) & kMarkedBit) != 0;
+    }
+    void setMarked(bool v) {
+        mark_flags_.store(v ? kMarkedBit : 0, std::memory_order_release);
+    }
+    // 并行标记：未标记→标记，返回是否由本线程完成置位（false=已被其他线程标记）
+    bool tryMark() {
+        uint8_t expected = 0;
+        return mark_flags_.compare_exchange_strong(expected, kMarkedBit,
+                                                   std::memory_order_acq_rel);
+    }
 
     // ---- generation (bit 1) ----
     uint8_t generation() const  { return (flags_ & kGenMask) >> kGenShift; }
@@ -144,7 +199,7 @@ struct GcObject {
     void  setAllocSize(size_t s) { allocSize_ = static_cast<uint32_t>(s); }
 
 private:
-    static constexpr uint8_t kMarkedBit    = 0x01;  // bit 0
+    static constexpr uint8_t kMarkedBit    = 0x01;  // mark_flags_ bit 0
     static constexpr uint8_t kGenMask      = 0x02;  // bit 1
     static constexpr uint8_t kGenShift     = 1;
     static constexpr uint8_t kFinalizedBit = 0x04;  // bit 2
@@ -152,6 +207,29 @@ private:
     static constexpr uint8_t kAgeShift     = 3;
     static constexpr uint8_t kForwardedBit = 0x80;  // bit 7
 };
+// 防布局回归断言（16 字节不变：desc 8B + allocSize 4B + mark_flags 1B + flags 1B + pad 2B）
+static_assert(sizeof(GcObject) == 16, "GcObject layout changed");
+
+// ============================================================
+// GcViewSlot — 视图值槽判定 traits（feature-07 Step 2）
+//
+// 捕获槽进 desc 有效指针字段的三态判据：
+//   - GC 指针槽：std::is_convertible_v<VT, GcObject*>          → 计入，偏移取槽偏移
+//   - 视图值槽：!is_convertible_v && GcViewSlot<VT>::value     → 计入，偏移取槽偏移 + sizeof(void*)
+//               （接口/迭代器视图值 {fnPtr, self}，self 裸指针须由 GC 追踪/重写）
+//   - 普通值槽：两者皆 false                                   → 不计入
+//
+// ⚠️ 必须用 void_t SFINAE 形态（审查 P1 实测，scripts/probe_f07_viewslot_decltype.cpp）：
+//   裸 `decltype(VT{}.self)` 对值槽（int32_t/double）**不在 SFINAE 立即上下文**，是硬
+//    编译错误而非替换失败；本 traits 对无 self 成员的类型安全落入 false 特化。
+//   G2：判据含类型可转换性（非仅成员存在性）——"含 self 但 self 非 GcObject*"的类型
+//    （如 self 为指针的普通结构）安全返回 false。
+// ============================================================
+template <typename T, typename = void>
+struct GcViewSlot : std::false_type {};
+template <typename T>
+struct GcViewSlot<T, std::void_t<decltype(std::declval<T&>().self)>>
+    : std::is_convertible<decltype(std::declval<T&>().self), GcObject*> {};
 
 // ============================================================
 // GcString — 前向声明，完整定义见 builtin/string.h

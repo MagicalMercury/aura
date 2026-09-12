@@ -19,20 +19,24 @@
 // 运行时单例 GcHeap 管理所有 GC 对象、根集合和 GC 周期。
 //
 // 注：本文件拆分自原 runtime/gc.h，实现分布在 gc/*.cpp 中。
-//     句柄模板（GcRootHandle/GcWeakHandle/GcSharedRoot 等）在 handles.h。
+//     句柄模板（GcRootHandle/GcWeakHandle 等）在 handles.h。
 // ============================================================
 
 #include "../types.h"
 #include "los.h"    // LargeObjectSpace
 #include "pages.h"  // Page / MediumPage / LargePage / PageClass / kPageSize 等
 #include <atomic>
+#include <chrono>   // bug-47 诊断：ThreadRootList 心跳时间戳
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <cstddef>
+#include <deque>
+#include <functional>  // registerIdleWakeup（阶段 2.1）
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -41,6 +45,15 @@ namespace aura_rt {
 
 // 前向声明（GcRootHandle 的构造/析构需要 GcHeap）
 class GcHeap;
+
+// 根持有模式（GcRootHandle 统一三模式）：
+// - Ref：引用外部变量（栈变量包装，线程局部根）
+// - ValueThreadLocal：值持有（接口适配器等临时对象，线程局部根）
+// - ValueGlobal：值持有 + 全局根（闭包捕获/全局缓存）
+// - Moved：已移动（根注册已转移给新句柄，析构跳过注销；不得再读值）
+enum class GcRootMode : uint8_t { Ref, ValueThreadLocal, ValueGlobal, Moved };
+// 值持有模式的根作用域（编译期静态决定，非运行时判断）
+enum class GcRootScope { ThreadLocal, Global };
 
 // ============================================================
 // GcRootHandleBase — GC 根句柄基类（侵入式链表节点）
@@ -62,40 +75,56 @@ public:
 };
 
 // ============================================================
-// GcRootHandle — 根引用包装
+// GcRootHandle — 根引用包装（统一三模式）
 //
-// 编译器生成的代码在声明 GC 指针局部变量时，将其包装为
-// GcRootHandle<T*>。该句柄持有指向实际指针的引用，
-// GC 标记阶段通过它发现从栈/寄存器出发的活对象。
+// 模式 A（Ref）：引用外部变量。编译器生成的代码在声明 GC 指针
+//   局部变量时使用（GcRootHandle<T*> h(ref)），GC 标记阶段通过
+//   ptr_ref_ 发现从栈出发的活对象，compact 时更新用户变量。
+// 模式 B/C（Value）：值持有。接口适配器（ThreadLocal）与闭包捕获/
+//   全局缓存（Global）场景使用，对象指针自身注册为根，GC 期间自动更新。
 //
+// 内存布局 40B：基类 24B + union{ptr_,val_} 8B + mode_ 1B(+padding)。
 // 构造/析构在 GcHeap 完整定义之后实现（见 handles.h）。
 // ============================================================
 template <typename T>
 class GcRootHandle : public GcRootHandleBase {
 public:
+    // 模式 A：引用外部变量（线程局部）← 现有 CodeGen 栈变量，语义零变化
     GcRootHandle(T& ref);
+    // 模式 B/C：值持有。scope 必须显式（无默认值），避免与 T& 重载歧义
+    GcRootHandle(T val, GcRootScope scope);
     ~GcRootHandle();
 
-    // 允许拷贝：新 GcRootHandle 注册独立 GC 根，ptr_ 指向同一栈地址
-    // 安全前提：原 GcRootHandle 的生命周期覆盖拷贝的生命周期
-    // （sync thread 的 waitGroup 保证 worker 任务完成前主线程栈稳定）
+    // 拷贝：按 other.mode_ 分支（Ref→引用同一变量；Value→深拷贝值+独立注册）
     GcRootHandle(const GcRootHandle& other);
     GcRootHandle& operator=(const GcRootHandle&) = delete;
 
-    // 更新被包装的引用目标（用于移动赋值后）
+    // 移动：接管 other 的根注册（O(1) 链表原位重连，无注册/注销开销）
+    // 源标记 Moved 失效，析构跳过注销；移动赋值保持不可用（闭包仅在工厂内
+    // placement-new 构造一次，无需赋值）
+    GcRootHandle(GcRootHandle&& other) noexcept;
+
+    // 更新被包装的引用目标（用于移动赋值后；仅 Ref 模式）
     // 同步更新 ptr_ref_，保持 GC 遍历一致性
     void rebind(T& ref) {
         ptr_ = &ref;
         ptr_ref_ = reinterpret_cast<GcObject**>(ptr_);
     }
 
-    T& operator*()  const { return *ptr_; }
-    T* operator->() const { return ptr_; }
-    T& get()              { return *ptr_; }  // 非 const：返回引用，可作赋值左侧
-    T  get()        const { return *ptr_; }  // const：返回值，兼容读取场景
+    // 按模式读取：Ref → *ptr_（外部变量）；Value → val_（内部值）
+    T& operator*()        { return mode_ == GcRootMode::Ref ? *ptr_ : val_; }
+    T  operator*()  const { return mode_ == GcRootMode::Ref ? *ptr_ : val_; }
+    T* operator->()       { return mode_ == GcRootMode::Ref ? ptr_ : &val_; }
+    T* operator->() const { return mode_ == GcRootMode::Ref ? ptr_
+                                                             : const_cast<T*>(&val_); }
+    T& get()              { return mode_ == GcRootMode::Ref ? *ptr_ : val_; }
+    T  get()        const { return mode_ == GcRootMode::Ref ? *ptr_ : val_; }
+
+    void set(T v);
 
 private:
-    T* ptr_;
+    union { T* ptr_; T val_; };  // Ref 用 ptr_（&外部变量）；Value 用 val_（内部持值）——共享 8B 槽
+    GcRootMode mode_;            // 1B：拷贝构造与析构据此分支（Ref/ValueTL/ValueGlobal）
     friend class GcHeap;
 };
 
@@ -129,26 +158,6 @@ public:
 };
 
 // ============================================================
-// GcGlobalRoot — 全局根引用（运行时缓存用）
-//
-// 用于 GcString::empty() / from(bool) / from(int) 等运行时缓存的 GC 单例。
-// 构造时注册为全局根，析构时取消。通常作为 static 局部变量。
-// ============================================================
-template <typename T>
-class GcGlobalRoot {
-public:
-    explicit GcGlobalRoot(T* obj);
-    ~GcGlobalRoot();
-    GcGlobalRoot(const GcGlobalRoot&) = delete;
-    GcGlobalRoot& operator=(const GcGlobalRoot&) = delete;
-
-    T* get() const { return ptr_; }
-    T* operator->() const { return ptr_; }
-
-private:
-    T* ptr_;
-};
-
 // Compacting GC 迁移条目（拷贝到新页时使用）
 struct CompactEntry {
     GcObject* oldAddr;
@@ -239,6 +248,7 @@ public:
         size_t losObjects;       // LOS 对象数
         size_t losBytes;          // LOS 字节数
         size_t mixedGcCount;     // Mixed GC 次数
+        uint64_t lastGcMicros;   // 最近一次 GC 总耗时（µs，0=尚无 GC）
     };
     Stats getStats() const;
 
@@ -247,6 +257,17 @@ public:
     // GC 遍历在 STW 期间聚合所有线程链表，无需锁
     struct ThreadRootList {
         GcRootHandleBase* head;
+        // bug-47 诊断（纯观测，不参与任何协议）：拥有者线程 OS TID + 最近一次
+        // 到达 safepoint() 检查点的心跳时刻。超时 dump 时据此回答"差的那几个
+        // 线程是谁、多久没到任何检查点"。diag_last_safepoint 为并发读写（mutator
+        // 线程写在先、initiator 线程超时 dump 读在后）——8 字节对齐单写实践中
+        // 原子，撕裂风险仅影响诊断数值，可接受（诊断专用，非协议状态）。
+        unsigned diag_tid = 0;
+        std::chrono::steady_clock::time_point diag_last_safepoint{};
+        // bug-47 诊断第二轮：本线程当前是否停靠在 safepoint 等待（else/Finalize 分支）。
+        // dump 时区分「心跳新鲜且已停靠（正常，已计数）」vs「心跳新鲜但未停靠
+        // （反复早退/循环别处——未计数真凶之一）」。
+        std::atomic<bool> diag_parked{false};
         ThreadRootList() : head(nullptr) {}
     };
 
@@ -254,6 +275,8 @@ public:
     // 构造/析构在 mutator 线程无锁操作自己的链表；GC 在 STW 期间遍历所有线程链表
     void registerRootThreadLocal(GcRootHandleBase* root);
     void unregisterRootThreadLocal(GcRootHandleBase* root);
+    // 原位替换：摘除 oldNode、newNode 插入同一位置（O(1)，移动构造用）
+    void moveRootNode(GcRootHandleBase* newNode, GcRootHandleBase* oldNode);
     ThreadRootList* ensureThreadRootList();   // registerThread 时分配（懒分配）
     void            releaseThreadRootList();  // unregisterThread 时释放
 
@@ -261,6 +284,37 @@ public:
     // 用于协程帧等不便于逐个包装 GcRootHandle 的场景
     void registerStackRoots(void* begin, void* end);
     void unregisterStackRoots(void* begin, void* end);
+
+    // ---- GC 事件日志（P3：AURA_GC_LOG 标签+级别细粒度，默认 Off）----
+    enum class GcLogLevel : uint8_t { Off = 0, Error, Warning, Info, Debug, Trace };
+    enum GcLogTag : uint8_t { kTagGc = 0, kTagPhase, kTagMemory, kTagTrigger, kTagCount };
+    // 单次 GC 事件（三个执行体计时构造；环形缓冲保留最近 64 条）
+    struct GcEvent {
+        uint8_t  kind;           // 0=minor 1=mixed 2=major 3=sweepLarge 4=concurrent
+        uint8_t  trigger;        // 0=young阈值 1=碎片率 2=old阈值 3=sweepLarge
+        uint64_t startMicros;    // 相对进程启动（steady_clock）
+        uint64_t rootsMicros;    // 阶段1：STW 根扫描（并发路径）
+        uint64_t markMicros;     // 阶段2：并发标记 / STW 标记
+        uint64_t finalizeMicros; // 阶段3：收尾总耗时（并发路径）
+        uint64_t finalizeWaitMicros; // 收尾中 STW 停靠等待（线程到达 Finalize；仅并发路径有意义）
+        uint64_t totalMicros;    // 总耗时
+        size_t   liveBefore, liveAfter;    // 对象数
+        size_t   bytesBefore, bytesAfter;  // 活跃字节数（young+old）
+        size_t   freedBytes;               // 回收字节（bytesBefore-bytesAfter）
+    };
+    void logGcEvent(const GcEvent& ev);    // 按标签/级别过滤输出 stderr
+    void setGcEventTrigger(uint8_t t) { lastTrigger_ = t; }  // 执行体记录触发原因
+    void parseGcLogEnv();                  // 构造时解析 AURA_GC_LOG
+
+    // ---- 空闲线程唤醒广播（阶段 2.1：GC 停靠前唤醒空闲 worker 尽快到 safepoint）----
+    void registerIdleWakeup(std::function<void()> cb);   // 单向注册（ThreadPool→GcHeap，GcHeap 不依赖 ThreadPool 类型）
+    void notifyIdleWakeups();                            // 停靠等待前调用（持 idleWakeupsM_ 遍历）
+
+    // ---- P2：跨平台线程中断广播（Linux SIGURG / Windows APC + IOCP 伪完成包）----
+    // 向所有已注册 mutator 线程投递中断，打断其阻塞 sleep 使其尽快回到
+    // gc_safepoint() 检查点。停靠等待循环中周期性调用（waitForRootThreadsStopped /
+    // 传统 STW initiator 等待）。不打断 CPU 执行中的代码（P3+ 编译器 poll 点范畴）
+    void broadcastInterrupt();
 
     // 全局根注册：用于运行时缓存的 GC 对象（如 GcString::empty() 单例）
     void registerGlobalRoot(GcObject** rootPtr);
@@ -278,7 +332,7 @@ public:
     size_t minorGcCount()      const { return minorGcCount_; }
 
 public:
-    GcHeap() = default;
+    GcHeap();   // 定义在 gc.cpp（构造时解析 AURA_GC_LOG 环境变量）
 
     // 分配器内部结构
     // 注：kPageSize / Page 已搬迁至 pages.h
@@ -356,6 +410,57 @@ public:
     void  markFields(GcObject* obj);
     void  markInlineArrayFields(GcObject* obj);
 
+    // ---- 并行标记（P1：显式标记栈 + GC 私有线程组）----
+    // 根对象入共享栈（tryMark + push，不递归）
+    void  markRootEnqueue(GcObject* obj);
+    // 非递归字段扫描：子对象 tryMark 后入本地栈
+    void  scanObjectFields(GcObject* obj, std::vector<GcObject*>& local);
+    // 单线程消费共享栈（串行路径，等价原递归 markObject）
+    void  drainMarkStack();
+    // 并行 worker：共享栈批量取 + 本地栈攒批回填（终止检测）
+    void  parallelMarkWorker();
+    // 并行标记入口：对象量 >= 阈值启用线程组，否则单线程消费
+    void  runMarkPhase();
+    // ---- GC 内部并行辅助（sweep/compact 引用更新分片）----
+    // 将 [0,total) 均分到 min(hardware_concurrency,4) 个线程执行 fn(begin,end)；
+    // total < threshold 或线程数 < 2 时退化为串行（零线程开销）。
+    // 注：fn 不得抛异常（worker 线程内无 catch，异常逃逸将 terminate）
+    void  parallelFor(size_t total, size_t threshold,
+                      const std::function<void(size_t begin, size_t end)>& fn);
+
+    // ---- 并发标记（P2：SATB，mark 与 mutator 并发）----
+    // 根扫描入栈（markPhase 前半：线程根/协程帧/全局根/记忆集-old 展开/oomError）
+    void  scanRootsOnly(bool youngOnly);
+    // P0-B：单个栈候选指针的保守扫描（小页/中页/大页/LOS 四路校验 + 入栈）
+    void  scanStackCandidate(GcObject* obj);
+    // bug-47 诊断：dump 所有注册线程/root list 状态（owner TID、心跳距今、根句柄数）
+    // 到 stderr。仅在 STW 超时 abort 前调用——回答"差的线程是谁、卡了多久"。
+    void dumpThreadStates(const char* where);
+    // 完整停靠：等所有"有根链表的线程"停止（threadRootLists_ 精确反映需停线程，
+    // 含启动窗口期新注册——registered_threads_ 快照可能落后，循环确认 size 稳定）
+    void  waitForRootThreadsStopped();
+    // 统一构造 GcEvent 入环形缓冲 + 触发 logGcEvent（P3 事件日志）
+    void  recordGcEvent(uint8_t kind, uint64_t t0, uint64_t tRoots, uint64_t tMark,
+                        uint64_t tWait, uint64_t tEnd,
+                        size_t liveBefore, size_t bytesBefore);
+    // t0 入口、tRoots 根扫描完、tMark 标记完、tWait Finalize 停靠完成、tEnd 收尾完（µs）；
+    // liveBefore/bytesBefore 必须为 GC 执行前的值（执行体在 GC 前取样传入）
+    // 触发：根扫描（线程已停，STW）→ 释放线程 → 并行标记消费（Marking，mutator 并发）
+    //        → 收尾（Finalize，短暂 STW）
+    void  startConcurrentGc();
+    // 阶段 3 收尾：补扫 born-marked + 消费 SATB + drain 标记栈 + sweep + compact
+    void  finalizeMarking();
+    // born-marked 封装（alloc 路径调用，替代直接 setMarked(false)）
+    inline void finishAlloc(GcObject* obj) {
+        if (markingInProgress_.load(std::memory_order_acquire)) {
+            obj->setMarked(true);                       // born-marked：标记期间新分配直接标记
+            std::lock_guard<std::mutex> lk(bornMutex_);
+            bornObjects_.push_back(obj);                // 收尾补扫字段（可能引用旧对象）
+        } else {
+            obj->setMarked(false);
+        }
+    }
+
     // 清除阶段
     void  sweepPhaseYoung();  // 新生代清除 + 晋升
     void  sweepPhaseAll();    // 全量清除 + 页回收
@@ -373,11 +478,18 @@ public:
     void  updateAllReferences(CompactScope scope);
     void  updateObjectFields(GcObject* obj);
     void  updateInlineArrayElements(GcObject* obj);
+    // 合并版：字段 + 内联数组单次遍历（desc 解析一次，缓存友好；
+    // updateAllReferences 并行分片路径使用，中页/大页路径仍用上两个函数）
+    void  updateObjectAllFields(GcObject* obj);
+    void  relocateGlobalRootPtrs();      // compact 后重定位堆内 globalRoots rootPtr（方案 P）
+    void  relocateRootsInForwardMap(const std::vector<std::tuple<GcObject*, GcObject*, size_t>>& forwardMap);  // 中页/大页版（线性扫）
 
     // === 阶段 2 新增：中页滑动窗口 compact ===
     bool  shouldCompactMedium();         // 中页碎片率 > 阈值
     void  compactMediumPages();          // 滑动窗口搬运存活对象
     void  updateMediumPageReferences(); // 更新中页搬运后的引用
+    // 中页高水位归还（须在 updateMediumPageReferences 之后调用，见 compact.cpp 时序约束）
+    void  reclaimExcessMediumPages();
 
     // === 阶段 2 新增：大页 mark-sweep ===
     bool  shouldSweepLargePages();      // 分配失败率 > 阈值
@@ -391,6 +503,10 @@ public:
     MediumPage* findMediumPage(GcObject* obj) const;
     LargePage*  findLargePage(GcObject* obj) const;
     // 小页反查沿用 compact.cpp 内部 pageByData
+
+    // 判断指针是否落在 GC 管理的任何页数据区内（小/中/大页）
+    // 供迭代器桥接区分"内置迭代器（GcObject 布局）"与"record 适配器（非 GC 对象）"
+    bool isGCAddress(const void* p) const;
 
     // compact 暂停计数控制（供 GcCompactSuspendGuard 使用）
     void incCompactSuspend() { ++compactSuspendedCount_; }
@@ -514,6 +630,22 @@ public:
     std::condition_variable     all_stopped_cv_;
     std::mutex                  all_stopped_m_;
 
+    // --- P2：跨平台线程中断（句柄存储；broadcastInterrupt 遍历投递）---
+    // native 用 void*/unsigned long，避免本头文件引入 windows.h/pthread.h。
+    // 注册/注销与 tl_roots_ 生命周期绑定（roots.cpp ensure/releaseThreadRootList），
+    // 保证「可中断线程集合」==「需停靠线程集合」（waitForRootThreadsStopped 依据）
+    struct ThreadHandle {
+        std::thread::id id;
+#ifdef _WIN32
+        void*           native;   // HANDLE（OpenThread(THREAD_SET_CONTEXT)）
+#else
+        unsigned long   native;   // pthread_t（glibc: unsigned long）
+#endif
+    };
+    std::mutex                  threadHandlesM_;
+    std::vector<ThreadHandle>   threadHandles_;
+    std::atomic<uint32_t>       interruptSentCount_{0};  // 诊断：累计广播次数（abort 时打印）
+
     // TLAB 全局列表（用于调试/统计，不参与 GC 扫描）
     std::mutex                  tlabList_m_;
     std::vector<Tlab*>          tlabList_;
@@ -523,6 +655,53 @@ public:
     // mark 通过正常引用链 + 保守栈扫描 LOS 检查
     // sweep 在 sweepPhaseYoung/sweepPhaseAll 中调用 los_.release()
     LargeObjectSpace            los_;
+
+    // ==================== P1：并行标记 ====================
+    // 共享标记栈（显式 DFS；P2 并发标记复用同一结构）
+    std::deque<GcObject*>      markStack_;      // 共享栈（mutex 保护）
+    std::mutex                 markStackM_;
+    std::atomic<int>           markActive_{0};  // 活跃 worker 计数（终止检测）
+    // 并行阈值与批量
+    static constexpr size_t    kParallelMarkThreshold = 50000;  // 对象数超过才并行
+    static constexpr size_t    kMarkBatchSize          = 32;    // 批量转移粒度
+    // ---- GC 并行阈值（sweep/compact；对象数低于阈值走串行，避免线程开销）----
+    static constexpr size_t    kParallelUpdateThreshold = 5000;   // 引用更新分片
+    static constexpr size_t    kParallelSweepThreshold  = 5000;   // sweep 分区
+    static constexpr size_t    kParallelCopyThreshold   = 1000;   // compact 搬运
+    static constexpr size_t    kParallelRootScanThreshold = 8;    // 根扫描分片（threadRootLists_/stackRoots_ 条目数）
+    std::vector<std::thread>   markThreads_;  // GC 私有线程组（每次 GC 周期创建/回收）
+    static thread_local bool   in_gc_internal_;  // GC 内部线程标志（不参与 STW/alloc）
+
+    // ==================== P2：SATB 并发标记 ====================
+    // 并发阶段：Marking=标记进行中（mutator 自由运行）/ Finalize=收尾（短暂 STW）
+    enum class GcPhase : uint8_t { Idle, Marking, Finalize };
+    std::atomic<GcPhase>      phase_{GcPhase::Idle};
+    std::atomic<bool>         markingInProgress_{false};  // alloc born-marked / 写屏障 SATB 开关
+    // SATB 队列（mutator 写屏障 push / 收尾消费）
+    std::mutex                satbMutex_;
+    std::vector<GcObject*>    satbQueue_;
+    // born-marked 对象（收尾补扫字段）
+    std::mutex                bornMutex_;
+    std::vector<GcObject*>    bornObjects_;
+    // 并发 GC 开关（安全网：false 走 P1 纯 STW 并行标记）
+    bool                      concurrentGcEnabled_ = true;
+    // 并发 GC 启动时判定的级别（收尾执行对应 sweep）：0=Minor 1=Mixed 2=Major 3=SweepLarge
+    int                       pendingGcKind_ = 0;
+    // forceGc 强制标志（多线程：safepoint initiator exchange 消费 → forceGcPending_）
+    std::atomic<bool>         forceGcRequested_{false};
+    bool                      forceGcPending_ = false;  // initiator 专用（执行体/startConcurrentGc 读取）
+    // ---- GC 事件日志状态 ----
+    uint8_t               gcLogLevels_[kTagCount] = {};  // 每标签级别（默认 Off）
+    uint8_t               lastTrigger_ = 0;              // 本次 GC 触发原因
+    std::deque<GcEvent>   gcEvents_;                     // 环形缓冲
+    std::mutex            gcEventsM_;
+    std::atomic<uint64_t> lastGcMicros_{0};              // 最近一次 GC 耗时（gc_stats 用）
+    uint64_t              gcStartBaseMicros_ = 0;        // 进程启动时刻（steady_clock，构造时记录）
+    // ---- 空闲唤醒广播状态（阶段 2.1）----
+    std::mutex                         idleWakeupsM_;
+    std::vector<std::function<void()>> idleWakeups_;
+    // ---- 退出标志（阶段 3 常驻 GC 线程；阶段 1 的 waitForRootThreadsStopped 早退已使用）----
+    std::atomic<bool>         shutdown_{false};
 };
 
 // ============================================================

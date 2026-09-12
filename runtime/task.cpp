@@ -20,6 +20,20 @@ namespace aura_rt {
 namespace { EventLoop g_eventLoop; }
 EventLoop& EventLoop::instance() { return g_eventLoop; }
 
+namespace detail {
+void scheduleOnEventLoop(std::coroutine_handle<> h) {
+    try {
+        EventLoop::instance().schedule(h);
+    } catch (...) {
+        // EventLoop::schedule 内 std::queue::push 可能抛 std::bad_alloc。
+        // await_suspend 是 noexcept（C++ 协程要求），异常必须在此吞掉，
+        // 否则越过 noexcept → std::terminate（比栈溢出更恶劣）。
+        // 吞掉后该 continuation 暂时不调度（任务丢弃）——OOM 场景下的降级行为。
+        std::fprintf(stderr, "[aura_rt] scheduleOnEventLoop: schedule failed (OOM), coroutine dropped\n");
+    }
+}
+} // namespace detail
+
 void EventLoop::schedule(std::coroutine_handle<> cont) {
     std::lock_guard<std::mutex> lk(ready_m_);
     ready_.push(cont);
@@ -57,6 +71,9 @@ void EventLoop::run(task<void>& mainTask) {
 
         // 2. 主协程完成 → 退出
         if (handle.done()) break;
+
+        // 2.5 阶段 2.2：响应 GC STW（协程全挂起时主线程在 IOCP 轮询不响应——停靠缺口）
+        gc.safepoint();
 
         // 3. 无就绪协程 + 有待处理 I/O → 轮询 IOCP
         if (ready_.empty()) {
@@ -108,8 +125,13 @@ void EventLoop::processReady() {
 
 #ifdef _WIN32
 void EventLoop::processIocp() {
-    auto result = IoCompletionPort::instance().getCompletion(10);  // 10ms 超时
+    // P2：10ms→1ms——GC 发起 Finalize 后主线程最坏阻塞从 10ms 降到 1ms；
+    //     broadcastInterrupt 的伪完成包（kGcWakeupKey）可进一步强制立即返回
+    auto result = IoCompletionPort::instance().getCompletion(1);
     if (result.valid) {
+        // P2：GC 唤醒伪完成包——不回调、不减 pending，直接返回；
+        //     外层循环的 gc.safepoint() 立即执行 → Finalize 分支停靠
+        if (result.key == IoCompletionPort::kGcWakeupKey) return;
         IoCompletionPort::instance().invokeCallback(result.bytes, result.ov);
         decPending();
     }

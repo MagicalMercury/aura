@@ -1,4 +1,5 @@
 #include "Lexer.h"
+#include <cerrno>
 #include <cstdlib>
 
 namespace Aura {
@@ -52,9 +53,15 @@ Token Lexer::scanOne() {
 Token Lexer::scanOperatorOrDelimiter(char c) {
     // 运算符与分隔符 — lexeme 始终包含实际字符
     switch (c) {
-    case '+': return makeToken(TokType::Plus,    "+");
-    case '*': return makeToken(TokType::Star,    "*");
-    case '%': return makeToken(TokType::Percent, "%");
+    case '+':
+        if (peek() == '=') { advance(); return makeToken(TokType::PlusEq, "+="); }
+        return makeToken(TokType::Plus, "+");
+    case '*':
+        if (peek() == '=') { advance(); return makeToken(TokType::StarEq, "*="); }
+        return makeToken(TokType::Star, "*");
+    case '%':
+        if (peek() == '=') { advance(); return makeToken(TokType::PercentEq, "%="); }
+        return makeToken(TokType::Percent, "%");
     case '(': return makeToken(TokType::LParen,  "(");
     case ')': return makeToken(TokType::RParen,  ")");
     case '{': return makeToken(TokType::LBrace,  "{");
@@ -88,15 +95,26 @@ Token Lexer::scanOperatorOrDelimiter(char c) {
 
     case '-':
         if (peek() == '>') { advance(); return makeToken(TokType::Arrow, "->"); }
+        if (peek() == '=') { advance(); return makeToken(TokType::MinusEq, "-="); }
         return makeToken(TokType::Minus, "-");
 
     case '/':
+        // '//' 与 '/*' 注释已在 skipWhitespaceAndComments 消费，此处只处理除法与 /=
+        if (peek() == '=') { advance(); return makeToken(TokType::SlashEq, "/="); }
         return makeToken(TokType::Slash, "/");
+
+    case '?':
+        return makeToken(TokType::Question, "?");
 
     case '.':
         if (std::isdigit(static_cast<unsigned char>(peek()))) {
             --pos_; --curPos_.col;
             return scanNumber();
+        }
+        // '...' → Ellipsis（C++ 桥接方法声明标记）
+        if (peek() == '.' && peekNext() == '.') {
+            advance(); advance();
+            return makeToken(TokType::Ellipsis, "...");
         }
         return makeToken(TokType::Dot, ".");
 
@@ -210,12 +228,20 @@ Token Lexer::scanNumber() {
     Token tok{{}, lexeme, 0, 0};
     if (isFloat) {
         char* end = nullptr;
+        errno = 0;
         double val = std::strtod(lexeme.c_str(), &end);
+        if (errno == ERANGE) {
+            return makeError("floating point literal out of range");
+        }
         tok.type = TokType::FloatLiteral;
         tok.literal = val;
     } else {
         char* end = nullptr;
+        errno = 0;
         int64_t val = std::strtoll(lexeme.c_str(), &end, base);
+        if (errno == ERANGE) {
+            return makeError("integer literal too large");
+        }
         tok.type = TokType::IntLiteral;
         tok.literal = val;
     }

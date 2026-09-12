@@ -43,6 +43,15 @@ IoCompletionPort::Completion IoCompletionPort::getCompletion(DWORD timeoutMs) {
     return r;
 }
 
+void IoCompletionPort::postWakeup() {
+    // IOCP 未启动（无异步 I/O 场景）→ 无需唤醒
+    if (!iocp_) return;
+    // 伪完成包：bytes=0, key=kGcWakeupKey, ov=nullptr
+    // GQCS 收到后返回 TRUE → getCompletion 得 valid=true + key=kGcWakeupKey
+    // → processIocp 过滤（不 invokeCallback）→ 外层 gc.safepoint() 停靠
+    PostQueuedCompletionStatus(iocp_, 0, kGcWakeupKey, nullptr);
+}
+
 void IoCompletionPort::registerCallback(OVERLAPPED* ov, Callback cb) {
     std::lock_guard<std::mutex> lk(mtx_);
     callbacks_[ov] = std::move(cb);
