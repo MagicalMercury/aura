@@ -131,6 +131,7 @@ void CodeGenerator::genTryCatchNoSetupIIFE(std::ostream& cpp,
     indentLevel_++;
 
     // IIFE：普通函数，执行 try 体所有语句（同步版本），返回 variant<monostate, Error>
+    // feature-05：生成面联合已弃用 std::variant，此处为 try 内部 monostate|Error 机制保留
     writeLine(cpp, "auto _try = [&]() -> std::variant<std::monostate, aura_rt::Error> {");
     indentLevel_++;
     writeLine(cpp, "try {");

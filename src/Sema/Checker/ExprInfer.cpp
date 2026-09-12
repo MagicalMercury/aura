@@ -70,11 +70,32 @@ std::unique_ptr<SemType> SemAnalyzer::inferIdentifier(const Identifier& e) {
         error(e, "undefined identifier '" + e.name + "'");
         return ErrorSemType::make();
     }
+    // feature-06（阶段 C）：函数/方法名出现在值位置 → 函数签名 FuncSemType
+    //（一等函数值：let f = double / 实参传函数名）。调用消费 double(...) 走
+    // inferCall 的 Function 分支（直查符号表，不经本函数），零回归。
+    if (sym->kind == SymKind::Function || sym->kind == SymKind::Method) {
+        auto ft = std::make_unique<FuncSemType>();
+        for (auto& p : sym->params)
+            ft->paramTypes.push_back(p.type ? p.type->clone() : ErrorSemType::make());
+        ft->returnType = sym->type ? sym->type->clone() : NoneSemType::make();
+        ft->throws = sym->throws;
+        return ft;
+    }
     // 类型别名名在值位置被当值使用（`let p = Point` / 实参传类型名 / `Point {}` 空具名
     // 形态）：inferIdentifier 会返回展开后的 record 类型 → CodeGen 生成
     // `Point* p_raw = Point;` 坏 C++。此处干净报错——类型名只能用于类型位置（标注/
     // 别名声明/泛型实参）；构造调用 `Point(...)` 走 inferCall 处理，不经本函数，不受影响。
     if (sym->kind == SymKind::TypeAlias) {
+        // feature-06（阶段 C）：构造器引用一等化——record 类型名（含显式 ctor）在值
+        // 位置 → ctor 签名 FuncSemType{ctorParams → record}（let k = Point; k(1,2)）。
+        // 无显式 ctor 的 record（字段构造形态）v1 不支持值引用 → 维持干净报错。
+        if (sym->ctorDeclared && sym->type) {
+            auto ft = std::make_unique<FuncSemType>();
+            for (auto& p : sym->ctorParams)
+                ft->paramTypes.push_back(p.type ? p.type->clone() : ErrorSemType::make());
+            ft->returnType = sym->type->clone();
+            return ft;
+        }
         error(e, "cannot use type '" + e.name + "' as a value");
         return ErrorSemType::make();
     }
@@ -209,9 +230,39 @@ std::unique_ptr<SemType> SemAnalyzer::inferListExpr(const ListExpr& e,
         // declaredElem 期望推断（闭包参数有标注可自行推断出具体类型，再由下方
         // isAssignable 对首元素具体类型做一致性校验）。
         auto ti = inferExpr(*e.elements[i], declaredElem);
-        if (!isAssignable(*elemType, *ti)) {
+        // bug-58/bug-67：elemType 含未绑定泛型形参（泛型方法体内的 T，如顶层混合
+        // [self.val, "str-elem"] 的 T 或嵌套混合 [[self.val], [self.s]] 的 [T]）时，
+        // isAssignable 递归到未绑定泛型 target 恒 true（设计"实例化时再检查"但 Aura
+        // 无实例化重校验）→ 混合放行 → 值类型实例化 append 类型不匹配坏 C++。
+        // 方向 1 收紧（#58 顶层裸泛型 → bug-67 递归扩展至 elemType 含未绑定泛型的
+        // 嵌套结构）：后续元素须与 elemType「结构同形 + 未绑定泛型位置同名」
+        //（sameShapeWithUnbound；[[T],[T]] 同形放行、[[T],[string]] 拒），否则与非
+        // 泛型 [1, "s"] 一致报 list element type mismatch；elemType 不含未绑定泛型
+        //（具体类型嵌套 [[int],[int]] 等）走原 isAssignable，不受影响。
+        bool mismatch = containsUnboundGenericParam(elemType.get())
+            ? !sameShapeWithUnbound(elemType.get(), ti.get())
+            : !isAssignable(*elemType, *ti);
+        if (mismatch) {
             error(*e.elements[i], "list element type mismatch: expected '" + elemType->toString() + "', got '" + ti->toString() + "'");
         }
+    }
+    // feature-06（阶段 C）传播点 2：[Callable] 标注列表 → 元素溯源签名并集进元素
+    // 类型（call all[0](1) 静态检查与 erased 调用拆箱依赖）。元素可为函数签名值/
+    // 函数名/方法值/ctor 引用（FuncSemType）或 Callable 值（沿用 origins）；functor
+    // record 元素 v1 不支持（CodeGen 无 invoke 签名通道）→ 干净报错。
+    if (auto* lct = dynamic_cast<const CallableSemType*>(elemType.get())) {
+        auto eff = std::make_unique<CallableSemType>();
+        for (auto& el : e.elements) {
+            if (!el || !el->inferredType) continue;
+            if (dynamic_cast<const RecordSemType*>(el->inferredType)) {
+                error(*el, "functor record cannot be stored in a '[Callable]' list in v1; "
+                           "bind it to a 'Callable' variable first");
+                continue;
+            }
+            auto os = callableOriginsFromType(*el->inferredType);
+            joinOrigins(eff->origins, os);
+        }
+        elemType = std::move(eff);
     }
     auto t = std::make_unique<ListSemType>();
     t->elementType = std::move(elemType);
@@ -291,7 +342,19 @@ std::unique_ptr<SemType> SemAnalyzer::inferRecordExpr(const RecordExpr& e,
                 if (rf.name == f.name && rf.type) { fieldExpected = rf.type.get(); break; }
             }
         }
-        t->fields.push_back({f.name, f.value ? inferExpr(*f.value, fieldExpected) : ErrorSemType::make()});
+        auto ft = f.value ? inferExpr(*f.value, fieldExpected) : ErrorSemType::make();
+        // bug-66：record 字面量字段值（f: int|None 等含 None 目标经 isAssignable 放行
+        // ——None 变体匹配）为 None 返回调用（推断纯 NoneSemType 且非显式 none()/None
+        // 值）→ None 返回 = void 语义无值可绑 → 干净报错（与 #63 let/const 声明拒
+        // 同源；字段目标不含 None 时 isAssignable false，由提交点 type mismatch 兜底，
+        // 不在此拦截）。显式 none()/None（isNoneValueInitializer）仍放行。
+        const bool noneReturnInit = !isNoneValueInitializer(f.value.get())
+            && dynamic_cast<const NoneSemType*>(ft.get());
+        if (fieldExpected && noneReturnInit && isAssignable(*fieldExpected, *ft)) {
+            error(f.value ? static_cast<const ASTNode&>(*f.value) : static_cast<const ASTNode&>(e),
+                  "cannot bind 'None' return value to field '" + f.name + "'; use a union annotation like 'int | None'");
+        }
+        t->fields.push_back({f.name, std::move(ft)});
     }
     typeStore_.push_back(std::move(t));
     const_cast<RecordExpr&>(e).inferredType = typeStore_.back().get();
@@ -401,7 +464,16 @@ std::unique_ptr<SemType> SemAnalyzer::inferNamedRecordExpr(const RecordExpr& e,
             if (rf.name == f.name) { fieldExpected = rf.type.get(); break; }
         }
         auto ft = f.value ? inferExpr(*f.value, fieldExpected) : ErrorSemType::make();
-        if (fieldExpected && !isAssignable(*fieldExpected, *ft)) {
+        // bug-66：字段目标含 None（int|None / Optional 等经 isAssignable 放行——None
+        // 变体匹配）时，字段值为 None 返回调用（推断纯 NoneSemType 且非显式
+        // none()/None 值）→ void 语义无值可绑 → 干净报错（与 #63 let/const 声明拒
+        // 同源；目标不含 None 时 isAssignable false 走下方既有 type mismatch 不改变）。
+        const bool noneReturnInit = !isNoneValueInitializer(f.value.get())
+            && dynamic_cast<const NoneSemType*>(ft.get());
+        if (fieldExpected && noneReturnInit && isAssignable(*fieldExpected, *ft)) {
+            error(f.value ? static_cast<const ASTNode&>(*f.value) : static_cast<const ASTNode&>(e),
+                  "cannot bind 'None' return value to field '" + f.name + "'; use a union annotation like 'int | None'");
+        } else if (fieldExpected && !isAssignable(*fieldExpected, *ft)) {
             error(f.value ? static_cast<const ASTNode&>(*f.value) : static_cast<const ASTNode&>(e),
                   "field '" + f.name + "' type mismatch: expected '"
                   + fieldExpected->toString() + "', got '" + ft->toString() + "'");
@@ -595,6 +667,50 @@ bool SemAnalyzer::containsUnboundGenericParam(const SemType* t) const {
         return false;
     }
     return false;
+}
+
+// ============================================================
+// sameShapeWithUnbound — 未绑定泛型位置的递归同形比较（bug-67）
+// ============================================================
+// 列表字面量 elemType 含未绑定泛型形参（泛型方法体 [self.val]/[[self.val]] 等推断）
+// 时，isAssignable 递归到未绑定泛型 target 恒 true（Assignability.cpp L20-29）→
+// 混合元素 [[T], [string]] 放行 → T=int 实例化坏 C++。#58 顶层裸泛型判定只覆盖
+// elemType 为裸 GenericSemType，嵌套形态（elemType=[T]，ListSemType）漏网——此处
+// 按「结构同形 + 未绑定泛型位置同名」递归收紧：target 子树不含未绑定泛型的位置
+// 回退 isAssignable 原判定（不改变具体类型语义）；target 为未绑定泛型时要求 source
+// 对应位置为同名未绑定泛型。Union/Record/Func 等其余容器未纳入（无登记形态，维持
+// isAssignable 原判定防误伤）。
+bool SemAnalyzer::sameShapeWithUnbound(const SemType* target, const SemType* source) const {
+    if (!target || !source) return false;
+    if (!containsUnboundGenericParam(target)) return isAssignable(*target, *source);
+    // 裸泛型变量（resolvedName 空）：source 须为同名未绑定泛型（[T] vs [string] 的
+    // T 位置不匹配 → false；[T] vs [T] 同名 → true）
+    if (auto* g = dynamic_cast<const GenericSemType*>(target)) {
+        auto* sg = dynamic_cast<const GenericSemType*>(source);
+        return sg && sg->resolvedName.empty() && sg->name == g->name;
+    }
+    // 列表 / Optional：容器层一致后递归元素（Optional source 兼容结构化
+    // OptionalSemType 与物化 GenericSemType{Optional,...} 两种历史表示）
+    if (auto* l = dynamic_cast<const ListSemType*>(target)) {
+        auto* sl = dynamic_cast<const ListSemType*>(source);
+        return sl && sl->elementType && l->elementType
+            && sameShapeWithUnbound(l->elementType.get(), sl->elementType.get());
+    }
+    if (auto* o = dynamic_cast<const OptionalSemType*>(target)) {
+        if (!o->elementType) return false;
+        const SemType* sElem = nullptr;
+        std::unique_ptr<SemType> owned;
+        if (auto* so = dynamic_cast<const OptionalSemType*>(source)) {
+            sElem = so->elementType.get();
+        } else if (auto* sg = dynamic_cast<const GenericSemType*>(source);
+                   sg && sg->name == "Optional" && !sg->resolvedName.empty()) {
+            owned = elemTypeOf(sg);
+            sElem = owned.get();
+        }
+        return sElem && sameShapeWithUnbound(o->elementType.get(), sElem);
+    }
+    // 其余含未绑定泛型的容器（Union/Record/Func）：未纳入收紧，维持原判定
+    return isAssignable(*target, *source);
 }
 
 // ============================================================

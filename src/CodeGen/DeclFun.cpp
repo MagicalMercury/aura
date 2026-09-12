@@ -163,11 +163,19 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     gcRootTypes_.clear();
     viewRootVarNames_.clear();
     viewRootTypes_.clear();
+    auto savedCallableObjVars = callableObjVars_;   // feature-06：函数级快照（尾部恢复）
     ioInScope_ = false;
     for (auto& p : decl.params) {
         if (p.name == "io") ioInScope_ = true;   // #46：形参名即生成的 C++ 变量名
         registerParamTracking(p);
         registerRawParamTracking(p);
+        // feature-06：函数类型形参（Sema FuncSemType——含 NamedType 函数别名 /
+        // auto 工厂形参形态）注册为 CallableObj 值变量。body 内直接调用该形参
+        // fn(args) 时 ExprCall isFunValueCall 命中 → 生成 fn->invoke(fn, args)
+        //（旧 fn(args) std::function 调用形态退役；未注册前别名/auto 形参因未
+        // handle 化而直呼 CallableObj 指针 → 坏 C++）
+        if (isFunctionTypedParam(p))
+            callableObjVars_.insert(safeName(p.name));
     }
 
     // 模板函数或 auto 返回（泛型闭包）→ 体放入头文件（跨模块可见）
@@ -222,6 +230,7 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     }
     out << "}\n\n";
     clearVarTrackingState();
+    callableObjVars_ = savedCallableObjVars;   // feature-06：函数级恢复（防泄漏到后续函数）
     ioInScope_ = false;   // #46：函数级复位（防泄漏到后续函数）
     currentReturnElem_.clear();
 }
@@ -274,6 +283,10 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
     // 所有协程：NoneType 返回 → void（task<void> 有 return_void()，task<NoneType> 没有）
     if (retType == "aura_rt::NoneType") retType = "void";
     if (fn == "main") fn = "aura_main";
+
+    // feature-06（阶段 B）：记录具名函数解析后 C++ 返回类型（genLetStmt 判别
+    // 函数调用初始化器值形态：CallableObj<...>* = CallableObj 值 / auto = 泛型工厂）
+    declaredFunRetTypes_[decl.name] = retType;
 
     sig << (isCoro ? "aura_rt::task<" + retType + ">" : retType);
     sig << " " << fn << "(";
@@ -504,11 +517,16 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     else
         valueTypeVarNames_.insert(decl.receiverName);
 
+    auto savedCallableObjVars = callableObjVars_;   // feature-06：方法级快照（尾部恢复）
     ioInScope_ = false;
     for (auto& p : decl.params) {
         if (p.name == "io") ioInScope_ = true;   // #46：形参名即生成的 C++ 变量名
         registerParamTracking(p);
         registerRawParamTracking(p);
+        // feature-06：函数类型形参注册（见 genFunDecl 同款注释——方法体/闭包体直呼
+        // fn(args) → fn->invoke(fn, args)）
+        if (isFunctionTypedParam(p))
+            callableObjVars_.insert(safeName(p.name));
     }
 
     std::string retType = decl.returnType ? mapType(*decl.returnType) : "void";
@@ -642,6 +660,7 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     currentMethodThisHandle_.clear();
     out << "}\n\n";
     clearVarTrackingState();
+    callableObjVars_ = savedCallableObjVars;   // feature-06：方法级恢复（防泄漏到后续函数）
     ioInScope_ = false;   // #46：方法级复位（防泄漏到后续函数）
     currentReturnElem_.clear();
 }
@@ -702,23 +721,52 @@ void CodeGenerator::genConstructor(std::ostream& cpp, const MethodDecl& decl) {
     out << "  " << fullType << "* " << recvName << "_raw = aura_rt::gc_alloc<"
         << fullType << ">(&" << fullType << "::_desc);\n";
     out << "  aura_rt::GcRootHandle<" << fullType << "*> " << recvName
-        << "(" << recvName << "_raw);\n";
+        << "(" << recvName << "_raw, aura_rt::GcRootScope::ThreadLocal);\n";
     gcRootVarNames_.insert(recvName);
     gcRootTypes_[recvName] = fullType + "*";
     // #46：ctor 形参含 io（record 构造带 Io 形参）→ 体生成期间 ioInScope_ = true
     ioInScope_ = false;
-    for (auto& p : decl.params)
+    auto savedCtorCallableObjVars = callableObjVars_;   // feature-06：ctor 级快照（尾部恢复）
+    // bug-69：ctor body 入口为堆类型/接口视图形参生成 GcRootHandle/ViewRoot 包装
+    // （对照 genFunDecl / genMethodDecl 的形参包装循环）。ctor 形参未持根时，
+    // ctor 体内 major GC（compact）移动对象 → 形参旧地址悬垂 → 写字段/解引用 UAF。
+    // 签名形如 `X* X_ctor(Point* init_raw)`，此处生成
+    // `GcRootHandle<decltype(init_raw)> init(init_raw);`；用 decltype 而非显式 ptype
+    // 可避开泛型闭包中未绑定模板参数无法在函数作用域解析的问题。
+    for (auto& p : decl.params) {
+        if (!p.type) continue;
+        std::string ptype = mapParamType(*p.type);
+        std::string varName = safeName(p.name);
+        if (isGcPointerType(ptype)) {
+            out << "  aura_rt::GcRootHandle<decltype(" << varName << "_raw)> "
+                << varName << "(" << varName << "_raw);\n";
+        } else if (isIfaceViewTypeName(ptype)) {
+            out << "  aura_rt::ViewRoot<decltype(" << varName << "_raw)> "
+                << varName << "(" << varName << "_raw);\n";
+        }
+    }
+    for (auto& p : decl.params) {
         if (p.name == "io") ioInScope_ = true;
+        // feature-06：ctor 函数类型形参（fun(U)->U 等）注册为 CallableObj 值变量——
+        // ctor 形参现已按 bug-69 加 _raw 并在入口包装为同名句柄，body 内直呼
+        // f(args) 时 isFunValueCall 命中 → f->invoke(f, args)（否则 CallableObj 指针
+        // 直呼坏 C++）
+        if (isFunctionTypedParam(p))
+            callableObjVars_.insert(safeName(p.name));
+        // bug-69：注册形参根/视图跟踪 → body 内引用生成 `p.get()`（而非裸 p_raw）
+        registerRawParamTracking(p);
+    }
     if (decl.body) genBlock(out, *decl.body, false);
     out << "  return " << recvName << ".get();\n";
     out << "}\n\n";
     clearVarTrackingState();   // 清 gcRootVarNames_（既有调用，防 "self" 名泄漏到后续函数）
+    callableObjVars_ = savedCtorCallableObjVars;   // feature-06：ctor 级恢复
     ioInScope_ = false;   // #46：ctor 级复位（防泄漏到后续函数）
     currentTParams_.clear();
 }
 
 std::string CodeGenerator::constructorSignature(const MethodDecl& decl,
-                                                  const std::vector<std::string>& tparams) {
+                                                  [[maybe_unused]]const std::vector<std::string>& tparams) {
     std::ostringstream sig;
     // bug-07：receiver 泛型仅取 receiverTypeArgs（见 genConstructor 注释，防
     // 方法/构造自身裸泛型 U 拼入造成 `Box<U>*` 非模板 record 错误）
@@ -736,6 +784,16 @@ std::string CodeGenerator::constructorSignature(const MethodDecl& decl,
         if (i > 0) sig << ", ";
         sig << (decl.params[i].type ? mapType(*decl.params[i].type) : "auto")
             << " " << safeName(decl.params[i].name);
+        // bug-69：ctor 形参根包装修复——堆类型/接口视图形参加 _raw 后缀，体入口
+        // 用 GcRootHandle/ViewRoot 包装为同名变量（对照 genFunDecl 的形参命名约定）。
+        // 形参为 GC 指针时体入口须持静态根，否则 ctor 体内 major GC（compact）
+        // 移动对象后形参旧地址悬垂（bug-69 根因）。
+        if (decl.params[i].type) {
+            std::string ptype = mapParamType(*decl.params[i].type);
+            if (isGcPointerType(ptype) || isIfaceViewTypeName(ptype)) {
+                sig << "_raw";
+            }
+        }
     }
     sig << ")";
     return sig.str();

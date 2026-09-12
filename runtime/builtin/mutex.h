@@ -354,6 +354,8 @@ inline Once* make_once() {
 // v1.2 多锁统一 Guard（用于 lock (a, b, c) { } CodeGen）
 //
 // 用 std::variant 持有三种 Guard，按运行时排序后构造
+// 注：feature-05 生成面（Aura 联合类型）已弃用 std::variant →
+// aura_rt::ValueVariant；此处为 runtime 内部多锁实现使用，保留。
 // ============================================================
 using LockGuardVariant = std::variant<Mutex::Guard, RWMutex::ReadGuard, RWMutex::WriteGuard>;
 

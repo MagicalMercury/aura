@@ -16,7 +16,9 @@
 
 #include <coroutine>
 #include <cstddef>
+#include <cstdio>
 #include <exception>
+#include <utility>
 #include <vector>
 
 namespace aura_rt {
@@ -217,6 +219,41 @@ inline task<void> when_all(std::vector<task<void>>& tasks) {
         if (t) co_await t;
     }
     co_return;
+}
+
+// ============================================================
+// run_to_completion ─ 在当前线程内把 lazy task 驱动至完成（bug-73）
+//
+// 用途：sync thread 的 worker 内执行「调用形态 spawn」到的协程函数。
+//   task<T> 的 initial_suspend() = suspend_always（lazy）→ 不 resume 就永不进入
+//   函数体；而 sync_thread_context::submit 形参是 std::function<void()>，会把调用
+//   返回值（task）隐式转换掉 → task 立即析构 → 协程体静默不执行（bug-73）。
+// 语义：
+//   - resume 一次：协程体同步执行到底（co_await 同步链如 io.println 的
+//     await_ready / 对称转移在同一 C++ 栈内跑完）
+//   - 完成后：promise.exception_ 在此重抛（ThreadPool::workerLoop 捕获后记入
+//     group 异常列表，waitGroup 再抛给 sync thread 块的调用方）
+//   - 若在真正异步点挂起（IOCP 完成包 / FutureAwaiter 等需要事件循环推进的
+//     await）：worker 线程没有事件循环，无法继续驱动。此时不能二次 resume（会在
+//     await 中途重入协程体 → UB），也不能析构 task（外部等待者仍持有该 handle →
+//     恢复已销毁帧 UAF）→ 故意把帧 detach（泄漏）并给出 stderr 诊断。原缺陷是
+//     「静默不执行」，此处至少可见且不越界。
+// ============================================================
+template <typename T>
+void run_to_completion(task<T> t) {
+    if (!t) return;                       // 空 task（callee 返回空句柄）→ 无操作
+    auto h = t.handle();
+    h.resume();                           // lazy：必须显式启动
+    if (!h.done()) {
+        (void)new task<T>(std::move(t));  // detach：保帧存活（防外部等待者 UAF）
+        std::fprintf(stderr,
+            "[aura_rt] run_to_completion: spawned coroutine suspended on an async "
+            "point that needs an event loop; a sync thread worker has none, so it "
+            "cannot be driven to completion (frame detached).\n");
+        return;
+    }
+    if (h.promise().exception_)
+        std::rethrow_exception(h.promise().exception_);
 }
 
 // ============================================================

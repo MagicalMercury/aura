@@ -251,6 +251,35 @@ bool SemAnalyzer::isAssignable(const SemType& target, const SemType& source) con
         return isAssignable(*oa->elementType, source);
     }
 
+    // feature-06（阶段 C）：Callable 赋值规则（收窄=编译期报错，v2.1 决策①）
+    // 目标为裸 Callable（CallableSemType，erased 或带 origins）：
+    //   (a) FuncSemType → Callable：widening ✅（origins 由传播点维护，此处只判可赋性）
+    //   (b) Callable → Callable：✅（引用语义拷贝；并集语义 origins 在传播点 join）
+    //   (d) record（functor 协议）→ Callable：record 声明 invoke 方法 → ✅
+    //       （调用侧 adapt 经 invoke 方法转发）
+    //   （其余 source → Callable：int/string 等不可赋）
+    if (dynamic_cast<const CallableSemType*>(&target)) {
+        if (dynamic_cast<const FuncSemType*>(&source)) return true;
+        if (dynamic_cast<const CallableSemType*>(&source)) return true;
+        if (auto* rs = dynamic_cast<const RecordSemType*>(&source)) {
+            // functor 协议：record 有 invoke 方法（typeMethods_/importedMethods_，
+            // 泛型 record 按基名回退——与 inferMethodCall 方法查找同源）
+            return findRecordMethod(rs->canonicalName, "invoke") != nullptr;
+        }
+        return false;
+    }
+    // 收窄（source=CallableSemType, target=FuncSemType）：`let f: fun(int)->int = all[0]`
+    // origins 中每一签名都必须与 target 兼容（matchFuncSig 语义——经 isAssignable 递归）；
+    // erased（无溯源）收窄 → 干净拒绝（引导 match 判别/保留 Callable 标注）。
+    if (auto* cs = dynamic_cast<const CallableSemType*>(&source)) {
+        if (auto* ft = dynamic_cast<const FuncSemType*>(&target)) {
+            if (cs->erased()) return false;
+            for (auto& o : cs->origins)
+                if (o && !isAssignable(*ft, *o)) return false;
+            return true;
+        }
+    }
+
     // 函数类型：逐参数检查（支持泛型参数）
     if (auto* ft = dynamic_cast<const FuncSemType*>(&target)) {
         if (auto* fs = dynamic_cast<const FuncSemType*>(&source)) {

@@ -92,8 +92,11 @@ CompileUnit CodeGenerator::generate(const Program& program,
             registerTypeName(t->name, true);
         if (auto* i = dynamic_cast<const InterfaceDecl*>(d.get()))
             interfaceNames_.insert(i->name);
-        if (auto* f = dynamic_cast<const FunDecl*>(d.get()))
+        if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
             registerTypeName(f->name, false);
+            // feature-06（阶段 B）：具名函数直呼快路径判别集合（B3a）
+            declaredFunNames_.insert(f->name == "main" ? "aura_main" : f->name);
+        }
         if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
             if (m->isConstructor)
                 registerTypeName(m->receiverType, true);

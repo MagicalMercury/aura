@@ -329,12 +329,13 @@ void GcHeap::updateAllReferences(CompactScope scope) {
     for (auto* list : threadRootLists_) {
         for (GcRootHandleBase* node = list->head; node; node = node->next_) {
             GcObject** fieldPtr = node->ptr_ref_;
-            if (fieldPtr && *fieldPtr) {
+            // bug-79 L2（对称加固）：页外/悬垂槽值跳过——与 scanRootsOnly 同款防御。
+            // updatePtr 对 *fieldPtr 直接调用 forwarded()，脏值（0x1 等）即未定义行为。
+            if (fieldPtr && *fieldPtr && isGCAddress(*fieldPtr)) {
                 updatePtr(*fieldPtr);
             }
         }
     }
-
     // 2. 跳过 stackRoots_ 保守扫描
     //    协程帧内的 GC 指针已通过 GcRootHandle 注册到 roots_（步骤 1 已更新）
 
@@ -647,6 +648,7 @@ bool GcHeap::isGCAddress(const void* p) const {
         if (c >= pg->data && c < pg->data + MediumPage::kSize) return true;
     for (LargePage* pg = largePages_; pg; pg = pg->next)
         if (c >= pg->data && c < pg->data + LargePage::kSize) return true;
+    if (los_.contains(reinterpret_cast<GcObject*>(const_cast<void*>(p)))) return true;   // bug-79 L2：补 LOS 页（对齐栈扫描路径 los_.contains）
     return false;
 }
 

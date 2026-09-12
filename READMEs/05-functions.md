@@ -116,3 +116,47 @@ let g: Optional<Func> = none()          // 函数类型 或 None
 > 联合运算符 `|` 优先级最低，只出现在类型表达式的最外层——因此函数返回类型会被
 > `|` 贪婪吸收（`fun() -> T | U` 即「返回 `T | U` 的函数」）。要组合函数类型本身，
 > 请用「类型别名 + `Optional<T>` / `T | U`」的写法，而不是 `(fun() -> T) | U`。
+
+## 5.5 函数作为值（一等可调用）与裸 `Callable`（feature-06）
+
+函数是一等值：**函数名、闭包字面量、方法值、构造器引用**都可赋给函数类型变量
+`fun(A...) -> R` 或裸 `Callable`（类型语义见 §3.2；值运行时为 GC 堆 `CallableObj`，
+捕获槽 desc 追踪，拷贝 = 引用语义）：
+
+```aura
+fun double(x: int) -> int { return x * 2 }
+
+let f = double                       // 函数名作值（推断 fun(int) -> int）
+let g = f                            // 拷贝句柄（引用语义），g(3) 与 f(3) 一致
+let rec = { x = 2, y = 3 }
+let h = rec.area                     // 方法值：绑定 receiver（方法值一等化）
+let k = Point                        // 构造器引用：Point 类型名作值
+```
+
+**裸 `Callable` + origins**：`Callable` 是无签名标注的可调用类型，可容纳任何可调用值，
+编译器以溯源签名集 origins 做编译期检查（调用点按签名集静态/动态三态派生）：
+
+```aura
+let c: Callable = double             // origins = { fun(int) -> int }
+let r = c(3)                         // 单一签名：静态检查 + 直调
+let all: [Callable] = [double, f2]   // 列表元素 origins 并集
+let s = all[0](1)                    // union 起源：编译期按签名集校验实参
+
+fun run(cb: Callable) -> int {       // 函数形参裸标 Callable = erased 契约
+    return cb(1)                     // erased 边界：运行时 sigId 校验兜底
+}
+```
+
+- **收窄赋值 = 编译期报错**：`let x: fun(int) -> int = all[0]`（origins 含不兼容签名）
+  直接报错，不做动态降级（v2.1 定案）。
+- **functor 协议**：record 声明 `invoke` 方法后可赋 `Callable`，调用 `a(5)` 降级为
+  `a.invoke(5)`：
+  ```aura
+  struct Adder { base: int }
+  impl Adder {
+      fun invoke(self, x: int) -> int { return self.base + x }
+  }
+  let add10: Callable = Adder(10)
+  let n = add10(5)                   // 15（降级 add10.invoke(5)）
+  ```
+- 无标注调用的结果类型无法推断（erased）时需加期望标注，否则编译期报错。

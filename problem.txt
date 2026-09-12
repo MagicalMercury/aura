@@ -1,0 +1,17 @@
+[1]. Variant直访和访问失败Runtime错误还未完全覆盖：
+type Point = { x: int, y: int }
+
+type HolderP = { v: int | Point }
+
+fun main(io: Io) throws {
+    let p: Point = { x = 7, y = 8 }
+    let h: HolderP = { v = p }
+    let got: int = h.v.x
+    io.println("got=" + str(got))
+    io.println("done")
+}
+
+Transform cb 形参在方法体被 cb(...) 直呼（未 invoke 化）——真实行为缺口
+同模块泛型缺参调用默认闭包实参坏 C++（裸 lambda vs CallableObj 形参）。这与任务第 3 步同源
+1.aura：部分失败——compose 管道/计数器/接口 XFunc 段已过，剩 retry/when/make_tree_mapper（auto-param 泛型闭包工厂，旧路径 F&& 承载 CallableObj 值，body 内 transform(value) 直呼不兼容）未转正
+String == between two variables falls to raw pointer comparison 

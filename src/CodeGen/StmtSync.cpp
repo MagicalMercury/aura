@@ -167,7 +167,9 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, b
         }
         if (!firstCapture) cpp << ", ";
         cpp << var;
-        for (auto& v : freeVars) cpp << ", " << safeName(v);
+        // bug-72：GC 根 / 视图根自由变量 → Global 根 init-capture（ThreadLocal 句柄副本
+        // 在提交线程注册、worker 线程析构 → 摘错 thread-local 根链表 → 扫根 GC UAF）
+        for (auto& v : freeVars) cpp << ", " << crossThreadCaptureItem(v);
         if (ioUsed) cpp << ", &io";
         cpp << "]() mutable {\n";
         indentLevel_++;
@@ -306,7 +308,9 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, b
     writeLine(cpp, "co_return;");
     indentLevel_--;
     cpp << indentStr() << "}(" << var;
-    for (auto& v : freeVars) cpp << ", " << safeName(v);
+    // bug-72：自由变量经协程 lambda 形参（auto v）承载——形参是句柄副本，注册于创建线程、
+    // 随协程帧在任意线程析构 → 实参改传 Global 根（auto 推导同型，体生成零改动）
+    for (auto& v : freeVars) cpp << ", " << crossThreadGlobalArg(v);
     if (refsIo) cpp << ", io";   // #46：追加了 io 参数才传 io
     cpp << ", _tasks));\n";
 

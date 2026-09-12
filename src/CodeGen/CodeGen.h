@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "../AST/ASTNode.h"
 #include "../AST/Expr.h"
@@ -140,6 +140,10 @@ public:
     // -- 协程判定入口 --
     [[nodiscard]] CoroDecision decideCoro(const FunDecl& decl);
     [[nodiscard]] CoroDecision decideCoro(const MethodDecl& decl);
+    // bug-78：闭包体挂起点扫描入口——复用 CoroScanner（io.async / channel send|receive /
+    // 协程函数与协程闭包调用 / 嵌套闭包穿透），替代原 IoDetector 的「仅 io.xxx 语句」
+    // 启发式，消除「调用其它协程闭包」「纯挂起表达式（无 io.xxx）」两类漏判。
+    [[nodiscard]] bool closureBodyIsCoro(const BlockStmt& body);
 
     // -- 错误 --
     const std::vector<std::string>& errors() const { return diag_.errorMessages(); }
@@ -304,6 +308,12 @@ private:
     // 模板参数、返回类型写 auto（否则 'U' was not declared + receiver 多拼）。
     [[nodiscard]] bool isFuncAliasRet(const TypeExpr* retType) const;
 
+    // feature-06：形参类型是否为函数类型（CallableObj 承载）——FunctionType 直接 /
+    // Sema 解析 inferredType FuncSemType / 非堆模板类型别名（Transform<T> 等函数式
+    // 别名）。命中则函数/方法/ctor 体生成期将该形参名注册进 callableObjVars_
+    //（body 内直呼 fn(args) → fn->invoke(fn, args) invoke 槽接线）
+    [[nodiscard]] bool isFunctionTypedParam(const Param& p) const;
+
     // ============================================================
     // 类型映射
     // ============================================================
@@ -430,10 +440,21 @@ private:
     // 数组项：使有效字段稳定排前（消费协议「前 cnt 项」恰好是有效偏移），
     // 多泛型参数时不再按声明顺序错位（Pair2<int,Point*> 读 int 当指针崩溃）。
     // 不足 k 个有效字段时返回 "0"（占位，位于 cnt 之后不被消费）。
+    // feature-07 Step 2：第 4 参数 viewSlots = 视图槽名集合（字符串层面登记，供诊断/
+    // 契约用；偏移分支判据恒由类型层面 traits 驱动——须与 _cnt 逐字同源，G1 崩溃级
+    // 风险，不引入第二判据）。默认空集 → 既有 record 模板 desc 调用点零改动。
     [[nodiscard]] std::string genDeferredSelectExpr(
         const std::string& fullName,
         const std::vector<std::string>& deferredPtrFieldNames,
-        size_t idx, size_t k) const;
+        size_t idx, size_t k,
+        const std::set<std::string>& viewSlots = {}) const;
+
+    // feature-07 Step 2（G1）：延迟槽「有效」判据串的**唯一生成点**——_ptrs（偏移序列）
+    // 与 _cnt（有效槽计数）两处消费必须逐字同源（任一错位 = GC 三处消费端读越界偏移
+    // 或漏标视图 self，崩溃/内存错误级）。形态（P1 traits + G2 类型可转换性双判据）：
+    //   std::is_convertible_v<T, aura_rt::GcObject*>
+    //     || (!std::is_convertible_v<T, aura_rt::GcObject*> && aura_rt::GcViewSlot<T>::value)
+    [[nodiscard]] std::string viewSlotCoreCond(const std::string& cppType) const;
 
     // --- 接口声明 (§4.5) ---
     void genInterfaceDecl(std::ostream& h, const InterfaceDecl& decl);
@@ -508,6 +529,10 @@ private:
     void genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt);  // sync thread 内的 spawn
     void genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt);   // 调用形态（协程版）：spawn func(args)
     void genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stmt); // 调用形态（线程版）：spawn func(args)
+    // bug-73：调用形态 spawn 的目标是否为协程函数 / 协程方法 / 协程闭包（此时生成的
+    // 调用返回 lazy aura_rt::task<T>，被 submit 的 std::function<void()> 擦除即静默丢失）
+    // ——线程版据此在 worker 内用 aura_rt::run_to_completion 显式驱动至完成。
+    [[nodiscard]] bool spawnCallTargetIsCoroutine(const ASTNode& callExpr) const;
     void genLockStmt(std::ostream& cpp, const LockStmt& stmt, bool isCoroutine);  // lock (m) { }
     void genMatchStmt(std::ostream& cpp, const MatchStmt& stmt, bool isCoroutine);
     void genExprStmt(std::ostream& cpp, const ExprStmt& stmt, bool isCoroutine);
@@ -649,6 +674,63 @@ private:
 
     // --- 闭包 ---
     [[nodiscard]] std::string genFunExpr(const FunExpr& e, bool isCoroutine);
+    // feature-07（Step 1，N2/P4）：CallableObj 闭包生成的唯一结构化参数——后续
+    // Step 2-4 只加字段、不加函数参数，避免签名漂移。
+    struct ClosureGenSpec {
+        const FunExpr& e;                        // 闭包 AST
+        const std::vector<std::string>& captures;
+        bool needsThisCapture = false;
+        // Step 1：递归自引用捕获（captures 含 currentLetName_）→ cap_self 槽
+        bool hasRecursiveCapture = false;
+        // Step 2 预留：视图捕获槽名集合（viewRootVarNames_ 命中的捕获）
+        std::set<std::string> viewSlots;
+        // Step 4 预留：协程形态（__invoke 返回 task<R>）
+        bool isCoroutine = false;
+    };
+
+    // feature-06（阶段 B）：非泛型非协程闭包（普通/GC 根/receiver 捕获；feature-07
+    // Step 1 起含递归自引用捕获）的 CallableObj 派生生成路径（genFunExpr 内分流，
+    // 旧 lambda 路径完整保留至 Step 5）
+    [[nodiscard]] std::string genFunExprCallableObj(const ClosureGenSpec& spec);
+
+    // ============================================================
+    // 重构第二轮（2026-09-12）：genFunExpr 拆分的私有辅助成员
+    // 纯机械提取——逻辑一字未改，仅把原 genFunExpr 的四段搬移为独立成员。
+    // ============================================================
+
+    // 「=== 1. 捕获分析」段结果（IdRefCollector + DeclaredCollector 收集）。
+    struct ClosureCaptureInfo {
+        std::vector<std::string> captures;   // 需捕获的自由变量名（按 allRefs 集合序）
+        bool needsThisCapture = false;       // receiver（self）被引用 → 显式捕获 this
+    };
+    // 收集闭包体引用的自由变量集（复刻原 === 1 段；成员状态 currentReceiverName_ /
+    // registeredTypes_ 直接访问）。heap 变量捕获在段内 error() 报错——行为不变。
+    [[nodiscard]] ClosureCaptureInfo collectClosureCaptures(const FunExpr& e);
+
+    // 「=== 2. 泛型分析」段结果（plan12 统一方案）。
+    struct ClosureGenericInfo {
+        std::set<std::string> genericParams;              // 闭包自身模板参数
+        std::set<std::string> returnOnlyGenerics;         // 仅出现在返回类型（不可从参数推导）
+        std::vector<size_t> callableParamIndices;         // FunctionType 形参下标
+        std::vector<std::string> callableResultGenerics;  // 各 FunctionType 返回的泛型名（逗号分隔）
+    };
+    // 复刻原 === 2 段 + 外层模板参数剔除（currentTParams_ / defaultArgMaterializedTypes_）。
+    [[nodiscard]] ClosureGenericInfo analyzeClosureGenerics(const FunExpr& e);
+
+    // 「=== 4. 生成 C++ lambda」段——旧路径 lambda 生成主体（逻辑一字未改）。
+    // 输入为前几段算出的捕获/泛型/mutable 等结果；closureIsCoro 为上方 closureBodyIsCoro
+    // 判定的协程形态。返回值即旧 genFunExpr 的后半输出。
+    [[nodiscard]] std::string genOldPathLambda(const FunExpr& e,
+                                               const ClosureCaptureInfo& cap,
+                                               const ClosureGenericInfo& gen,
+                                               bool needsMutable,
+                                               const std::set<std::string>& calledCaptures,
+                                               bool closureIsCoro);
+    // feature-06：识别 FuncSemType 是否含"非外层模板提供的未绑定泛型"（闭包自身
+    // 泛型形态——旧 lambda 路径值，非 GC 堆 CallableObj）。供 isHeapSemType /
+    // useCallableObj 分流判定共用（与 semTypeIsConcrete 互补：本函数只判"残留
+    // 自身泛型"，不递归容器）。true = 值非堆。
+    [[nodiscard]] bool funcTypeHasOwnUnboundGeneric(const FuncSemType* f) const;
 
     // 收集 BinaryExpr(+, left, right) 的所有 string 操作数，链长 ≥ 3 时用于 concat_multi
     [[nodiscard]] std::vector<std::string> collectStringChain(const BinaryExpr& e,
@@ -681,6 +763,16 @@ private:
 
     // 将 C++ 关键字/保留字做转义（如变量名和关键字冲突时加后缀）
     [[nodiscard]] std::string safeName(const std::string& name) const;
+
+    // bug-72：跨线程（spawn / sync thread / sync for）捕获发射处的 GC 根捕获形态。
+    // ThreadLocal 句柄副本「提交线程注册、worker 线程析构」→ 摘错 thread-local 根链表 →
+    // 提交线程残留已析构节点 → 后续扫根 GC heap-use-after-free。修复：GC 根 / 视图根捕获
+    // 改同名 init-capture 的 Global 根（注册/析构线程无关，先例 ExprClosure.cpp:788-801）；
+    // 非 GC 根值捕获保持不变。
+    //   crossThreadCaptureItem：capture 列表项文本（[..] 内使用）
+    //   crossThreadGlobalArg  ：实参表达式文本（协程 lambda 形参非 capture 场景）
+    [[nodiscard]] std::string crossThreadCaptureItem(const std::string& rawName) const;
+    [[nodiscard]] std::string crossThreadGlobalArg(const std::string& rawName) const;
 
     // 错误记录
     void error(const ASTNode& node, const std::string& msg);
@@ -723,6 +815,17 @@ private:
     std::set<std::string> coroutineFunctions_;
     std::set<std::string> coroClosureNames_;  // let 绑定的协程闭包名
     bool lastClosureIsCoro_ = false;           // genFunExpr → genLetStmt 传递
+    // feature-07 Step 4（B1/B2）：CallableObj 新路径协程闭包信号——与 lastClosureIsCoro_
+    // 解耦（后者同时是 isFunValueCall 的直呼排除项，不能复用登记）
+    //   lastClosureIsCoroTask_：genFunExprCallableObj 生成点回填是否为协程形态
+    //   lastClosureCppBase_  ：新路径闭包基类 C++ 类型（协程 = CallableObj<task<T>, A...>）
+    //   closureTaskVars_     ：task 形态闭包变量名（needAwait 信号源，ExprCall L467-471）
+    bool lastClosureIsCoroTask_ = false;
+    // 协程基类型门控：仅协程闭包需绕过 mapSemType（内层签名）
+    // 改用 task 签名基类；非协程（含泛型）保持原路径（auto/mapSemType）
+    bool lastClosureCppBaseIsCoro_ = false;
+    std::string lastClosureCppBase_;
+    std::set<std::string> closureTaskVars_;
 
     // 待嵌入 struct 的方法声明（genRecordStruct 消费）
     std::vector<PendingMethod> pendingMethods_;
@@ -743,6 +846,79 @@ private:
     // 仅在闭包体生成期间置位，退出恢复（嵌套闭包各自独立）。
     std::string currentClosureThisHandle_;
 
+    // feature-06（阶段 B）：CallableObj 闭包体内捕获名映射（Aura 变量名 → 槽位
+    // 访问串 "__c->cap_x"）。genFunExprCallableObj 生成闭包体期间置位/恢复；
+    // genIdentifier 命中时返回槽位串（嵌套闭包内层覆盖外层同名——词法捕获语义）。
+    std::map<std::string, std::string> currentClosureCaptures_;
+    // feature-06（阶段 B）：CallableObj 派生闭包类全局递增编号（__closure_N 命名）
+    int closureCounter_ = 0;
+
+    // ============================================================
+    // feature-06（阶段 C）：裸 Callable（CallableErased）值包装与调用
+    // ============================================================
+    // erased 包装的派生 struct / 适配器全局递增编号（__erased_N / __fnval_N / __mv_N / __ctorref_N）
+    int erasedCounter_ = 0;
+    // 把"函数形态 / record functor"值包装为 CallableErased* 的 IIFE（C4e+C4f 合并）：
+    //   kind 0：CallableObj 值表达式直接作 target（expr = 值文本）
+    //   kind 1：具名函数名 → 零捕获派生 __invoke 转发 fnCppName(a0..)
+    //   kind 2：record 构造器名 → 零捕获派生 __invoke 转发 fnCppName_ctor(a0..)
+    //   kind 3：方法值 p.next → cap_recv 槽派生 __invoke 转发 cap_recv->member(a0..)
+    //   kind 4：record functor 值 → target = record 指针（adapt 转发 rec->invoke(a0..)）
+    // sig 恒非空（erased 无签名形态不包装——直接拷贝 CallableErased 值）。
+    // target 槽经 GcObject* 中转 reinterpret（C4f 修正：target 静态类型
+    // CallableObj<int64_t>* 与被包装派生无继承关系，双 static_cast 保持指针值）。
+    struct ErasedWrapSpec {
+        int kind = 0;
+        std::string expr;          // kind0/4: CallableObj 值 / record 值文本
+        std::string recvCppType;   // kind3: receiver C++ 指针类型（如 "Point*"）
+        std::string member;        // kind3: 方法名（safeName 前）
+        std::string fnCppName;     // kind1/2: 具名函数名 / record 类型名
+        const FuncSemType* sig = nullptr;
+    };
+    [[nodiscard]] std::string genErasedWrap(const ErasedWrapSpec& spec);
+    // 把函数名/方法值/构造器引用包装为 CallableObj<sig>* 值（第 2 层目标：
+    // `let f = double` / `let h = p.next` / `let k = Point`——无标注 let 存储）。
+    // spec.kind 限 1/2/3；返回 alloc 派生包装的 IIFE（值为 CallableObj 基指针）。
+    [[nodiscard]] std::string genCallableObjValueWrap(const ErasedWrapSpec& spec);
+    // CallableErased* 目标存储点统一 init 值生成：函数形态 → erased 包装（C4e/f）；
+    // functor record → kind4（需 sig）；Callable 值拷贝 → 透传。sig 可空
+    //（仅 functor 需要；函数/方法值从 init.inferredType FuncSemType 自取）。
+    [[nodiscard]] std::string genErasedInitValue(const ASTNode& init,
+                                                 const FuncSemType* sig);
+    // 无标注 let/const 绑定"函数形态引用"（函数名/方法值/构造器名）→ CallableObj
+    // 值包装（第 2 层目标）；非引用形态返回空串。
+    [[nodiscard]] std::string genFnRefCallableObjValue(const ASTNode& init);
+    // 从 FuncSemType 映射 "aura_rt::CallableObj<R, A...>*"（sigId 签名串与 target
+    // 静态类型共用；与 mapSemType 同源）
+    [[nodiscard]] std::string callableObjCppOf(const FuncSemType& sig);
+    // erased/union 调用（c(1)）：calleeText 为 Erased 值表达式（句柄内保护）、
+    // args 为 (实参文本, 实参 C++ 类型) 对（Ptr 参数额外句柄栈保护）、retTy 为
+    // Sema 推断的返回类型（拆箱期望；None→void）。产出 IIFE 表达式。
+    [[nodiscard]] std::string genErasedInvoke(
+        const std::string& calleeText,
+        const std::vector<std::pair<std::string, std::string>>& args,
+        const SemType* retTy);
+    // 判断 callee Identifier 是否为 CallableErased 值变量（根化类型表查 C++ 类型）
+    [[nodiscard]] bool calleeVarIsErased(const std::string& calleeName) const;
+    // 具名函数 C++ 调用名（直呼名；泛型/内建映射同 genCallExpr 约定）
+    [[nodiscard]] std::string namedFnCppName(const std::string& auraName) const;
+
+    // feature-06（阶段 B）：本编译单元声明的具名函数 C++ 名集合（A 遍预收集）。
+    // genCallExpr 区分「具名函数直呼」与「函数值变量调用（CallableObj invoke）」
+    // ——直呼快路径零改动，函数值调用才生成 __invoke 接线（B3a）。
+    std::set<std::string> declaredFunNames_;
+
+    // feature-06（阶段 B）：C++ 值为 CallableObj 指针的变量/形参名（safeName）。
+    // 覆盖未根化形态（for-in 数组元素、auto 形参值等）——genCallExpr 据其生成
+    // invoke 接线（值调用），区别于具名函数/旧路径 lambda 值的直呼。
+    std::set<std::string> callableObjVars_;
+
+    // feature-06（阶段 B）：具名函数 Aura 名 → funSignature 解析后的 C++ 返回类型
+    //（含 auto——泛型闭包工厂）。genLetStmt 判定函数调用初始化器的值形态：
+    // CallableObj<...>* = 值即 GC 堆 CallableObj（按类型根化）；auto = 模板 lambda
+    //（旧路径值，保持 auto）。
+    std::map<std::string, std::string> declaredFunRetTypes_;
+
     // #56：当前方法体的 this 入口句柄名（非空 = 方法体入口已生成 GcRootHandle，
     // 如 "_this"）。genIdentifier 命中 currentReceiverName_ 且不在闭包句柄上下文时
     // 返回 "<此名>.get()" 取最新地址（消除方法体内 GC 后 this 悬垂）。仅 genMethodDecl
@@ -759,6 +935,10 @@ private:
     int listCounter_ = 0;
     int recordAllocCounter_ = 0;
     int argHandleCounter_ = 0;  // concat_multi 参数 GcRootHandle 变量名计数器
+    // feature-07 Step 3（G6 双读窗口加固）：invoke 调用 callee 物化局部
+    // (`_cbN`) + 实参物化局部 (`_cwN_i`) 的专用计数器——与 argHandleCounter_
+    // 分离，避免扰动既有生成编号（既有单测断言的 _hN_/_aN_ 序号保持稳定）。
+    int calleeGuardCounter_ = 0;
     int unionBoxingCounter_ = 0;  // P3b 隐式装箱临时变量名计数器
 
     // 当前正在生成的函数的协程状态

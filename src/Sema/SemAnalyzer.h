@@ -101,6 +101,36 @@ private:
     // 类型等价性
     [[nodiscard]] bool isAssignable(const SemType& target, const SemType& source) const;
 
+    // feature-06（阶段 C）：origins 溯源签名集辅助
+    // originsOf：从表达式类型提取溯源签名集（FuncSemType → {自身 clone}；
+    // CallableSemType → 其 origins 拷贝；其余 → 空）。joinOrigins：并集追加
+    //（FuncSemType::equals 语义去重——origins 内签名必须互异，防 union 调用
+    // 候选列表重复）。静态成员（不访问 this）。
+    static std::vector<std::shared_ptr<const FuncSemType>>
+    originsOf(const SemType& t);
+    static void joinOrigins(
+        std::vector<std::shared_ptr<const FuncSemType>>& dst,
+        const std::vector<std::shared_ptr<const FuncSemType>>& src);
+    // record 方法签名查找：typeMethods_（本模块）→ importedMethods_（跨模块导入），
+    // canonicalName 先全名后基名（泛型 record 物化实例名 → 声明基名）——供
+    // Assignability functor 规则 / C4b 方法值 / C4d functor 降级共用。未找到返回 nullptr
+    const InterfaceSemType::MethodSig* findRecordMethod(
+        const std::string& canonicalName, const std::string& methodName) const;
+
+    // feature-06（阶段 C）：裸 Callable 调用三态派生（erased/单签名/union 逐签名
+    // 匹配）+ 期望回流；functor record 调用降级为 invoke 方法调用（C4d）。见
+    // CallInfer.cpp。calleeName 用于错误文案/throws 上下文。
+    [[nodiscard]] std::unique_ptr<SemType> inferCallableCall(
+        const CallExpr& e, const CallableSemType& cs,
+        const SemType* expected, const std::string& calleeName);
+    [[nodiscard]] std::unique_ptr<SemType> inferFunctorCall(
+        const CallExpr& e, const RecordSemType& rec, const std::string& calleeName);
+    // 从赋值/绑定 init 的推断类型提取溯源签名集（传播点统一入口）：
+    // FuncSemType → {自身 clone}；CallableSemType → 其 origins；functor record →
+    // {invoke 方法签名}；含未绑定泛型的签名剔除（无法静态映射 C++ 包装 → erased）。
+    [[nodiscard]] std::vector<std::shared_ptr<const FuncSemType>>
+    callableOriginsFromType(const SemType& initTy) const;
+
     // SemType → C++ 类型名（供 ExprInfer 的 Iterator 桥接方法返回类型推导复用）
     [[nodiscard]] std::string semTypeToCppName(const SemType& t) const;
 
@@ -218,6 +248,11 @@ private:
 
     // None 不能作为独立类型标注（E017）
     bool rejectStandaloneNone(const Decl& decl, const TypeExpr* type);
+    // bug-63/bug-66：初始值是否为"显式 None 值"（none() 调用 / none 字面量）——
+    // 供 let/const 声明、record 字段、赋值提交点区分 None 返回调用（void 语义无值
+    // 可绑 → 拒）与显式 None 值（NoneType 值语义 → 含 None 联合目标下可绑 → 放行）。
+    // （static：仅查 AST 语法形态，不访问 this；定义在 StmtChecker.cpp）
+    static bool isNoneValueInitializer(const ASTNode* init);
     // sync 系 max 表达式类型检查（"sync" / "sync thread" / "sync for"）
     void checkSyncMax(const ASTNode& maxExpr, const std::string& kindName);
 
@@ -359,6 +394,12 @@ private:
     // 类型别名泛型参数全局注册使 lookup 恒命中（掩盖因素），此处仅按字面判定，
     // 供 inferListExpr 判定声明元素类型是否含需用首元素具体类型替代的泛型变量
     [[nodiscard]] bool containsUnboundGenericParam(const SemType* t) const;
+    // bug-67：收紧判定辅助——target（列表字面量 elemType）含未绑定泛型形参时，
+    // source 须与 target「结构同形 + 未绑定泛型位置同名」（isAssignable 递归到未绑定
+    // 泛型 target 恒 true 的放行洞，Assignability L20-29）；target 此子树不含未绑定
+    // 泛型时回退 isAssignable 原判定（不改变既有具体类型语义）。inferListExpr 后续
+    // 元素校验用（#58 顶层裸泛型判定的递归扩展，定义在 ExprInfer.cpp）
+    [[nodiscard]] bool sameShapeWithUnbound(const SemType* target, const SemType* source) const;
     // G4：递归收集类型中所有"裸泛型变量"名（GenericSemType 且 resolvedName 为空，
     // 去重）——供 checkFunBody/checkMethodBody/inferFunExpr 收集函数/闭包签名引用的
     // 泛型参数名，压入 fnGenericStack_（containsUnresolvedGeneric 据此判定可引用）

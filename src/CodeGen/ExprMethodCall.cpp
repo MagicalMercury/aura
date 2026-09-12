@@ -139,8 +139,22 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
     if (objIsIterator) {
         // 实参（闭包）表达式
         std::vector<std::string> iArgs;
-        for (size_t i = 0; i < e.args.size(); ++i)
-            iArgs.push_back(genExpr(*e.args[i], isCoroutine));
+        std::vector<const SemType*> iArgTypes;   // 包装后的实参类型标记（nullptr = 非堆）
+        for (size_t i = 0; i < e.args.size(); ++i) {
+            std::string arg = genExpr(*e.args[i], isCoroutine);
+            const SemType* argTy = e.args[i]->inferredType;
+            // feature-06（D1）：runtime Iterator 新路径形态（MapFnIter/FilterFnIter/
+            // FuncFnIter，iterator.h）直接以 CallableObj<...>* 指针槽装载（GC 堆回调，
+            // desc 追踪）——新路径闭包实参（CallableObj 派生指针 IIFE / 根化 CallableObj
+            // 值 .get()）直传，不再包 Global 根转发 lambda（机制性消灭 map/filter/from 的
+            // 手工包根）；旧路径 lambda 实参（泛型/协程/ViewRoot 捕获闭包）保持透传
+            //（runtime F=可调用值承载，MapIter/FilterIter/FuncIter 旧类保留）。
+            // 实参类型保留（FuncSemType，isHeapSemType=true）→ genGcRootedArgs 生成
+            // ThreadLocal 根保护调用窗口内的回调指针，装载进 GC 槽前不悬垂。
+            iArgs.push_back(arg);
+            iArgTypes.push_back(argTy);
+        }
+        auto typedArg = [&](size_t i) { return i < iArgTypes.size() ? iArgTypes[i] : nullptr; };
         if (e.method == "from" && iArgs.size() == 1) {
             // FuncIter 无自动推导（T 与 F 无关联）：T 从闭包返回类型 Optional<T> 显式提取。
             // A2：显式 `-> Optional<string>` 注解物化为 GenericSemType{name=="Optional"}，
@@ -170,14 +184,14 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
             std::string call = "aura_rt::make_map(" + obj + ", " + iArgs[0] + ")";
             std::vector<std::pair<std::string, const SemType*>> gArgs;
             gArgs.emplace_back(obj, e.object->inferredType);
-            gArgs.emplace_back(iArgs[0], e.args[0]->inferredType);
+            gArgs.emplace_back(iArgs[0], typedArg(0));
             return genGcRootedArgs(gArgs, call, isCoroutine);
         }
         if (e.method == "filter" && iArgs.size() == 1) {
             std::string call = "aura_rt::make_filter(" + obj + ", " + iArgs[0] + ")";
             std::vector<std::pair<std::string, const SemType*>> gArgs;
             gArgs.emplace_back(obj, e.object->inferredType);
-            gArgs.emplace_back(iArgs[0], e.args[0]->inferredType);
+            gArgs.emplace_back(iArgs[0], typedArg(0));
             return genGcRootedArgs(gArgs, call, isCoroutine);
         }
         if (e.method == "collect" && iArgs.empty()) {
@@ -202,6 +216,30 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
     bool isIoCall = false;
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
         if (id->name == "io") isIoCall = true;
+    }
+
+    // feature-06（B3a）：闭包字段调用 b.f(args)（bug-13 形态：record 字段声明为函数
+    // 类型，Sema 按方法调用推断）——字段 C++ 类型 = CallableObj 指针，须 invoke 接线：
+    // b->f->invoke(b->f, args)。判定：receiver 为 record、method 名非其方法集成员、
+    // 命中 RecordSemType 字段且字段声明类型为 FuncSemType。
+    bool closureFieldCall = false;
+    if (!isIoCall && e.object && e.object->inferredType) {
+        if (auto* rs = dynamic_cast<const RecordSemType*>(e.object->inferredType)) {
+            std::string recKey = rs->canonicalName;
+            size_t lt = recKey.find('<');
+            if (lt != std::string::npos) recKey = recKey.substr(0, lt);
+            auto mIt = recordMethods_.find(recKey);
+            bool isRealMethod = mIt != recordMethods_.end() && mIt->second.count(e.method);
+            if (!isRealMethod) {
+                for (auto& f : rs->fields) {
+                    if (f.name == e.method && f.type
+                        && dynamic_cast<const FuncSemType*>(f.type.get())) {
+                        closureFieldCall = true;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     // bug-38：Io 方法 Path 形参 + 字符串实参 → aura_rt::path::new_ 包装（string→Path
@@ -345,7 +383,14 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         } else {
             access = "->";
         }
-        oss << prefix << obj << access << safeName(e.method) << "(";
+        std::string fieldName = safeName(e.method);
+        if (closureFieldCall) {
+            // feature-06（B3a）：闭包字段调用 → obj->f->invoke(obj->f, args)
+            std::string m = obj + access + fieldName;
+            oss << prefix << m << "->invoke(" << m << ", ";
+        } else {
+            oss << prefix << obj << access << fieldName << "(";
+        }
     }
     // C5.3: 方法默认参数补齐（键 = ReceiverType.methodName）
     // recvTypeKey 从 receiver 的 inferredType 推导：
@@ -445,36 +490,23 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
                 }
             }
         }
-        // bug-07：方法 FunctionType 形参回调包装（仿 fnCallbackParams_ 消费先例
-        // ExprCall.cpp genCallExpr 的完整双分支）。键 = methodDefKey + "." + e.method
-        // （归一化 receiver 名，与 methodDefaultArgs_ 查询键一致）。包装逻辑照搬先例：
-        //   - 实参 inferredType 为具体 FuncSemType（U 已被 Sema 代换，仅发生在泛型
-        //     作用域内调用等场景）→ mapSemType 生成 std::function<具体>(lambda)；
-        //   - 否则保持含 U 的 ftStr 原串包装（std::function<U(U)>(lambda)，让 g++
-        //     与方法模板参数 U 同一化推导——U 无 Sema 实例化点（receiver 代换只替换
-        //     receiverTypeArgs 的 T），只能靠 g++ 从其他实参推导）。
+        // feature-06（阶段 B）：方法 FunctionType 形参回调（methodCallbackParams_ 消费）——
+        // 闭包实参已是 CallableObj 基指针（新路径产物/根化值），方法模板形参
+        // CallableObj<U,U>* 由 g++ 从实参静态类型推导——旧 std::function 包装退役
+        //（bug-07 双分支单路径化；表保留作函数类型形参标记）。
         auto mcbIt = methodCallbackParams_.find(methodDefKey + "." + e.method);
         if (mcbIt != methodCallbackParams_.end()) {
             for (auto& [idx, ftStr] : mcbIt->second) {
                 if (idx == i) {
-                    std::string wrapType = ftStr;
-                    if (auto* fst = dynamic_cast<const FuncSemType*>(e.args[i]->inferredType);
-                        fst && semTypeIsConcrete(fst)) {
-                        wrapType = mapSemType(*fst);
-                    }
-                    marg = wrapType + "(" + marg + ")";
+                    (void)ftStr;   // 透传（旧路径 lambda 值形态阶段 C 再评估）
                     break;
                 }
             }
         }
-        // bug-06：跨模块函数（isNs）FunctionType 形参回调包装——仿同模块 fnCallbackParams_
-        // 先例（ExprCall.cpp genCallExpr 的完整双分支）：fnCallbackParams_/methodCallbackParams_
-        // 仅注册本模块函数，跨模块函数形参信息经 crossModuleParamSemTypes_（依赖模块
-        // exports 的 SymParam.type）取得。包装逻辑照搬先例：
-        //   - 实参 inferredType 为具体 FuncSemType（调用点非泛型作用域，T 已被 Sema
-        //     双向推断代换为具体类型）→ mapSemType 生成 std::function<具体>(lambda)；
-        //   - 否则（调用点在泛型作用域内，实参仍含未绑定泛型 T）→ 保持形参 SemType
-        //     含 T 原串包装（std::function<T(T)>(lambda)，T 由外层模板参数提供）。
+        // feature-06（阶段 B）：跨模块函数（isNs）FunctionType 形参回调——同款单路径
+        // 化：闭包实参已是 CallableObj 基指针，形参（跨模块函数 C++ 侧同为
+        // CallableObj<...>*）由 g++ 推导——旧 std::function 包装删除（mapSemTypeKeepGeneric
+        // 现亦输出 CallableObj 形态，保持含外层模板参数原串直传即可）。
         if (isNs) {
             if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
                 auto cmPIt = crossModuleParamSemTypes_.find(id->name);
@@ -484,14 +516,9 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
                         const SemType* formal = fnPIt->second[i];
                         if (!formal) {
                             // 防御：形参 SemType 缺失（正常不会发生）
-                        } else if (auto* fst = dynamic_cast<const FuncSemType*>(formal)) {
-                            std::string wrapType = mapSemTypeKeepGeneric(*fst);
-                            if (auto* argFst =
-                                    dynamic_cast<const FuncSemType*>(e.args[i]->inferredType);
-                                argFst && semTypeIsConcrete(argFst)) {
-                                wrapType = mapSemType(*argFst);
-                            }
-                            marg = wrapType + "(" + marg + ")";
+                        } else if (dynamic_cast<const FuncSemType*>(formal)) {
+                            // 直传（实参 CallableObj 基指针/旧路径 lambda——lambda 值
+                            // 无法向 CallableObj 形参推导，属旧路径残留，阶段 C 评估）
                         } else if (semTypeIsConcrete(formal) || !cmMat.empty()) {
                             // bug-06 附注 3：跨模块 Optional/Union 形参装箱（mArgExprs 装箱
                             // 的 mpIt 查 methodParamCppTypes_ 对 isNs 调用不命中 → 跨模块函数
@@ -624,12 +651,20 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
     // （参数可能是返回 GC 指针的临时表达式，方法内部可能触发 GC 回收）
     auto buildRawCall = [&]() {
         std::ostringstream raw;
-        raw << prefix << obj << access << safeName(e.method) << "(";
-        for (size_t i = 0; i < mArgExprs.size(); ++i) {
-            if (i > 0) raw << ", ";
-            raw << "{" << i << "}";  // genGcRootedArgs 从 {0} 开始替换
+        if (closureFieldCall) {
+            std::string m = obj + access + safeName(e.method);
+            raw << prefix << m << "->invoke(" << m;
+            for (size_t i = 0; i < mArgExprs.size(); ++i)
+                raw << ", {" << i << "}";
+            raw << ")";
+        } else {
+            raw << prefix << obj << access << safeName(e.method) << "(";
+            for (size_t i = 0; i < mArgExprs.size(); ++i) {
+                if (i > 0) raw << ", ";
+                raw << "{" << i << "}";  // genGcRootedArgs 从 {0} 开始替换
+            }
+            raw << ")";
         }
-        raw << ")";
         return raw.str();
     };
     if (isIoCall || isNsCtor || isNs) {
@@ -658,12 +693,20 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         gcArgs.emplace_back(mArgExprs[i], mArgType(i));  // {i+1}
     // 构建带占位符的 callExpr
     std::ostringstream gcCall;
-    gcCall << prefix << "{0}" << access << safeName(e.method) << "(";
-    for (size_t i = 0; i < mArgExprs.size(); ++i) {
-        if (i > 0) gcCall << ", ";
-        gcCall << "{" << (i + 1) << "}";
+    if (closureFieldCall) {
+        std::string m = "{0}" + access + safeName(e.method);
+        gcCall << prefix << m << "->invoke(" << m;
+        for (size_t i = 0; i < mArgExprs.size(); ++i)
+            gcCall << ", {" << (i + 1) << "}";
+        gcCall << ")";
+    } else {
+        gcCall << prefix << "{0}" << access << safeName(e.method) << "(";
+        for (size_t i = 0; i < mArgExprs.size(); ++i) {
+            if (i > 0) gcCall << ", ";
+            gcCall << "{" << (i + 1) << "}";
+        }
+        gcCall << ")";
     }
-    gcCall << ")";
     std::string callResult = genGcRootedArgs(gcArgs, gcCall.str(), isCoroutine);
 
     return callResult;

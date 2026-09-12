@@ -6,6 +6,91 @@
 namespace Aura {
 
 std::string CodeGenerator::genMemberAccess(const MemberAccessExpr& e) {
+    // feature-06（阶段 C）：方法值（p.next——record 方法在取值位置）→ __mv_N 包装
+    //（CallableObj 值，cap_recv 槽承载 receiver）。判定：member 非字段而是方法
+    //（recordMethods_ 命中）且 Sema 推断为 FuncSemType（方法值）。字段访问（含闭包
+    // 字段值）保持 obj->field 原路径。字段/方法同名时字段优先（recordMethods_ 只含
+    // 方法名，字段闭包不注册）。
+    if (e.object && e.object->inferredType && e.inferredType
+        && dynamic_cast<const FuncSemType*>(e.inferredType)) {
+        if (auto* ro = dynamic_cast<const RecordSemType*>(e.object->inferredType)) {
+            std::string recKey = ro->canonicalName;
+            size_t lt = recKey.find('<');
+            if (lt != std::string::npos) recKey = recKey.substr(0, lt);
+            auto mIt = recordMethods_.find(recKey);
+            if (mIt != recordMethods_.end() && mIt->second.count(e.member)) {
+                std::string w = genFnRefCallableObjValue(e);
+                if (!w.empty()) return w;
+            }
+        }
+    }
+    // bug-68：Union receiver 字段直访（h.v.x，v: int | Point）→ 逐变体 get-if 分派
+    //（镜像 ExprMethodCall.cpp genUnionDispatch：按 active index 取具体变体字段；
+    // 含该字段的变体 → 具体类型 .field；其余 → default 抛 type_error）。
+    // 表示形态：有堆变体 → aura_rt::Variant<...>*（->index()/->get<I>()）；
+    // 全值 → aura_rt::ValueVariant<...>（.index()/.get<I>()），与 StmtMatch 一致。
+    // Sema inferMemberAccess 已按「任一 record 变体含该字段」前置校验。
+    if (e.object && e.object->inferredType) {
+        if (auto* u = dynamic_cast<const UnionSemType*>(e.object->inferredType)) {
+            std::vector<size_t> hit;
+            std::vector<std::string> varCpp;
+            const SemType* fieldType = nullptr;
+            bool hasHeap = false;
+            for (size_t k = 0; k < u->variants.size(); ++k) {
+                auto& v = u->variants[k];
+                varCpp.push_back(v ? mapSemType(*v) : "void");
+                if (v && isUnionHeapVariant(v.get())) hasHeap = true;
+                auto* rec = v ? dynamic_cast<const RecordSemType*>(v.get()) : nullptr;
+                if (!rec) continue;
+                for (auto& f : rec->fields) {
+                    if (f.name == e.member) {
+                        hit.push_back(k);
+                        if (!fieldType) fieldType = f.type.get();
+                        break;
+                    }
+                }
+            }
+            std::string retType = fieldType ? mapSemType(*fieldType) : "void";
+            std::ostringstream uout;
+            uout << "[&]() -> " << retType << " {\n";
+            indentLevel_++;
+            std::string objExpr = genExpr(*e.object, false);
+            uout << indentStr() << "auto _fa_v = (" << objExpr << ");\n";
+            if (hasHeap)
+                uout << indentStr()
+                     << "aura_rt::GcRootHandle<decltype(_fa_v)> _fa_rh(_fa_v);\n";
+            std::string acc = hasHeap ? "->" : ".";
+            if (hit.empty()) {
+                // 防御：正常编译产物不可达（Sema 已拦截无字段联合）
+                uout << indentStr() << "throw aura_rt::make_type_error(\"TypeError: variant has no field '"
+                     << e.member << "'\");\n";
+            } else if (hit.size() == 1) {
+                size_t I = hit[0];
+                uout << indentStr() << "if (_fa_v" << acc << "index() != " << I
+                     << ") throw aura_rt::make_type_error(\"TypeError: union ("
+                     << u->toString() << ") active variant has no field '" << e.member << "'\");\n";
+                uout << indentStr() << "return _fa_v" << acc << "get<" << I << ">()"
+                     << (varCpp[I].size() && varCpp[I][varCpp[I].size()-1] == '*' ? "->" : ".")
+                     << safeName(e.member) << ";\n";
+            } else {
+                uout << indentStr() << "switch (_fa_v" << acc << "index()) {\n";
+                indentLevel_++;
+                for (size_t I : hit) {
+                    uout << indentStr() << "case " << I << ": return _fa_v" << acc
+                         << "get<" << I << ">()"
+                         << (varCpp[I].size() && varCpp[I][varCpp[I].size()-1] == '*' ? "->" : ".")
+                         << safeName(e.member) << ";\n";
+                }
+                uout << indentStr() << "default: throw aura_rt::make_type_error(\"TypeError: union ("
+                     << u->toString() << ") active variant has no field '" << e.member << "'\");\n";
+                indentLevel_--;
+                uout << indentStr() << "}\n";
+            }
+            indentLevel_--;
+            uout << indentStr() << "}()";
+            return uout.str();
+        }
+    }
     std::string obj = genExpr(*e.object, false);
     bool isPointer = true;
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
@@ -188,6 +273,14 @@ std::string CodeGenerator::genIndexExpr(const IndexExpr& e, bool isCoroutine) {
 
 std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) {
     std::string target = genExpr(*e.target, isCoroutine);
+    // feature-06（阶段 C）：Callable 目标（CallableSemType 变量/字段/元素）重赋值 →
+    // 值包装为 CallableErased（函数形态包装；Callable 值拷贝透传）。目标签名取
+    // target->inferredType 的 origins（Sema 赋值传播点 3 已 join 本次签名）。
+    const FuncSemType* erasedSig = nullptr;
+    if (e.target && e.target->inferredType) {
+        if (auto* ctgt = dynamic_cast<const CallableSemType*>(e.target->inferredType))
+            if (ctgt->origins.size() == 1) erasedSig = ctgt->origins[0].get();
+    }
     // P3b：目标为"含 None 变体的联合"且赋 none() 时，生成 NoneType 值而非 Optional 指针
     std::string value;
     if (isNoneCallExpr(*e.value)) {
@@ -203,7 +296,10 @@ std::string CodeGenerator::genAssignExpr(const AssignExpr& e, bool isCoroutine) 
         // 且赋裸值（record/值/列表，如 o = {..} / arr[0] = {..}）→ make_optional 装箱
         std::string boxed;
         if (e.target && e.target->inferredType) {
-            if (auto* u = dynamic_cast<const UnionSemType*>(e.target->inferredType))
+            if (dynamic_cast<const CallableSemType*>(e.target->inferredType)) {
+                // feature-06（阶段 C）：Callable 目标 → 函数形态值包装为 CallableErased
+                boxed = genErasedInitValue(*e.value, erasedSig);
+            } else if (auto* u = dynamic_cast<const UnionSemType*>(e.target->inferredType))
                 boxed = genUnionBoxing(*u, *e.value, isCoroutine);
             else if (auto* os = dynamic_cast<const OptionalSemType*>(e.target->inferredType)) {
                 std::string elem = os->elementType ? mapSemType(*os->elementType) : "";

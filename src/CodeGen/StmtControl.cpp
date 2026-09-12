@@ -126,7 +126,7 @@ void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
             std::string var = "_rec_" + std::to_string(recIdx);
             writeLine(cpp, "auto* _raw = aura_rt::gc_alloc<" + recType
                       + ">(&" + recType + "::_desc);");
-            writeLine(cpp, "aura_rt::GcRootHandle<decltype(_raw)> " + var + "(_raw);");
+            writeLine(cpp, "aura_rt::GcRootHandle<decltype(_raw)> " + var + "(_raw, aura_rt::GcRootScope::ThreadLocal);");
             for (auto& f : rec->fields) {
                 // #10：按字段声明类型（rs->fields）装箱（Optional/Variant 字段）；
                 // rs 为 nullptr（returnIsOptional 等场景）时直赋不误伤
@@ -324,7 +324,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
             std::string adName = safeName(recName) + "Iterator";
             writeLine(cpp, "auto _it_raw = [&]() -> auto {");
             writeLine(cpp, "    " + recName + "* _ar = (" + itExpr + ");");
-            writeLine(cpp, "    aura_rt::GcRootHandle<" + recName + "*> _ah(_ar);");
+            writeLine(cpp, "    aura_rt::GcRootHandle<" + recName + "*> _ah(_ar, aura_rt::GcRootScope::ThreadLocal);");
             writeLine(cpp, "    auto* _ad = aura_rt::gcConstruct<" + adName
                       + ">(&" + adName + "::desc(), _ah.get());");
             writeLine(cpp, "    return " + adName + "::view(_ad);");
@@ -384,7 +384,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
             cpp << indentStr() << "{\n";
             indentLevel_++;
             writeLine(cpp, "auto _ch_raw = " + genExpr(*stmt.iterable, isCoroutine) + ";");
-            writeLine(cpp, "aura_rt::GcRootHandle<decltype(_ch_raw)> _ch(_ch_raw);");
+            writeLine(cpp, "aura_rt::GcRootHandle<decltype(_ch_raw)> _ch(_ch_raw, aura_rt::GcRootScope::ThreadLocal);");
             chName = "_ch.get()";
         }
         // sync thread 内：阻塞 while + receive（不调用 is_done()，避免冗余锁）
@@ -448,11 +448,23 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
 
     // 默认：数组/列表遍历
     std::string iter = genExpr(*stmt.iterable, isCoroutine);
-    cpp << indentStr() << "for (auto " << safeName(stmt.itemName)
+    // feature-06（B3a）：列表元素为函数值（CallableObj）时注册元素名为函数值变量
+    // ——循环体内 t(...) 调用生成 invoke 接线（元素是裸 CallableObj 指针，非根）。
+    bool elemIsFun = false;
+    if (stmt.iterable->inferredType) {
+        if (auto* ls = dynamic_cast<const ListSemType*>(stmt.iterable->inferredType))
+            elemIsFun = ls->elementType
+                && dynamic_cast<const FuncSemType*>(ls->elementType.get());
+    }
+    std::string itemVar = safeName(stmt.itemName);
+    bool savedElemIsFun = elemIsFun;
+    if (elemIsFun) callableObjVars_.insert(itemVar);
+    cpp << indentStr() << "for (auto " << itemVar
         << " : *" << iter << ") {\n";
     if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
     writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
     cpp << indentStr() << "}\n";
+    if (savedElemIsFun) callableObjVars_.erase(itemVar);
 }
 
 void CodeGenerator::genLoopStmt(std::ostream& cpp, const LoopStmt& stmt,

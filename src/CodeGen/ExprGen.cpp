@@ -41,7 +41,15 @@ bool CodeGenerator::isHeapSemType(const SemType* type) const {
     // 具体传参包装由 genGcRootedArgs 的视图排他判定（isIfaceView）另行排除。
     // std::function 是 C++ RT 值，不在 GC 堆中，恒非堆。
     if (dynamic_cast<const InterfaceSemType*>(type)) return true;
-    if (dynamic_cast<const FuncSemType*>(type)) return false;
+    // feature-06（阶段 B）：fun(A)->R 值 = GC 堆 CallableObj（捕获槽 desc 追踪，
+    // 存储/传参按堆保护——机制性消灭闭包 GcRootHandle 手工包根缺陷族 #14/#24/
+    // #32/#52/#55）。例外（旧 lambda 路径值非堆）：闭包自身泛型形态——未绑定泛型
+    // 且非外层模板参数（currentTParams_ 提供）时值是模板 lambda/auto，非 GC 指针，
+    // 生成 GcRootHandle<lambda> 会编译失败（change.md §5 风险首行的未绑定判定）。
+    if (auto* f = dynamic_cast<const FuncSemType*>(type)) return !funcTypeHasOwnUnboundGeneric(f);
+    // feature-06（阶段 C）：裸 Callable 值 = GC 堆 CallableErased（desc 追踪 target
+    // 槽）——存储/传参按堆保护（GcRootHandle），与第 2 层 CallableObj 同机制。
+    if (dynamic_cast<const CallableSemType*>(type)) return true;
     // 内置 Iterator：值视图（{nextFn, self}，16B），非 GC 堆对象。
     // 视图不能被 GcRootHandle<View> 包裹（视图非指针，模板参数不成立），
     // self 由保守栈扫描 / 视图字段 desc 子偏移（genTypeDescriptor）保护。
@@ -71,6 +79,50 @@ bool CodeGenerator::isUnboundGenericSemType(const SemType* type) {
 
 bool CodeGenerator::isDeferredGcRoot(const SemType* t) const {
     return isHeapSemType(t) && !isIfaceView(t) && isUnboundGenericSemType(t);
+}
+
+// feature-06：FuncSemType 是否含"非外层模板提供的未绑定泛型"（闭包自身泛型形态，
+// 如 fun([T], fun(T)->U)->[U] 中 T/U 为闭包自身泛型——C++ 值为模板 lambda / auto，
+// 非 GC 堆对象）。递归容器（ListSemType/FuncSemType 参数返回/Optional）——
+// compose/retry/mapper 形态的泛型函数别名实例（Mapper<T,U> 展开）参数/返回内嵌
+// 自身泛型，须与直接参数/返回同等判定（否则误判为 CallableObj 堆值）。
+bool CodeGenerator::funcTypeHasOwnUnboundGeneric(const FuncSemType* f) const {
+    if (!f) return false;
+    std::function<bool(const SemType*)> scan = [&](const SemType* t) -> bool {
+        if (!t) return false;
+        if (dynamic_cast<const ErrorSemType*>(t)) return false;
+        if (auto* g = dynamic_cast<const GenericSemType*>(t)) {
+            // 未实例化泛型（模板参数形态）。外层 C++ 模板参数（currentTParams_）
+            // 由声明提供——实例化后恒为 CallableObj<具体>*（堆）；闭包自身泛型
+            // （不在 currentTParams_）→ 旧 lambda 路径值（非堆）。
+            if (g->resolvedName.empty() && g->name != "Iterator") {
+                for (auto& tp : currentTParams_)
+                    if (tp == g->name) return false;
+                // feature-06：M3 调用点已物化的默认参数闭包泛型名（defaultArgMaterializedTypes_）
+                // ——调用点补默认闭包实参时 T 已按实参推导为具体类型（mapType 直出
+                // int32_t），闭包按具体签名走 CallableObj 新路径（IIFE），不算"自有未
+                // 绑定泛型"（否则走旧路径裸 lambda → 无法向 CallableObj 形参推导，坏 C++）
+                if (defaultArgMaterializedTypes_.count(g->name)) return false;
+                return true;
+            }
+            return false;   // 已物化（resolvedName 非空）——内部泛型词属 C++ 文本
+        }
+        if (auto* l = dynamic_cast<const ListSemType*>(t))
+            return scan(l->elementType.get());
+        if (auto* o = dynamic_cast<const OptionalSemType*>(t))
+            return scan(o->elementType.get());
+        if (auto* f2 = dynamic_cast<const FuncSemType*>(t)) {
+            if (scan(f2->returnType.get())) return true;
+            for (auto& p : f2->paramTypes)
+                if (scan(p.get())) return true;
+            return false;
+        }
+        return false;
+    };
+    if (scan(f->returnType.get())) return true;
+    for (auto& p : f->paramTypes)
+        if (scan(p.get())) return true;
+    return false;
 }
 
 bool CodeGenerator::listContainsUnboundGeneric(const ListSemType* ls) {
@@ -176,6 +228,12 @@ std::string CodeGenerator::genNoneLiteral() {
 std::string CodeGenerator::genIdentifier(const Identifier& e) {
     // 方法/构造函数体内的接收者名（如 self, p）映射为 C++ 的 this
     if (!currentReceiverName_.empty() && e.name == currentReceiverName_) {
+        // feature-06（阶段 B）：CallableObj 闭包体内 receiver 映射——先查捕获槽
+        // 映射（cap_recv 槽承载句柄，取槽值即最新地址），再落入旧句柄机制。
+        if (!currentClosureCaptures_.empty()) {
+            auto ccit = currentClosureCaptures_.find(safeName(e.name));
+            if (ccit != currentClosureCaptures_.end()) return ccit->second;
+        }
         // bug-24：闭包体引用 receiver → 经闭包句柄 "_this_root.get()" 解引用
         //（#56 统一后协程/非协程闭包均句柄捕获，此分支恒先于方法体分支）
         if (!currentClosureThisHandle_.empty())
@@ -188,6 +246,15 @@ std::string CodeGenerator::genIdentifier(const Identifier& e) {
     }
 
     std::string name = safeName(e.name);
+
+    // feature-06（阶段 B）：CallableObj 闭包体内捕获名映射——body 内经
+    // currentClosureCaptures_ 将捕获变量引用改为槽位访问（"__c->cap_x"）。
+    // 在 receiver/句柄映射之后、gcRoot/ViewRoot 之前判定：新路径闭包体内捕获
+    // 变量一律由槽承载（槽即 GC 追踪对象，无需再经 .get() 解引用）。
+    if (!currentClosureCaptures_.empty()) {
+        auto ccit = currentClosureCaptures_.find(name);
+        if (ccit != currentClosureCaptures_.end()) return ccit->second;
+    }
 
     // 已注册为 GcRootHandle 的变量 → 生成 .get() 解引用
     if (gcRootVarNames_.count(name)) {
@@ -303,6 +370,15 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
 
     // 生成所有元素表达式
     std::vector<std::string> elemExprs;
+    // feature-06（阶段 C）：元素类型为裸 Callable（CallableSemType → Array<CallableErased*>）
+    // → 元素逐一包装为 CallableErased 值（函数形态 → genErasedWrap；值拷贝透传）
+    bool elemIsCallableErased = false;
+    if (e.inferredType) {
+        if (auto* lt0 = dynamic_cast<const ListSemType*>(e.inferredType))
+            if (lt0->elementType)
+                elemIsCallableErased =
+                    dynamic_cast<const CallableSemType*>(lt0->elementType.get()) != nullptr;
+    }
     for (auto& elem : e.elements) {
         // #13：Optional 元素列表——元素值经 genOptionalTargetInit 按目标元素 C++ 类型
         // 装箱：some(arg)/none()/已 Optional 值（Optional 变量、返回 Optional 的调用）直通，
@@ -310,7 +386,9 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
         // #7：接口视图元素且值为 record → record→view 转换（否则 Array<视图>::append
         // 直传 record 指针类型不匹配）；元素已是视图值（range 产 Iterator 等）直用。
         if (elem) {
-            if (!listElemCpp.empty()) {
+            if (elemIsCallableErased) {
+                elemExprs.push_back(genErasedInitValue(*elem, nullptr));
+            } else if (!listElemCpp.empty()) {
                 elemExprs.push_back(genOptionalTargetInit(*elem, listElemCpp, isCoroutine));
             } else if (elemIsIfaceView
                        && dynamic_cast<const RecordSemType*>(elem->inferredType)
@@ -392,16 +470,17 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
     if (elemType == "int32_t") {
         const auto& first = elemExprs[0];
 
-        // 检测 FunExpr（闭包）→ 转为 std::function
+        // 检测 FunExpr（闭包）→ 转为 CallableObj 元素类型（feature-06：闭包值 =
+        // GC 堆 CallableObj 指针）
         if (e.elements[0] && dynamic_cast<const FunExpr*>(e.elements[0].get())) {
             auto* fe = static_cast<const FunExpr*>(e.elements[0].get());
-            std::string retType = fe->returnType ? mapType(*fe->returnType) : "auto";
+            std::string retType = fe->returnType ? mapType(*fe->returnType) : "void";
             std::string params;
             for (size_t j = 0; j < fe->params.size(); ++j) {
                 if (j > 0) params += ", ";
                 params += fe->params[j].type ? mapType(*fe->params[j].type) : "auto";
             }
-            elemType = "std::function<" + retType + "(" + params + ")>";
+            elemType = "aura_rt::CallableObj<" + retType + (params.empty() ? "" : ", " + params) + ">*";
         }
         // 检测 RecordExpr → 用对应的注册堆类型名
         else if (auto* rec = dynamic_cast<const RecordExpr*>(e.elements[0].get())) {
@@ -434,7 +513,7 @@ std::string CodeGenerator::genListExpr(const ListExpr& e, bool isCoroutine) {
     oss << "[&]() -> aura_rt::Array<" << elemType << ">* {\n";
     oss << "    auto* _raw = aura_rt::Array<" << elemType
         << ">::make(" << e.elements.size() << ");\n";
-    oss << "    aura_rt::GcRootHandle<decltype(_raw)> " << var << "(_raw);\n";
+    oss << "    aura_rt::GcRootHandle<decltype(_raw)> " << var << "(_raw, aura_rt::GcRootScope::ThreadLocal);\n";
     // 每个元素：预求值并用 GcRootHandle 保护（防止 append 内部 alloc 触发 GC 回收临时值）
     // append 内部 ArrayChunk::make 会触发 GC，未保护的临时 GcString* 会被 mark-sweep 回收
     for (size_t i = 0; i < elemExprs.size(); ++i) {
@@ -508,7 +587,7 @@ std::string CodeGenerator::genRecordExpr(const RecordExpr& e, bool isCoroutine) 
         oss << "[&]() -> " << recType << "* {\n";
         oss << "    auto* _raw = aura_rt::gc_alloc<" << recType
             << ">(&" << recType << "::_desc);\n";
-        oss << "    aura_rt::GcRootHandle<decltype(_raw)> " << var << "(_raw);\n";
+        oss << "    aura_rt::GcRootHandle<decltype(_raw)> " << var << "(_raw, aura_rt::GcRootScope::ThreadLocal);\n";
         for (auto& f : e.fields) {
             // 堆类型字段值：预求值并用 GcRootHandle 保护
             // #10：按字段声明类型（e.inferredType->fields）装箱（Optional/Variant 字段）

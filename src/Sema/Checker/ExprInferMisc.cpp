@@ -15,6 +15,19 @@ std::unique_ptr<SemType> SemAnalyzer::inferMemberAccess(const MemberAccessExpr& 
                 return f.type ? f.type->clone() : ErrorSemType::make();
             }
         }
+        // feature-06（阶段 C）：字段未命中 → 查方法表（方法值一等化 p.next）。
+        // 方法值 FuncSemType 供非调用位置引用（let h = p.next; h()）；
+        // 调用形态 p.next(...) 是 MethodCallExpr（独立 AST 节点，走 inferMethodCall，
+        // 不经本函数）→ 既有调用路径零影响。CodeGen 对方法值 MemberAccess 生成
+        // __mv_N 包装（cap_recv 槽），见 genMemberAccess。
+        if (auto* m = findRecordMethod(rec->canonicalName, e.member)) {
+            auto ft = std::make_unique<FuncSemType>();
+            for (auto& pt : m->paramTypes)
+                ft->paramTypes.push_back(pt ? pt->clone() : nullptr);
+            ft->returnType = m->returnType ? m->returnType->clone() : NoneSemType::make();
+            ft->throws = m->throws;
+            return ft;
+        }
         error(e, "record type " + rec->toString() + " has no field '" + e.member + "'");
         return ErrorSemType::make();
     }
@@ -44,6 +57,42 @@ std::unique_ptr<SemType> SemAnalyzer::inferMemberAccess(const MemberAccessExpr& 
             msg += "; use 'len()' instead";
         error(e, msg);
         return ErrorSemType::make();
+    }
+    // bug-68：Union receiver 字段直访（h.v.x，v: int | Point）——按「任一 record
+    // 变体含该字段」校验字段存在性；命中的变体字段类型合并返回（单命中即该类型，
+    // 多命中并集，同 inferIndexExpr 的联合合并语义）。字段不存在 → 干净报错引导
+    // 用户先 match 提取（此前静默放行 → CodeGen 生成 Variant<...>.x 坏 C++）。
+    if (auto* u = dynamic_cast<const UnionSemType*>(objType.get())) {
+        std::vector<std::unique_ptr<SemType>> hitTypes;
+        for (auto& v : u->variants) {
+            if (!v) continue;
+            auto* rec = dynamic_cast<const RecordSemType*>(v.get());
+            if (!rec) continue;
+            for (auto& f : rec->fields) {
+                if (f.name == e.member) {
+                    hitTypes.push_back(f.type ? f.type->clone() : ErrorSemType::make());
+                    break;
+                }
+            }
+        }
+        if (hitTypes.empty()) {
+            error(e, "union type " + u->toString() + " has no field '"
+                     + std::string(e.member) + "' (extract the variant first with 'match')");
+            return ErrorSemType::make();
+        }
+        if (hitTypes.size() == 1) return hitTypes[0]->clone();
+        auto ures = std::make_unique<UnionSemType>();
+        auto push = [&](std::unique_ptr<SemType>&& t) {
+            for (auto& v : ures->variants)
+                if (v && v->equals(*t)) return;
+            ures->variants.push_back(std::move(t));
+        };
+        for (auto& t : hitTypes) push(std::move(t));
+        // 去重后仅剩一个变体（如 Point.x / Other.x 同为 int）→ 直接返回该类型，
+        // 否则会得到单变体 UnionSemType（toString 与 PrimSemType 同名但不等价，
+        // 后续赋值兼容性判定失败）。
+        if (ures->variants.size() == 1) return ures->variants[0]->clone();
+        return ures;
     }
     // 接口类型或其他：允许成员访问（编译时无法确定）
     return ErrorSemType::make();
@@ -127,7 +176,18 @@ std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
         typeStore_.push_back(targetTy->clone());
         propagateCanonicalName(*e.value, typeStore_.back().get());
     }
-    if (!isAssignable(*targetTy, *valueTy)) {
+    // bug-66：赋值 RHS 为 None 返回调用（推断纯 NoneSemType 且非显式 none()/None 值）
+    // → None 返回 = void 语义无值可绑。目标含 None 变体（int|None / Optional<T>）时
+    // isAssignable 放行 → CodeGen void 表达式赋 variant 坏 C++ → 干净报错（与 #63
+    // let/const 声明拒同源）。显式 none()/None（isNoneValueInitializer）为 NoneType
+    // 值语义仍放行；目标不含 None（isAssignable false）走下方既有 type mismatch；
+    // 目标为 error（undefined 标识符等已有诊断）不叠加。
+    const bool noneReturnValue = !dynamic_cast<const ErrorSemType*>(targetTy.get())
+        && !isNoneValueInitializer(e.value.get())
+        && dynamic_cast<const NoneSemType*>(valueTy.get());
+    if (noneReturnValue && isAssignable(*targetTy, *valueTy)) {
+        error(e, "cannot bind 'None' return value in assignment; use a union annotation like 'int | None'");
+    } else if (!isAssignable(*targetTy, *valueTy)) {
         error(e, "assignment type mismatch: cannot assign '" + valueTy->toString() + "' to '" + targetTy->toString() + "'");
     }
     // 目标类型有效但值仍含不可解析元素（如赋值目标自身类型错误时目标为 error 类型，
@@ -137,6 +197,24 @@ std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
         && !diag_.hasErrors()
         && containsErrorElement(valueTy.get())) {
         error(e, "cannot infer element type from assignment; add explicit type annotation (e.g. let xs: [int] = []; xs = [])");
+    }
+
+    // feature-06（阶段 C）传播点 3：Callable 变量重赋值 → 符号类型 origins = 旧 ∪ 新
+    //（流不敏感近似，恒有限——同变量多次赋不同签名逐步并集）。CodeGen 调用 c(1) 的
+    // 静态检查/包装按并集进行。
+    if (!diag_.hasErrors() && targetTy
+        && !dynamic_cast<const ErrorSemType*>(targetTy.get())) {
+        if (auto* id = dynamic_cast<const Identifier*>(e.target.get())) {
+            if (auto* sym = symtab_.lookup(id->name)) {
+                if (auto* ct = dynamic_cast<const CallableSemType*>(sym->type.get())) {
+                    auto eff = std::make_unique<CallableSemType>();
+                    eff->origins = ct->origins;
+                    auto os = callableOriginsFromType(*valueTy);
+                    joinOrigins(eff->origins, os);
+                    sym->type = std::move(eff);
+                }
+            }
+        }
     }
 
     return valueTy->clone();

@@ -267,3 +267,114 @@ TEST(SemaFunctions, NoneReturnStatementContextAccepted) {
         diag);
     EXPECT_FALSE(diag.hasErrors());
 }
+
+// ============================================================
+// bug-63（2026-09-05 批次 15）：有标注 None 绑定补拒——#33 配套只覆盖无标注形态，
+// 有标注（decl.type 非空）曾走标注分支放行 → CodeGen void 值赋 Optional 目标坏 C++
+// （void value not ignored）。修复：StmtChecker checkLetDecl/checkConstDecl 有标注分支
+// 按 initializer 语法形态区分——isNoneValueInitializer（显式 none()/None 字面量）豁免，
+// None 返回调用（推断纯 NoneSemType 且非 none 值 init）干净拒绝。
+// ============================================================
+TEST(SemaFunctions, AnnotatedNoneReturnBindRejected) {
+    // 主线：let z: int | None = r.clean()（clean 返回 None，有标注）→ 拒绝（修复前坏 C++）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Room = { name: string }"
+        " fun (self Room) clean() -> None { let x = 1 }"
+        " fun main(io: Io) { let r: Room = { name = \"h\" }; let z: int | None = r.clean() }",
+        diag);
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot bind 'None' return value"));
+}
+
+TEST(SemaFunctions, AnnotatedNoneReturnConstRejected) {
+    // const 同构：const z: int | None = r.clean() → 同拒
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Room = { name: string }"
+        " fun (self Room) clean() -> None { let x = 1 }"
+        " fun main(io: Io) { let r: Room = { name = \"h\" }; const z: int | None = r.clean() }",
+        diag);
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot bind 'None' return value"));
+}
+
+TEST(SemaFunctions, AnnotatedUnionExplicitNoneValueAccepted) {
+    // 对照：显式 none 值（none() 调用 / None 字面量）作有标注 init → isNoneValueInitializer
+    // 豁免放行（u6 族 `int|None = none()` 语义保持，不得因补拒误伤）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) {"
+        " let a: int | None = none()"
+        " const b: float | None = None"
+        " let c: string | None = None }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaFunctions, AnnotatedUnionNoneReturningFuncAccepted) {
+    // 对照：返回 int | None 联合的函数调用（推断 UnionSemType 非纯 NoneSemType）→ 不触发拒绝
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun maybe() -> int | None { return none() }"
+        " fun main(io: Io) { let z: int | None = maybe() }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// bug-66（2026-09-06 批次 15 同族延伸）：None 返回绑定同族残留——#63 拒绝只挂
+// let/const 声明提交点，record 字面量字段（`{ f = r.clean() }`，f: int|None）与
+// 赋值语句（`x = r.clean()`）isAssignable(NoneSemType → 含 None 目标) 放行 →
+// CodeGen void 值赋联合值形态（feature-05 后为 ValueVariant）坏 C++（no match for operator=）。修复：字段
+//（inferRecordExpr 匿名 + inferNamedRecordExpr 具名）与赋值（inferAssign）提交点
+// 复用 #63 isNoneValueInitializer 语义——推断纯 NoneSemType 且非显式 None 值 → 拒；
+// 显式 None 值（None 字面量于字段 / none() 于声明，u6 族）仍放行不误伤。
+// ============================================================
+TEST(SemaFunctions, RecordFieldNoneReturnRejected) {
+    // 主线（匿名 record 字段 + 标注 let）：let w: Wrap = { f = r.clean() }（修复前坏 C++）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Room = { name: string }"
+        " type Wrap = { f: int | None }"
+        " fun (self Room) clean() -> None { let x = 1 }"
+        " fun main(io: Io) { let r: Room = { name = \"h\" }; let w: Wrap = { f = r.clean() } }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot bind 'None' return value to field 'f'"));
+}
+
+TEST(SemaFunctions, NamedRecordFieldNoneReturnRejected) {
+    // 具名 record 字段形态：Wrap { f = r.clean() }（inferNamedRecordExpr 提交点）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Room = { name: string }"
+        " type Wrap = { f: int | None }"
+        " fun (self Room) clean() -> None { let x = 1 }"
+        " fun main(io: Io) { let r: Room = { name = \"h\" }; let w: Wrap = Wrap { f = r.clean() } }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot bind 'None' return value to field 'f'"));
+}
+
+TEST(SemaFunctions, AssignNoneReturnRejected) {
+    // 赋值语句形态：x = r.clean()（x: int|None）（修复前坏 C++）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Room = { name: string }"
+        " fun (self Room) clean() -> None { let x = 1 }"
+        " fun main(io: Io) { let r: Room = { name = \"h\" }; let x: int | None = 1; x = r.clean() }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot bind 'None' return value in assignment"));
+}
+
+TEST(SemaFunctions, RecordFieldNoneLiteralAccepted) {
+    // 对照：显式 None 值（None 字面量）于 record 字段 → isNoneValueInitializer 豁免
+    // → 放行不误伤（none() 调用于 Union 字段的 CodeGen 元素注入属既有边界，不在
+    // bug-66 范围；none() 于声明的放行已由 AnnotatedUnionExplicitNoneValueAccepted
+    // 与 u6 族覆盖）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Wrap = { f: int | None }"
+        " fun main(io: Io) { let w1: Wrap = { f = None }; let w2: Wrap = Wrap { f = None } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}

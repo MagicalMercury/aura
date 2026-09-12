@@ -189,7 +189,7 @@ let n = opt.unwrap().collect().length   // Optional<Iterator<int>> → Iterator 
 
 - ✅ 接口视图变体：`type R = Stringer | int`（接口变体按 `self` 子偏移 GC 扫描）
 - ✅ 堆类型变体：`string` / `[T]` / record / `Optional<T>`
-- ❌ 函数类型变体 `fun(...)`：`std::function` 捕获的 GC 指针对 GC 不可见
+- ❌ 函数类型变体 `fun(...)`：不可存 `Variant<T...>`（编译器禁令）；函数类型值用 `Optional<fun...>` 折叠形态。注：feature-06 起函数类型值的运行时表示已为 GC 堆 `CallableObj`（捕获槽 desc 追踪、GC 可见），禁令不再是 GC 不可见问题，而是 `Variant` 的类型面限制
 - ❌ 嵌套联合 `(A | B) | C`：未扁平化，不可入联合
 - ✅ 内置 `Iterator<T>` 变体（2026-08-10 放开）：按 `self` 子偏移 GC 扫描，compact 后自动更新
 - `None` 不能单独作变量声明类型（联合中除外）
@@ -232,6 +232,33 @@ let callback: fun() -> None = fun() {
 }
 callback()                       // 调用
 ```
+
+> **运行时表示与语义**（feature-06）：`fun(A...) -> R` 类型的值运行时为 **GC 堆对象 `CallableObj`**（C++ 侧 `aura_rt::CallableObj<R, A...>*`），与 record/string 同为 GC 托管：闭包捕获槽注册进对象 desc（与 record 字段同构），`mark_sweep` / `compact` 自动追踪/重写捕获指针——**拷贝语义 = 引用语义**（`let g = f` 复制句柄指针，原/副本调用一致；GC 压实后双引用仍有效）。
+>
+> 函数名、闭包字面量、方法值（`p.next`）、构造器引用（`let k = Point`）都可赋给函数类型变量：
+>
+> ```aura
+> let f: fun(int) -> int = double          // 函数名
+> let g = f                                // 拷贝 = 引用语义（拷句柄）
+> let h: fun() -> int = p.next             // 方法值一等化（绑定 receiver）
+> let k: fun(int, int) -> Point = Point    // 构造器引用
+> ```
+
+**裸 `Callable` 类型**（feature-06，第 3 层擦除边界）：
+
+`Callable` 是无签名标注的可调用类型（C++ 侧 `aura_rt::CallableErased*`），任何可调用值（函数名 / 闭包 / 方法值 / 构造器引用 / 带 `invoke` 方法的 record）都可赋给它；编译器记录**溯源签名集 origins**（来源签名集合）做编译期检查：
+
+```aura
+let c: Callable = double          // origins = { fun(int) -> int }
+let p: Point = { x = 1, y = 2 }
+let m: Callable = p.next          // origins = { fun() -> int }
+let all: [Callable] = [double, p.next]   // 列表元素 origins 并集
+let r = all[0](1)                 // union 起源：编译期按签名集检查实参
+```
+
+- **收窄赋值 = 编译期报错**：`let f: fun(int) -> int = all[0]`（origins 含不兼容签名，如 `fun() -> int`）直接报错（v2.1 定案，不做动态降级）。
+- 动态校验只剩三个显式 erased 边界：函数形参裸标 `Callable`（契约）、跨模块 opaque 导入、运行时签名不匹配。
+- **functor 协议**：record 声明 `invoke` 方法即可赋 `Callable`，`a(5)` 降级为 `a.invoke(5)`。
 
 **元组类型**：
 

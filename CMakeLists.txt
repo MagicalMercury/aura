@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.1)
+﻿cmake_minimum_required(VERSION 4.1)
 
 # 深度调试选项：开启后切换到 MSYS2 CLANG64 的 clang 并启用 AddressSanitizer
 # 默认关闭，使用环境变量配置的 g++（UCRT64 GCC，即当前常规模式）
@@ -86,6 +86,10 @@ set(AURA_SOURCES
     src/CodeGen/ExprMethodCall.cpp
     src/CodeGen/ExprAccess.cpp
     src/CodeGen/ExprClosure.cpp
+    src/CodeGen/ExprClosureArgs.cpp
+    src/CodeGen/ExprClosureCallableObj.cpp
+    src/CodeGen/ExprClosureCaptures.cpp
+    src/CodeGen/ExprClosureOldPath.cpp
     src/CodeGen/CoroDecide.cpp
     src/CodeGen/StmtLet.cpp
     src/CodeGen/UnionBoxing.cpp

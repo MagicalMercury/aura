@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # test/CMakeLists.txt — Aura 编译器单元测试
 #
 # 构建一个独立可执行文件 aura_tests，包含全部编译器源码
@@ -61,6 +61,10 @@ set(AURA_LIB_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprMethodCall.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprAccess.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprClosure.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprClosureArgs.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprClosureCallableObj.cpp
+${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprClosureCaptures.cpp
+${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprClosureOldPath.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/CoroDecide.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtLet.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/UnionBoxing.cpp
@@ -112,8 +116,14 @@ set(AURA_TEST_SOURCES
     sema/test_sema_functype.cpp
     sema/test_sema_crashguard.cpp
 
-    # ---- 代码生成 ----
-    codegen/test_codegen.cpp
+    # ---- 代码生成（test_codegen.cpp 按主题拆分，2026-09-06）----
+    codegen/test_codegen_coro.cpp
+    codegen/test_codegen_struct_type.cpp
+    codegen/test_codegen_generic.cpp
+    codegen/test_codegen_optional_union.cpp
+    codegen/test_codegen_iface_view.cpp
+    codegen/test_codegen_closure.cpp
+    codegen/test_codegen_concurrency_gc.cpp
 
     # ---- 诊断引擎 ----
     diag/test_diag.cpp

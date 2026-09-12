@@ -97,6 +97,16 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
     bool savedIoInScope = ioInScope_;
     if (hasIo || bodyRefsIo) ioInScope_ = true;
 
+    // bug-75: spawn 形参中的函数类型（fun 值）注册进 callableObjVars_ —— body 内对
+    // 形参的直呼 g(x) 命中 ExprCall isFunValueCall -> g->invoke(g, x)。spawn lambda
+    // 形参实为裸 aura_rt::CallableObj<R,...>*（非 GcRootHandle），直呼即坏 C++。
+    // 与 DeclFun.cpp:177（函数形参）/ ExprClosure.cpp:1367（闭包形参）同源同机制；
+    // spawn 形态此前漏注册 —— bug-75 唯一根因（协程/线程两形态同缺口）。
+    auto savedSpawnCallableVarsS = callableObjVars_;
+    for (auto& spS : stmt.params) {
+        if (isFunctionTypedParam(spS))
+            callableObjVars_.insert(safeName(spS.name));
+    }
     // 屏蔽参数名：闭包参数可能与外层同名 GcRootHandle 变量冲突（gcRootVarNames_ 无
     // 作用域清理），否则参数被误判生成 .get()；块结束（实参生成前）guard 析构恢复外层状态
     {
@@ -117,6 +127,7 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
         for (auto& s : stmt.body)
             if (s) genStmt(out, *s, true);
     }
+    callableObjVars_ = savedSpawnCallableVarsS;   // bug-75: 恢复外层集合
     ioInScope_ = savedIoInScope;
 
     insideSpawn_ = false;
@@ -216,6 +227,16 @@ void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt)
     // #56 §1.8：spawn lambda 体生成期间隔离外层闭包/方法句柄映射；体后恢复
     std::string savedClosureHandle = currentClosureThisHandle_;
     std::string savedMethodHandle = currentMethodThisHandle_;
+    // bug-75: spawn 形参中的函数类型（fun 值）注册进 callableObjVars_ —— body 内对
+    // 形参的直呼 g(x) 命中 ExprCall isFunValueCall -> g->invoke(g, x)。spawn lambda
+    // 形参实为裸 aura_rt::CallableObj<R,...>*（非 GcRootHandle），直呼即坏 C++。
+    // 与 DeclFun.cpp:177（函数形参）/ ExprClosure.cpp:1367（闭包形参）同源同机制；
+    // spawn 形态此前漏注册 —— bug-75 唯一根因（协程/线程两形态同缺口）。
+    auto savedSpawnCallableVarsC = callableObjVars_;
+    for (auto& spC : stmt.params) {
+        if (isFunctionTypedParam(spC))
+            callableObjVars_.insert(safeName(spC.name));
+    }
     if (needsThisCapture) {
         currentClosureThisHandle_ = "_sp_this_f";
         // 缺口 1：task body 首语句物化 frame-local 句柄（协程 lambda init-capture 的
@@ -227,6 +248,7 @@ void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt)
     // isCoroutine=true：若 callee 为协程函数，genExpr 自动加 co_await；返回值丢弃
     writeLine(cpp, genExpr(*stmt.callExpr, true) + ";");
     insideSpawn_ = false;
+    callableObjVars_ = savedSpawnCallableVarsC;   // bug-75: 恢复外层集合
     currentClosureThisHandle_ = savedClosureHandle;
     currentMethodThisHandle_ = savedMethodHandle;
     writeLine(cpp, "co_return;");
@@ -236,6 +258,35 @@ void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt)
         cpp << safeName(v) << ", ";
     if (refsIo) cpp << "io, ";   // #46：追加了 io 参数才传 io
     cpp << "_tasks));\n";
+}
+
+// bug-73：调用形态 spawn 的目标是否为协程函数（具名函数 / 协程闭包 / 协程方法）。
+//
+// 判定口径与 genCall / genMethodCall 的 co_await 判定同源（bug-02 固定点收敛后的
+// coroutineFunctions_）：
+//   - 具名函数：键 = 函数名（coroutineFunctions_）
+//   - 协程闭包值：coroClosureNames_ 按名登记
+//   - 方法：键 = "ReceiverType.methodName"，receiver 类型取 inferredType 的
+//     RecordSemType.canonicalName 截断 '<'（ExprMethodCall.cpp 同款口径）
+// 判定为真 ⇒ 生成的调用返回 lazy aura_rt::task<T> ⇒ 线程版必须显式驱动
+//（否则返回值被 submit 的 std::function<void()> 擦除 → 协程体静默不执行）。
+bool CodeGenerator::spawnCallTargetIsCoroutine(const ASTNode& callExpr) const {
+    if (auto* call = dynamic_cast<const CallExpr*>(&callExpr)) {
+        auto* id = dynamic_cast<const Identifier*>(call->callee.get());
+        if (!id) return false;
+        return coroutineFunctions_.count(id->name) > 0
+            || coroClosureNames_.count(id->name) > 0;
+    }
+    if (auto* mc = dynamic_cast<const MethodCallExpr*>(&callExpr)) {
+        if (!mc->object || !mc->object->inferredType) return false;
+        auto* rec = dynamic_cast<const RecordSemType*>(mc->object->inferredType);
+        if (!rec || rec->canonicalName.empty()) return false;
+        std::string recvKey = rec->canonicalName;
+        size_t lt = recvKey.find('<');
+        if (lt != std::string::npos) recvKey = recvKey.substr(0, lt);
+        return coroutineFunctions_.count(recvKey + "." + mc->method) > 0;
+    }
+    return false;
 }
 
 // 调用形态（sync thread 块内）：spawn func(args)
@@ -289,7 +340,9 @@ void CodeGenerator::genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stm
     for (size_t i = 0; i < freeVars.size(); ++i) {
         if (!firstCapture) cpp << ", ";
         firstCapture = false;
-        cpp << safeName(freeVars[i]);
+        // bug-72：GC 根 / 视图根自由变量 → Global 根 init-capture（ThreadLocal 句柄副本
+        // 在提交线程注册、worker 线程析构 → 摘错 thread-local 根链表 → 扫根 GC UAF）
+        cpp << crossThreadCaptureItem(freeVars[i]);
     }
     if (ioUsed) {
         if (!firstCapture) cpp << ", ";
@@ -303,9 +356,26 @@ void CodeGenerator::genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stm
     // 直接映射 init-capture 句柄（move 进线程池队列时注册正确迁移）
     std::string savedClosureHandle = currentClosureThisHandle_;
     std::string savedMethodHandle = currentMethodThisHandle_;
+    // bug-75: spawn 形参中的函数类型（fun 值）注册进 callableObjVars_ —— body 内对
+    // 形参的直呼 g(x) 命中 ExprCall isFunValueCall -> g->invoke(g, x)。spawn lambda
+    // 形参实为裸 aura_rt::CallableObj<R,...>*（非 GcRootHandle），直呼即坏 C++。
+    // 与 DeclFun.cpp:177（函数形参）/ ExprClosure.cpp:1367（闭包形参）同源同机制；
+    // spawn 形态此前漏注册 —— bug-75 唯一根因（协程/线程两形态同缺口）。
+    auto savedSpawnCallableVarsT = callableObjVars_;
+    for (auto& spT : stmt.params)
+        if (isFunctionTypedParam(spT))
+            callableObjVars_.insert(safeName(spT.name));
     if (needsThisCapture) currentClosureThisHandle_ = "_sp_this";
-    writeLine(cpp, genExpr(*stmt.callExpr, false) + ";");
+    // bug-73：callee 为协程函数时调用返回 lazy task<void>/<T>——submit 的
+    // std::function<void()> 会擦除返回值并立即析构（initial_suspend = suspend_always）
+    // → 协程体静默不执行。改在 worker 内显式驱动至完成（run_to_completion 内部
+    // resume 至 completion + 异常重抛；抛出后由 workerLoop 记入 group 异常列表）。
+    std::string callText = genExpr(*stmt.callExpr, false);
+    if (spawnCallTargetIsCoroutine(*stmt.callExpr))
+        callText = "aura_rt::run_to_completion(" + callText + ")";
+    writeLine(cpp, callText + ";");
     insideSpawn_ = false;
+    callableObjVars_ = savedSpawnCallableVarsT;   // bug-75: 恢复外层集合
     currentClosureThisHandle_ = savedClosureHandle;
     currentMethodThisHandle_ = savedMethodHandle;
     indentLevel_--;
@@ -523,7 +593,9 @@ void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
             }
         } else {
             // 同名自动绑定（args 空 或 数量不匹配兜底——bug-21 Sema 已拦截数量不匹配，兜底为死代码）
-            captureItems.push_back(pname);
+            // bug-72：外层同名变量若为 GC 根 / 视图根 → Global 根 init-capture（裸名值捕获的
+            // ThreadLocal 副本跨线程析构会摘错根链表 → 后续扫根 GC UAF）
+            captureItems.push_back(crossThreadCaptureItem(stmt.params[i].name));
         }
     }
     // #46 兜底：线程形态 spawn 显式声明 io 参数（&io 引用捕获）但外层无 io → 干净报错
@@ -571,12 +643,22 @@ void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
     // 直接映射 init-capture 句柄（move 进线程池队列时注册正确迁移）
     std::string savedClosureHandle = currentClosureThisHandle_;
     std::string savedMethodHandle = currentMethodThisHandle_;
+    // bug-75: spawn 形参中的函数类型（fun 值）注册进 callableObjVars_ —— body 内对
+    // 形参的直呼 g(x) 命中 ExprCall isFunValueCall -> g->invoke(g, x)。spawn lambda
+    // 形参实为裸 aura_rt::CallableObj<R,...>*（非 GcRootHandle），直呼即坏 C++。
+    // 与 DeclFun.cpp:177（函数形参）/ ExprClosure.cpp:1367（闭包形参）同源同机制；
+    // spawn 形态此前漏注册 —— bug-75 唯一根因（协程/线程两形态同缺口）。
+    auto savedSpawnCallableVarsT2 = callableObjVars_;
+    for (auto& spT2 : stmt.params)
+        if (isFunctionTypedParam(spT2))
+            callableObjVars_.insert(safeName(spT2.name));
     if (needsThisCapture) currentClosureThisHandle_ = "_sp_this";
     // 显式参数已在 Sema 中注册为只读符号，此处直接生成体
     for (auto& s : stmt.body) {
         if (s) genStmt(cpp, *s, false);  // 非协程！
     }
     insideSpawn_ = false;
+    callableObjVars_ = savedSpawnCallableVarsT2;   // bug-75: 恢复外层集合
     currentClosureThisHandle_ = savedClosureHandle;
     currentMethodThisHandle_ = savedMethodHandle;
     indentLevel_--;
@@ -593,6 +675,56 @@ void CodeGenerator::genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt) {
 
     ioSync_ = oldIoSync;
     currentFunctionIsCoroutine_ = oldCoroutine;
+}
+
+// ============================================================
+// bug-72：跨线程捕获发射处的 GC 根捕获形态
+//
+// 机制：GcRootHandle / ViewRoot 内的句柄是 thread-local 侵入式链表节点（注册与注销都用
+// 「当前线程」的 tl_roots_）。spawn / sync thread 的 lambda 在**提交线程**构造（句柄注册
+// 进提交线程链表），却在**执行它的 worker 线程**析构 → unregisterRootThreadLocal 用
+// worker 的 tl_roots_ 摘链（worker 无链表时直接 return）→ 提交线程链表残留已析构节点 →
+// 之后任意扫根 GC 读取已释放内存（ASAN 实测：mark_sweep.cpp 扫根 READ heap-use-after-free）。
+//
+// 修复：命中的 GC 根 / 视图根捕获改**同名 init-capture 的 Global 根**——注册进
+// globalRoots_（互斥保护、按 ptr_ref_ 值查找），注册线程与析构线程无关；lambda 体内
+// `name.get()` 形态不变（同名 init-capture 遮蔽外层变量），生成代码其余部分零改动。
+// 同名命中两项时优先 GcRootHandle（与 genIdentifier 判定顺序一致）。
+// 返回：未命中 → 裸名（原行为不变）。
+// ============================================================
+std::string CodeGenerator::crossThreadCaptureItem(const std::string& rawName) const {
+    const std::string cn = safeName(rawName);
+    if (gcRootVarNames_.count(cn)) {
+        auto it = gcRootTypes_.find(cn);
+        if (it != gcRootTypes_.end())
+            return cn + " = aura_rt::GcRootHandle<" + it->second + ">(" + cn
+                   + ".get(), aura_rt::GcRootScope::Global)";
+    } else if (viewRootVarNames_.count(cn)) {
+        auto it = viewRootTypes_.find(cn);
+        if (it != viewRootTypes_.end())
+            return cn + " = aura_rt::ViewRoot<" + it->second + ">(" + cn + ".v, " + cn
+                   + ".h.get(), aura_rt::GcRootScope::Global)";
+    }
+    return cn;
+}
+
+// 同上，但返回**实参表达式**：协程 lambda 的自由变量经形参（`auto v`）承载，不是 capture。
+// 形参同样是句柄副本（注册于创建线程、随协程帧在任意线程析构）→ 实参改传 Global 根临时值；
+// `auto` 推导类型与修复前完全一致（GcRootHandle<T> / ViewRoot<T>），lambda 体生成零改动。
+std::string CodeGenerator::crossThreadGlobalArg(const std::string& rawName) const {
+    const std::string cn = safeName(rawName);
+    if (gcRootVarNames_.count(cn)) {
+        auto it = gcRootTypes_.find(cn);
+        if (it != gcRootTypes_.end())
+            return "aura_rt::GcRootHandle<" + it->second + ">(" + cn
+                   + ".get(), aura_rt::GcRootScope::Global)";
+    } else if (viewRootVarNames_.count(cn)) {
+        auto it = viewRootTypes_.find(cn);
+        if (it != viewRootTypes_.end())
+            return "aura_rt::ViewRoot<" + it->second + ">(" + cn + ".v, " + cn
+                   + ".h.get(), aura_rt::GcRootScope::Global)";
+    }
+    return cn;
 }
 
 } // namespace Aura

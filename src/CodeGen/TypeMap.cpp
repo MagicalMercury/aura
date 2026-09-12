@@ -190,7 +190,9 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
                     return "aura_rt::Optional<" + mapType(*other) + ">*";
             }
         }
-        // P3b：含堆变体 → aura_rt::Variant<...>*（GC 堆封装）；全值 → std::variant<...>
+        // P3b：含堆变体 → aura_rt::Variant<...>*（GC 堆封装）；全值 → aura_rt::ValueVariant<...>
+        // （feature-05：全值联合弃用 std::variant → ValueVariant 值语义，static_assert
+        //  编译期拒绝指针/接口视图变体误入值语义路径）
         // #42（bug-60 修正）：保守判堆的"未注册裸泛型名"检测——判据对象是 TypeExpr
         // 的 Aura 名而非 mapType 的 C++ 产物（"int32_t" 等内置 C++ 名不在以 Aura 名
         // 为 key 的 BuiltinRegistry 中：int→"int32_t" 查 findType("int32_t") 落空 →
@@ -257,7 +259,7 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
             }
             if (heap) { hasHeap = true; break; }
         }
-        std::string result = hasHeap ? "aura_rt::Variant<" : "std::variant<";
+        std::string result = hasHeap ? "aura_rt::Variant<" : "aura_rt::ValueVariant<";
         for (size_t i = 0; i < u->types.size(); ++i) {
             if (i > 0) result += ", ";
             result += u->types[i] ? mapType(*u->types[i]) : "???";
@@ -266,15 +268,17 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
         return result;
     }
     if (auto* f = dynamic_cast<const FunctionType*>(&type)) {
-        // 函数类型 → 映射为 std::function
-        std::string sig = "std::function<";
+        // feature-06（阶段 B）：fun(A)->R → aura_rt::CallableObj<R, A...>*（GC 堆
+        // 对象，捕获槽 desc 追踪）。返回类型 None 保持 aura_rt::NoneType（与旧
+        // std::function<aura_rt::NoneType()> 时代 lambda 返回约定一致，闭包体生成
+        // 复用无分裂）。无参形态无尾缀参数；有参逐参 mapType。
+        std::string sig = "aura_rt::CallableObj<";
         sig += f->returnType ? mapType(*f->returnType) : "void";
-        sig += "(";
         for (size_t i = 0; i < f->paramTypes.size(); ++i) {
-            if (i > 0) sig += ", ";
-            sig += f->paramTypes[i] ? mapType(*f->paramTypes[i]) : "???";
+            sig += ", ";
+            sig += f->paramTypes[i] ? mapType(*f->paramTypes[i]) : "/*?*/";
         }
-        sig += ")>";
+        sig += ">*";
         return sig;
     }
     return "/* unknown_type */";
@@ -306,8 +310,15 @@ std::string CodeGenerator::optionalElemCppName(const SemType* optType) {
             && !dynamic_cast<const ErrorSemType*>(os->elementType.get())) {
             // 元素 GenericSemType（Sema elemTypeOf 经 semTypeFromCppName 还原）：
             //   resolvedName 即元素 C++ 名（可能缺 record 的 *）；其余走 mapSemType
-            if (auto* ge = dynamic_cast<const GenericSemType*>(os->elementType.get()))
-                return finalizeCppElem(ge->resolvedName);
+            if (auto* ge = dynamic_cast<const GenericSemType*>(os->elementType.get())) {
+                if (!ge->resolvedName.empty()) return finalizeCppElem(ge->resolvedName);
+                // bug-64 配套：模板期裸泛型元素（OptionalSemType{GenericSemType{T}}，
+                // T 为当前 C++ 模板参数）→ 返回模板参数名；不在 currentTParams_ 中则
+                // 维持空（防御报错，不伪装具体类型）
+                for (const auto& tp : currentTParams_)
+                    if (tp == ge->name) return ge->name;
+                return "";
+            }
             return mapSemType(*os->elementType);
         }
         return "";
@@ -496,11 +507,12 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
             if (noneV && otherFold)
                 return "aura_rt::Optional<" + mapSemType(*otherV) + ">*";
         }
-        // P3b：含堆 → Variant 指针；全值 → std::variant
+        // P3b：含堆 → Variant 指针；全值 → ValueVariant 值语义（feature-05，
+        // 与上方 mapType UnionType 分支同步切换，防声明/表达式形态分裂）
         bool hasHeap = false;
         for (auto& v : u->variants)
             if (v && isUnionHeapVariant(v.get())) { hasHeap = true; break; }
-        std::string result = hasHeap ? "aura_rt::Variant<" : "std::variant<";
+        std::string result = hasHeap ? "aura_rt::Variant<" : "aura_rt::ValueVariant<";
         for (size_t i = 0; i < u->variants.size(); ++i) {
             if (i > 0) result += ", ";
             result += u->variants[i] ? mapSemType(*u->variants[i]) : "void";
@@ -524,15 +536,21 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
         return "aura_rt::GcObject*";
     }
     if (auto* f = dynamic_cast<const FuncSemType*>(&semType)) {
-        std::string sig = "std::function<";
+        // feature-06（阶段 B）：FuncSemType → aura_rt::CallableObj<R, A...>*（与
+        // mapType FunctionType 分支同构；None 保持 aura_rt::NoneType 防闭包体分裂）。
+        std::string sig = "aura_rt::CallableObj<";
         sig += f->returnType ? mapSemType(*f->returnType) : "void";
-        sig += "(";
         for (size_t i = 0; i < f->paramTypes.size(); ++i) {
-            if (i > 0) sig += ", ";
+            sig += ", ";
             sig += f->paramTypes[i] ? mapSemType(*f->paramTypes[i]) : "auto";
         }
-        sig += ")>";
+        sig += ">*";
         return sig;
+    }
+    if (dynamic_cast<const CallableSemType*>(&semType)) {
+        // feature-06（阶段 C）：裸 Callable → aura_rt::CallableErased*（GC 堆包装，
+        // desc 追踪 target 槽；与 BuiltinRegistry "Callable" 条目 cppType 一致）
+        return "aura_rt::CallableErased*";
     }
     if (auto* is = dynamic_cast<const InterfaceSemType*>(&semType)) {
         // P1：接口 → 值视图类型名。泛型接口实例化（Comparable<Point>）时用 typeArgs
@@ -643,7 +661,8 @@ void CodeGenerator::genTypeDescriptor(std::ostream& cpp,
 
     // #54：per-instantiation desc——全量数组 + constexpr 计数变量模板，_desc 保持常量初始化。
     // 数组布局「确定字段在前、延迟候选在后」；_cnt<T> = N确定 + Σ(延迟字段
-    // is_convertible_v<裸名, GcObject*> ? 1 : 0)，GC 只消费前 _cnt 项。
+    // viewSlotCoreCond(裸名) ? 1 : 0)（feature-07 Step 2：判据含视图 traits 侧，
+    // 与 _ptrs 单点同源），GC 只消费前 _cnt 项。
     // 变量模板每实例化独立（现状 _X_ptrs<T> 同机制）；_desc 仍为聚合常量初始化
     // （无动态初始化时序风险，区别于 make_desc 函数方案）；消费点 &X::_desc 零改动。
     // T=值类型 → is_convertible false → 不计数不消费（desc 层不误追踪假根）；
@@ -674,8 +693,10 @@ void CodeGenerator::genTypeDescriptor(std::ostream& cpp,
     cpp << tprefix << "constexpr size_t _" << structName << "_cnt = " << ptrFieldNames.size();
     for (auto& df : deferredPtrFieldNames) {
         auto bar = df.find('|');
-        cpp << "\n    + (std::is_convertible_v<" << df.substr(bar + 1)
-            << ", aura_rt::GcObject*> ? 1 : 0)";
+        // feature-07 Step 2（G1）：判据与 _ptrs 内 genDeferredSelectExpr 单点同源——
+        // 旧串仅 is_convertible（视图值字段不计入）会与已 traits 化的 _ptrs 分叉：
+        // _ptrs 项为视图复合偏移、_cnt 不计 → 视图 self 漏标（静默内存错误）
+        cpp << "\n    + ((" << viewSlotCoreCond(df.substr(bar + 1)) << ") ? 1 : 0)";
     }
     cpp << ";\n";
     cpp << tprefix << "const aura_rt::TypeDescriptor " << fullName
@@ -693,21 +714,46 @@ void CodeGenerator::genTypeDescriptor(std::ostream& cpp,
 }
 
 // #54（审查后修正，问题 C）：递归生成「第 k 个有效延迟字段偏移」嵌套条件表达式。
-// deferred 条目格式 "name|cppType"；有效 = std::is_convertible_v<cppType, GcObject*>。
+// deferred 条目格式 "name|cppType"；有效 = std::is_convertible_v<cppType, GcObject*>
+//        || (!is_convertible_v && aura_rt::GcViewSlot<cppType>::value)（feature-07 Step 2）。
 // 语义：从 idx 起扫描，第 k 个有效字段（1-based）的 __builtin_offsetof；不足返回 "0"。
 // 生成示例（Pair2 a:A,b:B，位置 1 = 第 2 个有效字段）：
 //   (A可转 ? (B可转 ? off(b) : 0) : 0)
 // 递归终止：idx 越界 → "0"（每次递归 idx+1，字段数有限，无死循环）。
+// feature-07 Step 2（G1）：有效槽判据串唯一生成点（与 runtime/types.h GcViewSlot 配套，
+// P1 traits 修订 + G2 类型可转换性双判据）。同一字符串同时用于 _ptrs 条件分支与 _cnt
+// 计数项——两处均由本函数单点产出，构造性保证「逐字同源」（G1：判据错位 = GC 消费端
+// 读越界偏移、或视图 self 漏标）。
+std::string CodeGenerator::viewSlotCoreCond(const std::string& cppType) const {
+    std::string ptrConv = "std::is_convertible_v<" + cppType + ", aura_rt::GcObject*>";
+    return ptrConv + " || (!" + ptrConv + " && aura_rt::GcViewSlot<" + cppType + ">::value)";
+}
+
 std::string CodeGenerator::genDeferredSelectExpr(
     const std::string& fullName,
     const std::vector<std::string>& deferredPtrFieldNames,
-    size_t idx, size_t k) const {
+    size_t idx, size_t k,
+    const std::set<std::string>& viewSlots) const {
+    // feature-07 Step 2：viewSlots 为字符串层面登记的视图槽名集合（契约/诊断用）。
+    // 有效槽判据与偏移分支恒由**类型层面**判据驱动（下方 ptrConv/cond），与生成代码
+    // 内 _cnt 判据逐字同源——若改用字符串集合做第二判据，一旦分叉即 _cnt 计入而 _ptrs
+    // 偏移错位（GC 把非 GC 数据当 GcObject* 解引用，崩溃级，审查 G1）。
+    (void)viewSlots;
     if (idx >= deferredPtrFieldNames.size()) return "0";
     auto bar = deferredPtrFieldNames[idx].find('|');
     std::string name = deferredPtrFieldNames[idx].substr(0, bar);
     std::string cppType = deferredPtrFieldNames[idx].substr(bar + 1);
-    std::string cond = "(std::is_convertible_v<" + cppType + ", aura_rt::GcObject*>)";
-    std::string off = "__builtin_offsetof(" + fullName + ", " + name + ")";
+    // GC 指针槽判据（视图槽判据为其补集侧：视图值类型不可转换为 GcObject*）
+    std::string ptrConv = "std::is_convertible_v<" + cppType + ", aura_rt::GcObject*>";
+    // 有效槽判据（P1 traits 修订 + G2 类型可转换性双判据）——单点取自 viewSlotCoreCond，
+    // 与代码内 _cnt 判据串**构造性逐字同源**（G1）
+    std::string cond = "(" + viewSlotCoreCond(cppType) + ")";
+    // 偏移（G5：弃 offsetof(VT, self) 依赖表达式）：GC 指针槽取槽偏移；视图槽取
+    // 槽偏移 + sizeof(void*)——接口/迭代器视图布局恒为 {fnPtr, self}，self 偏移恒
+    // sizeof(void*)（与 iterator.h MapFnIter desc 的 offsetof(Iterator<T>, self) 语义
+    // 等价，规避泛型上下文非标准布局 UB 面）。分支判据 = ptrConv（与 cond 同源）
+    std::string off = "(" + ptrConv + " ? __builtin_offsetof(" + fullName + ", " + name + ")"
+        + " : __builtin_offsetof(" + fullName + ", " + name + ") + sizeof(void*))";
     if (k == 1) {
         // 本字段有效 → 本字段偏移；否则递归下一个字段
         return "(" + cond + " ? " + off + " : "

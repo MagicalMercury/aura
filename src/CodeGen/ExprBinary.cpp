@@ -57,8 +57,22 @@ bool CodeGenerator::isStringExprInChain(const std::string& s) const {
 // ============================================================
 
 std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) {
+    // bug-64：比较（==/!=）一侧为裸 none()，另一侧为 Optional<T>（元素可为模板期
+    // 未绑定泛型名）时，把对端元素 C++ 名临时注入 currentReturnElem_，使 genCallExpr
+    // none() 分支生成 make_none<elem>()（elem 为模板参数名时由 g++ 实例化推导）。
+    // 仿 genConditionalExpr save/restore；注入须在 genExpr(left/right) 之前完成。
+    std::string savedElem = currentReturnElem_;
+    if (e.op == "==" || e.op == "!=") {
+        std::string injectElem;
+        if (isNoneCallExpr(*e.left) && e.right->inferredType)
+            injectElem = optionalElemCppName(e.right->inferredType);
+        else if (isNoneCallExpr(*e.right) && e.left->inferredType)
+            injectElem = optionalElemCppName(e.left->inferredType);
+        if (!injectElem.empty()) currentReturnElem_ = injectElem;
+    }
     std::string left  = genExpr(*e.left, isCoroutine);
     std::string right = genExpr(*e.right, isCoroutine);
+    currentReturnElem_ = savedElem;   // 恢复（left/right 已生成）
 
     // C5b: 比较符号 → Comparable 接口分发
     // 判定"record 实现 Comparable"查组合收集 interfaceImplementations_（含 "Comparable"），
@@ -207,6 +221,28 @@ std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) 
                        || right.find("aura_rt::concat") != std::string::npos
                        || right.find("aura_rt::string_concat") != std::string::npos
                        || right.find("aura_rt::string_of") != std::string::npos;
+
+        // bug-70：与 `+` 分支对齐的两层兜底——仅靠生成文本子串会漏判「双字符串变量」
+        // 形态（genExpr(Identifier) 只产 `v.get()`，不含 make_string/concat/... 子串），
+        // 落到 L239 裸指针比较 → 内容相等的动态字符串判 false（静默错误结果）。
+        // 第一层：stringVarNames_ 查表（strip `.get()` 后）；第二层：Sema 推断 string 兜底。
+        auto stripGet70 = [](const std::string& s) -> std::string {
+            if (s.size() > 6 && s.substr(s.size() - 6) == ".get()")
+                return s.substr(0, s.size() - 6);
+            return s;
+        };
+        if (!leftIsStr && stringVarNames_.count(stripGet70(left))) leftIsStr = true;
+        if (!rightIsStr && stringVarNames_.count(stripGet70(right))) rightIsStr = true;
+
+        auto isStringSemType70 = [](const SemType* type) -> bool {
+            if (!type) return false;
+            if (auto* p = dynamic_cast<const PrimSemType*>(type))
+                return p->kind == PrimSemType::String;
+            return false;
+        };
+        if (!leftIsStr && isStringSemType70(e.left->inferredType)) leftIsStr = true;
+        if (!rightIsStr && isStringSemType70(e.right->inferredType)) rightIsStr = true;
+
         if (leftIsStr || rightIsStr) {
             std::vector<std::pair<std::string, const SemType*>> gcArgs;
             gcArgs.emplace_back(left, e.left->inferredType);

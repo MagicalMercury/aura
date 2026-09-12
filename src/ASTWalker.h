@@ -138,45 +138,9 @@ struct ExprWalker {
 // 可被 CodeGen/CoroDecide/Sema 等任意模块复用。
 // ============================================================
 
-// IoDetector — 检测闭包体内是否包含 io.xxx 方法调用
-// 用于判定闭包是否需要协程化（genFunExpr 中 isCoroutine && !ioSync_ 场景）
-//
-// 注意：Stmt-only，不递归到 Expr。IfStmt 不扫条件（与原内联实现一致）。
-class IoDetector {
-public:
-    bool found = false;
-    bool scanStmt(const Stmt& stmt) { return StmtWalker<IoDetector>::walk(stmt, *this); }
-    static bool scan(const BlockStmt& body) {
-        IoDetector d;
-        for (auto& s : body.stmts)
-            if (s && d.scanStmt(*s)) { d.found = true; break; }
-        return d.found;
-    }
-    bool visit(const MethodCallExpr& n, IoDetector&) {
-        if (n.object) {
-            if (auto* id = dynamic_cast<const Identifier*>(n.object.get()))
-                if (id->name == "io") { found = true; return true; }
-        }
-        return false;
-    }
-    bool visit(const BlockStmt& n, IoDetector& self) { for (auto& ss : n.stmts) if (ss && self.scanStmt(*ss)) return true; return false; }
-    bool visit(const IfStmt& n, IoDetector& self) { if (n.thenBranch && self.scanStmt(*n.thenBranch)) return true; for (auto& ei : n.elseIfs) if (ei.body && self.scanStmt(*ei.body)) return true; if (n.elseBranch && self.scanStmt(*n.elseBranch)) return true; return false; }
-    bool visit(const WhileStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const ForStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const LoopStmt& n, IoDetector& self) { return n.body && self.scanStmt(*n.body); }
-    bool visit(const TryCatchStmt& n, IoDetector& self) { if (n.tryBody && self.scanStmt(*n.tryBody)) return true; return n.catchBody && self.scanStmt(*n.catchBody); }
-    bool visit(const MatchStmt& n, IoDetector& self) { for (auto& c : n.cases) if (c.body) { if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) { if (self.scanStmt(*cb)) return true; } } return false; }
-    bool visit(const ExprStmt& n, IoDetector& self) { if (n.expr) { if (auto* mc = dynamic_cast<const MethodCallExpr*>(n.expr.get())) return self.visit(*mc, self); } return false; }
-    bool visit(const ReturnStmt&, IoDetector&) { return false; }
-    bool visit(const ThrowStmt&, IoDetector&) { return false; }
-    bool visit(const LetDecl&, IoDetector&) { return false; }
-    bool visit(const ConstDecl&, IoDetector&) { return false; }
-    bool visit(const BreakStmt&, IoDetector&) { return false; }
-    bool visit(const ContinueStmt&, IoDetector&) { return false; }
-    bool visit(const SyncStmt&, IoDetector&) { return false; }
-    bool visit(const SyncForStmt&, IoDetector&) { return false; }
-    bool visit(const SpawnStmt&, IoDetector&) { return false; }
-};
+// IoDetector 已移除（bug-78）：闭包体挂起点判定改用 CodeGenerator::closureBodyIsCoro
+// （复用 CoroScanner：io.async / channel send|receive / 协程函数与协程闭包调用 / 嵌套
+// 闭包穿透），消除原「仅语句级 io.xxx」启发式的漏判面。实现见 src/CodeGen/CoroDecide.cpp。
 
 // AssignTargetCollector — 检测指定名称的捕获变量是否在赋值表达式左侧出现
 // 用于决定闭包是否需要 mutable 关键字

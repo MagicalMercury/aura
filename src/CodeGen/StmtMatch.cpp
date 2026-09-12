@@ -16,14 +16,14 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
     // 匹配值类别（依据 Sema inferredType）：
     //   - UnionSemType 含堆变体 → aura_rt::Variant<T...>*（->is<I>() / ->get<I>()）
     //   - OptionalSemType → aura_rt::Optional<T>*（is_none() / unwrap()，P3a 折叠的 T | None）
-    //   - 其他（含全值 std::variant）→ 现有 holds_alternative / get 路径
+    //   - 其他（含全值 ValueVariant，feature-05 前为 std::variant）→ is<I>() / get<I>() 路径
     const SemType* mt = stmt.expr ? stmt.expr->inferredType : nullptr;
     bool isVariantPtr = false;   // aura_rt::Variant<T...>*
     bool isOptional   = false;   // aura_rt::Optional<T>*
     std::string elemCppType;                 // Optional 元素 C++ 类型（步骤 5 用）
     bool elemIsHeap = false;                 // Optional 元素是否为堆类型（步骤 5 用）
     std::vector<std::string> gcTmpVars;      // 本分支临时注册的 GC 根变量名（步骤 4/5 注册、步骤 6 清理）
-    std::vector<std::string> variantCppTypes;  // 各变体 C++ 类型（索引对应；std::variant 与 Variant 路径共用）
+    std::vector<std::string> variantCppTypes;  // 各变体 C++ 类型（索引对应；ValueVariant 与 Variant 路径共用）
     if (auto* u = dynamic_cast<const UnionSemType*>(mt)) {
         for (auto& v : u->variants) {
             if (v && isUnionHeapVariant(v.get())) isVariantPtr = true;
@@ -55,7 +55,8 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
 
     // 使用 if/else 链代替 std::visit，以正确支持 co_await
     // plan2 §4.7: match → std::visit，但 co_await 无法在 visitor 泛型 lambda 中使用
-    // 改用 std::holds_alternative + std::get 替代方案
+    // 改用按变体下标 is<I>() / get<I>() 的替代方案（feature-05 前全值路径为
+    // std::holds_alternative + std::get，现已统一到与堆 Variant 同款 API）
     cpp << indentStr() << "{\n";
     indentLevel_++;
     if (isVariantPtr || isOptional) {
@@ -64,13 +65,13 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
         writeLine(cpp, "auto _match_val = " + expr + ";");
         writeLine(cpp, "aura_rt::GcRootHandle<decltype(_match_val)> _match_rh(_match_val);");
     } else {
-        // 全值 std::variant / 普通类型：无 GC 指针跨栈窗口，保持现状 auto&&（避免拷贝）
+        // 全值 ValueVariant / 普通类型：无 GC 指针跨栈窗口，保持现状 auto&&（避免拷贝）
         writeLine(cpp, "auto&& _match_val = " + expr + ";");
     }
 
     // P5：常量匹配条件生成（联合/含堆 Variant/Optional 路径先判定变体再比值；非联合直接比较）
     auto genConstCond = [&](const ASTNode* lit) -> std::string {
-        // None 常量：匹配 None 变体（Variant is<I> / Optional is_none / std::variant holds_alternative）
+        // None 常量：匹配 None 变体（Variant/ValueVariant is<I> / Optional is_none）
         if (dynamic_cast<const NoneLiteral*>(lit)) {
             if (isVariantPtr) {
                 for (size_t k = 0; k < variantCppTypes.size(); ++k)
@@ -80,9 +81,10 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
             }
             if (isOptional) return "_match_val->is_none()";
             if (mt && dynamic_cast<const UnionSemType*>(mt)) {
+                // 全值联合（ValueVariant，feature-05）：按 None 变体下标 is<k>()
                 for (size_t k = 0; k < variantCppTypes.size(); ++k)
                     if (variantCppTypes[k] == "aura_rt::NoneType")
-                        return "std::holds_alternative<aura_rt::NoneType>(_match_val)";
+                        return "_match_val.is<" + std::to_string(k) + ">()";
             }
             return "true";  // 非联合 None：值恒为 None，直接命中
         }
@@ -116,12 +118,15 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
             return "!_match_val->is_none() && _match_val->unwrap() == " + litExpr;
         }
         if (mt && dynamic_cast<const UnionSemType*>(mt)) {
+            // 全值联合（ValueVariant，feature-05）：is<idx>() / get<idx>()，
+            // 与上方 isVariantPtr 分支同款形态（双路径统一）
             int idx = findVariantIdx();
             if (idx < 0) return "false";
-            std::string t = variantCppTypes[static_cast<size_t>(idx)];
+            std::string prefix = "_match_val.is<" + std::to_string(idx) + ">() && ";
+            std::string cmp = "_match_val.get<" + std::to_string(idx) + ">()";
             if (dynamic_cast<const StringLiteral*>(lit))
-                return "std::holds_alternative<" + t + ">(_match_val) && aura_rt::string_eq(std::get<" + t + ">(_match_val), " + litExpr + ")";
-            return "std::holds_alternative<" + t + ">(_match_val) && std::get<" + t + ">(_match_val) == " + litExpr;
+                return prefix + "aura_rt::string_eq(" + cmp + ", " + litExpr + ")";
+            return prefix + cmp + " == " + litExpr;
         }
         // 非联合：直接比较
         if (dynamic_cast<const StringLiteral*>(lit))
@@ -181,7 +186,7 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
                                       + std::to_string(idx) + ">();";
                             if (isGcPointerType(cppType)) {
                                 binding += " aura_rt::GcRootHandle<decltype(" + rawName
-                                           + ")> " + varName + "(" + rawName + ");";
+                                           + ")> " + varName + "(" + rawName + ", aura_rt::GcRootScope::ThreadLocal);";
                                 gcRootVarNames_.insert(varName);
                                 gcRootTypes_[varName] = "decltype(" + rawName + ")";
                                 gcTmpVars.push_back(varName);
@@ -216,7 +221,7 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
                         std::string rawName = varName + "_raw";
                         binding = "auto " + rawName + " = _match_val->unwrap();"
                                 + " aura_rt::GcRootHandle<decltype(" + rawName
-                                + ")> " + varName + "(" + rawName + ");";
+                                + ")> " + varName + "(" + rawName + ", aura_rt::GcRootScope::ThreadLocal);";
                         gcRootVarNames_.insert(varName);
                         gcRootTypes_[varName] = "decltype(" + rawName + ")";
                         gcTmpVars.push_back(varName);
@@ -226,11 +231,22 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
                     }
                 }
             } else if (mt && dynamic_cast<const UnionSemType*>(mt)) {
-                // 全值联合（std::variant 路径）：holds_alternative / get
-                cond = "std::holds_alternative<" + cppType + ">(_match_val)";
-                if (!tp->varName.empty())
-                    binding = "auto& " + safeName(tp->varName) +
-                              " = std::get<" + cppType + ">(_match_val);";
+                // 全值联合（ValueVariant，feature-05）：按 cppType 定位变体下标，
+                // is<idx>() / get<idx>()（与上方 isVariantPtr 分支同构，含裸名前缀匹配）
+                int idx = -1;
+                for (size_t k = 0; k < variantCppTypes.size(); ++k)
+                    if (variantCppTypes[k] == cppType ||
+                        (!cppType.empty() && variantCppTypes[k].rfind(cppType + "<", 0) == 0)) {
+                        idx = static_cast<int>(k); break;
+                    }
+                if (idx >= 0) {
+                    cond = "_match_val.is<" + std::to_string(idx) + ">()";
+                    if (!tp->varName.empty())
+                        binding = "auto& " + safeName(tp->varName) +
+                                  " = _match_val.get<" + std::to_string(idx) + ">();";
+                } else {
+                    cond = "false";  // 类型模式与任何变体不匹配（Sema 应已拦截）
+                }
             } else {
                 // 普通类型：类型静态已知，条件恒真，直接绑定
                 cond = "true";

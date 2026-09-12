@@ -286,6 +286,15 @@ void SemAnalyzer::propagateCanonicalName(const ASTNode& expr, const SemType* typ
     // 若被声明类型改写会丢失 record 具体类型；CodeGen 接口视图绑定
     // （genLetStmt §3.10）依赖 initializer 保持 RecordSemType 以识别 record 指针）
     if (dynamic_cast<const Identifier*>(&expr)) return;
+    // feature-06（阶段 C）：目标为裸 Callable（CallableSemType）时，闭包字面量
+    // （FunExpr）叶节点保留自身推断的 FuncSemType——闭包的"值形态"由自身结构决定
+    //（genExpr 产 CallableObj 派生指针），不能被改写为 CallableSemType：否则
+    // CodeGen genErasedInitValue 见 CallableSemType 走"erased 值拷贝透传"分支，
+    // 闭包字面量缺 CallableErased 包装（CallableObj* 赋 CallableErased* 坏 C++）。
+    // 与 Identifier/IndexExpr/MemberAccessExpr 同族：表达式真实类型由自身决定，
+    // 期望类型的宽化（origins）只写符号表（checkLetDecl 传播点 1），不改写节点。
+    if (dynamic_cast<const CallableSemType*>(type)
+        && dynamic_cast<const FunExpr*>(&expr)) return;
     const_cast<ASTNode&>(expr).inferredType = type;
 }
 

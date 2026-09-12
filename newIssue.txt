@@ -1,9 +1,34 @@
 目前有几个想法：
 1、enum
-2、Error输出规范化以及调用栈
-3、"#"配置器（推迟）
+2、运行时Error输出规范化以及调用栈
+3、"#"配置器 + 反射机制
+    主要作用：用于配置某些东西，既想把它当宏（用一个标准库实现）用，又想把它当Java的注解用，也想把它当python的装饰器用
+    #type SubscribeEvent = {
+        event: event,
+        #side: Thread // sync thread 中 spawn 要额外添加配置器注明线程名，thread内置库支持线程命名
+    }
+
+    使用：
+    #SubscribeEvent{event = ...}
+    fun (self Player) link(url: str, db: DataBase){
+        #[side = Server]{
+            ...
+        }
+        #[side = Client]{
+            ...
+        }
+    }
+
+    sync thread(max = 7){
+        #Thread("Server")
+        spawn ...
+    }
+
+    type EventFuncCollector = {}
+
 5、typeof函数内置
-6、sync.Channel登记注册乱了（暂不处理）
-7、sema架构改变支持反推类型
-8、VarInt
-9、编译期Channel死锁检查
+6、VarInt
+7、编译期Channel死锁检查
+8、sync的runtime优化
+9、编译期函数：
+    

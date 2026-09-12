@@ -52,10 +52,12 @@ bool SemAnalyzer::rejectStandaloneNone(const Decl& decl, const TypeExpr* type) {
     return false;
 }
 
-// bug-63：初始值是否为"显式 None 值"（none() 调用 / none 字面量）——仅这类表达式有
+// bug-63/bug-66：初始值是否为"显式 None 值"（none() 调用 / none 字面量）——仅这类表达式有
 // 可绑定的 NoneType 值。函数/方法返回 None（`-> None`）是 void 语义、无运行时可绑定
 // 值，出现在值上下文应拒绝；同一 NoneSemType 推断来源不同，需按 initializer 形态区分。
-static bool isNoneValueInitializer(const ASTNode* init) {
+// （静态成员：let/const 声明、record 字段（ExprInfer.cpp）、赋值（ExprInferMisc.cpp）
+// 提交点共用；定义提升自 bug-63 的 file-static 版本，bug-66 扩展使用范围）
+bool SemAnalyzer::isNoneValueInitializer(const ASTNode* init) {
     if (!init) return false;
     if (dynamic_cast<const NoneLiteral*>(init)) return true;
     if (auto* ce = dynamic_cast<const CallExpr*>(init)) {
@@ -141,6 +143,16 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
             // 仅拦截 CallExpr：record 字面量（RecordExpr）字段内空列表元素由字段类型
             // 决定，语义合法，不能误报（used/1.aura Tree<int> 用例）
             error(decl, "cannot infer element type from initializer; add explicit type annotation (e.g. let x: [int] = [])");
+        }
+        // feature-06（阶段 C）传播点 1：标注 Callable → 符号携带溯源签名集。
+        // init 为函数签名/函数值/方法值/ctor 引用 → origins={该签名}；Callable 值
+        // 拷贝 → 沿用其 origins（erased 保持 erased）。调用点 c(1) 静态检查与
+        // CodeGen erased 包装（adapt 签名）都依赖此 origins。
+        if (!diag_.hasErrors()
+            && dynamic_cast<const CallableSemType*>(declaredType.get())) {
+            auto eff = std::make_unique<CallableSemType>();
+            eff->origins = callableOriginsFromType(*inferredType);
+            declaredType = std::move(eff);
         }
         inferredType = std::move(declaredType);
     } else if (!diag_.hasErrors() && containsErrorElement(inferredType.get())) {
@@ -237,6 +249,14 @@ void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
                    && containsErrorElement(inferredType.get())) {
             // 与 checkLetDecl 同：仅拦截 CallExpr 初始值（record 字面量字段空列表不误报）
             error(decl, "cannot infer element type from initializer; add explicit type annotation (e.g. let x: [int] = [])");
+        }
+        // feature-06（阶段 C）传播点 1（const）：同 checkLetDecl——标注 Callable →
+        // 符号携带溯源签名集（调用点静态检查与 CodeGen erased 包装依赖）
+        if (!diag_.hasErrors()
+            && dynamic_cast<const CallableSemType*>(declaredType.get())) {
+            auto eff = std::make_unique<CallableSemType>();
+            eff->origins = callableOriginsFromType(*inferredType);
+            declaredType = std::move(eff);
         }
         inferredType = std::move(declaredType);
     } else if (!diag_.hasErrors() && containsErrorElement(inferredType.get())) {

@@ -85,6 +85,32 @@ struct FuncSemType : SemType {
     [[nodiscard]] std::unique_ptr<SemType> clone() const override;
 };
 
+// feature-06（阶段 C）：裸 Callable 类型（origins 溯源签名集）
+// 溯源签名集：空 = erased（裸 Callable 形参 / 跨模块 opaque / 传播丢失）
+// 运行时 C++ 表示 = aura_rt::CallableErased*（GC 堆包装，desc 追踪 target 槽）
+struct CallableSemType : SemType {
+    // 溯源签名集（shared_ptr 共享不可变签名——clone 只拷贝句柄）
+    std::vector<std::shared_ptr<const FuncSemType>> origins;
+    bool erased() const { return origins.empty(); }
+    // equals：同为 Callable 即等（origins 不参与相等性——赋值兼容性由
+    // Assignability 按 origins 判定，避免传播精度差异影响类型等同）
+    [[nodiscard]] bool equals(const SemType& o) const override {
+        return dynamic_cast<const CallableSemType*>(&o) != nullptr;
+    }
+    [[nodiscard]] std::string toString() const override {
+        if (erased()) return "Callable";
+        std::string s = "Callable<";
+        for (size_t i = 0; i < origins.size(); ++i)
+            s += (i ? " | " : "") + origins[i]->toString();
+        return s + ">";
+    }
+    [[nodiscard]] std::unique_ptr<SemType> clone() const override {
+        auto n = std::make_unique<CallableSemType>();
+        n->origins = origins;   // shared_ptr 共享签名（不可变）
+        return n;
+    }
+};
+
 struct InterfaceSemType : SemType {
     std::string name;
     // 泛型接口实例化实参（如 Comparable<Point> 的 [Point]）；非泛型接口为空。

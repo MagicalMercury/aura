@@ -87,7 +87,10 @@ void GcHeap::scanRootsOnly(bool youngOnly) {
                          node; node = node->next_) {
                         GcObject* obj;
                         std::memcpy(&obj, node->ptr_ref_, sizeof(GcObject*));
-                        if (obj) markRootEnqueue(obj);
+                        // bug-79 L2：根链值页内判定（与栈扫描 scanStackCandidate 防御对称）——
+                        // 悬垂槽垃圾值（0x1 等）与非 GC 堆指针（Channel* 等）一律跳过，
+                        // 消灭 markRootEnqueue 直接 forwarded() 解引用的未定义行为
+                        if (obj && isGCAddress(obj)) markRootEnqueue(obj);
                     }
                 }
             });

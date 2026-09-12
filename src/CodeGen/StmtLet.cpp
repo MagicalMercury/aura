@@ -5,6 +5,39 @@
 
 namespace Aura {
 
+// feature-06（递归闭包辅助）："aura_rt::CallableObj<R, P1, P2>*" →
+// "std::function<R(P1, P2)>"（递归闭包旧路径 lambda 的 std::function 承载；
+// 按顶层逗号分割，兼容内嵌模板逗号）
+static std::string callableObjToStdFunction(const std::string& cbTy) {
+    static const std::string prefix = "aura_rt::CallableObj<";
+    if (cbTy.rfind(prefix, 0) != 0 || cbTy.size() <= prefix.size() + 2)
+        return cbTy;
+    std::string inner = cbTy.substr(prefix.size(), cbTy.size() - prefix.size() - 2);
+    std::vector<std::string> parts;
+    std::string cur;
+    int depth = 0;
+    for (char c : inner) {
+        if (c == '<') ++depth;
+        else if (c == '>') --depth;
+        else if (c == ',' && depth == 0) { parts.push_back(cur); cur.clear(); continue; }
+        cur += c;
+    }
+    if (!cur.empty()) parts.push_back(cur);
+    if (parts.empty()) return cbTy;
+    for (auto& p : parts) {
+        auto b = p.find_first_not_of(" \t");
+        auto en = p.find_last_not_of(" \t");
+        p = (b == std::string::npos) ? "" : p.substr(b, en - b + 1);
+    }
+    std::string ret = parts[0];
+    std::string ps;
+    for (size_t i = 1; i < parts.size(); ++i) {
+        if (i > 1) ps += ", ";
+        ps += parts[i];
+    }
+    return "std::function<" + ret + "(" + ps + ")>";
+}
+
 void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     // 解构 let a, b = f()：临时元组成根后逐字段绑定（三形态分发与单名 let 一致）
     if (!decl.names.empty()) {
@@ -14,7 +47,7 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
         writeLine(cpp, "auto " + tvar + "_raw = "
                   + genExpr(*decl.initializer, currentFunctionIsCoroutine_) + ";");
         writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + tvar + "_raw)> "
-                  + tvar + "(" + tvar + "_raw);");
+                  + tvar + "(" + tvar + "_raw, aura_rt::GcRootScope::ThreadLocal);");
         for (size_t i = 0; i < decl.names.size() && i < rs->fields.size(); ++i) {
             std::string varName = safeName(decl.names[i]);
             std::string fldType = rs->fields[i].type ? mapSemType(*rs->fields[i].type) : "auto";
@@ -30,7 +63,7 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
             } else if (isGcPointerType(fldType)) {
                 writeLine(cpp, fldType + " " + varName + "_raw = " + getter + ";");
                 writeLine(cpp, "aura_rt::GcRootHandle<" + fldType + "> " + varName
-                          + "(" + varName + "_raw);");
+                          + "(" + varName + "_raw, aura_rt::GcRootScope::ThreadLocal);");
                 gcRootVarNames_.insert(varName);
                 gcRootTypes_[varName] = fldType;
             } else {
@@ -119,6 +152,10 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
         } else if (auto* os = dynamic_cast<const OptionalSemType*>(decl.inferredType)) {
             // Optional<T> 推断类型 → 映射为 aura_rt::Optional<T>*
             type = mapSemType(*os);
+        } else if (dynamic_cast<const CallableSemType*>(decl.inferredType)) {
+            // feature-06（阶段 C）：无标注 Callable 值拷贝（let g = f）→
+            // aura_rt::CallableErased*（GC 堆包装——isGcPointerType 根化存储）
+            type = "aura_rt::CallableErased*";
         }
     }
     // 提取类型标注中的模板参数（如 math.Pair<float, bool>），供 genMethodCall 用于跨模块构造
@@ -178,7 +215,7 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                     init = "aura_rt::gc_alloc<" + recType + ">(&" + recType + "::_desc)";
                     std::string var = safeName(decl.name);
                     writeLine(cpp, type + " " + var + "_raw = " + init + ";");
-                    writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + var + "(" + var + "_raw);");
+                    writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + var + "(" + var + "_raw, aura_rt::GcRootScope::ThreadLocal);");
                     gcRootVarNames_.insert(var);
                     gcRootTypes_[var] = type;
                     int recIdx = recordAllocCounter_++;
@@ -334,6 +371,13 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
             coroClosureNames_.insert(safeName(decl.name));
             lastClosureIsCoro_ = false;
         }
+        // feature-07 Step 4（C5）：新路径协程闭包（__invoke 返回 task<T>）——
+        // 不进 coroClosureNames_（会被 isFunValueCall 直呼排除误伤），改登记
+        // closureTaskVars_ 作为 needAwait 信号（ExprCall L467-471）。
+        if (lastClosureIsCoroTask_) {
+            closureTaskVars_.insert(safeName(decl.name));
+            lastClosureIsCoroTask_ = false;
+        }
         currentLetName_.clear();
     }
 
@@ -343,8 +387,20 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     // "Array<T>"/"Array<U>"（依赖具体泛型名，闭包内 [U] 兜底 Array<A> 时不命中，
     // bug-04 主线），改为「init 是空列表生成（含 ::make(0) 或 nullptr）且 decl.type 为
     // Array 标注」→ 用 decl.type 的 mapType 精确纠正（bug-04 let 主线）。
-    if (decl.type && (init.find("nullptr") != std::string::npos
-                      || init.find("::make(0)") != std::string::npos)) {
+    // feature-06 修复：判定收紧为「整体形态匹配」——旧 find("nullptr")/find("::make(0)")
+    // 子串匹配会误伤内部合法含 nullptr 的非空列表 IIFE（如 [Callable] 列表元素包装的
+    // CallableObj 派生 desc 初始化串 TypeDescriptor{..., 0, nullptr}）→ 2 元素 IIFE
+    // 被整体替换为 make(0) → 运行时下标越界。现在：① nullptr 形态须匹配空列表兜底
+    // 注释前缀（genListExpr 空元素分支唯一产物）；② make(0) 形态须 init 整体即
+    // "aura_rt::Array<...>::make(0)" 表达式（前缀 + 后缀），嵌套于 IIFE 内部的
+    // make(0)/nullptr 不再触发。
+    bool isEmptyListInit =
+        init.find("/* empty list - element type unknown */ nullptr")
+            != std::string::npos
+        || (init.rfind("aura_rt::Array<", 0) == 0
+            && init.size() >= 9
+            && init.compare(init.size() - 9, 9, "::make(0)") == 0);
+    if (decl.type && isEmptyListInit) {
         std::string arrType = mapType(*decl.type);
         // arrType 形如 "aura_rt::Array<X>*"，取元素类型 X 并生成 make(0)
         if (arrType.find("aura_rt::Array<") == 0) {
@@ -357,7 +413,111 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
 
     expectedTemplateArgs_.clear();
 
+    // feature-06（阶段 C）：
+    // ① 标注裸 Callable 目标（C++ 类型 CallableErased*）→ init 包装为 Erased 值
+    //    （函数形态 → genErasedWrap；Callable 值拷贝 → genErasedInitValue 内透传）。
+    //    目标签名 sig 来自 decl.inferredType（CallableSemType.origins 单签名——
+    //    Sema 传播点 1 已把 init 签名并入）。
+    // ② 无标注函数形态引用（let f = double / let h = p.next / let k = Point）→
+    //    init 包装为 CallableObj 值（第 2 层；与闭包 IIFE 同存储形态，下方
+    //    funValue 特例按类型根化）。
+    if (type == "aura_rt::CallableErased*" && decl.initializer) {
+        const FuncSemType* sig = nullptr;
+        if (auto* dct = dynamic_cast<const CallableSemType*>(decl.inferredType))
+            if (dct->origins.size() == 1) sig = dct->origins[0].get();
+        init = genErasedInitValue(*decl.initializer, sig);
+    } else if (!decl.type && decl.initializer && !init.empty()
+               && dynamic_cast<const FuncSemType*>(decl.inferredType)) {
+        std::string wrapped = genFnRefCallableObjValue(*decl.initializer);
+        if (!wrapped.empty()) init = wrapped;
+    }
+
     std::string varName = safeName(decl.name);
+
+    // feature-06（阶段 B）：无标注 let 推断为函数类型（FuncSemType）→ 值是 GC 堆
+    // CallableObj：按类型根化存储（GcRootHandle 包装——机制性消灭闭包手工包根
+    // 缺陷族）。触发范围严格限定为"确为 CallableObj 产物的初始化器"：
+    //   - 新路径闭包 IIFE（[&]() -> aura_rt::CallableObj<…>）
+    //   - 已根化函数值变量的拷贝（.get() 尾缀）
+    //   - record fun 字段读取（let back = box.f → 字段槽内 CallableObj 指针）
+    // 其余形态（auto 泛型工厂调用 compose()/retry()/make_mapper() 返回模板 lambda、
+    // 旧路径 lambda 产物等）保持 auto——值非 CallableObj，不得按 CallableObj 类型
+    // 绑定（否则模板 lambda 无法向 CallableObj<…>* 转换，坏 C++）。
+    bool funValueLetDecltype = false;
+    if (!decl.type && decl.inferredType && !init.empty()
+        && dynamic_cast<const FuncSemType*>(decl.inferredType)) {
+        auto* fst = static_cast<const FuncSemType*>(decl.inferredType);
+        // 顶层 CallableObj 闭包 IIFE 前缀（严格前缀——内嵌闭包 IIFE 的
+        // "-> aura_rt::CallableObj<" 子串不得误判，防 compose 等包装 IIFE）
+        static const std::string kClosurePfx = "[&]() -> aura_rt::CallableObj<";
+        bool initIsNewClosure = init.rfind(kClosurePfx, 0) == 0;
+        bool initIsRootedVarRef = init.size() >= 6
+            && init.compare(init.size() - 6, 6, ".get()") == 0;
+        // 具名函数调用返回 CallableObj（非 auto 泛型闭包工厂）→ 值即 CallableObj，
+        // 按类型根化（与 make_multiplier()->fun(int)->int 形态；compose()/retry() 等
+        // auto 工厂返回模板 lambda，不在 declaredFunRetTypes_ 或返回 auto → 保持 auto）
+        bool initIsCallableObjFnCall = false;
+        if (auto* ce = dynamic_cast<const CallExpr*>(decl.initializer.get()))
+            if (auto* cid = dynamic_cast<const Identifier*>(ce->callee.get())) {
+                auto rtIt = declaredFunRetTypes_.find(cid->name);
+                if (rtIt != declaredFunRetTypes_.end())
+                    initIsCallableObjFnCall = rtIt->second.find("aura_rt::CallableObj<") == 0;
+            }
+        // record fun 字段读取（let back = box.f → box.get()->f）：值即字段槽内的
+        // CallableObj 指针（record desc 追踪该槽，compact 会重写）——栈上副本须按
+        // 静态类型根化（与显式标注 fun(int)->int 同语义），否则字段对象 compact
+        // 搬移后裸指针悬垂、且调用点无 .get() 句柄可派发。record 方法值（p.next）
+        // 已由上方 genFnRefCallableObjValue 包装为新 IIFE（initIsNewClosure 命中），
+        // 此处仅剩"非方法的 fun 字段"（MemberAccess 目标对象为 record）。
+        // bug-74：元素取出的函数值（let g = arr[0]）——初始化器为 IndexExpr（可嵌套
+        // nested[0][0]），值即列表元素槽内的 CallableObj 指针，与「record fun 字段
+        // 读取」同形态：栈上副本须按静态类型根化，否则 compact 搬移后裸指针悬垂，
+        // 且调用点无 .get() 句柄可派发 → 直呼 g(x) 坏 C++。
+        bool initIsElementFunValue = false;
+        if (dynamic_cast<const IndexExpr*>(decl.initializer.get())
+            && decl.initializer->inferredType
+            && dynamic_cast<const FuncSemType*>(decl.initializer->inferredType))
+            initIsElementFunValue = true;
+        bool initIsFunFieldRead = false;
+        if (auto* ma = dynamic_cast<const MemberAccessExpr*>(decl.initializer.get())) {
+            auto* ro = ma->object && ma->object->inferredType
+                ? dynamic_cast<const RecordSemType*>(ma->object->inferredType) : nullptr;
+            if (ro) {
+                std::string recKey = ro->canonicalName;
+                size_t lt = recKey.find('<');
+                if (lt != std::string::npos) recKey = recKey.substr(0, lt);
+                auto mIt = recordMethods_.find(recKey);
+                if (mIt == recordMethods_.end() || !mIt->second.count(ma->member))
+                    initIsFunFieldRead = true;
+            }
+        }
+        if ((initIsNewClosure || initIsRootedVarRef || initIsCallableObjFnCall
+             || initIsFunFieldRead || initIsElementFunValue)
+            && !lastClosureIsCoro_ && !funcTypeHasOwnUnboundGeneric(fst)) {
+            // feature-07 Step 4（C6/B2）：新路径闭包（initIsNewClosure 命中）的根化
+            // 类型单源取 genFunExprCallableObj 回填的基类 C++ 类型（协程 =
+            // CallableObj<task<T>, A...>，非协程 = 与 mapSemType 一致）——消除协程闭包
+            // mapSemType(FuncSemType) 产出内层签名与对象基类不一致的双源漂移。
+            if (initIsNewClosure && lastClosureCppBaseIsCoro_ && !lastClosureCppBase_.empty()) {
+                type = lastClosureCppBase_ + "*";   // 协程形态：task 签名基类（唯一权威源）
+            } else if (semTypeIsConcrete(fst)) {
+                type = mapSemType(*fst);   // 具体签名 → 静态类型 → isGcPointerType 根化
+            } else {
+                type = "auto";
+                funValueLetDecltype = true;   // 泛型上下文（U 由外层模板提供）→ decltype 根化
+            }
+        }
+    }
+
+    // feature-07 Step 4（C6 补充 —— 带类型标注形态）：协程闭包（__invoke 返回
+    // task<T>）的根化类型必须与对象基类一致；标注形态 mapType(FunctionType)
+    // 产出的是内层签名（CallableObj<R,A...>*）——与 IIFE 实际返回类型
+    // CallableObj<task<R>,A...>* 不匹配（cannot convert）。故在初始化器为
+    // 新路径协程闭包 IIFE 时统一改用 lastClosureCppBase_（唯一权威源）。
+    if (lastClosureCppBaseIsCoro_ && !lastClosureCppBase_.empty()
+        && decl.initializer
+        && dynamic_cast<const FuncSemType*>(decl.inferredType))
+        type = lastClosureCppBase_ + "*";
 
     // P1：接口视图类型 let 绑定（let s: Stringer = rec / let c: Comparable<Point> = p）
     // init 为 record 指针 → IIFE gcConstruct 适配器 + view()；
@@ -392,23 +552,36 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     // P1：视图 let（接口视图 / 迭代器视图）→ 值绑定 raw + ViewRoot 包裹
     // 视图含 self 裸指针，GC compact 不重写栈上指针，ViewRoot 内 GcRootHandle<GcObject*>
     // 在 GC 时被更新（updateAllReferences 步骤 1），get() 重建视图取最新 self
+    // feature-06（递归闭包）：标注函数类型 + init 为旧路径 lambda 且自引用
+    //（[&fact] 捕获自身）→ 值无法放入 CallableObj*（lambda 非 CallableObj），
+    // 保持旧世界 std::function 两段式承载（先声明后赋值——自引用需变量先于
+    // lambda 定义存在）。调用点直呼/自引用均经 std::function operator()。
     if (!viewRootType.empty() && !init.empty()) {
         writeLine(cpp, viewRootType + " " + varName + "_raw = " + init + ";");
         writeLine(cpp, "aura_rt::ViewRoot<" + viewRootType + "> " + varName + "(" + varName + "_raw);");
         viewRootVarNames_.insert(varName);
         viewRootTypes_[varName] = viewRootType;   // P2b：闭包捕获转 Global ViewRoot 用
-    } else if (genericListDecl && !init.empty()) {
+    } else if (!init.empty() && init[0] == '['
+               && init.find("&" + varName) != std::string::npos
+               && type.find("aura_rt::CallableObj<") == 0) {
+        // 递归闭包（let 变量被自身闭包引用，旧 lambda 路径产物）
+        std::string sf = callableObjToStdFunction(type);
+        writeLine(cpp, sf + " " + varName + ";");
+        writeLine(cpp, varName + " = " + init + ";");
+    } else if ((genericListDecl || funValueLetDecltype) && !init.empty()) {
         // #55：未绑定泛型元素列表 → auto 声明 + GcRootHandle<decltype> 包装。
         // decltype(arr_raw) 在 T 实例化后为 Array<X>*（继承 GcObject），模板实参合法、
         // 无假根；gcRootTypes_ 用 decltype 形态与 DeclFun.cpp:55 / StmtMatch.cpp:186 先例一致。
+        // feature-06：泛型上下文函数值 let（CallableObj<U,U>* 模板参数形态）同款——
+        // decltype(raw) 为 CallableObj<U,U>*（恒 GcObject 派生指针），无假根。
         writeLine(cpp, "auto " + varName + "_raw = " + init + ";");
         writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + varName + "_raw)> " + varName
-                  + "(" + varName + "_raw);");
+                  + "(" + varName + "_raw, aura_rt::GcRootScope::ThreadLocal);");
         gcRootVarNames_.insert(varName);
         gcRootTypes_[varName] = "decltype(" + varName + "_raw)";
     } else if (isGcPointerType(type) && !init.empty()) {
         writeLine(cpp, type + " " + varName + "_raw = " + init + ";");
-        writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + varName + "(" + varName + "_raw);");
+        writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + varName + "(" + varName + "_raw, aura_rt::GcRootScope::ThreadLocal);");
         gcRootVarNames_.insert(varName);
         gcRootTypes_[varName] = type;
     } else {
@@ -513,13 +686,79 @@ void CodeGenerator::genConstStmt(std::ostream& cpp, const ConstDecl& decl) {
 
     expectedTemplateArgs_.clear();
 
+    // feature-06（阶段 C）：标注裸 Callable 目标 → init 包装为 Erased 值；
+    // 无标注函数形态引用 → CallableObj 值包装（同 genLetStmt）
+    if (type == "aura_rt::CallableErased*" && decl.initializer) {
+        const FuncSemType* sig = nullptr;
+        if (auto* dct = dynamic_cast<const CallableSemType*>(decl.inferredType))
+            if (dct->origins.size() == 1) sig = dct->origins[0].get();
+        init = genErasedInitValue(*decl.initializer, sig);
+    } else if (!decl.type && decl.initializer && !init.empty()
+               && dynamic_cast<const FuncSemType*>(decl.inferredType)) {
+        std::string wrapped = genFnRefCallableObjValue(*decl.initializer);
+        if (!wrapped.empty()) init = wrapped;
+    } else if (!decl.type && decl.initializer
+               && dynamic_cast<const CallableSemType*>(decl.inferredType)) {
+        // 无标注 Callable 值拷贝 → CallableErased*（根化）
+        type = "aura_rt::CallableErased*";
+    }
+
     std::string varName = safeName(decl.name);
+
+    // feature-06（阶段 B）：无标注 const 推断为函数类型（具体 FuncSemType）→
+    // CallableObj 值按静态类型根化（与 genLetStmt 同机制；旧 lambda 产物保持 auto）。
+    if (!decl.type && decl.inferredType && !init.empty()
+        && dynamic_cast<const FuncSemType*>(decl.inferredType)) {
+        auto* fst = static_cast<const FuncSemType*>(decl.inferredType);
+        static const std::string kClosurePfx = "[&]() -> aura_rt::CallableObj<";
+        bool initIsNewClosure = init.rfind(kClosurePfx, 0) == 0;
+        bool initIsOldLambda = init[0] == '[' && !initIsNewClosure;
+        bool initIsCallableObjFnCall = false;
+        if (auto* ce = dynamic_cast<const CallExpr*>(decl.initializer.get()))
+            if (auto* cid = dynamic_cast<const Identifier*>(ce->callee.get())) {
+                auto rtIt = declaredFunRetTypes_.find(cid->name);
+                if (rtIt != declaredFunRetTypes_.end())
+                    initIsCallableObjFnCall = rtIt->second.find("aura_rt::CallableObj<") == 0;
+            }
+        // record fun 字段读取（const back = box.f）：与 genLetStmt 同——字段槽内
+        // CallableObj 指针须按静态类型根化（compact 搬移后调用点 .get() 取新址）
+        // bug-74：元素取出的函数值（const g = arr[0]）——与 genLetStmt 同（元素槽内
+        // CallableObj 指针须按静态类型根化，compact 搬移后调用点 .get() 取新址）
+        bool initIsElementFunValue = false;
+        if (dynamic_cast<const IndexExpr*>(decl.initializer.get())
+            && decl.initializer->inferredType
+            && dynamic_cast<const FuncSemType*>(decl.initializer->inferredType))
+            initIsElementFunValue = true;
+        bool initIsFunFieldRead = false;
+        if (auto* ma = dynamic_cast<const MemberAccessExpr*>(decl.initializer.get())) {
+            auto* ro = ma->object && ma->object->inferredType
+                ? dynamic_cast<const RecordSemType*>(ma->object->inferredType) : nullptr;
+            if (ro) {
+                std::string recKey = ro->canonicalName;
+                size_t lt = recKey.find('<');
+                if (lt != std::string::npos) recKey = recKey.substr(0, lt);
+                auto mIt = recordMethods_.find(recKey);
+                if (mIt == recordMethods_.end() || !mIt->second.count(ma->member))
+                    initIsFunFieldRead = true;
+            }
+        }
+        // feature-07 Step 4（C7/B2）：与 C6 平行——新路径闭包根化类型单源取
+        // lastClosureCppBase_（协程 = CallableObj<task<T>, A...>）；非新闭包保持原路径。
+        if (!initIsOldLambda && !lastClosureIsCoro_
+            && (initIsNewClosure || initIsCallableObjFnCall || initIsFunFieldRead
+                || initIsElementFunValue)) {
+            if (initIsNewClosure && lastClosureCppBaseIsCoro_ && !lastClosureCppBase_.empty())
+                type = lastClosureCppBase_ + "*";   // 协程形态（同 C6）
+            else if (semTypeIsConcrete(fst))
+                type = mapSemType(*fst);
+        }
+    }
 
     // GC 指针类型 const 变量 → 包装为 GcRootHandle
     if (isGcPointerType(type) && !init.empty()) {
         writeLine(cpp, "const " + type + " " + varName + "_raw = " + init + ";");
         writeLine(cpp, "aura_rt::GcRootHandle<" + type + "> " + varName
-                  + "(const_cast<" + type + "&>(" + varName + "_raw));");
+                  + "(const_cast<" + type + "&>(" + varName + "_raw), aura_rt::GcRootScope::ThreadLocal);");
         gcRootVarNames_.insert(varName);
         gcRootTypes_[varName] = type;
     } else {

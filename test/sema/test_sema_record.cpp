@@ -844,3 +844,41 @@ TEST(SemaRecord, ListIndexStillWorks) {
         diag);
     EXPECT_FALSE(diag.hasErrors());
 }
+
+// ============================================================
+// bug-68（2026-09-12）：Union record 变体字段直访的 Sema 校验
+// ============================================================
+
+TEST(SemaRecord, UnionRecordFieldAccessOk) {
+    // 任一 record 变体含该字段 → 放行，字段类型为命中变体字段类型
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }\n"
+        " type H = { v: int | Point }\n"
+        " fun main(io: Io) throws { let h: H = { v = 1 } let got: int = h.v.x }\n",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaRecord, UnionRecordFieldAccessNoFieldError) {
+    // 无任何变体含该字段 → 干净报错（引导先 match 提取），不再静默放行到坏 C++
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Point = { x: int, y: int }\n"
+        " type H = { v: int | Point }\n"
+        " fun main(io: Io) throws { let h: H = { v = 1 } let got: int = h.v.nosuch }\n",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "has no field 'nosuch'"));
+    EXPECT_TRUE(hasErrorContaining(diag, "extract the variant first with 'match'"));
+}
+
+TEST(SemaRecord, ValueUnionFieldAccessError) {
+    // 全值联合（无 record 变体，ValueVariant）字段直访 → 同样干净报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let v: int | float = 3 let got: int = v.foo }\n",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "has no field 'foo'"));
+}

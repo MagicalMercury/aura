@@ -739,7 +739,7 @@ TEST(SemaOptional, MatchNoneFoldUnionStillOk) {
 }
 
 TEST(SemaOptional, MatchNoneUnionIntNoneStillOk) {
-    // 回归红线：全值 int|None（UnionSemType 非堆不折叠 → std::variant）match None 不破坏
+    // 回归红线：全值 int|None（UnionSemType 非堆不折叠 → ValueVariant）match None 不破坏
     Aura::DiagnosticEngine diag;
     analyzeSource(
         "fun main(io: Io) {"

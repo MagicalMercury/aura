@@ -282,44 +282,40 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
     h << "};\n\n";
 
     // 2. 闭包适配器（XFunc）——仅非泛型单方法接口（泛型接口无类型参数可绑定）
-    //    GC 化：单继承 GcObject，std::function 由 finalizer 显式析构
-    // bug-07：单方法含自由裸泛型（如 Getter.getU() -> fun(U)->U）→ XFunc 的 fnType
-    // std::function<std::function<U(U)>()> 含未绑定 U → 跳过 XFunc 生成。
+    // feature-06（阶段 B，B3b）：收敛为 CallableObj 派生接线。闭包实参（GC 堆
+    // CallableObj 派生，捕获槽 desc 追踪）直接作视图 self——适配器仅需静态转发：
+    //   <iface>Fn(GcObject* self, args) → static_cast<CallableObj<Ret,Params...>*>
+    //     (self)->invoke(self, args...)
+    // 捕获 GC 可见性由闭包自身 desc 保证（替代旧 std::function 成员 + desc 0 追踪
+    // 盲区——feature-06 §1 痛点 3）。view() 从基指针构造视图，调用点零额外分配。
     if (decl.typeParams.empty() && decl.methods.size() == 1
         && !ifaceMethodHasFreeGeneric(decl, decl.methods[0])) {
         auto& m = decl.methods[0];
         std::string retType = m.returnType ? mapType(*m.returnType) : "void";
         if (retType == "aura_rt::NoneType") retType = "void";   // #33：接口方法 None→void（对齐 genMethodDecl M1）
-        std::string params, argNames;
+        // 接口方法签名 → CallableObj<Ret, Params...>（与闭包生成路径同源映射）
+        std::string base = "aura_rt::CallableObj<" + retType;
+        std::string fnParams;    // 转发函数形参（含 self）
+        std::string argNames;    // 转发实参名（invoke 调用）
+        fnParams = "aura_rt::GcObject* self";
         for (size_t i = 0; i < m.params.size(); ++i) {
-            if (i > 0) { params += ", "; argNames += ", "; }
-            params += m.params[i].type ? mapType(*m.params[i].type) : "auto";
+            base += ", ";
+            fnParams += ", ";
+            if (i > 0) argNames += ", ";
+            std::string pt = m.params[i].type ? mapType(*m.params[i].type) : "auto";
+            base += pt;
+            fnParams += pt + " " + safeName(m.params[i].name);
             argNames += safeName(m.params[i].name);
         }
-        std::string fnType = "std::function<" + retType + "(" + params + ")>";
-        h << "struct " << name << "Func final : aura_rt::GcObject {\n";
-        // FnType 类型别名：C++ 语法不允许 qualified template-id 跟在 ~ 后（~std::function<...> 非法），
-        // 用别名承接析构调用（与 runtime iterator.h 的 MapIter::fn_.~F() 同模式）
-        h << "  using FnType = " << fnType << ";\n";
-        h << "  FnType func;\n";
-        h << "  explicit " << name << "Func(FnType f) : func(std::move(f)) {}\n";
-        h << "  static " << retType << " " << m.name << "Fn(aura_rt::GcObject* self";
-        for (size_t i = 0; i < m.params.size(); ++i) {
-            h << ", " << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
-              << " " << safeName(m.params[i].name);
-        }
-        h << ") {\n";
-        h << "    return static_cast<" << name << "Func*>(self)->func(" << argNames << ");\n";
+        base += ">";
+        h << "struct " << name << "Func final : " << base << " {\n";
+        h << "  static " << retType << " " << m.name << "Fn(" << fnParams << ") {\n";
+        h << "    auto* __c = static_cast<" << base << "*>(self);\n";
+        h << "    return __c->invoke(__c" << (argNames.empty() ? "" : ", " + argNames)
+          << ");\n";
         h << "  }\n";
-        h << "  static " << name << " view(" << name << "Func* o) {\n";
-        h << "    return { &" << m.name << "Fn, o };\n";
-        h << "  }\n";
-        h << "  static const aura_rt::TypeDescriptor& desc() {\n";
-        h << "    static const aura_rt::TypeDescriptor d = { sizeof(" << name
-          << "Func), 0, nullptr, 0, nullptr,\n";
-        h << "        [](aura_rt::GcObject* obj) { static_cast<" << name
-          << "Func*>(obj)->func.~FnType(); } };\n";
-        h << "    return d;\n";
+        h << "  static " << name << " view(" << base << "* o) {\n";
+        h << "    return { &" << name << "Func::" << m.name << "Fn, o };\n";
         h << "  }\n";
         h << "};\n\n";
     }

@@ -117,6 +117,25 @@ bool CodeGenerator::isFuncAliasRet(const TypeExpr* retType) const {
         && it != registeredTypes_.end() && !it->second; // 函数式别名 registered non-heap
 }
 
+bool CodeGenerator::isFunctionTypedParam(const Param& p) const {
+    const TypeExpr* pty = p.type.get();
+    if (!pty) return false;
+    if (dynamic_cast<const FunctionType*>(pty)) return true;
+    if (pty->inferredType
+        && dynamic_cast<const FuncSemType*>(pty->inferredType))
+        return true;
+    // NamedType 非堆注册类型别名（Transform<T>/Transform = 函数式别名；含非模板别名
+    // type Transform = fun(int)->int）：Sema 对形参类型标注的 inferredType 可能为空
+    //（未走表达式推断），按别名注册表兜底。非堆注册类型仅函数/联合值别名——联合
+    // 形参不会作为 callee 直呼（Sema 拦截），注册无副作用（对照 fnCallbackParams_
+    // 的 NamedType 注册先例放开 typeAliasTemplateParams_ 限定，覆盖非模板别名）
+    if (auto* nt = dynamic_cast<const NamedType*>(pty)) {
+        auto rit = registeredTypes_.find(nt->name);
+        if (rit != registeredTypes_.end() && !rit->second) return true;
+    }
+    return false;
+}
+
 std::vector<std::string> CodeGenerator::collectMethodTParams(const MethodDecl& decl) const {
     std::set<std::string> names;
     // 优先从 receiverTypeArgs（如 Stack<T> 中的 T）

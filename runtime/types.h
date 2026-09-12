@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>       // is_pointer_v / void_t / enable_if_t / is_convertible_v
+#include <utility>           // declval（GcViewSlot 视图槽 traits）
 
 namespace aura_rt {
 
@@ -208,6 +209,27 @@ private:
 };
 // 防布局回归断言（16 字节不变：desc 8B + allocSize 4B + mark_flags 1B + flags 1B + pad 2B）
 static_assert(sizeof(GcObject) == 16, "GcObject layout changed");
+
+// ============================================================
+// GcViewSlot — 视图值槽判定 traits（feature-07 Step 2）
+//
+// 捕获槽进 desc 有效指针字段的三态判据：
+//   - GC 指针槽：std::is_convertible_v<VT, GcObject*>          → 计入，偏移取槽偏移
+//   - 视图值槽：!is_convertible_v && GcViewSlot<VT>::value     → 计入，偏移取槽偏移 + sizeof(void*)
+//               （接口/迭代器视图值 {fnPtr, self}，self 裸指针须由 GC 追踪/重写）
+//   - 普通值槽：两者皆 false                                   → 不计入
+//
+// ⚠️ 必须用 void_t SFINAE 形态（审查 P1 实测，scripts/probe_f07_viewslot_decltype.cpp）：
+//   裸 `decltype(VT{}.self)` 对值槽（int32_t/double）**不在 SFINAE 立即上下文**，是硬
+//    编译错误而非替换失败；本 traits 对无 self 成员的类型安全落入 false 特化。
+//   G2：判据含类型可转换性（非仅成员存在性）——"含 self 但 self 非 GcObject*"的类型
+//    （如 self 为指针的普通结构）安全返回 false。
+// ============================================================
+template <typename T, typename = void>
+struct GcViewSlot : std::false_type {};
+template <typename T>
+struct GcViewSlot<T, std::void_t<decltype(std::declval<T&>().self)>>
+    : std::is_convertible<decltype(std::declval<T&>().self), GcObject*> {};
 
 // ============================================================
 // GcString — 前向声明，完整定义见 builtin/string.h

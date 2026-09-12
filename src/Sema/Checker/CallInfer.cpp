@@ -36,6 +36,14 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e,
             // 暂不检查参数/返回值（跳过）
             return fst->returnType ? fst->returnType->clone() : NoneSemType::make();
         }
+        // feature-06（阶段 C）：非标识符 Callable 值调用（all[0](1) 等）——三态派生
+        if (auto* cs = dynamic_cast<const CallableSemType*>(calleeType.get()))
+            return inferCallableCall(e, *cs, expected, "<callable>");
+        // C4d：非标识符 functor record 值调用（数组元素等）→ invoke 方法降级
+        if (auto* rs = dynamic_cast<const RecordSemType*>(calleeType.get())) {
+            if (findRecordMethod(rs->canonicalName, "invoke"))
+                return inferFunctorCall(e, *rs, "<callable>");
+        }
         error(*e.callee, "callee is not a function type");
         return ErrorSemType::make();
     }
@@ -281,6 +289,21 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e,
     }
     // Variable / Parameter 但类型是函数类型 → 可作为函数调用
     if (sym->kind == SymKind::Variable || sym->kind == SymKind::Parameter) {
+        // feature-06（阶段 C）：Callable 变量调用（c(1)）——三态派生 + 期望回流。
+        // callee->inferredType 挂 CallableSemType（CodeGen erased 调用信号/拆箱依据）
+        if (auto* cs = dynamic_cast<const CallableSemType*>(sym->type.get())) {
+            typeStore_.push_back(sym->type->clone());
+            const_cast<Identifier&>(*callee).inferredType = typeStore_.back().get();
+            return inferCallableCall(e, *cs, expected, callee->name);
+        }
+        // C4d：functor record 变量调用（a(5) → invoke 方法降级；inferredType 供 CodeGen）
+        if (auto* rs = dynamic_cast<const RecordSemType*>(sym->type.get())) {
+            if (findRecordMethod(rs->canonicalName, "invoke")) {
+                typeStore_.push_back(sym->type->clone());
+                const_cast<Identifier&>(*callee).inferredType = typeStore_.back().get();
+                return inferFunctorCall(e, *rs, callee->name);
+            }
+        }
         if (auto* fst = dynamic_cast<const FuncSemType*>(sym->type.get())) {
             checkThrowsContext(e, callee->name, fst->throws);
             std::vector<const SemType*> formalTypes;
@@ -312,6 +335,100 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e,
 
     error(*e.callee, "undefined function '" + callee->name + "'");
     return ErrorSemType::make();
+}
+
+std::unique_ptr<SemType> SemAnalyzer::inferCallableCall(
+    const CallExpr& e, const CallableSemType& cs,
+    const SemType* expected, const std::string& calleeName) {
+    // erased（无溯源）：期望回流（动态性封闭在单次调用内——运行时 adapt 校验兜底）
+    if (cs.erased()) {
+        if (!expected) {
+            error(e, "cannot infer result of erased 'Callable' call; "
+                     "annotate the variable or use a 'fun(A)->R' signature");
+            return ErrorSemType::make();
+        }
+        // 实参类型推断（CodeGen GcRootHandle/CallArg 打包依赖 inferredType）
+        for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
+        return expected->clone();
+    }
+    if (cs.origins.size() == 1) {
+        // 单一签名：完全静态（参数逐个检查——checkCallArgs 复用）
+        const FuncSemType& sig = *cs.origins[0];
+        checkThrowsContext(e, calleeName, sig.throws);
+        std::vector<const SemType*> formalTypes;
+        for (auto& pt : sig.paramTypes) formalTypes.push_back(pt.get());
+        std::map<std::string, std::unique_ptr<SemType>> genericMap;
+        checkCallArgs(e, calleeName, "callable", formalTypes, e.args, genericMap, 0);
+        return sig.returnType ? sig.returnType->clone() : NoneSemType::make();
+    }
+    // union：实参须与某签名兼容（编译期），返回类型并集去重
+    for (auto& arg : e.args) if (arg) (void)inferExpr(*arg);
+    std::vector<std::unique_ptr<SemType>> rets;
+    bool anyOk = false;
+    std::string cands;
+    for (size_t k = 0; k < cs.origins.size(); ++k) {
+        auto& os = cs.origins[k];
+        if (!os) continue;
+        if (k > 0) cands += " | ";
+        cands += os->toString();
+        const FuncSemType& sig = *os;
+        if (e.args.size() != sig.paramTypes.size()) continue;
+        bool ok = true;
+        for (size_t i = 0; i < e.args.size() && ok; ++i) {
+            // record 字面量实参需带期望反推（无精确签名上下文）→ 不参与静态匹配
+            if (!e.args[i] || !e.args[i]->inferredType || isRecordLiteralArg(*e.args[i])) {
+                ok = false; break;
+            }
+            if (!isAssignable(*sig.paramTypes[i], *e.args[i]->inferredType)) ok = false;
+        }
+        if (!ok) continue;
+        anyOk = true;
+        if (sig.returnType) {
+            bool dup = false;
+            for (auto& r : rets)
+                if (r && r->equals(*sig.returnType)) { dup = true; break; }
+            if (!dup) rets.push_back(sig.returnType->clone());
+        }
+    }
+    if (!anyOk) {
+        error(e, "callable holds one of [" + cands
+                 + "]; no variant accepts the given arguments");
+        return ErrorSemType::make();
+    }
+    if (rets.empty()) return NoneSemType::make();
+    if (rets.size() == 1) return std::move(rets[0]);
+    // 多返回类型无法静态拆箱（erased 边界运行时只返回单一 CallArg）
+    error(e, "callable union call may return multiple distinct types; "
+             "narrow to a single 'fun(A)->R' signature");
+    return ErrorSemType::make();
+}
+
+std::unique_ptr<SemType> SemAnalyzer::inferFunctorCall(
+    const CallExpr& e, const RecordSemType& rec, const std::string& calleeName) {
+    auto* m = findRecordMethod(rec.canonicalName, "invoke");
+    if (!m) {
+        error(e, "record type '" + rec.toString() + "' has no callable 'invoke' method");
+        return ErrorSemType::make();
+    }
+    checkThrowsContext(e, calleeName, m->throws);
+    std::vector<const SemType*> formalTypes;
+    for (auto& pt : m->paramTypes) formalTypes.push_back(pt.get());
+    std::map<std::string, std::unique_ptr<SemType>> genericMap;
+    checkCallArgs(e, calleeName, "function", formalTypes, e.args, genericMap, 0);
+    auto result = m->returnType ? m->returnType->clone() : NoneSemType::make();
+    // 泛型 record 实例（canonicalName 含 '<'）：返回类型中 receiver 泛型实参代换
+    //（对齐 inferMethodCall record 分支 L595-599）
+    auto lt = rec.canonicalName.find('<');
+    if (lt != std::string::npos) {
+        auto recTypeArgs = extractTypeArgsFromCanonicalName(rec.canonicalName);
+        auto* recSym = symtab_.lookup(rec.canonicalName.substr(0, lt));
+        if (recSym && !recSym->typeParams.empty()) {
+            for (size_t k = 0; k < recSym->typeParams.size() && k < recTypeArgs.size(); ++k)
+                if (recTypeArgs[k])
+                    result = substitute(*result, recSym->typeParams[k], *recTypeArgs[k]);
+        }
+    }
+    return result;
 }
 
 std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {

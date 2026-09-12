@@ -10,8 +10,11 @@ namespace Aura {
 class CodeGenerator::CoroScanner {
 public:
     explicit CoroScanner(const std::set<std::string>& coroFns, bool ioSync = false,
-                         bool skipClosureBody = false)
-        : coroFns_(coroFns), ioSync_(ioSync), skipClosureBody_(skipClosureBody) {}
+                         bool skipClosureBody = false,
+                         const std::set<std::string>* closureTaskVars = nullptr,
+                         const std::set<std::string>* coroClosureNames = nullptr)
+        : coroFns_(coroFns), ioSync_(ioSync), skipClosureBody_(skipClosureBody),
+          closureTaskVars_(closureTaskVars), coroClosureNames_(coroClosureNames) {}
 
     // 统一入口：自动区分 Stmt/Expr
     bool scan(const ASTNode& node) {
@@ -216,6 +219,11 @@ private:
         if (auto* call = dynamic_cast<const CallExpr*>(&expr)) {
             if (auto* id = dynamic_cast<const Identifier*>(call->callee.get())) {
                 if (coroFns_.count(id->name)) return true;
+                // bug-78：调用协程闭包变量（task 形态 closureTaskVars_ / 旧路径
+                // coroClosureNames_）同样是挂起点——闭包体内 d(...) 会生成 co_await
+                // invoke，外层闭包须判为协程，否则 co_await 落非协程 __invoke → 坏 C++。
+                if (closureTaskVars_ && closureTaskVars_->count(id->name)) return true;
+                if (coroClosureNames_ && coroClosureNames_->count(id->name)) return true;
             }
         }
         return false;
@@ -224,6 +232,8 @@ private:
     const std::set<std::string>& coroFns_;
     bool ioSync_ = false;
     bool skipClosureBody_ = false;
+    const std::set<std::string>* closureTaskVars_ = nullptr;   // bug-78（可空）
+    const std::set<std::string>* coroClosureNames_ = nullptr;  // bug-78（可空）
 };
 
 // ============================================================
@@ -258,6 +268,19 @@ CoroDecision CodeGenerator::decideCoro(const MethodDecl& decl) {
     if (scanner.scan(*decl.body))
         return CoroDecision::Coroutine;
     return CoroDecision::Plain;
+}
+
+// bug-78：闭包体「是否含挂起点」判定（genFunExpr 的 closureIsCoro 用）。
+// 复用 CoroScanner（与具名函数/方法同源判据），并注入闭包侧信号集：
+//   - closureTaskVars_ / coroClosureNames_：调用其它协程闭包（co_await d(...)）
+//   - channel send/receive、io.async 方法：纯挂起表达式（体内无 io.xxx 语句）
+//   - 嵌套 FunExpr 穿透：外层闭包体内定义的协程闭包，其挂起点传播至外层
+//     （CoroScanner::visit(FunExpr) 已递归扫描闭包体）
+// 与旧 IoDetector（仅识别语句级 io.xxx MethodCallExpr）相比，消除全部漏判面。
+bool CodeGenerator::closureBodyIsCoro(const BlockStmt& body) {
+    CoroScanner scanner(coroutineFunctions_, ioSync_, /*skipClosureBody=*/false,
+                        &closureTaskVars_, &coroClosureNames_);
+    return scanner.scan(body);
 }
 
 } // namespace Aura

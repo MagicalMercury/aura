@@ -99,6 +99,8 @@ GcHeap::ThreadRootList* GcHeap::ensureThreadRootList() {
     return list;
 }
 
+
+
 void GcHeap::releaseThreadRootList() {
     if (!tl_roots_) return;
     // 注：调用前应保证该线程所有 GcRootHandle 已析构（链表应为空）

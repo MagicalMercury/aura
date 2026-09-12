@@ -271,6 +271,12 @@ private:
             // 不是堆类型，用户不能直接声明
             {"RWMutexReadView",  {"RWMutexReadView",  false, false, BuiltinPrim::Other, "aura_rt::RWMutex::ReadGuard"}},
             {"RWMutexWriteView", {"RWMutexWriteView", false, false, BuiltinPrim::Other, "aura_rt::RWMutex::WriteGuard"}},
+            // feature-06（阶段 C）：裸 Callable（origins 溯源签名集的 erased 边界）。
+            // C++ 形态 = aura_rt::CallableErased*（GC 堆包装，desc 追踪被包装对象；
+            // isHeap=true 使 let/实参按堆保护）。Sema 侧 semTypeFromAuraName 特判为
+            // CallableSemType（非 GenericSemType）；CodeGen mapNamedType 经 findType
+            // 命中本条目输出 CallableErased*。
+            {"Callable", {"Callable", true, true, BuiltinPrim::Other, "aura_rt::CallableErased*"}},
         };
 
         // ============================================================

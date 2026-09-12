@@ -192,7 +192,9 @@ std::string cppNameOfTypeExpr(const TypeExpr* te) {
         bool hasHeap = false;
         for (auto& v : u->types)
             if (v && unionVariantHasHeap(v.get())) { hasHeap = true; break; }
-        std::string result = hasHeap ? "aura_rt::Variant<" : "std::variant<";
+        // feature-05：全值联合弃用 std::variant → aura_rt::ValueVariant 值语义
+        // （与 TypeMap::mapType / mapSemType 生成形态一致，消除 resolvedName 分裂）
+        std::string result = hasHeap ? "aura_rt::Variant<" : "aura_rt::ValueVariant<";
         for (size_t i = 0; i < u->types.size(); ++i) {
             if (i > 0) result += ", ";
             result += u->types[i] ? unionVariantCppName(u->types[i].get()) : "void";

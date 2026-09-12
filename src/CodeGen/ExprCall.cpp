@@ -268,6 +268,41 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
     if (auto* id = dynamic_cast<const Identifier*>(e.callee.get()))
         calleeName = id->name;
 
+    // feature-06（阶段 C）：erased/union 调用——callee 为 CallableErased 值
+    //（Callable 变量 / [Callable] 元素索引等）。信号：Identifier 变量 C++ 类型为
+    // CallableErased*（gcRootTypes_），或非 Identifier callee 的 inferredType 为
+    // CallableSemType。参数按实参自身类型打包进 CallArg，返回按 e.inferredType 拆箱。
+    // Sema 已静态检查（C4a 三态：erased 期望回流/单签名/union 匹配）→ 此处只生成。
+    bool erasedCallee = false;
+    const CallableSemType* erasedCalleeTy = nullptr;
+    // 信号 1：Sema 已挂 callee->inferredType = CallableSemType（Callable 变量/参数/
+    // [Callable] 元素索引等——inferCall 三态分支统一设置）
+    if (e.callee && e.callee->inferredType) {
+        if (auto* cs = dynamic_cast<const CallableSemType*>(e.callee->inferredType)) {
+            erasedCallee = true;
+            erasedCalleeTy = cs;
+        }
+    }
+    // 信号 2：Identifier 变量 C++ 类型为 CallableErased*（根化类型表；形参 decltype
+    // 形态不匹配时由信号 1 兜底）
+    if (!erasedCallee && !calleeName.empty() && calleeVarIsErased(calleeName)) {
+        erasedCallee = true;
+        if (e.callee && e.callee->inferredType)
+            erasedCalleeTy = dynamic_cast<const CallableSemType*>(e.callee->inferredType);
+    }
+    if (erasedCallee) {
+        (void)erasedCalleeTy;
+        std::string calleeExpr = genExpr(*e.callee, isCoroutine);
+        std::vector<std::pair<std::string, std::string>> a;
+        for (auto& arg : e.args) {
+            std::string cppTy = (arg && arg->inferredType)
+                ? mapSemType(*arg->inferredType) : "";
+            if (cppTy == "auto" || cppTy == "/* unknown_semtype */") cppTy = "";
+            a.emplace_back(arg ? genExpr(*arg, isCoroutine) : "???", cppTy);
+        }
+        return genErasedInvoke(calleeExpr, a, e.inferredType);
+    }
+
     // channel 构造函数特殊处理：channel(cap) → new Channel<T>(cap)
     if (calleeName == "channel") {
         std::string targ = expectedTemplateArgs_.empty() ? "int32_t" : expectedTemplateArgs_[0];
@@ -431,8 +466,13 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
 
     bool needAwait = false;
     if (isCoroutine && !isCtor) {
+        // feature-07 Step 4（B1）：新路径协程闭包变量（task 形态 CallableObj）以
+        // closureTaskVars_ 为 needAwait 信号源。⚠️ 必须用 calleeName（裸标识符名，L267-269）
+        // 而非 calleeExpr：根化变量的 calleeExpr == "c.get()"，与登记键
+        // safeName(decl.name) == "c" 恒不命中（复审 P5）。
         needAwait = coroutineFunctions_.count(calleeExpr) > 0
-                 || coroClosureNames_.count(calleeExpr) > 0;
+                 || coroClosureNames_.count(calleeExpr) > 0
+                 || (!calleeName.empty() && closureTaskVars_.count(calleeName) > 0);
     }
 
     // 接口参数自动包装（双源：具体 record → 适配器；闭包 → IfaceFunc；接口变量 → 透传）
@@ -479,15 +519,13 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
                               "  }()";
                         viewArgTypes[i] = makeIfaceViewMarker(ifaceName);
                     } else if (dynamic_cast<const FuncSemType*>(argTy)) {
-                        // 闭包 → XFunc GC 化：值拷贝 std::function 后 gcConstruct 分配适配器
-                        // （func 捕获的 GcRootHandle 为全局根 ValueGlobal，alloc 期间安全；
-                        //   finalizer 析构 func，见 genInterfaceDecl XFunc）
-                        arg = "[&]() -> auto {\n"
-                              "    auto _cf = (" + arg + ");\n"
-                              "    auto* _cd = aura_rt::gcConstruct<" + ifaceName + "Func>"
-                              "(&" + ifaceName + "Func::desc(), std::move(_cf));\n"
-                              "    return " + ifaceName + "Func::view(_cd);\n"
-                              "  }()";
+                        // feature-06（B3c）：闭包实现接口（CallableObj 派生，捕获槽
+                        // desc 追踪）→ <iface>Func::view() 基指针接线（fnAdapter 经
+                        // invoke 槽转发；视图 self 即闭包对象，捕获 GC 可见）。旧
+                        // std::function 值拷贝 + gcConstruct 分配适配器路径退役
+                        //（旧 XFunc desc 0 捕获盲区机制性消除）。
+                        arg = "[&]() -> auto { return " + ifaceName
+                              + "Func::view((" + arg + ")); }()";
                         viewArgTypes[i] = makeIfaceViewMarker(ifaceName);
                     }
                     // 其余（inferredType 缺失/非闭包的视图变量等，如闭包内捕获的
@@ -499,20 +537,17 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
                 }
             }
         }
-        // 回调参数：包装裸 lambda 为 std::function
+        // feature-06（阶段 B）：回调形参（fnCallbackParams_ 消费点，B2d）——闭包实参
+        // 已是 CallableObj 派生/基指针（genFunExpr 新路径产物，签名具体或含外层模板
+        // 参数），形参为 CallableObj<T,T>* 时 g++ 从实参静态类型直接推导 T——
+        // 旧 std::function<...>(lambda) 包装退役（bug-07 双分支机制单路径化）。
+        // 表保留：仍需标记哪些形参是函数类型（注释性 + 兼容查询）。
         if (cbIt != fnCallbackParams_.end()) {
             for (auto& [idx, ftStr] : cbIt->second) {
                 if (idx == i) {
-                    // 泛型函数调用点：ftStr 含未绑定泛型变量（如 std::function<T(T)>），
-                    // 非泛型调用点无 T 作用域 → 编译失败。改用实参推断的具体 FuncSemType
-                    // 生成 std::function 类型（双向推断已将 T 代换为具体类型）；
-                    // 实参仍含泛型（调用点在泛型作用域内，T 在作用域）时保持原 ftStr。
-                    std::string wrapType = ftStr;
-                    if (auto* fst = dynamic_cast<const FuncSemType*>(e.args[i]->inferredType);
-                        fst && semTypeIsConcrete(fst)) {
-                        wrapType = mapSemType(*fst);
-                    }
-                    arg = wrapType + "(" + arg + ")";
+                    // 旧路径闭包（泛型/协程等，lambda 值）无法向 CallableObj 形参推导，
+                    // 保持透传（Sema 已按具体签名检查；此类形态阶段 C 再评估）。
+                    (void)ftStr;
                     break;
                 }
             }
@@ -545,6 +580,14 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
                 for (auto& [g, cpp] : fnCallMat)
                     if (containsBareToken(pCpp, g)) { boxable = false; break; }
             }
+            // feature-06（阶段 C）：CallableErased* 形参（裸 Callable）——函数形态实参
+            // 包装为 CallableErased（值拷贝直接透传：Callable 值 inferredType 分支）
+            if (boxable && pCpp == "aura_rt::CallableErased*") {
+                if (e.args[i] && e.args[i]->inferredType
+                    && !dynamic_cast<const CallableSemType*>(e.args[i]->inferredType))
+                    arg = genErasedInitValue(*e.args[i], nullptr);
+                boxable = false;   // 已包装为 Erased 值，跳过 Optional/Union 装箱
+            }
             if (boxable) {
                 std::string boxed = genParamBoxing(pCpp, *e.args[i], isCoroutine);
                 if (!boxed.empty()) arg = boxed;
@@ -571,6 +614,9 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
             if (fit->second[k] && dynamic_cast<const FunExpr*>(fit->second[k])) {
                 hasFunDefault = true; break;
             }
+        // feature-06（阶段 B）：默认实参闭包物化映射生效期间 genFunExpr 新路径直接
+        // 产出 CallableObj 基指针（具体签名），形参推导由 g++ 从实参类型完成——
+        // 旧 std::function<...>(lambda) 包装删除（B2d 单路径）。
         std::map<std::string, std::string> savedMat;
         if (hasFunDefault) {
             collectDefaultArgGenericMap(calleeName, e.args, materialized);
@@ -579,37 +625,183 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
                 defaultArgMaterializedTypes_ = materialized;
             }
         }
-        // fnCallbackParams_ 注册的回调形参索引（默认实参闭包须按物化类型包装 std::function）
-        auto cbIt = fnCallbackParams_.find(calleeName);
         for (size_t k = e.args.size(); k < fit->second.size(); ++k) {
             if (!fit->second[k]) continue;
-            std::string arg = genExpr(*fit->second[k], isCoroutine);
-            if (!materialized.empty() && cbIt != fnCallbackParams_.end()) {
-                for (auto& [idx, ftStr] : cbIt->second) {
-                    if (idx == k) {
-                        // 物化映射生效期间 mapType 输出 std::function<int32_t(int32_t)>
-                        // （回调形参类型含裸泛型名 T，mapType 递归物化）
-                        const TypeExpr* ft = (k < fnParamTypeExprs_[calleeName].size())
-                            ? fnParamTypeExprs_[calleeName][k] : nullptr;
-                        std::string wrapType = ft ? mapType(*ft) : ftStr;
-                        arg = wrapType + "(" + arg + ")";
-                        break;
-                    }
-                }
-            }
-            argExprs.push_back(arg);
+            argExprs.push_back(genExpr(*fit->second[k], isCoroutine));
         }
         if (!materialized.empty()) defaultArgMaterializedTypes_ = savedMat;
     }
 
-    std::string prefix = needAwait ? "co_await " : "";
-    std::ostringstream oss;
-    oss << prefix << calleeExpr << targs << "(";
-    for (size_t i = 0; i < argExprs.size(); ++i) {
-        if (i > 0) oss << ", ";
-        oss << "{" << i << "}";
+    // feature-06（B3a）：函数值调用判别——CallableObj 值须经 __invoke 槽接线
+    // （f.get()->invoke(f.get(), args...)），具名函数/内建/协程闭包/ctor 保持直呼。
+    // 判别信号：calleeExpr 为 GcRootHandle 解引用（.get() 尾缀，FunctionType 值变量/
+    // 形参均经 isHeapSemType/GC 指针判定被根化）且非具名函数/内建/协程闭包名；
+    // 或 callee 名注册在 callableObjVars_（函数类型形参 / for-in 元素——feature-06
+    // 形参注册：未 handle 化的 CallableObj 指针形参裸名直呼须 invoke 化）；
+    // 或 calleeExpr 为 CallableObj 闭包捕获槽（__c->cap_f，捕获函数值槽——body 内
+    // 直呼捕获的函数值须 invoke 槽接线）。
+    // bug-79 A 方案：闭包槽访问前缀由 "__c->cap_" 改为 "__c_h.get()->cap_"（句柄 Value
+    // 模式自持 val_，compact 后恒最新）；同时兼容旧前缀（旧 lambda 路径/未迁移生成源）
+    bool calleeIsClosureSlot = calleeExpr.rfind("__c_h.get()->cap_", 0) == 0
+        || calleeExpr.rfind("__c->cap_", 0) == 0;
+    // bug-74：非 Identifier callee 但静态类型为函数值——数组/容器元素取出的函数值
+    // （arr[0](x)，callee 为 IndexExpr，Sema inferIndexExpr 返回列表元素类型
+    // FuncSemType）。此前该形态不被任何判据覆盖（calleeName 为空、calleeExpr 无
+    // ".get()" 尾缀、非闭包槽）→ 落直呼分支生成 `(*arr.get())[0](x)` 坏 C++。
+    // 判别用 Sema 已挂的 callee->inferredType（FuncSemType，排除含未绑定泛型的
+    // 形态——泛型闭包值不产出具体 CallableObj 指针）。
+    bool calleeIsElementAccess = !isCtor && calleeName.empty() && e.callee
+        && e.callee->inferredType
+        && dynamic_cast<const FuncSemType*>(e.callee->inferredType) != nullptr
+        && !funcTypeHasOwnUnboundGeneric(
+               static_cast<const FuncSemType*>(e.callee->inferredType));
+    bool isFunValueCall = !isCtor && !calleeName.empty()
+        && !declaredFunNames_.count(calleeName)
+        && !BuiltinRegistry::get().hasFunctionName(calleeName)
+        && !coroClosureNames_.count(calleeName)
+        && ((calleeExpr.size() >= 6
+             && calleeExpr.compare(calleeExpr.size() - 6, 6, ".get()") == 0)
+            || callableObjVars_.count(calleeName)
+            || calleeIsClosureSlot);
+    // 元素取出的函数值与上述「裸名/句柄」形态同走 invoke 接线
+    isFunValueCall = isFunValueCall || calleeIsElementAccess;
+
+    // feature-06（B3a）：旧路径泛型闭包值（auto 模板 lambda，如 make_mapper 返回的
+    // mapper）形参以 F&& 承载函数值——调用点须把 CallableObj 实参包成可调用转发
+    // lambda（F&& 推导为 lambda 才可被旧路径闭包体直呼；根句柄捕获保活 GC 安全）。
+    // 判别：callee 为普通标识符（非具名函数/内建/协程/根化 CallableObj/新路径闭包）。
+    bool calleeIsOldPathLambdaValue = !isCtor && !calleeName.empty()
+        && !declaredFunNames_.count(calleeName)
+        && !BuiltinRegistry::get().hasFunctionName(calleeName)
+        && !coroClosureNames_.count(calleeName)
+        && !(calleeExpr.size() >= 6
+             && calleeExpr.compare(calleeExpr.size() - 6, 6, ".get()") == 0)
+        && !callableObjVars_.count(calleeName)
+        && calleeExpr.rfind("[&]() -> aura_rt::CallableObj<", 0) != 0;
+    std::set<size_t> noHeapArgIdx;   // 已包成 lambda 的实参（非堆，跳过 GcRootHandle）
+    if (calleeIsOldPathLambdaValue) {
+        for (size_t i = 0; i < argExprs.size() && i < e.args.size(); ++i) {
+            const SemType* aty = e.args[i]->inferredType;
+            if (!aty || !dynamic_cast<const FuncSemType*>(aty)) continue;
+            auto* fst = dynamic_cast<const FuncSemType*>(aty);
+            if (!fst || !semTypeIsConcrete(fst)) continue;
+            const std::string& a = argExprs[i];
+            bool aIsNewClosure = a.rfind("[&]() -> aura_rt::CallableObj<", 0) == 0;
+            bool aIsRooted = a.size() >= 6
+                && a.compare(a.size() - 6, 6, ".get()") == 0;
+            if (!aIsNewClosure && !aIsRooted) continue;
+            if (a.size() >= 1 && a[0] == '[' && !aIsNewClosure) continue;   // 旧路径 lambda 透传
+            std::string cbTy = mapSemType(*fst);
+            std::string ret = fst->returnType ? mapSemType(*fst->returnType) : "void";
+            std::string ps, as;
+            for (size_t pi = 0; pi < fst->paramTypes.size(); ++pi) {
+                if (pi > 0) ps += ", ";
+                if (pi > 0) as += ", ";
+                ps += (fst->paramTypes[pi] ? mapSemType(*fst->paramTypes[pi]) : "auto")
+                    + " a" + std::to_string(pi);
+                as += "a" + std::to_string(pi);
+            }
+            argExprs[i] = "[h = aura_rt::GcRootHandle<" + cbTy + ">(" + a
+                + ", aura_rt::GcRootScope::Global)](" + ps + ") -> " + ret
+                + " { return h.get()->invoke(h.get()" + (as.empty() ? "" : ", " + as) + "); }";
+            noHeapArgIdx.insert(i);
+        }
     }
-    oss << ")";
+
+    std::string prefix = needAwait ? "co_await " : "";
+    // feature-06（阶段 C）：functor record 变量调用（a(5) → record->invoke(args)，
+    // C4d）。判别：callee 为根化 record 值（Sema 已挂 inferredType=RecordSemType，
+    // 且 record 必有 invoke——无 invoke 的 record 变量调用已被 Sema 拦截）。
+    bool isRecordFunctorCall = !isCtor && !calleeName.empty()
+        && !declaredFunNames_.count(calleeName)
+        && !BuiltinRegistry::get().hasFunctionName(calleeName)
+        && !coroClosureNames_.count(calleeName)
+        && e.callee && e.callee->inferredType
+        && dynamic_cast<const RecordSemType*>(e.callee->inferredType) != nullptr;
+    // feature-07 Step 3（G6 双读窗口加固，change.md §8 风险表第 9 行）：
+    // `callee->invoke(callee, args)` 的 callee 被读两次，C++17 [expr.call]/8 规定
+    // postfix-expression（此处即 callee 左操作数）先于实参求值。若实参表达式含
+    // GC 触发点（gc_force()/intern_string/装箱/调用返回堆值等），callee 的裸指针
+    // 快照可能在 compact 搬移后悬垂 -> UAF。加固策略：实参先物化为 IIFE 局部
+    // （求值完成后不再有 GC 触发点），callee 的取值延后到全部实参求值之后并只做
+    // 一次（`_cbN`），其两次使用之间无任何 GC 触发点。
+    // 两条路径的覆盖：实参含堆类型时由 genGcRootedArgs 的物化 IIFE 天然满足
+    // （实参局部先定义、callee 在 return 中求值）；实参全非堆类型时 genGcRootedArgs
+    // 不生成 IIFE（直接字符串替换），故此处就地生成守卫 IIFE。
+    bool calleeGuardEmitted = false;
+    const std::string coAwaitKw = "co_await ";
+    std::ostringstream oss;
+    // bug-74：元素取出的函数值（`(*arr.get())[i]`）表达式含下标运算，若沿用下方
+    // 「calleeExpr 代入两次」的 invoke 形态会**求值两次**（一次算下标、一次再算），
+    // 既重复副作用也浪费——强制走守卫 IIFE（`_cbN` 单次物化，实参先求值、callee
+    // 后求值且只求值一次）。空实参同样走守卫（原条件 `!argExprs.empty()` 会漏）。
+    bool forceCalleeGuard = calleeIsElementAccess;
+    if ((isFunValueCall || isRecordFunctorCall) && (!argExprs.empty() || forceCalleeGuard)) {
+        bool anyHeapArg = false;
+        for (size_t i = 0; i < argExprs.size(); ++i) {
+            const SemType* ty = nullptr;
+            auto vit = viewArgTypes.find(i);
+            if (vit != viewArgTypes.end()) ty = vit->second.get();
+            else if (i < e.args.size()) ty = e.args[i]->inferredType;
+            if (isHeapSemType(ty) && !isIfaceView(ty)) { anyHeapArg = true; break; }
+        }
+        if (!anyHeapArg || forceCalleeGuard) {
+            const int hid = calleeGuardCounter_++;
+            calleeGuardEmitted = true;
+            // 单表达式形态（可嵌入 co_return / let / 实参等任意表达式位置）：
+            // 实参作为 lambda 调用实参在**调用点**先求值，callee 在 lambda 体内
+            // 求值 —— C++20 [expr.call] 保证实参先于函数体执行，故 callee 的取值
+            // 必然晚于全部实参求值；callee 只求值一次（`_cbN`），其两次使用之间
+            // 无任何 GC 触发点。co_await 实参留在调用点（协程函数体内），不进入
+            // lambda 体的「推导返回类型」上下文（规避 C++20 co_await 限制）。
+            // invoke 形态：isFunValueCall 为 `_cb->invoke(_cb, args...)`
+            //（self 由首个实参提供）；isRecordFunctorCall 为 `_cb->invoke(args...)`
+            //（record 成员 invoke，self 隐含）。
+            oss << prefix << "[&](auto&&... _as) -> auto { auto* _cb" << hid
+                << " = (" << calleeExpr << "); return _cb" << hid << "->invoke(";
+            if (!isRecordFunctorCall) oss << "_cb" << hid;
+            // feature-07 Step 3 (G6): the IIFE takes one parameter pack `auto&&... _as`,
+            // so invoke must receive ONE tail pack expansion `static_cast<decltype(_as)>(_as)...`
+            // (the trailing `...` expands it element-wise). Emitting one identical
+            // expansion per argument was correct only for N==1; for N>=2 it produced N
+            // copies of the same pack name -> ill-formed C++.
+            if (!isRecordFunctorCall) oss << ", ";
+            oss << "static_cast<decltype(_as)>(_as)";
+            oss << "...); }(";
+            for (size_t i = 0; i < argExprs.size(); ++i)
+                oss << (i > 0 ? ", " : "") << argExprs[i];
+            oss << ")";
+        }
+    }
+    if (calleeGuardEmitted) {
+        // 已就地生成（实参全非堆，无需 GcRootHandle 保护）
+        return oss.str();
+    }
+    if (isRecordFunctorCall) {
+        // record 成员 invoke 直调（self 隐含；receiver 由 calleeExpr 句柄 .get() 提供）
+        oss << prefix << calleeExpr << "->invoke(";
+        for (size_t i = 0; i < argExprs.size(); ++i) {
+            if (i > 0) oss << ", ";
+            oss << "{" << i << "}";
+        }
+        oss << ")";
+    } else if (isFunValueCall) {
+        // B3a：CallableObj 值调用——invoke 槽直调（self 两次代入同一句柄解引用，
+        // 根句柄在调用窗口内保持对象存活/重写，跨 gc_force 安全）
+        oss << prefix << calleeExpr << "->invoke(" << calleeExpr;
+        for (size_t i = 0; i < argExprs.size(); ++i) {
+            oss << ", ";
+            oss << "{" << i << "}";
+        }
+        oss << ")";
+    } else {
+        oss << prefix << calleeExpr << targs << "(";
+        for (size_t i = 0; i < argExprs.size(); ++i) {
+            if (i > 0) oss << ", ";
+            oss << "{" << i << "}";
+        }
+        oss << ")";
+    }
     std::string callExpr = oss.str();
 
     // 有堆类型参数 → GcRootHandle 保护（含构造函数调用、补齐的默认实参）
@@ -620,6 +812,8 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
             auto vit = viewArgTypes.find(i);
             if (vit != viewArgTypes.end()) {
                 ty = vit->second.get();   // G3：record→view 转换后的实参按视图类型
+            } else if (noHeapArgIdx.count(i)) {
+                ty = nullptr;   // feature-06：已包成转发 lambda 的实参（非堆，自持全局根）
             } else if (i < e.args.size()) {
                 ty = e.args[i]->inferredType;
             } else if (isCtor) {
@@ -638,7 +832,13 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
 
     // 无堆类型参数 → 直接生成
     std::ostringstream oss2;
-    oss2 << prefix << calleeExpr << targs << "(";
+    if (isRecordFunctorCall) {
+        oss2 << prefix << calleeExpr << "->invoke(";
+    } else if (isFunValueCall) {
+        oss2 << prefix << calleeExpr << "->invoke(" << calleeExpr;
+    } else {
+        oss2 << prefix << calleeExpr << targs << "(";
+    }
     for (size_t i = 0; i < argExprs.size(); ++i) {
         if (i > 0) oss2 << ", ";
         oss2 << argExprs[i];

@@ -806,7 +806,8 @@ TEST(SemaGenerics, MethodReturnTypeReceiverSubstUnannotatedLetOk) {
         "   let fs = r.getTransforms()"
         " }", diag);
     EXPECT_FALSE(diag.hasErrors());
-    EXPECT_CONTAINS(unit.impl, "Array<std::function<int32_t(int32_t)>>* fs_raw");
+    // 无泄漏 T（物化为 int32_t）；列表元素为 CallableObj 指针（feature-06）
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Array<aura_rt::CallableObj<int32_t, int32_t>*>* fs_raw");
 }
 
 TEST(SemaGenerics, MethodReturnTypeReceiverSubstNestedReceiverOk) {
@@ -992,4 +993,67 @@ TEST(SemaGenerics, GenericRecordLiteralNoTypeArgsError) {
         diag);
     EXPECT_TRUE(diag.hasErrors());
     EXPECT_TRUE(hasErrorContaining(diag, "generic type 'Box' requires type arguments"));
+}
+
+// ============================================================
+// bug-58（2026-09-05 批次 15）：泛型方法体混合列表收紧——elemType 为顶层裸泛型形参
+// （GenericSemType resolvedName 空）时 isAssignable 恒 true（设计"实例化时再检查"但
+// Aura 无实例化重校验）→ [self.val, "str-elem"]（T=int）放行 → Array<int> append
+// (GcString*) 坏 C++。方向 1：后续元素须为同一未绑定形参才放行（与非泛型 [1,"s"]
+// mismatch 同源同文案）；[T, T] 同形两元素放行（#29 多元素逐元素保护路径不误伤）。
+// ============================================================
+TEST(SemaGenerics, GenericMethodMixedListTIntRejected) {
+    // 主线：[self.val, "str-elem"]（val: T 未绑定，T=int 实例化）→ 干净报错（修复前坏 C++）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { val: T }"
+        " fun (self Box<T>) collect() -> int { let arr = [self.val, \"s\"]; return arr.len() }"
+        " fun main(io: Io) { let b: Box<int> = { val = 7 }; let r = b.collect(); io.println(str(r)) }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "list element type mismatch"));
+}
+
+TEST(SemaGenerics, GenericMethodSameTListAccepted) {
+    // 对照：[self.val, self.other]（同一未绑定形参两元素）→ 放行（多元素列表合法路径）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { val: T, other: T }"
+        " fun (self Box<T>) collect() -> int { let arr = [self.val, self.other]; return arr.len() }"
+        " fun main(io: Io) { let b: Box<int> = { val = 7, other = 8 }; io.println(str(b.collect())) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// bug-67（2026-09-06 批次 15 同族延伸）：#58 顶层收紧不扩递归的嵌套残留洞——
+// 嵌套混合 [[self.val], [self.s]]（元素 1=[T]、元素 2=[string]，T=int）顶层
+// elemType=[T]（ListSemType 非裸泛型）不触发 #58 顶层判定 → isAssignable List 递归
+//（内层 T 未绑定 target 恒 true）放行 → 实例化 Array<Array<int>*> append
+// (Array<GcString*>*) 坏 C++。修复：收紧判定扩展至 elemType 含未绑定泛型
+//（containsUnboundGenericParam 递归），后续元素须与 elemType「结构同形 + 未绑定
+// 泛型位置同名」（sameShapeWithUnbound：[[T],[T]] 放行、[[T],[string]] 拒）；具体
+// 类型嵌套 [[int],[int]] 与单元素 [[T]] 走原路径不受影响。
+// ============================================================
+TEST(SemaGenerics, NestedGenericMixedListRejected) {
+    // 主线：[[self.val], [self.s]]（val: T、s: string，T=int 实例化）→ 干净报错（修复前坏 C++）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { val: T, s: string }"
+        " fun (self Box<T>) collect() -> int { let arr = [[self.val], [self.s]]; return arr.len() }"
+        " fun main(io: Io) { let b: Box<int> = { val = 7, s = \"x\" }; io.println(str(b.collect())) }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "list element type mismatch"));
+}
+
+TEST(SemaGenerics, NestedSameTListAccepted) {
+    // 对照：[[self.val], [self.other]]（同一未绑定形参的同形嵌套两元素）→ 放行
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "type Box<T> = { val: T, other: T }"
+        " fun (self Box<T>) collect() -> int { let arr = [[self.val], [self.other]]; return arr.len() }"
+        " fun main(io: Io) { let b: Box<int> = { val = 7, other = 8 }; io.println(str(b.collect())) }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
 }

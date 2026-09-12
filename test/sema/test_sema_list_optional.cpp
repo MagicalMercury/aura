@@ -194,7 +194,7 @@ TEST(SemaListOptional, PlainRecordListNotAffected) {
 }
 
 // ============================================================
-// 回归：E `[int|None] = [1,2]`（全值 union → std::variant，不误伤）
+// 回归：E `[int|None] = [1,2]`（全值 union → ValueVariant，feature-05，不误伤）
 // ============================================================
 TEST(SemaListOptional, IntUnionNoneNotAffected) {
     Aura::DiagnosticEngine diag;
@@ -206,7 +206,7 @@ TEST(SemaListOptional, IntUnionNoneNotAffected) {
     auto unit = compileSource(
         std::string(kMain) + " let e: [int|None] = [1,2] }", diag2);
     EXPECT_FALSE(diag2.hasErrors());
-    EXPECT_CONTAINS(unit.impl, "std::variant<int32_t, aura_rt::NoneType>");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::ValueVariant<int32_t, aura_rt::NoneType>");
 }
 
 // ============================================================

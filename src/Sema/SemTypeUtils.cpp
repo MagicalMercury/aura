@@ -95,6 +95,10 @@ std::unique_ptr<SemType> replaceGenericRef(const SemType& type,
 } // namespace
 
 std::unique_ptr<SemType> SemAnalyzer::semTypeFromAuraName(const std::string& name) const {
+    // feature-06（阶段 C）：裸 Callable 标注 → CallableSemType（erased 契约——标注即
+    // 擦除，origins 由赋值/传播点维护）。先于 BuiltinRegistry 通用 GenericSemType
+    // 占位路径（registry 条目仍用于 CodeGen mapNamedType 输出 C++ 名 CallableErased*）。
+    if (name == "Callable") return std::make_unique<CallableSemType>();
     // 先查 BuiltinRegistry：基础类型 → Prim；其他内置类型 → GenericSemType 占位
     if (auto* ti = BuiltinRegistry::get().findType(name)) {
         switch (ti->primKind) {
@@ -246,6 +250,10 @@ std::string SemAnalyzer::semTypeToCppName(const SemType& t) const {
         }
     }
     if (dynamic_cast<const NoneSemType*>(&t)) return "aura_rt::NoneType";
+    // feature-06（阶段 C）：CallableSemType → aura_rt::CallableErased*（与 CodeGen
+    // mapSemType 分支一致；供嵌套容器 C++ 名拼接（如 [Callable] 列表元素/实参名））
+    if (dynamic_cast<const CallableSemType*>(&t))
+        return "aura_rt::CallableErased*";
     if (auto* l = dynamic_cast<const ListSemType*>(&t))
         return "aura_rt::Array<" + semTypeToCppName(*l->elementType) + ">*";
     // 函数值（std::function 值类型，无尾 *）：与 CodeGen mapSemType 的 FuncSemType
@@ -491,6 +499,98 @@ std::unique_ptr<SemType> SemAnalyzer::semTypeFromBuiltinReturn(
         }
     }
     return ErrorSemType::make();
+}
+
+// ============================================================
+// feature-06（阶段 C）：origins 溯源签名集辅助
+// ============================================================
+std::vector<std::shared_ptr<const FuncSemType>>
+SemAnalyzer::originsOf(const SemType& t) {
+    std::vector<std::shared_ptr<const FuncSemType>> r;
+    if (auto* f = dynamic_cast<const FuncSemType*>(&t)) {
+        // 函数签名值 → 单元素 origins（clone 自持——签名可能是临时推断类型）
+        r.push_back(std::shared_ptr<const FuncSemType>(
+            static_cast<const FuncSemType*>(f->clone().release())));
+        return r;
+    }
+    if (auto* c = dynamic_cast<const CallableSemType*>(&t)) {
+        r = c->origins;   // shared_ptr 拷贝（共享不可变签名）
+        return r;
+    }
+    return r;   // 其余类型 → 空（非可调用值）
+}
+
+void SemAnalyzer::joinOrigins(
+    std::vector<std::shared_ptr<const FuncSemType>>& dst,
+    const std::vector<std::shared_ptr<const FuncSemType>>& src) {
+    for (auto& o : src) {
+        if (!o) continue;
+        bool dup = false;
+        for (auto& d : dst)
+            if (d && d->equals(*o)) { dup = true; break; }
+        if (!dup) dst.push_back(o);
+    }
+}
+
+const InterfaceSemType::MethodSig* SemAnalyzer::findRecordMethod(
+    const std::string& canonicalName, const std::string& methodName) const {
+    auto findIn = [&](const std::map<std::string,
+                     std::vector<InterfaceSemType::MethodSig>>& tbl,
+                     const std::string& key)
+        -> const std::vector<InterfaceSemType::MethodSig>* {
+        auto it = tbl.find(key);
+        return it != tbl.end() ? &it->second : nullptr;
+    };
+    // canonicalName 先全名（typeMethods_ 本模块 / importedMethods_ 跨模块导入），
+    // 泛型 record 物化实例名（如 "Stack<int32_t>"）按基名回退查找
+    const std::vector<InterfaceSemType::MethodSig>* methods =
+        findIn(typeMethods_, canonicalName);
+    if (!methods) methods = findIn(importedMethods_, canonicalName);
+    if (!methods) {
+        auto lt = canonicalName.find('<');
+        if (lt != std::string::npos) {
+            std::string base = canonicalName.substr(0, lt);
+            methods = findIn(typeMethods_, base);
+            if (!methods) methods = findIn(importedMethods_, base);
+        }
+    }
+    if (!methods) return nullptr;
+    for (auto& m : *methods)
+        if (m.name == methodName) return &m;
+    return nullptr;
+}
+
+std::vector<std::shared_ptr<const FuncSemType>>
+SemAnalyzer::callableOriginsFromType(const SemType& initTy) const {
+    // 函数签名值 → 单签名（未绑定泛型无法静态生成 C++ 包装 → 剔除落 erased）
+    if (auto* f = dynamic_cast<const FuncSemType*>(&initTy)) {
+        if (containsUnboundGenericParam(f)) return {};
+        return originsOf(initTy);
+    }
+    // Callable 值拷贝 → 沿用其 origins（erased 保持 erased）
+    if (auto* c = dynamic_cast<const CallableSemType*>(&initTy)) {
+        if (c->erased()) return {};
+        std::vector<std::shared_ptr<const FuncSemType>> r;
+        for (auto& o : c->origins)
+            if (o && !containsUnboundGenericParam(o.get())) r.push_back(o);
+        return r;
+    }
+    // functor record → invoke 方法签名（Assignability (d) 放行的可赋形态）
+    if (auto* rs = dynamic_cast<const RecordSemType*>(&initTy)) {
+        if (auto* m = findRecordMethod(rs->canonicalName, "invoke")) {
+            auto fs = std::make_shared<FuncSemType>();
+            for (auto& pt : m->paramTypes)
+                fs->paramTypes.push_back(pt ? pt->clone() : nullptr);
+            fs->returnType = m->returnType ? m->returnType->clone() : NoneSemType::make();
+            fs->throws = m->throws;
+            if (containsUnboundGenericParam(fs.get())) return {};   // 泛型 functor v1 不支持
+            std::vector<std::shared_ptr<const FuncSemType>> r;
+            r.push_back(std::move(fs));
+            return r;
+        }
+        return {};
+    }
+    return {};
 }
 
 } // namespace Aura
