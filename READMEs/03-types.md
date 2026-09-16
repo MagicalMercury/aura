@@ -233,7 +233,7 @@ let callback: fun() -> None = fun() {
 callback()                       // 调用
 ```
 
-> **运行时表示与语义**（feature-06）：`fun(A...) -> R` 类型的值运行时为 **GC 堆对象 `CallableObj`**（C++ 侧 `aura_rt::CallableObj<R, A...>*`），与 record/string 同为 GC 托管：闭包捕获槽注册进对象 desc（与 record 字段同构），`mark_sweep` / `compact` 自动追踪/重写捕获指针——**拷贝语义 = 引用语义**（`let g = f` 复制句柄指针，原/副本调用一致；GC 压实后双引用仍有效）。
+> **运行时表示与语义**（feature-06；feature-07 补全各形态）：`fun(A...) -> R` 类型的值运行时为 **GC 堆对象 `CallableObj`**（C++ 侧 `aura_rt::CallableObj<R, A...>*`），与 record/string 同为 GC 托管：闭包捕获槽注册进对象 desc（与 record 字段同构），`mark_sweep` / `compact` 自动追踪/重写捕获指针——**拷贝语义 = 引用语义**（`let g = f` 复制句柄指针，原/副本调用一致；GC 压实后双引用仍有效）。
 >
 > 函数名、闭包字面量、方法值（`p.next`）、构造器引用（`let k = Point`）都可赋给函数类型变量：
 >
@@ -243,6 +243,18 @@ callback()                       // 调用
 > let h: fun() -> int = p.next             // 方法值一等化（绑定 receiver）
 > let k: fun(int, int) -> Point = Point    // 构造器引用
 > ```
+>
+> **feature-07 起，以下形态同样统一为 `CallableObj`**（运行时表示不再有分叉）：
+>
+> | 形态 | 承载类型 | 说明 |
+> |---|---|---|
+> | 递归闭包 | `CallableObj<R, A...>` | 自引用槽（分配后回填），**可逃逸**（见 §5.3.1） |
+> | 捕获视图值（迭代器等） | `CallableObj<R, A...>` | 视图槽，`self` 按子偏移扫描 |
+> | `fun` 类型形参 | `CallableObj<R, A...>*` 直接承载 | 免 `F&&` 转发包装；先物化 callee 再求值实参 |
+> | **协程闭包** | `CallableObj<task<R>, A...>` | `__invoke` 返回 `task<R>`，调用点 `await`（见 §5.6） |
+>
+> **保留边界**（有意设计，非遗漏）：闭包自身泛型（`genericParams` / `returnOnlyGenerics`）与
+> 接口默认方法 receiver 仍打印为 C++ 模板 lambda；对用户**语义一致**（见 §5.7）。
 
 **裸 `Callable` 类型**（feature-06，第 3 层擦除边界）：
 

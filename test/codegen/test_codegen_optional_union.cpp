@@ -1194,3 +1194,35 @@ TEST(CodeGen, NonUnionFieldAccessUnchanged) {
     EXPECT_CONTAINS(unit.impl, "->y");
     EXPECT_NOT_CONTAINS(unit.impl, "_fa_v");
 }
+
+// ============================================================
+// bug-77（2026-09-13）：Union 方法调用接收者求值窗口加固
+// ============================================================
+
+TEST(CodeGen, UnionMethodCallReceiverEvalWindowHardened) {
+    // bug-77：`recv.method(<触发 GC 的实参>)` 旧形态先绑定裸接收者再求值实参
+    // （C++17 [expr.call]/8：后缀表达式先于实参求值）→ 实参触发 GC/compact 后
+    // 接收者悬垂。加固同 G6：实参经 `auto&&... _as` 包在调用点先求值，接收者
+    // 在 lambda 体内绑定并经 GcRootHandle 根化，全部访问走 `.get()` 重取。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "interface Greetable { greet(other: string) -> string }\n"
+        " type Person = { name: string }\n"
+        " fun (self Person impl Greetable) greet(other: string) -> string"
+        " { return self.name + other }\n"
+        " fun mkstr(s: string) -> string { return s + \"!\" }\n"
+        " fun main(io: Io) throws { let p: Greetable | None = Person { name = \"A\" }"
+        " io.println(p.greet(mkstr(\"x\"))) }\n",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 加固形态：参数包 + 接收者在体内绑定并根化
+    EXPECT_CONTAINS(unit.impl, "[&](auto&&... _as) -> ");
+    EXPECT_CONTAINS(unit.impl,
+        "aura_rt::GcRootHandle<std::remove_reference_t<decltype(_dsp_v0)>>"
+        " _dsp_h0(_dsp_v0, aura_rt::GcRootScope::ThreadLocal);");
+    EXPECT_CONTAINS(unit.impl, "_dsp_h0.get()->index() != 0");
+    EXPECT_CONTAINS(unit.impl,
+        "_dsp_h0.get()->get<0>().greet(static_cast<decltype(_as)>(_as)...)");
+    // negative：接收者不再是无根裸引用（旧形态 `auto&& _dsp_v = (obj);` 后直接调方法）
+    EXPECT_NOT_CONTAINS(unit.impl, "_dsp_v->get<0>().greet(");
+}

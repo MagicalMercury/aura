@@ -117,13 +117,13 @@ CompileUnit CodeGenerator::generate(const Program& program,
     }
 
     // 适配器生成需遍历的接口集合 = 用户接口 + 内置接口（interfaces.aurai：Stringer/Comparable/Iterator）
-    std::vector<const InterfaceDecl*> allIfaces;
+    allIfaces_.clear();
     for (auto& d : program.decls) {
         if (auto* i = dynamic_cast<const InterfaceDecl*>(d.get()))
-            allIfaces.push_back(i);
+            allIfaces_.push_back(i);
     }
     for (auto& i : BuiltinRegistry::get().auraiInterfaces())
-        allIfaces.push_back(i.get());
+        allIfaces_.push_back(i.get());
 
     // 第二遍：协程判定（固定点迭代，bug-02）
     // decideCoro 单调：直接挂起点（io.xxx 异步 / channel send-receive）或调用已标协程者
@@ -151,6 +151,26 @@ CompileUnit CodeGenerator::generate(const Program& program,
                 if (decideCoro(*m) == CoroDecision::Coroutine) {
                     // 方法键 = "ReceiverType.methodName"（与 methodDefaultArgs_/methodParamCppTypes_
                     // 同键格式）：避免同名方法跨不同 receiver 互相污染协程判定。
+                    coroutineFunctions_.insert(key);
+                    changed = true;
+                }
+            }
+        }
+        // feature-12 批次 3 · 5.1b（2026-09-16）：接口默认方法协程登记。
+        // 接口默认方法在视图 struct 内生成成员函数，体内若含 sync/spawn
+        // （生成产物含 co_await）→ 必须协程化（返回 aura_rt::task<R>），
+        // 否则非协程函数内 co_await → 坏 C++。
+        // 键格式与调用点（ExprMethodCall 的 recvTypeKey 推导）、声明侧
+        //（methodDefaultArgs_/methodParamCppTypes_ 的 "接口名.methodName"）同源。
+        // 登记后才能向外传染：实现方（record impl）体内调用该视图方法时
+        // 本身也被标协程 → 调用点才会加 co_await 解包。
+        for (auto* iface : allIfaces_) {
+            if (!iface) continue;
+            for (auto& im : iface->methods) {
+                if (!im.defaultBody) continue;
+                std::string key = iface->name + "." + im.name;
+                if (coroutineFunctions_.count(key)) continue;
+                if (decideCoro(*im.defaultBody)) {
                     coroutineFunctions_.insert(key);
                     changed = true;
                 }
@@ -263,6 +283,13 @@ CompileUnit CodeGenerator::generate(const Program& program,
     for (auto& i : BuiltinRegistry::get().auraiInterfaces())
         genInterfaceDecl(header, *i);
 
+    // feature-12 批次 1（方案 F）：泛型闭包 struct 的 header 插入点——
+    // 这里已经过“类型/接口声明”且命名空间已打开、函数声明/定义
+    // 尚未写入。闭包 struct 必须落在【函数定义之前】（否则
+    // 函数内 return [&]() -> __GcUClosure_N* ... 引用未声明类型）。
+    const size_t closureSplicePos = header.tellp() >= 0
+        ? static_cast<size_t>(header.tellp()) : 0;
+
     // 第三遍 A：先生成所有声明（避免前向引用问题）
     for (auto& d : program.decls) {
         if (!d) continue;
@@ -272,7 +299,7 @@ CompileUnit CodeGenerator::generate(const Program& program,
 
     // 接口适配器收尾（第三遍 A 之后）：为所有 record × 接口组合生成适配器——
     // 此时所有 record struct 已完整定义，适配器内联方法体可安全解引用 record 方法
-    for (auto* i : allIfaces) {
+    for (auto* i : allIfaces_) {
         for (auto& [rec, ifaces] : interfaceImplementations_) {
             if (!ifaces.count(i->name)) continue;
             std::string key = rec + i->name;
@@ -307,6 +334,27 @@ CompileUnit CodeGenerator::generate(const Program& program,
                 unit.footer = footerStream.str();
                 break;
             }
+        }
+    }
+
+    // feature-12 批次 1（方案 F）：泛型闭包的文件作用域 struct 定义落盘
+    //（必须在 impl 使用点之前——它们是 B 遍生成函数体时收集的）
+    // 位置：插入 header 的 closureSplicePos（函数声明/定义之前）。
+    { 
+        std::string hstr = header.str();
+        header.str(std::string());
+        header.seekp(0);
+        std::string block;
+        {
+            std::ostringstream tmp;
+            flushClosureHeader(tmp);
+            block = tmp.str();
+        }
+        if (!block.empty()) {
+            size_t pos = closureSplicePos <= hstr.size() ? closureSplicePos : hstr.size();
+            header << hstr.substr(0, pos) << block << hstr.substr(pos);
+        } else {
+            header << hstr;
         }
     }
 
@@ -376,6 +424,19 @@ void CodeGenerator::flushHoistPrefix(std::ostream& os) {
         os << line << '\n';
     }
     hoistPrefixPending_.clear();
+}
+
+// feature-12 批次 1（方案 F）：把闭包 struct 定义写入 header（文件作用域）。
+// 调用时机：unit.header = header.str() 之前、命名空间已打开、B 遍已跑完。
+// 拼接顺序：closureHeaderStack_ 里每层是「该层收集到的定义（子先父后已就序）」，
+//           按栈序（外层在前）拼接即可——因为每层内部已保证子定义在其之前。
+void CodeGenerator::flushClosureHeader(std::ostream& header) {
+        if (closureHeaderStream_.empty()) return;
+    header << "\n    // ==== feature-12：泛型闭包（多态值形态）文件作用域定义 ====\n";
+    header << closureHeaderStream_;
+    if (closureHeaderStream_.back() != '\n') header << '\n';
+    closureHeaderStream_.clear();
+    closureHeaderStack_.clear();
 }
 
 std::string CodeGenerator::indentStr() const {

@@ -251,16 +251,52 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
         if (retType == "aura_rt::NoneType") retType = "void";   // #33：接口方法 None→void（对齐 genMethodDecl M1）
         if (m.defaultBody) {
             // 默认方法：体内 Aura 代码（self.xxx(...)）经 genBlock 翻译为 this->xxx(...)
-            h << "  " << retType << " " << m.name << "(";
+            // feature-12 批次 3 · 5.1b（2026-09-16）：**接口默认方法体内 sync 合法化**。
+            // 接口默认方法在视图 struct 内是普通成员函数（非协程），但 `sync` 的产物含
+            // `co_await _sync.wait_all()` → 非协程函数里非法（g++ 报 "unable to find the
+            // promise type"）。故按与具名函数/方法**同源**的 CoroScanner 判据决定是否
+            // 协程化：含 sync/spawn 挂起点 → 签名改 `aura_rt::task<R>`，体内 return 变
+            // co_return，调用点 co_await 解包（登记见 CodeGen.cpp 的固定点迭代）。
+            bool ifaceCoro = decideCoro(*m.defaultBody);
+            std::string retTypeActual = ifaceCoro ? ("aura_rt::task<" + retType + ">") : retType;
+            h << "  " << retTypeActual << " " << m.name << "(";
             for (size_t i = 0; i < m.params.size(); ++i) {
                 if (i > 0) h << ", ";
                 h << (m.params[i].type ? mapType(*m.params[i].type) : "auto")
                   << " " << safeName(m.params[i].name);
             }
             h << ") {\n";
+            // feature-12 批次 3（5.1）：接口默认方法 receiver 迁移。
+            // 接口视图 this 是【栈上值类型】{fnPtr, self}，不能作 `T*` 指针槽
+            //（闭包逃逸即悬垂）。故：
+            //   ① 生成本地视图副本 + ViewRoot（self 经 GcRootHandle 保活/重定位）；
+            //   ② 设 currentReceiverCppType_ = 接口名（裸名/泛型裸名，见 TypeMap
+            //      isIfaceViewTypeName 的 `in<` 前缀判定），使闭包分流走 CallableObj
+            //      路径、cap_recv 走【视图值槽】（槽按值存整个视图，desc 复合偏移
+            //      + sizeof(void*) 追踪 self）；
+            //   ③ 设 currentMethodThisHandle_ 指向 ViewRoot，与 receiverThisSourceExpr()
+            //      同源（恒产出 `_self_root.get()` —— 视图值语义，非指针）。
+            // ⚠️ ViewRoot 声明在方法体最外层作用域（与 genMethodDecl 的 `_this` 同级）。
+            std::string selfViewVar = "self_view_" + m.name;
+            h << "  " << name << " " << selfViewVar << " = *this;\n";
+            h << "  aura_rt::ViewRoot<" << name << "> _self_root(" << selfViewVar << ");\n";
+            // 视图副本经 ViewRoot 持有：this->xxx 直调改走 _self_root.get().xxx
+            //（genIdentifier 的 receiver 分支按 currentMethodThisHandle_ 产出
+            //  `_self_root.get()`；成员函数调用路径同源见 receiverThisSourceExpr）
+            std::string savedRecvType = currentReceiverCppType_;
+            std::string savedThisHandle = currentMethodThisHandle_;
+            std::string savedRecvName = currentReceiverName_;
             currentReceiverName_ = "self";
-            genBlock(h, *m.defaultBody, /*isCoroutine=*/false);
-            currentReceiverName_.clear();
+            currentReceiverCppType_ = name;
+            currentMethodThisHandle_ = "_self_root";
+            viewRootVarNames_.insert("self");
+            viewRootTypes_["self"] = name;
+            genBlock(h, *m.defaultBody, /*isCoroutine=*/ifaceCoro);
+            currentReceiverName_ = savedRecvName;
+            currentReceiverCppType_ = savedRecvType;
+            currentMethodThisHandle_ = savedThisHandle;
+            viewRootVarNames_.erase("self");
+            viewRootTypes_.erase("self");
             // 清理方法体生成残留的变量跟踪状态（与 genMethodDecl 末尾一致）
             clearVarTrackingState();
             h << "  }\n";

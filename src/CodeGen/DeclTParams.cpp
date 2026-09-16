@@ -83,15 +83,33 @@ void CodeGenerator::collectTParams(const TypeExpr& type, std::set<std::string>& 
     }
 }
 
+
+// feature-12 bug-82: 仅收集「形参类型本身是 FunctionType 时其内部 <> 引入的函数级泛型名」。
+// 与 collectTParams 的区别：
+//   make_adder(inc: <T>)                 -> 形参类型是【裸 GenericTypeRef】-> 不收集（闭包自身泛型）
+//   make_tree_mapper(f: fun(<T>) -> <U>) -> 形参类型是【FunctionType】，其内部泛型 -> 收集
+// 实现：仅当形参类型动态类型是 FunctionType 时，对其 paramTypes/returnType 跑 collectTParams。
+// 注意：collectTParams 对 FunctionType 本身就会递归（L78-83），故此判定落在形参类型的
+//       【动态类型】上，而不是 collectTParams 的递归里。
+void CodeGenerator::collectFnTypeNestedGenerics(
+        const TypeExpr& type, std::set<std::string>& out) const {
+    if (auto* fn = dynamic_cast<const FunctionType*>(&type)) {
+        for (auto& p : fn->paramTypes)
+            if (p) collectTParams(*p, out);
+        if (fn->returnType) collectTParams(*fn->returnType, out);
+    }
+}
+
 std::vector<std::string> CodeGenerator::collectFunTParams(const FunDecl& decl) const {
     std::set<std::string> names;
 
     // plan12 统一方案：若返回泛型闭包，外层函数不模板化，泛型由闭包自身声明
     if (decl.returnType) {
         std::set<std::string> retGen;
+        bool retIsGenericFunc = false;
         if (auto* ft = dynamic_cast<const FunctionType*>(decl.returnType.get())) {
             collectTParams(*ft, retGen);
-            if (!retGen.empty()) return {}; // 泛型闭包 → 不模板化
+            retIsGenericFunc = !retGen.empty();
         } else if (auto* nt = dynamic_cast<const NamedType*>(decl.returnType.get())) {
             // 仅函数式类型别名（如 Pipeline<T> = fun(T)->T，非堆类型）跳过模板化
             // 堆类型（如 Tree<T>）保持模板参数
@@ -99,6 +117,18 @@ std::vector<std::string> CodeGenerator::collectFunTParams(const FunDecl& decl) c
             if (typeAliasTemplateParams_.count(nt->name)
                 && it != registeredTypes_.end() && !it->second)  // registered as non-heap
                 return {};
+        }
+        // bug-82：返回泛型函数类型时，若这些泛型名由形参的【函数类型】内部 <> 引入
+        // （函数级泛型）-> 必须模板化，不可早退。反之（闭包自身泛型，如 makeU /
+        // make_adder 的形参顶层 <T>）-> 保持原早退行为。
+        if (retIsGenericFunc) {
+            std::set<std::string> fnNestedGen;
+            for (auto& p : decl.params)
+                if (p.type) collectFnTypeNestedGenerics(*p.type, fnNestedGen);
+            bool needTemplatize = false;
+            for (auto& g : retGen)
+                if (fnNestedGen.count(g)) { needTemplatize = true; break; }
+            if (!needTemplatize) return {};   // 闭包自身泛型 -> 原行为
         }
     }
 

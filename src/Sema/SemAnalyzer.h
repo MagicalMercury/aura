@@ -50,6 +50,9 @@ public:
 private:
     // ============ 错误记录 ============
     void error(const ASTNode& node, const std::string& msg);
+    // 兼容 DiagnosticEngine 的同名带 hint 形态（无错误码 + 修复提示；
+    // 用于联合类型收窄等"信息完整但缺指引"的诊断，输出附 "= help: ..." 行）
+    void error(const ASTNode& node, const std::string& msg, const std::string& hint);
     void error(const ASTNode& node, DiagCode code, const std::string& msg, const std::string& hint = "");
     void error(int line, int col, const std::string& msg);
     void error(int line, int col, DiagCode code, const std::string& msg, const std::string& hint = "");

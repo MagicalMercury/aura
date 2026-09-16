@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "../AST/ASTNode.h"
 #include "../AST/Expr.h"
@@ -140,6 +140,12 @@ public:
     // -- 协程判定入口 --
     [[nodiscard]] CoroDecision decideCoro(const FunDecl& decl);
     [[nodiscard]] CoroDecision decideCoro(const MethodDecl& decl);
+    // feature-12 批次 3 · 5.1b：接口默认方法体协程判定（体内含 sync/spawn → 须协程化）
+    [[nodiscard]] bool decideCoro(const BlockStmt& body);
+    // feature-12 批次 3 · 5.1b：按方法名反查接口名（纯虚/默认方法）。
+    // 用于调用点判定「接口视图接收者的方法是否为协程」（inferredType 缺失时的
+    // 同源兜底；键格式 = "接口名.方法名"，与 coroutineFunctions_ 登记键一致）。
+    [[nodiscard]] std::string ifaceNameForMethod(const std::string& methodName) const;
     // bug-78：闭包体挂起点扫描入口——复用 CoroScanner（io.async / channel send|receive /
     // 协程函数与协程闭包调用 / 嵌套闭包穿透），替代原 IoDetector 的「仅 io.xxx 语句」
     // 启发式，消除「调用其它协程闭包」「纯挂起表达式（无 io.xxx）」两类漏判。
@@ -276,6 +282,11 @@ private:
 
     // 递归扫描类型表达式，收集所有泛型引用名（GenericTypeRef + NamedType.typeArgs）
     void collectTParams(const TypeExpr& type, std::set<std::string>& out) const;
+
+    // feature-12 bug-82: 仅收集「形参类型本身是 FunctionType 时其内部 <> 引入的函数级泛型名」
+    // （区别于 collectTParams 会递归进 FunctionType 内部）。
+    void collectFnTypeNestedGenerics(const TypeExpr& type, std::set<std::string>& out) const;
+
     // M3：调用点补默认参数闭包物化——从「函数形参类型表达式 + 调用点实参 SemType」
     // 推导函数模板泛型绑定（泛型名 → 具体 C++ 类型），供 genFunExpr 生成普通 lambda。
     // 如 useT(inc:<T>, v:T) 调用 useT(5,10) → T → "int32_t"。currentTParams_ 中的外层
@@ -370,6 +381,11 @@ private:
     //   - 接口视图（InterfaceSemType：Stringer/Comparable/用户接口）
     // 视图不能被 GcRootHandle<View> 包裹（视图非指针，模板参数不成立）
     [[nodiscard]] bool isIfaceView(const SemType* t) const;
+
+    // feature-12 批次 3（5.1）：当前 receiver 映射是否产出【视图值】（接口默认方法
+    // 的栈上视图副本，成员访问用 `.`）而非 GC 指针（record 方法，用 `->`）。
+    // 与 genIdentifier 的 receiver 分支同源：闭包句柄形态恒为指针。
+    [[nodiscard]] bool receiverMapsToViewValue() const;
     // 联合变体堆封装判定：堆类型 或 视图类型
     // （视图含 self GC 指针，放 std::variant 内部 GC 不可见 → 必须 aura_rt::Variant<T...>* 封装，
     //   descForI 按 self 子偏移扫描；与 isHeapSemType 的"传参包装"语义不同，勿混用）
@@ -490,6 +506,12 @@ private:
     // --- 函数签名 ---
     [[nodiscard]] std::string funSignature(const FunDecl& decl,
                                               const std::vector<std::string>& tparams = {});
+    // feature-12 批次 1（缺陷 B）：扫描函数体是否存在「return <FunExpr>」——用于
+    // 区分「签名降 auto 的函数」是否真的产出 F 产物（泛型闭包字面量）。
+    // 递归进入 BlockStmt/IfStmt/TryCatchStmt/MatchStmt 等语句容器，
+    // 遇到 ReturnStmt 检查其 expr 的动态类型；**不进入嵌套 FunExpr**（内层闭包的
+    // return 属于内层函数，与本函数的返回形态无关）。
+    [[nodiscard]] static bool bodyReturnsFunExpr(const Stmt* s);
     [[nodiscard]] std::string constructorSignature(const MethodDecl& decl,
                                                        const std::vector<std::string>& tparams = {});
 
@@ -717,15 +739,35 @@ private:
     // 复刻原 === 2 段 + 外层模板参数剔除（currentTParams_ / defaultArgMaterializedTypes_）。
     [[nodiscard]] ClosureGenericInfo analyzeClosureGenerics(const FunExpr& e);
 
-    // 「=== 4. 生成 C++ lambda」段——旧路径 lambda 生成主体（逻辑一字未改）。
-    // 输入为前几段算出的捕获/泛型/mutable 等结果；closureIsCoro 为上方 closureBodyIsCoro
-    // 判定的协程形态。返回值即旧 genFunExpr 的后半输出。
-    [[nodiscard]] std::string genOldPathLambda(const FunExpr& e,
-                                               const ClosureCaptureInfo& cap,
-                                               const ClosureGenericInfo& gen,
-                                               bool needsMutable,
-                                               const std::set<std::string>& calledCaptures,
-                                               bool closureIsCoro);
+    // feature-12 批次 3 · 5.2（Q3 单点判据合并，2026-09-16）
+    // **闭包是否属 F 域（genGcUClosure）**——原本分流判据（ExprClosure.cpp 的
+    // isGenericDomain）与 genGcUClosure 入口守卫（ExprClosureOldPath.cpp:450）是同一套
+    // 判据的【两处拷贝】，改动需双改（实测漏改一处，被守卫拦下）。
+    // 现合并为单点，两处共调本函数。
+    //
+    // F 域判据：
+    //   ① 闭包自身泛型非空（gen.genericParams / gen.returnOnlyGenerics）；或
+    //   ② 【形参含未绑定泛型】（方案 D 扩展，2026-09-16）：callableParamIndices 中
+    //      任一形参自身含未绑定泛型 → 该签名无法由 CallableObj 静态承载，须走 F
+    //      （F 用成员函数模板表达，配合「借用参数」处理外层模板参数，见 genGcUClosure）。
+    [[nodiscard]] bool isFClosureDomain(const ClosureGenericInfo& gen,
+                                        const FuncSemType* inferFst);
+
+    // 「=== 4. 生成 C++ 宿主对象」段——feature-12 批次 1：模板 lambda → 具名旧模板 struct。
+    // 语义不变（多态值保留）：类模板参数 = 捕获槽类型（恒具体），闭包自身泛型由
+    // genericParams 驱动的成员函数模板 operator() 承载。
+    // 输入为前几段算出的捕获/泛型/mutable（calledCaptures）等结果；closureIsCoro 为
+    // 上方 closureBodyIsCoro 判定的协程形态。返回值即 genFunExpr 的后半输出。
+    [[nodiscard]] std::string genGcUClosure(const FunExpr& e,
+                                           const ClosureCaptureInfo& cap,
+                                           const ClosureGenericInfo& gen,
+                                           bool needsMutable,
+                                           const std::set<std::string>& calledCaptures,
+                                           bool closureIsCoro);
+    // feature-12 批次 3 · 5.2 收口（2026-09-16）：旧路径 `genOldPathLambda` 已**正式删除**
+    // （415 行）。三类排除形态（接口 receiver / callableParamIndices /
+    // funcTypeHasOwnUnboundGeneric）经批次 2/3 逐域迁出，最后一个形态由方案 D
+    // 「借用参数」迁入 F。删除验证：全量回归零触发 + 产物逐字比对 94/94 一致。
     // feature-06：识别 FuncSemType 是否含"非外层模板提供的未绑定泛型"（闭包自身
     // 泛型形态——旧 lambda 路径值，非 GC 堆 CallableObj）。供 isHeapSemType /
     // useCallableObj 分流判定共用（与 semTypeIsConcrete 互补：本函数只判"残留
@@ -813,6 +855,10 @@ private:
 
     // 当前编译单元中已知的需要协程的函数名
     std::set<std::string> coroutineFunctions_;
+    // feature-12 批次 3 · 5.1b：用户接口 + 内置接口的全集（第二遍协程判定/调用点
+    // 反查共用）。原为 genProgram 局部变量，提升为成员供
+    // ifaceNameForMethod 使用（含 interfaces.aurai 的 Stringer/Comparable/Iterator）。
+    std::vector<const InterfaceDecl*> allIfaces_;
     std::set<std::string> coroClosureNames_;  // let 绑定的协程闭包名
     bool lastClosureIsCoro_ = false;           // genFunExpr → genLetStmt 传递
     // feature-07 Step 4（B1/B2）：CallableObj 新路径协程闭包信号——与 lastClosureIsCoro_
@@ -821,6 +867,58 @@ private:
     //   lastClosureCppBase_  ：新路径闭包基类 C++ 类型（协程 = CallableObj<task<T>, A...>）
     //   closureTaskVars_     ：task 形态闭包变量名（needAwait 信号源，ExprCall L467-471）
     bool lastClosureIsCoroTask_ = false;
+    // feature-12 批次 1（方案 F）：GcUClosure（具名模板 struct）闭包信号。
+    // ⚠️ 2026-09-14（GLM5.3 C′ 方案）：**杀掉顺序依赖机制**——原
+    // `gcUFnRetBases_`（函数名→类型，登记在函数体输出后）+ `gcULetBaseVarName_`
+    // + `lastClosureGcUBase_` 定型用途全部删除，改为 **Sema 判据**
+    //（`funcTypeHasOwnUnboundGeneric(decl.inferredType)` 命中 → F 家族闭包）。
+    // 理由：Sema 先于 CodeGen 全量完成 → 顺序无关 by construction；且该判据为真
+    // ⟺ 值是多态函数值 ⟹ 必然是 F 产物（现状下含自有未绑定泛型的闭包都落泛型域）。
+    // 原机制在跨函数时（`let g = makeU2()` 而 makeU2 尚未生成完）编号错位/查不到。
+    //
+    //   lastClosureIsGcU_   ：genGcUClosure 生成点回填是否为 F 形态（仅字面量路径用）
+    //   lastClosureGcUBase_ ：F 闭包「实例化后」C++ 类型（字面量路径定型用）
+    //   uClosureVars_       ：F 形态闭包变量名（StmtLet 登记；ExprCall genCallExpr
+    //                         据此发射 f.get()->operator()(args)——F 对象无 invoke 槽，
+    //                         绝不可落 isFunValueCall 的 f.get()->invoke(...) 形态）
+    bool lastClosureIsGcU_ = false;
+    std::string lastClosureGcUBase_;
+    std::set<std::string> uClosureVars_;
+    // feature-12 批次 1（方案 F，C′）：F 家族闭包 let 变量名集合（Sema 判据登记）——
+    // 供 genLetStmt 类型推导「第 6 路」识别（与 uClosureVars_ 同源、同一判据登记；
+    // 保留独立集合是为了让类型推导分支与调用形态分支的判据演进解耦）。
+    std::set<std::string> gcULetVarNames_;
+    // feature-12 批次 1（方案 F，C′）：本次 genLetStmt 中需要「decltype 定型根化」的
+    // F 闭包变量名（用 auto <name>_raw = init; GcRootHandle<decltype(<name>_raw)>
+    // 生成——**不依赖任何跨函数类型串**，彻底消除顺序依赖）。
+    std::set<std::string> gcULetDecltypeVars_;
+    // ============================================================
+    // feature-12 批次 1（缺陷 B 修复，2026-09-14 主 Agent 实测裁定）：
+    // 「返回泛型闭包形态」的函数分类表（替代 GLM5.3 的别名展开方案 C″）。
+    //
+    // ⚠️ C″ 已被实测证伪：`decl.inferredType` 在别名形态下**仍是 FuncSemType**
+    //（Sema 已解析别名、泛型已按实参物化，如 retry → `(int) -> int`），
+    // 故「别名展开」无的放矢；真正失明的是 C′ 第二环 funcTypeHasOwnUnboundGeneric
+    //（它判「签名是否还留未绑定泛型」，而 F 产物的标志是「函数体 return 泛型闭包
+    //  字面量」——实现细节，与调用点签名是否具体化无关）。
+    //
+    // 登记时机：funSignature（第三遍 A，**全部声明**阶段，早于 B 遍所有函数体生成）
+    // → 查询点在 StmtLet（B 遍）必命中 → **零生成顺序依赖**（GLM 的核心诉求）。
+    //
+    //   gcUClosureReturningFns_：签名降 auto（isGenClosureRet）**且函数体内有
+    //     「return <FunExpr>」** 的函数名集合 —— 这些函数调用点返回 F 产物
+    //     （__GcUClosure_N<...>*），let 须走 F 登记 + decltype 根化。
+    //   aliasRetTransparentFns_：签名降 auto 但**体内无 FunExpr 返回**（形参透传，
+    //     如 `fun pick(f: Transform<T>) -> Transform<T> { return f }`）——这些函数
+    //     调用点返回的是**形参承载的 CallableObj**（非 F 产物），let 须按
+    //     CallableObj 静态类型根化（mapSemType），不可按 F 处理。
+    //     ⚠️ 实测依据：`pick` 产物为裸 `return f;`（auto），非 __GcUClosure。
+    std::set<std::string> gcUClosureReturningFns_;
+    std::set<std::string> aliasRetTransparentFns_;
+    // F 对象的捕获槽名 → 实例化 C++ 类型。F 闭包体生成期由 genGcUClosure 填充，
+    // 供嵌套调用点判定「捕获的函数值是否为 F 对象」而发射
+    // __c_h.get()->cap_x->operator()(args)（而非 invoke）。
+    std::map<std::string, std::string> currentClosureSlotTypes_;
     // 协程基类型门控：仅协程闭包需绕过 mapSemType（内层签名）
     // 改用 task 签名基类；非协程（含泛型）保持原路径（auto/mapSemType）
     bool lastClosureCppBaseIsCoro_ = false;
@@ -852,6 +950,8 @@ private:
     std::map<std::string, std::string> currentClosureCaptures_;
     // feature-06（阶段 B）：CallableObj 派生闭包类全局递增编号（__closure_N 命名）
     int closureCounter_ = 0;
+    // feature-12 批次 1（方案 F）：__GcUClosure_N 全局递增编号（确定性：按生成顺序）
+    int gcUClosureCounter_ = 0;
 
     // ============================================================
     // feature-06（阶段 C）：裸 Callable（CallableErased）值包装与调用
@@ -891,6 +991,19 @@ private:
     // 从 FuncSemType 映射 "aura_rt::CallableObj<R, A...>*"（sigId 签名串与 target
     // 静态类型共用；与 mapSemType 同源）
     [[nodiscard]] std::string callableObjCppOf(const FuncSemType& sig);
+    // feature-12 批次 2（__MonoWrap 桥，2026-09-15）：F 闭包产物（__GcUClosure_N*）
+    // 无法满足 CallableObj<U,T>* 形参（洞 B）→ 生成桥实例化文本。
+    //   closureExpr：F 闭包产物表达式（指针值；如 "g.get()" 或 IIFE 文本）
+    //   retCpp / paramCpp：期望签名的 C++ 类型串（U / T）
+    // 返回 "aura_rt::make_mono_wrap<std::remove_pointer_t<decltype(EXPR)>, U, T>(EXPR)"。
+    // FCls 用 decltype 表达 → 无需文本解析 F 闭包类型、无需跨函数查表（顺序无关）。
+    [[nodiscard]] std::string genMonoWrap(const std::string& closureExpr,
+                                          const std::string& retCpp,
+                                          const std::string& paramCpp);
+    // feature-12 批次 2：从迭代器/接收者的具体 C++ 类型串剥出模板实参
+    //（"aura_rt::Iterator<int32_t>" → "int32_t"，经 finalizeCppElem 补齐内嵌 record 的 *）。
+    // 取不到（非具体形态/含裸泛型）时返回空串。
+    [[nodiscard]] std::string iteratorElemCppOf(const SemType* iteratorType);
     // erased/union 调用（c(1)）：calleeText 为 Erased 值表达式（句柄内保护）、
     // args 为 (实参文本, 实参 C++ 类型) 对（Ptr 参数额外句柄栈保护）、retTy 为
     // Sema 推断的返回类型（拆箱期望；None→void）。产出 IIFE 表达式。
@@ -940,6 +1053,8 @@ private:
     // 分离，避免扰动既有生成编号（既有单测断言的 _hN_/_aN_ 序号保持稳定）。
     int calleeGuardCounter_ = 0;
     int unionBoxingCounter_ = 0;  // P3b 隐式装箱临时变量名计数器
+    // bug-77：方法调用接收者延后物化（联合分派路径）——GcRootHandle 临时变量名计数器
+    int unionDispatchCounter_ = 0;
 
     // 当前正在生成的函数的协程状态
     bool currentFunctionIsCoroutine_ = false;
@@ -951,6 +1066,28 @@ private:
     std::string hoistPrefixPending_;
     // 将缓冲中的 outer 前缀语句写入输出流并清空
     void flushHoistPrefix(std::ostream& os);
+
+    // ============================================================
+    // feature-12 批次 1（方案 F）：__GcUClosure_N 的【文件作用域】定义缓冲
+    //
+    // 为什么需要它（三层约束，探针 9/10 实证）：
+    //   ① 局部类禁止成员函数模板 → F 的 struct 不能像 CallableObj 那样放 IIFE 内；
+    //   ② struct 的 operator() 函数体 = 闭包体，只有生成「使用它的那个函数」时才产出；
+    //   ③ gcConstruct<T>() 需要完整类型（sizeof + T::desc()）。
+    //
+    // 解法（GLM5.3 提案，header 通道）：
+    //   B 遍生成宿主函数体时，闭包 struct 定义写入本缓冲（per-closure 局部 oss 收集）；
+    //   组装阶段（unit.header = header.str() 之前）按「子先父后」拼接进 header——
+    //   impl 使用点在 header 完整定义之后，直接 gcConstruct<T>(...) 即可，无需工厂函数。
+    //
+    // 与既有 hoistPrefixPending_ 的区别：后者是「函数体内语句前」的语句级提升；
+    //   本缓冲是「文件作用域、函数定义之前」的类型级落盘。
+    // ============================================================
+    std::string closureHeaderStream_;
+    // 当前闭包嵌套深度（用于 per-closure 局部收集与「子先父后」拼接）
+    std::vector<std::string> closureHeaderStack_;
+    // 将闭包 struct 定义写入 header 的类型区之后（组装阶段调用一次）
+    void flushClosureHeader(std::ostream& header);
 
     // #46：当前生成的 C++ 函数/闭包/spawn lambda 作用域是否有名为 io 的变量
     //（io 形参由 CodeGen 按形参名生成，函数/方法入口置位、退出复位；闭包体/spawn

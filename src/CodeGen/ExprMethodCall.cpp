@@ -70,6 +70,7 @@ bool CodeGenerator::isSyncChannelType(const SemType* inferredType,
 }
 
 std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCoroutine) {
+
     // P4：联合接收者动态分派——receiver 是 UnionSemType 时生成运行时类型判定分派
     if (e.object && e.object->inferredType) {
         if (auto* u = dynamic_cast<const UnionSemType*>(e.object->inferredType))
@@ -155,6 +156,47 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
             iArgTypes.push_back(argTy);
         }
         auto typedArg = [&](size_t i) { return i < iArgTypes.size() ? iArgTypes[i] : nullptr; };
+        // feature-12 批次 2（__MonoWrap 桥，2026-09-15）：出口 A —— Iterator 内建特化
+        // 三处（map/filter/Iterator.from）的闭包实参若为 F 产物（__GcUClosure_N*，
+        // 多态 operator()），无法满足运行时 CallableObj<U,T>* 形参（洞 B）→ 包桥。
+        // 判据（实测钉死，见 scripts/f12_batch2_wrap_brief.md §4.4 探针）：
+        //   ① 实参 SemType 为 FuncSemType 且 funcTypeHasOwnUnboundGeneric 为真
+        //      ⟺ 该闭包走 F 路径（genGcUClosure）⟹ 产物必是 __GcUClosure_N*。
+        //      ⚠️ **不可用文本前缀判据**：实测 iArgs[0] 为 "g.get()"（变量形态，
+        //      不含 __GcUClosure_）或 IIFE 文本（不以 __GcUClosure_ 开头）。
+        //   ② T（形参）= 源迭代器元素 C++ 类型（iteratorElemCppOf 从 objTy 的
+        //      已物化 resolvedName 剥出）；取不到则不包（旧路径/报错兜底）。
+        //   ③ U（返回）= 闭包返回类型物化；返回类型为闭包自身泛型名（如 identity
+        //      形态 fun(T)->T）时 U = T。
+        auto monoWrapArg = [&](size_t i, const std::string& expr) -> std::string {
+            const SemType* at = typedArg(i);
+            auto* fst = at ? dynamic_cast<const FuncSemType*>(at) : nullptr;
+            if (!fst || !funcTypeHasOwnUnboundGeneric(fst)) return expr;
+            std::string tCpp = iteratorElemCppOf(e.object->inferredType);
+            if (tCpp.empty()) return expr;
+            std::string uCpp;
+            if (auto* gt = dynamic_cast<const GenericSemType*>(fst->returnType.get())) {
+                // 返回类型 = 闭包自身泛型（未绑定）→ 若是"返回即形参"（identity 形态）
+                // 则 U = T；否则无法静态固化，不包桥（避免产出裸泛型名的坏 C++）。
+                // 形参类型是否为【同一泛型名】（identity 形态 fun(T)->T）：
+                // 比较 GenericSemType::name（toString() 带尖括号 "<T>"，不可用）
+                bool isOwnParam = false;
+                for (auto& p : fst->paramTypes) {
+                    if (!p) continue;
+                    if (auto* pg = dynamic_cast<const GenericSemType*>(p.get()))
+                        if (pg->name == gt->name && pg->resolvedName.empty()) { isOwnParam = true; break; }
+                }
+                if (isOwnParam && !gt->resolvedName.empty()) isOwnParam = false;
+                if (isOwnParam && gt->resolvedName.empty()) uCpp = tCpp;
+            } else if (fst->returnType) {
+                uCpp = mapSemType(*fst->returnType);
+                for (const auto& tp : currentTParams_)
+                    if (uCpp == tp) { uCpp.clear(); break; }
+            }
+            if (uCpp.empty()) return expr;
+            std::string wrapped = genMonoWrap(expr, uCpp, tCpp);
+            return wrapped.empty() ? expr : wrapped;
+        };
         if (e.method == "from" && iArgs.size() == 1) {
             // FuncIter 无自动推导（T 与 F 无关联）：T 从闭包返回类型 Optional<T> 显式提取。
             // A2：显式 `-> Optional<string>` 注解物化为 GenericSemType{name=="Optional"}，
@@ -178,17 +220,20 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
             } else if (elem.empty()) {
                 elem = "int32_t";  // 非 Optional 返回：既有兜底（与 Sema 一致）
             }
-            return "aura_rt::make_iterator_from<" + elem + ">(" + iArgs[0] + ")";
+            return "aura_rt::make_iterator_from<" + elem + ">("
+                + monoWrapArg(0, iArgs[0]) + ")";
         }
         if (e.method == "map" && iArgs.size() == 1) {
-            std::string call = "aura_rt::make_map(" + obj + ", " + iArgs[0] + ")";
+            std::string call = "aura_rt::make_map(" + obj + ", "
+                + monoWrapArg(0, iArgs[0]) + ")";
             std::vector<std::pair<std::string, const SemType*>> gArgs;
             gArgs.emplace_back(obj, e.object->inferredType);
             gArgs.emplace_back(iArgs[0], typedArg(0));
             return genGcRootedArgs(gArgs, call, isCoroutine);
         }
         if (e.method == "filter" && iArgs.size() == 1) {
-            std::string call = "aura_rt::make_filter(" + obj + ", " + iArgs[0] + ")";
+            std::string call = "aura_rt::make_filter(" + obj + ", "
+                + monoWrapArg(0, iArgs[0]) + ")";
             std::vector<std::pair<std::string, const SemType*>> gArgs;
             gArgs.emplace_back(obj, e.object->inferredType);
             gArgs.emplace_back(iArgs[0], typedArg(0));
@@ -329,6 +374,15 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
                     if (lt != std::string::npos) recvKey = recvKey.substr(0, lt);
                 }
             }
+            // feature-12 批次 3 · 5.1b（2026-09-16）：接口视图接收者。
+            // 接口方法调用点（n.get().work()，n: Named）的 receiver inferredType
+            // 就是 InterfaceSemType —— 键 = 接口名，与声明侧
+            //（methodDefaultArgs_/methodParamCppTypes_ 的 "接口名.methodName"）、第二遍
+            // 协程登记（allIfaces_ 同键）同源。record 分支未命中时进入；
+            // record 名与接口名不会重名 → 零误伤。
+            else if (auto* is = dynamic_cast<const InterfaceSemType*>(e.object->inferredType)) {
+                recvKey = is->name;
+            }
         }
         if (!recvKey.empty() && coroutineFunctions_.count(recvKey + "." + e.method))
             needAwait = true;
@@ -372,6 +426,12 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
             if (importNsNames_.count(id->name)) {
                 access = "::";
             } else if (valueTypeVarNames_.count(id->name)) {
+                access = ".";
+            } else if (id->name == currentReceiverName_ && receiverMapsToViewValue()) {
+                // feature-12 批次 3（5.1）：接口默认方法 receiver —— genIdentifier
+                // 产出的是 `_self_root.get()`（栈上视图【值】拷贝），成员访问用 `.`
+                //（视图是值类型，C++ 不允许 ->）。与 genIdentifier 同源判定
+                //（receiverMapsToViewValue：闭包句柄形态恒为指针，此处已排除）。
                 access = ".";
             } else {
                 access = "->";
@@ -567,7 +627,60 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
     if (!isNs && !isNsCtor) {
         if (auto mmIt = methodDefaultArgs_.find(methodDefKey + "." + e.method); mmIt != methodDefaultArgs_.end())
             for (size_t k = e.args.size(); k < mmIt->second.size(); ++k)
-                if (mmIt->second[k]) mArgExprs.push_back(genExpr(*mmIt->second[k], isCoroutine));
+                if (mmIt->second[k]) {
+                    // feature-12 批次 2（__MonoWrap 桥，2026-09-15）：出口 B —— 方法
+                    // 默认参数闭包若走 F 路径（产物含 __GcUClosure_N），而形参期望类型
+                    // 是 CallableObj<U,T>*（单态槽契约）→ 无法直接装载（洞 B）→ 包桥。
+                    // 判据（实测钉死）：① 产物文本含 "__GcUClosure_"（F 产物信号；
+                    //   IIFE 文本以 "[&]() -> __GcUClosure_N* {" 开头，**不可用前缀判据**）；
+                    // ② 形参 C++ 类型（经 instantiateMethodParamCpp 在调用点实例化后）
+                    //   以 "aura_rt::CallableObj<" 开头。二者同时满足才包。
+                    // U/T 从该形参类型串剥出（"CallableObj<U, T>*" → "U"/"T"）。
+                    std::string de = genExpr(*mmIt->second[k], isCoroutine);
+                    bool isFProd = de.find("__GcUClosure_") != std::string::npos;
+                    if (isFProd) {
+                        // 形参 C++ 类型（键与装箱同源：原键优先，fallback 声明件）
+                        std::string pCpp;
+                        auto kIt = methodParamCppTypes_.find(recvTypeKey + "." + e.method);
+                        bool kFb = false;
+                        if (kIt == methodParamCppTypes_.end()) {
+                            kIt = methodParamCppTypes_.find(methodDefKey + "." + e.method);
+                            if (kIt != methodParamCppTypes_.end()) kFb = true;
+                        }
+                        if (kIt != methodParamCppTypes_.end() && k < kIt->second.size()) {
+                            pCpp = kFb ? instantiateMethodParamCpp(methodDefKey, kIt->second[k], recvTypeKey)
+                                       : kIt->second[k];
+                            static const std::string kCb = "aura_rt::CallableObj<";
+                            if (pCpp.rfind(kCb, 0) == 0 && pCpp.size() > kCb.size() + 1
+                                && pCpp.back() == '*') {
+                                // 深度感知分割 "U, T"（逗号在 <...> 内时不切）
+                                std::string inner = pCpp.substr(kCb.size(),
+                                    pCpp.size() - kCb.size() - 2);
+                                std::vector<std::string> cargs;
+                                {
+                                    std::string cur;
+                                    int depth = 0;
+                                    for (char c : inner) {
+                                        if (c == '<') ++depth;
+                                        else if (c == '>') --depth;
+                                        if (c == ',' && depth == 0) { cargs.push_back(cur); cur.clear(); }
+                                        else cur += c;
+                                    }
+                                    cargs.push_back(cur);
+                                    for (auto& a : cargs) {
+                                        while (!a.empty() && a.front() == ' ') a.erase(a.begin());
+                                        while (!a.empty() && a.back() == ' ') a.pop_back();
+                                    }
+                                }
+                                if (cargs.size() == 2 && !cargs[0].empty() && !cargs[1].empty()) {
+                                    std::string w = genMonoWrap(de, cargs[0], cargs[1]);
+                                    if (!w.empty()) de = w;
+                                }
+                            }
+                        }
+                    }
+                    mArgExprs.push_back(de);
+                }
     }
     // C5.4: 跨模块函数默认参数补齐（math.foo(...) 缺参时）
     if (isNs) {

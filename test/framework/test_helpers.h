@@ -232,6 +232,15 @@ inline bool hasErrorCodeAndMsg(const Aura::DiagnosticEngine& diag,
     return false;
 }
 
+// 是否存在某条 error 的 fixHint（"= help: ..." 提示行）含指定子串
+inline bool hasErrorHintContaining(const Aura::DiagnosticEngine& diag,
+                                   const std::string& substr) {
+    for (const auto& d : diag.diagnostics())
+        if (d.severity == Aura::DiagSeverity::Error &&
+            d.fixHint.find(substr) != std::string::npos) return true;
+    return false;
+}
+
 // 打印 AST（用于调试/快照）
 inline std::string dumpAst(const Aura::Program& program) {
     std::ostringstream os;

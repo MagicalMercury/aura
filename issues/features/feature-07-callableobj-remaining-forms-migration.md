@@ -2,12 +2,13 @@
 type: todo_feature
 kind: refactor
 module: Runtime
-status: planned
+status: done
 priority: P3
 estimated_effort: L
 blocked_by:
   - "[[feature-06-unified-callable-origins]]"
 discover_date: 2026-09-07
+completed_date: 2026-09-12
 tags:
   - callable
   - closure
@@ -17,7 +18,13 @@ tags:
   - gc
 ---
 
-# 【CallableObj 全形态迁移】[ ] **主标题：feature-06 遗留三类闭包形态迁移至 CallableObj（协程 / 泛型 / ViewRoot 捕获）+ 递归闭包支持——旧 lambda 路径退役收口**
+# 【CallableObj 全形态迁移】[x] **主标题：feature-06 遗留三类闭包形态迁移至 CallableObj（协程 / 泛型 / ViewRoot 捕获）+ 递归闭包支持——旧 lambda 路径退役收口**
+
+> ✅ **2026-09-12 完成**（Step 1-4 全部落地 + Step 5 收尾）。单测基线 1274 → **1315 / 0 failed**；期间闭环 11 个缺陷（bug-68~75 / 78~80）。
+>
+> ⚠️ **Step 5 范围修订**：原计划「删光旧路径」经前置勘察（`scripts/f07_step5_survey_report.md`）证实**不可行**——`genericParams` / `returnOnlyGenerics`（闭包自身泛型）、接口 receiver 默认方法、`callableParamIndices` 的 `F&&` 转发这些**受限域仍是有意的保留边界**，其旧 lambda 实现是**活代码**而非残骸。Step 5 改为「承认保留域 + 更新描述 + 补文档」收尾。
+>
+> 🔜 **后续特性**：保留域的统一迁移见 **[[feature-12-callable-reserved-domains-migration]]**（旧路径最终退役 + `relocateGlobalRootPtrs` 删除 + 旧迭代器类删除）。
 
 > **一句话摘要**：feature-06 v1 为控回归面将四类闭包形态保留旧 lambda + GcRootHandle 路径（协程闭包 body 含 co_await、泛型闭包 `[&]<typename T>`、ViewRoot 捕获接口视图值、递归闭包自引用），本特性完成这四类的 CallableObj 迁移并拆除旧路径（含 relocateGlobalRootPtrs 手术代码的最终删除），实现统一可调用表示的完整收口。
 

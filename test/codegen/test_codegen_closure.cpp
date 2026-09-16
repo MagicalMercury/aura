@@ -125,8 +125,23 @@ TEST(CodeGen, MethodReturnsFuncAliasSkipsAliasTParams) {
     // struct 内声明返回 auto，不出现未声明的 'Mapper<A, U> makeM'
     EXPECT_CONTAINS(unit.header, "auto makeM();");
     EXPECT_NOT_CONTAINS(unit.header, "Mapper<A, U> makeM");
-    // 闭包自身泛型 U 由 invoke_result_t 声明（调用点推断）
-    EXPECT_CONTAINS(unit.header, "using U = typename std::invoke_result_t<F0&&, A&&>;");
+    // ⚠️ feature-12 批次 3 · 5.2（方案 D，2026-09-16）**行为有意变更**：
+    // 原断言固化「闭包自身泛型 U 由 invoke_result_t 声明」（旧路径模板 lambda 的
+    // 机制：`using U = typename std::invoke_result_t<F0&&, A&&>;`）。
+    // 方案 D 后该形态改走 **F（具名模板 struct + 借用参数）**：
+    //   - 外层模板参数 A 提升为**类模板参数**（"借用参数"，文件作用域合法）；
+    //   - 自身泛型 U 由**成员函数模板**表达。
+    // 产物实测：`template <typename A>` + `struct __GcUClosure_0` +
+    //          `template <typename U>` + `gcConstruct<__GcUClosure_0<A>>`。
+    // 旧断言（invoke_result_t）随之过期。
+    EXPECT_NOT_CONTAINS(unit.header, "invoke_result_t<F0&&, A&&>");
+    // 借用参数：A 提升为类模板参数
+    EXPECT_CONTAINS(unit.header, "template <typename A>");
+    // 具名模板 struct + 成员函数模板 U
+    EXPECT_CONTAINS(unit.header, "struct __GcUClosure_0 final : aura_rt::CallableObjBase");
+    EXPECT_CONTAINS(unit.header, "template <typename U>");
+    // 实例化点：借用参数在方法体内完成绑定（A 可见）
+    EXPECT_CONTAINS(unit.header, "gcConstruct<__GcUClosure_0<A>>");
 }
 
 TEST(CodeGen, MethodReturnsNonFuncAliasKeepsExplicitRet) {
@@ -147,14 +162,21 @@ TEST(CodeGen, MethodReturnsNonFuncAliasKeepsExplicitRet) {
 
 TEST(CodeGen, ClosureOwnGenericStillDeclared) {
     // T 遮蔽修复不误伤：函数不模板化（返回泛型闭包，currentTParams_ 空）时，
-    // 闭包自身泛型 T 仍正常声明为模板 lambda `[]<typename T>(T x) -> T`
+    // 闭包自身泛型 T 仍正常声明。
+    //
+    // ⚠️ feature-12 批次 1（2026-09-14，方案 F）：产物形态由「模板 lambda」
+    //（`[]<typename T>(T x) -> T`）改为「生成到 header 的具名模板 struct」
+    //（`struct __GcUClosure_N : CallableObjBase` + 成员函数模板 `operator()`）——
+    // 断言相应更新（T 仍在成员模板头声明）。
     Aura::DiagnosticEngine diag;
     auto unit = compileSource(
         "fun make_adder(inc: <T>) -> fun(T) -> T {"
         "   return fun(x: T) -> T { return x + inc } }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
-    EXPECT_CONTAINS(unit.header, "]<typename T>(T x) -> T");
+    EXPECT_CONTAINS(unit.header, "struct __GcUClosure_0 final : aura_rt::CallableObjBase");
+    EXPECT_CONTAINS(unit.header, "template <typename T>");
+    EXPECT_CONTAINS(unit.header, "T operator()(T x)");
 }
 
 TEST(CodeGen, ClosureRefsOuterMethodTParamInCtorNoShadow) {
@@ -295,7 +317,10 @@ TEST(CodeGen, G6CalleeGuardMultiArgPackExpansion) {
 
 TEST(CodeGen, FunRetGenericFunTypeClosureSelfGeneric) {
     // M5：顶层函数直接写泛型函数类型返回（fun(U)->U）——外层函数不模板化，
-    // 返回类型 auto，闭包自身模板化 `[]<typename U>(U x) -> U`
+    // 返回类型 auto，闭包自身泛型 U 声明在成员函数模板头。
+    //
+    // ⚠️ feature-12 批次 1（方案 F）：产物由模板 lambda 改为 header 具名模板 struct
+    //（`struct __GcUClosure_N : CallableObjBase` + `template <typename U> ... operator()`）。
     Aura::DiagnosticEngine diag;
     auto unit = compileSource(
         "fun makeU() -> fun(U) -> U {"
@@ -304,7 +329,9 @@ TEST(CodeGen, FunRetGenericFunTypeClosureSelfGeneric) {
     EXPECT_FALSE(diag.hasErrors());
     EXPECT_CONTAINS(unit.header, "auto makeU();");
     EXPECT_CONTAINS(unit.header, "auto makeU() {");
-    EXPECT_CONTAINS(unit.header, "[]<typename U>(U x) -> U");
+    EXPECT_CONTAINS(unit.header, "struct __GcUClosure_0 final : aura_rt::CallableObjBase");
+    EXPECT_CONTAINS(unit.header, "template <typename U>");
+    EXPECT_CONTAINS(unit.header, "U operator()(U x)");
 }
 
 TEST(CodeGen, MethodRetGenericFunTypeClosureSelfGeneric) {
@@ -321,8 +348,11 @@ TEST(CodeGen, MethodRetGenericFunTypeClosureSelfGeneric) {
     EXPECT_CONTAINS(unit.header, "auto getU();");
     EXPECT_NOT_CONTAINS(unit.header, "std::function<U(U, T)> getU");
     EXPECT_CONTAINS(unit.header, "auto Box::getU()");
-    // 闭包自身模板化（U/T 由闭包声明，非方法模板参数）
-    EXPECT_CONTAINS(unit.header, "[]<typename T, typename U>(U x, T y)");
+    // 闭包自身泛型（U/T 由闭包声明，非方法模板参数）→ 成员函数模板头
+    // ⚠️ feature-12 批次 1（方案 F）：形态 → header 具名模板 struct
+    EXPECT_CONTAINS(unit.header, "struct __GcUClosure_0 final : aura_rt::CallableObjBase");
+    EXPECT_CONTAINS(unit.header, "template <typename T, typename U>");
+    EXPECT_CONTAINS(unit.header, "U operator()(U x, T y)");
 }
 
 TEST(CodeGen, FunRetGenericFunTypeReaderForm) {
@@ -338,8 +368,15 @@ TEST(CodeGen, FunRetGenericFunTypeReaderForm) {
     EXPECT_FALSE(diag.hasErrors());
     EXPECT_CONTAINS(unit.header, "auto makeMapper2() {");
     // #32：GC 指针闭包参数（items: [T] → Array<T>*）加 _raw 后缀
-    EXPECT_CONTAINS(unit.header, "[]<typename T, typename F0>(aura_rt::Array<T>* items_raw, F0&& transform)");
-    EXPECT_CONTAINS(unit.header, "using U = typename std::invoke_result_t<F0&&, T&&>;");
+    // ⚠️ feature-12 批次 1（方案 F）：形态 → header 具名模板 struct；且
+    // **U 不再靠 `invoke_result_t` 推导**（F 的成员函数模板直接推导，段 11 已删）
+    // —— 故旧断言 `using U = typename std::invoke_result_t<F0&&, T&&>;` 已消失，
+    //     改为断言 U 声明在成员模板头（与 T 并列）。
+    EXPECT_CONTAINS(unit.header, "struct __GcUClosure_0 final : aura_rt::CallableObjBase");
+    EXPECT_CONTAINS(unit.header, "template <typename T, typename U>");
+    EXPECT_CONTAINS(unit.header, "aura_rt::Array<U>* operator()(aura_rt::Array<T>* items_raw");
+    EXPECT_CONTAINS(unit.header, "aura_rt::CallableObj<U, T>* transform_raw");
+    EXPECT_NOT_CONTAINS(unit.header, "std::invoke_result_t");
 }
 
 TEST(CodeGen, NestedClosureReturnOnlyGenericUsesConcreteSrcType) {
@@ -357,15 +394,18 @@ TEST(CodeGen, NestedClosureReturnOnlyGenericUsesConcreteSrcType) {
         "   let f = makeNest(t); io.println(str(f(41))) }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
-    // srcType 具体化：declval<int32_t>，非 declval<auto>（makeNest 定义在 header）；
-    // feature-06：delegate（函数类型形参，CallableObj 承载）经 invoke 槽求返回类型
-    EXPECT_CONTAINS(unit.header, "using U = decltype(transform->invoke(transform, std::declval<int32_t>()));");
+    // ⚠️ feature-12 批次 1（方案 F）：形态 → header 具名模板 struct。
+    // 原断言 `using U = decltype(transform->invoke(transform, std::declval<int32_t>()));`
+    // 是**旧路径段 12**（returnOnlyGenerics 经捕获 delegate + invoke 槽推导）的产物；
+    // F 重写段 12 后 delegate 成为**捕获槽**（cap_transform）、U 由调用点
+    // `operator()` 直接推导 → 该 using 声明已消失。
+    //
+    // 端到端探针已验证该形态正确（makeNest + `f(41)` → 输出 42，compile=0），
+    // 故此处 needle 更新为 F 形态。
+    EXPECT_CONTAINS(unit.header, "struct __GcUClosure_");
+    EXPECT_CONTAINS(unit.header, "operator()(");
     EXPECT_NOT_CONTAINS(unit.header, "std::declval<auto>");
-    // 内层闭包复用外层 using U：声明恰好 1 次（外层），内层不再重复 using U
-    const std::string needle = "using U = decltype(transform->invoke(transform, std::declval<int32_t>()));";
-    int cnt = 0;
-    for (size_t pos = 0; (pos = unit.header.find(needle, pos)) != std::string::npos; pos += needle.size()) ++cnt;
-    EXPECT_EQ(cnt, 1);
+    EXPECT_NOT_CONTAINS(unit.header, "transform->invoke(");
 }
 
 TEST(CodeGen, NestedClosureRefsOuterTemplateUNoShadow) {
@@ -380,10 +420,14 @@ TEST(CodeGen, NestedClosureRefsOuterTemplateUNoShadow) {
         " fun main(io: Io) throws { let f = makeOuter6(); let g = f(41); io.println(str(g(100))) }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
-    // 外层闭包声明模板参数 U（makeOuter6 定义在 header）；返回 CallableObj<U,U>* 闭包
-    EXPECT_CONTAINS(unit.header, "[]<typename U>(U x) -> aura_rt::CallableObj<U, U>*");
-    // 内层闭包复用外层模板参数 U：IIFE 工厂（无 []<typename U> 遮蔽）
-    EXPECT_CONTAINS(unit.header, "auto inner_raw = [&]() -> aura_rt::CallableObj<U, U>* {");
+    // 外层闭包声明模板参数 U（makeOuter6 定义在 header）→ 成员函数模板头。
+    // ⚠️ feature-12 批次 1（方案 F）：外层由模板 lambda 改为 header 具名模板 struct；
+    // 内层闭包复用外层模板参数 U（不重声明）的语义**必须保持**。
+    EXPECT_CONTAINS(unit.header, "struct __GcUClosure_");
+    EXPECT_CONTAINS(unit.header, "template <typename U>");
+    EXPECT_CONTAINS(unit.header, "operator()(U x)");
+    // 内层闭包不得重声明 `typename U` 遮蔽外层模板参数（原语义不变）
+    EXPECT_NOT_CONTAINS(unit.header, "template <typename U, typename U>");
     EXPECT_NOT_CONTAINS(unit.header, "[]<typename U>(U y)");
 }
 
@@ -402,8 +446,12 @@ TEST(CodeGen, OuterClosureCaptureExcludesInnerClosureParams) {
         "   let f = makeNest(t); io.println(str(f(41))) }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
-    // 外层闭包只捕获 transform（不捕获内层参数 y）
-    EXPECT_CONTAINS(unit.header, "return [transform](int32_t x)");
+    // 外层闭包只捕获 transform（不捕获内层参数 y）——**核心语义不变**。
+    // ⚠️ feature-12 批次 1（方案 F）：捕获列表（`[transform](int32_t x)`）在 F 下
+    // 变为**具名模板 struct 的捕获槽**（`cap_transform` 成员 + desc 追踪），
+    // 「不误捕 y」的判据转为断言槽集合不含 y 对应槽。
+    EXPECT_CONTAINS(unit.header, "cap_transform");
+    EXPECT_NOT_CONTAINS(unit.header, "cap_y");
     EXPECT_NOT_CONTAINS(unit.header, "[transform, y]");
 }
 
@@ -658,10 +706,19 @@ TEST(CodeGen, ClosureStringParamRawSuffixEntryRoot) {
     EXPECT_CONTAINS(all, "_h0_0.get()->len()");
 }
 
-TEST(CodeGen, InterfaceDefaultMethodClosureRefsSelfCapturesThis) {
+TEST(CodeGen, InterfaceDefaultMethodClosureRefsSelfUsesViewSlot) {
     // 接口默认方法（currentReceiverName_="self"，视图值 struct，恒非协程）返回闭包引用
-    // self.greeting() → 捕获 [this]，body 内 this->greeting()（视图地址稳定 + ViewRoot
-    // 内 GcRootHandle 保活底层 record，[this] 安全）
+    // self.greeting()。
+    //
+    // ⚠️ feature-12 批次 3（5.1，2026-09-16）**行为有意变更**：
+    // 原断言固化「捕获 [this] + body 内 this->greeting()」，其注释声称
+    // 「视图地址稳定 + ViewRoot 内 GcRootHandle 保活底层 record，[this] 安全」——
+    // **该假设经实测证伪**：
+    //   ① 「视图地址稳定」不成立——视图是【栈上值】，逃逸即悬垂（探针实测
+    //      EXIT=0xC0000005 段错误）；
+    //   ② 「ViewRoot 保活」当时【并未生成】（本次 5.1 才真正生成）。
+    // 故改为断言新形态：**视图值槽 cap_recv + ViewRoot 保活**（见
+    // 主 Agent 探针：`Named cap_recv;` + `aura_rt::ViewRoot<Named> _self_root(...)`）。
     Aura::DiagnosticEngine diag;
     auto unit = compileSource(
         "interface Greeter {"
@@ -671,8 +728,54 @@ TEST(CodeGen, InterfaceDefaultMethodClosureRefsSelfCapturesThis) {
         " fun main(io: Io) { io.println(\"x\") }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
-    EXPECT_CONTAINS(unit.header, "[this]() -> aura_rt::GcString*");
-    EXPECT_CONTAINS(unit.header, "return this->greeting()");
+    // ① 不再有裸 [this] 捕获（视图地址不可靠）
+    EXPECT_NOT_CONTAINS(unit.header, "[this]() ->");
+    // ② receiver 走【视图值槽】（槽类型 = 视图类型，不带 *）
+    EXPECT_CONTAINS(unit.header, "Greeter cap_recv;");
+    // ③ ViewRoot 保活（self 经 GcRootHandle 追踪，compact 后重建视图）
+    EXPECT_CONTAINS(unit.header, "aura_rt::ViewRoot<Greeter>");
+    // ④ body 内经视图值访问（. 而非 ->，视图是值类型）
+    EXPECT_NOT_CONTAINS(unit.header, "cap_recv->greeting()");
+}
+
+TEST(CodeGen, InterfaceDefaultMethodWithSyncIsCoroutineized) {
+    // feature-12 批次 3 · 5.1b（2026-09-16）：接口默认方法体内 `sync` 合法化。
+    // 接口默认方法在视图 struct 内是普通成员函数（非协程），但 sync 的产物含
+    // `co_await _sync.wait_all()` → 非协程函数里非法 → 必须按同源 CoroScanner 判据
+    // 协程化（签名 task<R> + co_return + 调用点 co_await 解包）。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "interface Named {"
+        " name() -> string"
+        " work() -> int {"
+        "   let t = 0"
+        "   sync { t = t + 1 }"
+        "   return t } }"
+        " fun main(io: Io) { io.println(\"x\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // ① 签名协程化（task<int32_t>）
+    EXPECT_CONTAINS(unit.header, "aura_rt::task<int32_t> work()");
+    // ② 体内 return 变 co_return
+    EXPECT_CONTAINS(unit.header, "co_return t;");
+    // ③ sync 的协程原语在位
+    EXPECT_CONTAINS(unit.header, "co_await");
+}
+
+TEST(CodeGen, InterfaceDefaultMethodWithoutSyncStaysPlain) {
+    // 反向断言：接口默认方法**不含** sync/spawn → **不得**被协程化。
+    // 防「判据过宽」（把普通默认方法也包成 task<>，破坏既有调用点解包契约）。
+    Aura::DiagnosticEngine diag;
+    auto unit = compileSource(
+        "interface Named {"
+        " name() -> string"
+        " greet() -> string { return self.name() } }"
+        " fun main(io: Io) { io.println(\"x\") }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+    // 未协程化：签名仍是普通返回类型
+    EXPECT_CONTAINS(unit.header, "aura_rt::GcString* greet()");
+    EXPECT_NOT_CONTAINS(unit.header, "task<aura_rt::GcString*> greet()");
 }
 
 TEST(CodeGen, TopFunClosureNoThisCaptureControl) {
@@ -838,8 +941,9 @@ TEST(CodeGen, XFuncCaptureTracked) {
 TEST(CodeGen, TopFunGenericFnAliasParamCallableObjInvoke) {
     // 1.aura retry/when 三流 codegen 断言：顶层泛型工厂函数形参承载为 C++ 简写
     // auto（泛型函数类型别名 Transform<T>/fun(<T>) 含未绑定 T，无法声明为具体
-    // CallableObj<...>*），body 内直呼函数值形参须 invoke 槽接线
-    // （transform->invoke(transform, ...) / condition.get()->invoke(...)）——
+    // CallableObj<...>*），body 内直呼函数值形参须 invoke 槽接线——
+    // 形参经【捕获槽】承载（feature-12 批次 1：泛型域闭包改走 genGcUClosure 具名
+    // 模板 struct，形参不再裸转发而是 cap_<name> 槽）→ this->cap_transform->invoke(...)。
     // 不得残留旧 std::function 直呼形态。
     Aura::DiagnosticEngine diag;
     auto unit = compileSource(
@@ -868,11 +972,11 @@ TEST(CodeGen, TopFunGenericFnAliasParamCallableObjInvoke) {
     EXPECT_CONTAINS(all, "auto retry(int32_t max_retries, auto transform)");
     EXPECT_CONTAINS(all, "auto when(auto condition_raw, auto true_branch, auto false_branch)");
     // retry body 直呼函数值形参 → 裸指针 invoke 接线
-    EXPECT_CONTAINS(all, "transform->invoke(transform, ");
+    EXPECT_CONTAINS(all, "this->cap_transform->invoke(this->cap_transform, ");
     // when body 直呼 condition/true_branch/false_branch → invoke 接线
-    EXPECT_CONTAINS(all, "condition.get()->invoke(condition.get(), ");
-    EXPECT_CONTAINS(all, "true_branch->invoke(true_branch, ");
-    EXPECT_CONTAINS(all, "false_branch->invoke(false_branch, ");
+    EXPECT_CONTAINS(all, "this->cap_condition->invoke(this->cap_condition, ");
+    EXPECT_CONTAINS(all, "this->cap_true_branch->invoke(this->cap_true_branch, ");
+    EXPECT_CONTAINS(all, "this->cap_false_branch->invoke(this->cap_false_branch, ");
     // 无旧 std::function 包装/直呼残留
     EXPECT_NOT_CONTAINS(all, "std::function<");
 }

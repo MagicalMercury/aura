@@ -603,6 +603,66 @@ TEST(SemaListOptional, Gap1RecordToOptListFieldErr) {
     EXPECT_TRUE(hasErrorContaining(diag, "type mismatch"));
 }
 
+// ============================================================
+// bug-80 结案：联合类型收窄失败的诊断提示（UX，仅改文本）
+// ------------------------------------------------------------
+// 场景：h.w 为三变体联合 int|Point|Other，不能隐式收窄为 int
+// → 仍报错（语义不变），且追加 match 提取指引（= help 行）。
+// ============================================================
+const char* kUnionNarrowDef =
+    "type Point = { x: int, y: int } "
+    "type Other = { x: int, z: int } "
+    "type H = { w: int | Point | Other } ";
+
+// 联合收窄失败（let 声明）→ 报错 + 提示可见
+TEST(SemaListOptional, UnionNarrowLetHint) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kUnionNarrowDef) + kMain +
+        " let o: Other = { x = 1, z = 2 } "
+        " let h: H = { w = o } "
+        " let bad: int = h.w }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot assign 'int | "));
+    EXPECT_TRUE(hasErrorHintContaining(diag, "match"));
+}
+
+// 普通不匹配（let int = "str"）→ 报错，且**不含**match 提示（零噪声）
+TEST(SemaListOptional, PlainMismatchNoUnionHint) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kMain) + " let x: int = \"str\" }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot assign 'string' to 'int'"));
+    EXPECT_FALSE(hasErrorHintContaining(diag, "match"));
+}
+
+// 联合收窄失败（赋值语句）→ 同样报错 + 提示
+TEST(SemaListOptional, UnionNarrowAssignHint) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kUnionNarrowDef) +
+        " fun f(h: H) -> int { let bad: int = 0 "
+        " bad = h.w "
+        " return bad } "
+        + kMain + " }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorContaining(diag, "cannot assign 'int | "));
+    EXPECT_TRUE(hasErrorHintContaining(diag, "match"));
+}
+
+// 联合收窄失败（const 声明）→ 同样报错 + 提示
+TEST(SemaListOptional, UnionNarrowConstHint) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        std::string(kUnionNarrowDef) + kMain +
+        " let o: Other = { x = 1, z = 2 } "
+        " let h: H = { w = o } "
+        " const bad: int = h.w }", diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_TRUE(hasErrorHintContaining(diag, "match"));
+}
+
 // ⑩ 非法：`[Point] = [5]` 首元素 int ≠ Point（单元素列表首元素从不校验）
 TEST(SemaListOptional, FirstElemIntToPointErr) {
     Aura::DiagnosticEngine diag;

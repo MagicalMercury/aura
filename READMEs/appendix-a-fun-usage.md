@@ -5,3 +5,14 @@
 | 顶层/方法声明 | §5.1 | `fun add(a: int, b: int) -> int { ... }` | 定义具名函数或方法 |
 | 闭包字面量 | §5.3 | `let f = fun(x: int) -> int { return x * 2 }` | 作为表达式，创建匿名函数值 |
 | 函数类型注解 | §3.2 | `fun(int) -> int` | 用于变量注解、参数类型、返回类型 |
+
+## 可调用值相关章节索引
+
+| 主题 | 章节 |
+|---|---|
+| 闭包捕获语义与 GC 安全（值槽 / GC 根槽 / 视图槽、递归自引用槽） | [§5.3.1](05-functions.md#531-闭包的捕获语义与-gc-安全feature-0607) |
+| 函数类型与联合 `\|` 的优先级 | [§5.4](05-functions.md#54-函数类型与联合--的优先级) |
+| 函数作为一等值、裸 `Callable`、functor 协议 | [§5.5](05-functions.md#55-函数作为值一等可调用与裸-callablefeature-06) |
+| 协程闭包（`CallableObj<task<R>, ...>`） | [§5.6](05-functions.md#56-协程闭包feature-07-step-4) |
+| 泛型闭包与函数类型形参直接承载 | [§5.7](05-functions.md#57-泛型闭包feature-07-step-3) |
+| `CallableObj` 运行时表示（GC 托管、引用语义） | [§3.2](03-types.md#32-复合类型) |

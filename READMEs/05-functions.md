@@ -93,6 +93,38 @@ fun make_handler(prefix: string) -> fun(string) -> None {
 
 > **闭包本身不能声明泛型参数**。如需泛型能力，请通过外层泛型函数或泛型函数类型引入——见第 6 节。
 
+### 5.3.1 闭包的捕获语义与 GC 安全（feature-06/07）
+
+闭包捕获的外部变量按**槽（slot）**存放在运行时对象 `CallableObj` 中（见 §5.5），
+槽按类型分三类，GC（`mark_sweep` / `compact`）都能正确追踪：
+
+| 捕获变量类型 | 槽形态 | GC 行为 |
+|---|---|---|
+| 普通值（int / bool / …） | 值槽 | 非指针，无需追踪 |
+| **GC 指针**（`string` / record / `[T]` / `Optional<T>` / 嵌套闭包） | GC 根槽 | 进对象 desc；`compact` 搬运后自动重写槽内地址 |
+| **视图值**（迭代器 / `fun` 值视图等 `{fn, self}` 形态） | 视图槽 | 进 desc；`self` 按**子偏移**扫描，防漏标 |
+
+```aura
+let tag = "T79"
+let make = fun(n: int) -> string {
+    return tag + "-" + string(n)      // tag 以 GC 根槽持有；GC 压实后仍指向新址
+}
+```
+
+**递归闭包**：闭包**引用自身**（如 `let fact = fun(n: int) -> int { ... fact(n - 1) }`）
+时，编译器为其生成一个**自引用槽**并在对象分配后回填——不再依赖「按引用捕获 `&f`」
+（栈帧绑定、不可逃逸、GC 不可见）。因此**递归闭包可以逃逸**（返回、存入字段、跨线程传递）。
+
+```aura
+let fact: fun(int) -> int = fun(n: int) -> int {
+    if n <= 1 { return 1 }
+    return n * fact(n - 1)            // 自引用槽，分配后回填
+}
+```
+
+**捕获槽的初始化不变量**：槽的初始化表达式不得触发 GC（分配 / 装箱 / 字符串拼接），
+因为此时对象尚未进入安全态。编译器对接收者（`self`）的捕获额外加根句柄保护。
+
 ## 5.4 函数类型与联合 `|` 的优先级
 
 `->` 的优先级**高于** `|`（联合运算符）：`fun() -> int | None` 解析为「返回
@@ -160,3 +192,44 @@ fun run(cb: Callable) -> int {       // 函数形参裸标 Callable = erased 契
   let n = add10(5)                   // 15（降级 add10.invoke(5)）
   ```
 - 无标注调用的结果类型无法推断（erased）时需加期望标注，否则编译期报错。
+
+## 5.6 协程闭包（feature-07 Step 4）
+
+闭包体内含挂起点时，该闭包是**协程闭包**：`__invoke` 返回 `task<R>`，调用点需 `await`。
+
+```aura
+let fetch = fun(io: Io) -> string {
+    let data = io.read_file("a.txt")!    // 挂起点（io.xxx 触发协程化）
+    return data
+}
+let t = fetch(io)                         // 不执行；得到 task<string>
+let s = await t                           // 挂起当前协程，返回 string
+```
+
+**判定规则**：闭包体内含 `io.xxx` 调用、或调用其它协程闭包/协程函数、或体含纯挂起表达式
+（如 `ch.receive()`）时判为协程闭包。若闭包体**无任何挂起点**，则不是协程闭包，`await` it 会报错。
+
+**与具名协程函数的一致性**：协程闭包与具名 `cofun` 语义相同——都是可挂起的 `task<R>`。
+区别只在可调用值的承载：协程闭包是 `CallableObj<task<R>, A...>`（沿用同一套捕获槽 / GC 根机制）。
+
+**跨线程注意**：协程闭包在 `spawn` / `sync thread` 中执行时，其捕获的 GC 根会升级为
+**全局根**（跨线程安全）；真异步挂起型协程在 worker 线程上无事件循环驱动，属已知限制。
+
+## 5.7 泛型闭包（feature-07 Step 3）
+
+闭包**自身不能声明泛型参数**（见 §5.3），但可接收**函数类型形参**并以「直接调用」形态承载：
+
+```aura
+fun twice(f: fun(int) -> int, x: int) -> int {
+    return f(f(x))               // f 以 CallableObj<int,int>* 直接承载，无需转发包装
+}
+```
+
+`fun` 类型形参在编译器内部以 `CallableObj<R, A...>*` 直接传递（不再经 `F&&` 完美转发 +
+转发 lambda），调用点生成 `.get()->invoke(...)`，且**先物化 callee 再求值实参**（防实参
+求值触发 GC 后 callee 悬垂）。
+
+> **保留边界**：闭包自身泛型（`genericParams` / `returnOnlyGenerics`，如 `fun<T>(x: T) -> T`）
+> 与接口默认方法 receiver 仍走旧的 lambda 路径（打印为 C++ 模板 lambda）；这是有意的设计边界，
+> 不是遗漏。两种形态对用户**语义一致**。这些受限域的统一迁移已立项追踪
+> （`issues/features/feature-12-callable-reserved-domains-migration.md`）。

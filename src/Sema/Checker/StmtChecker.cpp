@@ -133,7 +133,17 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
             && dynamic_cast<const NoneSemType*>(inferredType.get())) {
             error(decl, "cannot bind 'None' return value to a variable; use a union annotation like 'int | None'");
         } else if (!isAssignable(*declaredType, *inferredType)) {
-            error(decl, "type mismatch: cannot assign '" + inferredType->toString() + "' to '" + declaredType->toString() + "'");
+            // UX（bug-80 结案）：联合类型（如 h.w）不能隐式收窄为其中某一变体。
+            // 报错文本两侧常"看起来同名/同形"（'int | {..} | {..}' 收窄到 'int'），
+            // 易被误读为"编译器同类却不判等价"。目标非联合而来源是联合时，追加
+            // match 提取指引；普通不匹配（'string' to 'int'）保持原样不加提示，避免噪音。
+            // 注意：本分支只影响诊断文本，isAssignable 的判定语义零改动。
+            if (dynamic_cast<const UnionSemType*>(inferredType.get())) {
+                error(decl, "type mismatch: cannot assign '" + inferredType->toString() + "' to '" + declaredType->toString() + "'",
+                      "the value has a union type; extract the desired variant first with a 'match' expression");
+            } else {
+                error(decl, "type mismatch: cannot assign '" + inferredType->toString() + "' to '" + declaredType->toString() + "'");
+            }
         } else if (!diag_.hasErrors()
                    && decl.initializer
                    && dynamic_cast<const CallExpr*>(decl.initializer.get())
@@ -242,7 +252,14 @@ void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
             && dynamic_cast<const NoneSemType*>(inferredType.get())) {
             error(decl, "cannot bind 'None' return value to a variable; use a union annotation like 'int | None'");
         } else if (!isAssignable(*declaredType, *inferredType)) {
-            error(decl, "type mismatch in const: expected '" + declaredType->toString() + "', got '" + inferredType->toString() + "'");
+            // UX（bug-80 结案）：同 checkLetDecl——联合类型不能隐式收窄为单变体，
+            // 追加 match 提取指引；非联合不匹配保持原样。仅改诊断文本，判定不动。
+            if (dynamic_cast<const UnionSemType*>(inferredType.get())) {
+                error(decl, "type mismatch in const: expected '" + declaredType->toString() + "', got '" + inferredType->toString() + "'",
+                      "the value has a union type; extract the desired variant first with a 'match' expression");
+            } else {
+                error(decl, "type mismatch in const: expected '" + declaredType->toString() + "', got '" + inferredType->toString() + "'");
+            }
         } else if (!diag_.hasErrors()
                    && decl.initializer
                    && dynamic_cast<const CallExpr*>(decl.initializer.get())

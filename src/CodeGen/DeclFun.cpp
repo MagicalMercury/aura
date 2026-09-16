@@ -229,10 +229,65 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
         out << "  return;\n";
     }
     out << "}\n\n";
+    // feature-12 批次 1（方案 F，C′ 2026-09-14）：原「函数名 → 返回 F 闭包类型」登记
+    // 已删除（GLM5.3 C′ 方案）——该表依赖生成顺序（登记在函数体输出后、查表在 let
+    // 生成时，跨函数时被调函数可能尚未登记 → 编号错位）。现改为 Sema 判据
+    //（StmtLet 用 funcTypeHasOwnUnboundGeneric(decl.inferredType) 识别 F 家族闭包），
+    // 与生成顺序无关。信号仅保留「是否 F 产物」布尔供字面量路径使用。
+    lastClosureIsGcU_ = false;
+    lastClosureGcUBase_.clear();
     clearVarTrackingState();
     callableObjVars_ = savedCallableObjVars;   // feature-06：函数级恢复（防泄漏到后续函数）
     ioInScope_ = false;   // #46：函数级复位（防泄漏到后续函数）
     currentReturnElem_.clear();
+}
+
+// feature-12 批次 1（缺陷 B）：函数体是否含「return <FunExpr>」。
+// 用于区分「签名降 auto 的函数」是否真产出 F 产物（泛型闭包字面量）：
+//   有 FunExpr 返回 → F 产物（__GcUClosure_N<...>*）
+//   无（形参透传，如 `return f;`）→ CallableObj 指针，非 F
+//
+// 扫描策略：递归遍历语句容器（Block/If/TryCatch/While/Loop/For/Sync/Lock/
+// Match/SyncFor），命中 ReturnStmt 时检查其 expr 的动态类型是否为 FunExpr。
+// **不进入嵌套 FunExpr 体**——内层闭包的 return 属于内层函数语义，
+// 与本函数的返回形态无关（否则 makeComp 形态会被误判）。
+bool CodeGenerator::bodyReturnsFunExpr(const Stmt* s) {
+    if (!s) return false;
+    if (auto* b = dynamic_cast<const BlockStmt*>(s)) {
+        for (auto& st : b->stmts)
+            if (bodyReturnsFunExpr(st.get())) return true;
+        return false;
+    }
+    if (auto* r = dynamic_cast<const ReturnStmt*>(s))
+        return r->expr && dynamic_cast<const FunExpr*>(r->expr.get()) != nullptr;
+    if (auto* i = dynamic_cast<const IfStmt*>(s)) {
+        if (bodyReturnsFunExpr(i->thenBranch.get())) return true;
+        for (auto& ei : i->elseIfs)
+            if (bodyReturnsFunExpr(ei.body.get())) return true;
+        return bodyReturnsFunExpr(i->elseBranch.get());
+    }
+    if (auto* t = dynamic_cast<const TryCatchStmt*>(s))
+        return bodyReturnsFunExpr(t->tryBody.get())
+            || bodyReturnsFunExpr(t->catchBody.get());
+    if (auto* w = dynamic_cast<const WhileStmt*>(s))
+        return bodyReturnsFunExpr(w->body.get());
+    if (auto* l = dynamic_cast<const LoopStmt*>(s))
+        return bodyReturnsFunExpr(l->body.get());
+    if (auto* f = dynamic_cast<const ForStmt*>(s))
+        return bodyReturnsFunExpr(f->body.get());
+    if (auto* sy = dynamic_cast<const SyncStmt*>(s))
+        return bodyReturnsFunExpr(sy->body.get());
+    if (auto* lk = dynamic_cast<const LockStmt*>(s))
+        return bodyReturnsFunExpr(lk->body.get());
+    if (auto* sf = dynamic_cast<const SyncForStmt*>(s))
+        return bodyReturnsFunExpr(sf->body.get());
+    if (auto* m = dynamic_cast<const MatchStmt*>(s)) {
+        for (auto& c : m->cases)
+            if (bodyReturnsFunExpr(dynamic_cast<const Stmt*>(c.body.get())))
+                return true;
+        return false;
+    }
+    return false;
 }
 
 std::string CodeGenerator::funSignature(const FunDecl& decl,
@@ -256,6 +311,19 @@ std::string CodeGenerator::funSignature(const FunDecl& decl,
 
     if (isGenClosureRet)
         retType = "auto";
+
+    // feature-12 批次 1（缺陷 B 修复）：签名降 auto 的函数按「函数体是否 return
+    // 闭包字面量」再分类——这是区分 F 产物（__GcUClosure_N<...>*）与形参透传
+    // （CallableObj 指针）的唯一可靠依据。登记时机在此（第三遍 A，全部声明），
+    // 早于 B 遍所有函数体生成 → 查询点零顺序依赖。
+    //   ⚠️ 实测反例：`fun pick(f: Transform<T>) -> Transform<T> { return f }`
+    //   签名同为 auto，但体内无 FunExpr → 产物为裸 `return f;`（非 F）。
+    if (isGenClosureRet && decl.body) {
+        if (bodyReturnsFunExpr(decl.body.get()))
+            gcUClosureReturningFns_.insert(decl.name);
+        else
+            aliasRetTransparentFns_.insert(decl.name);
+    }
 
     currentReturnCppType_ = retType;
     // P3b：填充当前函数返回"含堆联合"的变体 C++ 类型列表（供 genReturnStmt 隐式装箱）

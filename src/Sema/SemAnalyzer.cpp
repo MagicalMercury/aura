@@ -24,6 +24,10 @@ void SemAnalyzer::error(const ASTNode& node, const std::string& msg) {
     diag_.error(node, msg);
 }
 
+void SemAnalyzer::error(const ASTNode& node, const std::string& msg, const std::string& hint) {
+    diag_.error(node, msg, hint);
+}
+
 void SemAnalyzer::error(const ASTNode& node, DiagCode code, const std::string& msg, const std::string& hint) {
     diag_.error(node, code, msg, hint);
 }

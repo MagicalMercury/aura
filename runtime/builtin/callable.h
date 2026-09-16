@@ -30,11 +30,29 @@
 
 namespace aura_rt {
 
+// ---- 第 1.5 层：Callable 家族标记基类（feature-12，2026-09-13）----
+// 语言层「可调用值」的统一家族标记（空基类，EBO 零布局开销）。
+//
+// 为什么要它（读法 1 定案）：
+//   C++ 层【两形状是数学必然】——CallableObj<R,A...> 的 invoke 槽签名编译期定死，
+//   而多态闭包（__GcUClosure_N）的调用签名随调用点实例化，二者无法合并为同一签名契约。
+//   但语言层需要一个统一的「这是可调用值」判据：
+//     · reflect.collect / feature-10 家族校验
+//     · `fun(A) -> R` 的类型家族归属
+//     · 编译期 is-Callable 判定（std::is_convertible_v<T*, CallableObjBase*>）
+//   → 家族层统一（本基类），C++ 层两形状保留（单态 CallableObj / 多态 GcUClosure）。
+//
+// 继承关系：
+//   CallableObjBase : GcObject
+//   ├── CallableObj<R, A...>        ← 单态分支（invoke 槽）
+//   └── __GcUClosure_N<Cap...>      ← 多态分支（成员函数模板 operator()）
+struct CallableObjBase : GcObject {};
+
 // ---- 第 2 层：fun(A)->R 的统一 C++ 表示 ----
 // 泛型上下文（形参 fun(T)->T 合法形态）：CallableObj<U, U>*（模板参数
 // 作 Sig 实参）；调用点从派生类指针 static_cast 回此基类（生成点已知签名）。
 template <typename R, typename... Args>
-struct CallableObj : GcObject {
+struct CallableObj : CallableObjBase {
     R (*invoke)(CallableObj*, Args...);
 };
 
@@ -47,6 +65,45 @@ inline Derived* gc_alloc_callable() {
     auto* o = static_cast<Derived*>(
         GcHeap::instance().alloc(sizeof(Derived), &Derived::desc()));
     o->invoke = &Derived::__invoke;
+    return o;
+}
+
+// ---- 第 2.5 层：__MonoWrap 桥（feature-12 批次 2，2026-09-15）----
+// F 闭包产物 __GcUClosure_N<Cap...>（多态 operator()，继承 CallableObjBase 空基）
+// 无法满足 CallableObj<U, T>* 形参（单态 invoke 槽契约）——运行时 map/filter/
+// Iterator.from 的 CallableObj 重载与 F 闭包之间缺一段适配（"洞 B"）。
+//
+// 桥的形态（零新机制：沿用既有 CallableObj + gc_alloc_callable）：
+//   · FCls = F 闭包【具体实例化类型】（如 __GcUClosure_0 或 __GcUClosure_1<int32_t*>），
+//     由生成点以 std::remove_pointer_t<decltype(<闭包产物表达式>)> 表达——
+//     无需文本解析/类型还原，也无需跨函数查表（顺序无关）。
+//   · U/T = 期望签名（返回/形参），由生成点从需求点上下文取出。
+//   · cap_f 存【指针槽】（desc 追踪）——GC 随对象搬移自动重写，零 Global 根。
+//   · 与旧转发包装的本质区别：旧包装是带 Global 根的 lambda（触发 relocate），
+//     桥是 GC 堆对象持指针槽（不触发 relocate），且静态类型即 CallableObj<U,T> 派生。
+//
+// 注意 cap_f 不得退化为 CallableObjBase*：F 闭包的 operator() 是【成员函数模板】，
+// 基类无此成员 → cap_f->operator()(x) 无法解析（探针 scripts/probe_bridge.cpp 已证）。
+template <typename FCls, typename U, typename T>
+struct __MonoWrap final : CallableObj<U, T> {
+    FCls* cap_f = nullptr;                  // F 闭包作指针槽（desc 追踪）
+    static U __invoke(CallableObj<U, T>* self, T x) {
+        auto* w = static_cast<__MonoWrap*>(self);
+        return w->cap_f->operator()(x);     // 转发进多态 operator()
+    }
+    static const TypeDescriptor& desc() {
+        static const size_t offs[] = { offsetof(__MonoWrap, cap_f) };
+        static const TypeDescriptor d = {
+            sizeof(__MonoWrap), 1, offs, 0, nullptr, nullptr };
+        return d;
+    }
+};
+
+// 桥分配 + 填槽（编译器生成点内联使用）。f = F 闭包指针。
+template <typename FCls, typename U, typename T>
+inline CallableObj<U, T>* make_mono_wrap(FCls* f) {
+    auto* o = gc_alloc_callable<__MonoWrap<FCls, U, T>>();
+    o->cap_f = f;
     return o;
 }
 

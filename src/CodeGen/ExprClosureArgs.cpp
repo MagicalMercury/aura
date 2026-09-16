@@ -373,6 +373,67 @@ std::string CodeGenerator::genCallableObjValueWrap(const ErasedWrapSpec& spec) {
     return oss.str();
 }
 
+// genMonoWrap — feature-12 批次 2（__MonoWrap 桥，2026-09-15）。
+// F 闭包产物（__GcUClosure_N*，多态 operator()）无法满足 CallableObj<U,T>* 形参
+//（单态 invoke 槽契约）——"洞 B"。桥在【需求点】把上下文已知的 U/T 固化下来，
+// 用 decltype 表达 F 闭包具体类型（零文本解析、零跨函数查表）。
+//
+//   aura_rt::make_mono_wrap<std::remove_pointer_t<decltype(EXPR)>, U, T>(EXPR)
+//
+// ⚠️ decltype 是 unevaluated context——EXPR（可能含 IIFE/函数调用）只求值一次。
+// ⚠️ FCls 必须取【具体实例化类型】：GcUClosure 带捕获时为 __GcUClosure_N<Cap...>，
+//    decltype(EXPR) 天然给出具体实例化形态（产物表达式返回的正是该类型指针）。
+std::string CodeGenerator::genMonoWrap(const std::string& closureExpr,
+                                       const std::string& retCpp,
+                                       const std::string& paramCpp) {
+    if (closureExpr.empty() || retCpp.empty() || paramCpp.empty()) return std::string();
+    // ⚠️ 必须剥【引用】再剥指针：decltype(EXPR) 对返回左值的调用表达式产 `T*&`
+    //（实测 "g.get()" → "__GcUClosure_0*&"，直接 remove_pointer_t 会让模板实参
+    // 变成"指向引用的指针"→ g++ error: forming pointer to reference type）。
+    return "aura_rt::make_mono_wrap<std::remove_pointer_t<std::remove_reference_t<decltype("
+        + closureExpr + ")>>, " + retCpp + ", " + paramCpp + ">(" + closureExpr + ")";
+}
+
+// iteratorElemCppOf — 从迭代器接收者的具体 C++ 类型串剥出元素 C++ 名。
+// GenericSemType{name="Iterator", resolvedName="aura_rt::Iterator<int32_t>"} 的
+// resolvedName 是 Sema 侧已物化的具体形态（探针实测：let 变量形态下亦为具体）——
+// 从中剥 <...> 并经 finalizeCppElem 补内嵌 record 的 '*'。
+// 取不到（resolvedName 空 / 含裸泛型名 / 非 Iterator 形态）返回空串 → 调用点不包桥。
+std::string CodeGenerator::iteratorElemCppOf(const SemType* iteratorType) {
+    if (!iteratorType) return std::string();
+    const GenericSemType* g = dynamic_cast<const GenericSemType*>(iteratorType);
+    if (!g || g->name != "Iterator" || g->resolvedName.empty()) return std::string();
+    auto lt = g->resolvedName.find('<');
+    auto rt = g->resolvedName.rfind('>');
+    if (lt == std::string::npos || rt == std::string::npos || rt <= lt) return std::string();
+    std::string elem = finalizeCppElem(g->resolvedName.substr(lt + 1, rt - lt - 1));
+    if (elem.empty()) return std::string();
+    // 裸泛型名（模板参数）不得固化进桥的模板实参——该形态下行内无法表达具体类型
+    //（如 Iterator<T> 出现在泛型函数体内）→ 交由旧路径/报错兜底，不产出坏 C++。
+    for (const auto& tp : currentTParams_)
+        if (elem == tp) return std::string();
+    if (elem.find('<') == std::string::npos) {
+        // 单词形态：裸泛型名单词（T/U/...）判据——C++ 内建/已知类型放行
+        static const std::set<std::string> known{
+            "int32_t", "int64_t", "double", "bool", "float", "char",
+            "aura_rt::GcString*", "void"};
+        auto isIdentWord = [](const std::string& w) {
+            if (w.empty()) return false;
+            if (!(std::isalpha(static_cast<unsigned char>(w[0])) || w[0] == '_')) return false;
+            for (char c : w)
+                if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) return false;
+            return true;
+        };
+        std::string bare = elem;
+        if (!bare.empty() && bare.back() == '*') bare.pop_back();
+        if (isIdentWord(bare) && !known.count(elem)
+            && !registeredTypes_.count(bare)
+            && !interfaceNames_.count(bare))
+            return std::string();
+    }
+    return elem;
+}
+
 // genErasedInvoke — erased/union 调用点（c(1)）：callee 句柄化 + 参数 CallArg 打包 +
 // invokeErased + 按期望类型拆箱。args 元素 = (实参 C++ 文本, 实参 C++ 类型)。
 std::string CodeGenerator::genErasedInvoke(

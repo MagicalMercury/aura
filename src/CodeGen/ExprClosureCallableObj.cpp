@@ -150,8 +150,21 @@ std::string CodeGenerator::genFunExprCallableObj(const ClosureGenSpec& spec)
     if (needsThisCapture) {
         // this/receiver 槽（cap_recv）：源取 receiverThisSourceExpr()（方法入口句柄
         // .get()，捕获时点求值——句柄保护窗口在闭包构造前）
-        addSlot(safeName(currentReceiverName_), "cap_recv",
-                currentReceiverCppType_ + "*", receiverThisSourceExpr());
+        // feature-12 批次 3（5.1）：按 receiver 类型分流——
+        //   • 接口/迭代器视图 receiver（isIfaceViewTypeName）：receiver 是【栈上
+        //     视图值】{fnPtr, self}，不能作 `T*` 指针槽（逃逸即悬垂，主 Agent 探针
+        //     实测段错误 0xC0000005）→ 走【视图值槽】：槽按值存整个视图，desc 由
+        //     GcViewSlot traits 复合偏移 + sizeof(void*) 追踪 self（与下方 L175-185
+        //     的 viewSlots 分支同机制，零新增机制）；init 取 ViewRoot::get()（视图值
+        //     拷贝，捕获时点求值——与栈上源解耦）。
+        //   • record 等 GC 指针 receiver：保持 `T*` 指针槽 + `.get()` 取最新地址。
+        if (isIfaceViewTypeName(currentReceiverCppType_)) {
+            addSlot(safeName(currentReceiverName_), "cap_recv",
+                    currentReceiverCppType_, receiverThisSourceExpr());
+        } else {
+            addSlot(safeName(currentReceiverName_), "cap_recv",
+                    currentReceiverCppType_ + "*", receiverThisSourceExpr());
+        }
     }
     for (auto& cn : captures) {
         if (needsThisCapture && cn == currentReceiverName_) continue;

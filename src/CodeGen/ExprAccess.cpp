@@ -155,47 +155,60 @@ std::string CodeGenerator::genUnionDispatch(const MethodCallExpr& e,
     if (retIsVoid) retType = "void";
 
     std::ostringstream out;
-    out << "[&]() -> " << retType << " {\n";
+    // bug-77: method-call receiver evaluation window (union dispatch path).
+    // C++17 [expr.call]/8: the postfix-expression (the receiver) is evaluated
+    // BEFORE the arguments. The old form bound a raw receiver reference first
+    // and then evaluated the arguments; that reference is a PLAIN pointer with
+    // no root, so an argument triggering GC (intern_string / concat / gc_force)
+    // could compact the object and leave it dangling -> UAF.
+    // Hardening (same shape as G6, see ExprCall.cpp:721-779): pass arguments as
+    // a parameter pack, so they are evaluated AT THE CALL SITE (before the
+    // receiver); bind the receiver inside the lambda body and root it via
+    // GcRootHandle so compact rewrites it. All access goes through the handle
+    // (one pack expansion only, matching G6 fixed form). co_await arguments
+    // stay at the call site: C++20 forbids co_await in a deduced-return lambda.
+    const int dspHid = unionDispatchCounter_++;
+    out << "[&](auto&&... _as) -> " << retType << " {\n";
     indentLevel_++;
-    out << indentStr() << "auto&& _dsp_v = (" << obj << ");\n";
+    out << indentStr() << "auto&& _dsp_v" << dspHid << " = (" << obj << ");\n";
+    out << indentStr() << "aura_rt::GcRootHandle<std::remove_reference_t<decltype(_dsp_v"
+        << dspHid << ")>> _dsp_h" << dspHid << "(_dsp_v" << dspHid
+        << ", aura_rt::GcRootScope::ThreadLocal);\n";
+    // 单包展开的实参传递（经 _as 包，与 G6 一致：只有一个 \...\）
+    // arguments are injected through the _as pack (single ... expansion, same as G6)
+    std::string argCallArgs;   // args injected via the _as pack (single ... expansion, same as G6)
+    if (!argExprs.empty())
+        argCallArgs = "static_cast<decltype(_as)>(_as)...";
     if (sups.size() == 1) {
         // 单支持变体：运行时类型检查 + 直调
         size_t I = sups[0];
-        out << indentStr() << "if (_dsp_v->index() != " << I
+        out << indentStr() << "if (_dsp_h" << dspHid << ".get()->index() != " << I
             << ") throw aura_rt::make_type_error(\"TypeError: variant active variant has no method '"
             << e.method << "'\");\n";
         out << indentStr();
         if (!retIsVoid) out << "return ";
         // #3：接口视图变体是值类型（Stringer），用 . 访问；其余变体用 ->
-        out << "_dsp_v->get<" << I << ">()"
+        out << "_dsp_h" << dspHid << ".get()->get<" << I << ">()"
             << (isIfaceView(u.variants[I].get()) ? "." : "->")
-            << safeName(e.method) << "(";
-        for (size_t i = 0; i < argExprs.size(); ++i) {
-            if (i > 0) out << ", ";
-            out << argExprs[i];
-        }
+            << safeName(e.method) << "(" << argCallArgs << ")";
         if (retIsVoid)
-            out << "); return;\n";
+            out << "; return;\n";
         else
-            out << ");\n";
+            out << ";\n";
     } else {
         // 多变体：switch 分派，default 抛 TypeError
-        out << indentStr() << "switch (_dsp_v->index()) {\n";
+        out << indentStr() << "switch (_dsp_h" << dspHid << ".get()->index()) {\n";
         indentLevel_++;
         for (size_t k : sups) {
             out << indentStr() << "case " << k << ": ";
             if (!retIsVoid) out << "return ";
-            out << "_dsp_v->get<" << k << ">()"
+            out << "_dsp_h" << dspHid << ".get()->get<" << k << ">()"
                 << (isIfaceView(u.variants[k].get()) ? "." : "->")
-                << safeName(e.method) << "(";
-            for (size_t i = 0; i < argExprs.size(); ++i) {
-                if (i > 0) out << ", ";
-                out << argExprs[i];
-            }
+                << safeName(e.method) << "(" << argCallArgs << ")";
             if (retIsVoid)
-                out << "); return;\n";
+                out << "; return;\n";
             else
-                out << ");\n";
+                out << ";\n";
         }
         out << indentStr() << "default: throw aura_rt::make_type_error(\"TypeError: variant ("
             << u.toString() << ") active variant has no method '" << e.method << "'\");\n";
@@ -203,7 +216,12 @@ std::string CodeGenerator::genUnionDispatch(const MethodCallExpr& e,
         out << indentStr() << "}\n";
     }
     indentLevel_--;
-    out << indentStr() << "}()";
+    out << indentStr() << "}(";
+    for (size_t i = 0; i < argExprs.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << argExprs[i];
+    }
+    out << ")";
     return out.str();
 }
 

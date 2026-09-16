@@ -378,6 +378,38 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
             closureTaskVars_.insert(safeName(decl.name));
             lastClosureIsCoroTask_ = false;
         }
+        // feature-12 批次 1（方案 F，GLM5.3 C′ 方案 2026-09-14）：GcUClosure 闭包
+        // 变量登记——**判据改用 Sema 推断类型**（`funcTypeHasOwnUnboundGeneric`），
+        // 与顺序无关（Sema 先于 CodeGen 全量完成）。
+        //
+        // 为什么杀掉原机制（gcUFnRetBases_ 表 + lastClosureGcUBase_ 信号）：
+        //   表/信号都依赖「生成顺序」（登记在函数体输出之后、查表在 let 生成时），
+        //   跨函数时被调函数可能尚未登记 → 编号错位/查不到。
+        //   Sema 判据 by construction 无顺序依赖（feature-07 的 CallableObj 路径
+        //   就是这个形态：mapSemType(inferredType)）。
+        //
+        // 判据可靠性：funcTypeHasOwnUnboundGeneric(inferredType) 为真 ⟺ 值是多态
+        // 函数值 ⟹ 必然是 F 产物（现状下所有「inferredType 含自有未绑定泛型」的
+        // 闭包都落泛型域 → genGcUClosure）。
+        if (!decl.type && decl.inferredType && !init.empty()) {
+            if (auto* fst = dynamic_cast<const FuncSemType*>(decl.inferredType);
+                fst && funcTypeHasOwnUnboundGeneric(fst)) {
+                uClosureVars_.insert(safeName(decl.name));
+                gcULetVarNames_.insert(safeName(decl.name));
+            }
+            // feature-12 批次 1（缺陷 B 修复，2026-09-14）：签名降 auto 的泛型闭包
+            // 工厂调用（`let r = retry(...)` / `let w = wrap(...)`）——其 Sema
+            // inferredType 泛型**已物化**（如 retry → `(int) -> int`），
+            // funcTypeHasOwnUnboundGeneric 恒 false → 上方判据失明。
+            // 按「被调函数是否产出 F 产物」补登记（表由 funSignature 在第三遍 A
+            // 填充，零顺序依赖）。
+            if (auto* ce = dynamic_cast<const CallExpr*>(decl.initializer.get()))
+                if (auto* cid = dynamic_cast<const Identifier*>(ce->callee.get()))
+                    if (gcUClosureReturningFns_.count(cid->name)) {
+                        uClosureVars_.insert(safeName(decl.name));
+                        gcULetVarNames_.insert(safeName(decl.name));
+                    }
+        }
         currentLetName_.clear();
     }
 
@@ -443,6 +475,35 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     // 其余形态（auto 泛型工厂调用 compose()/retry()/make_mapper() 返回模板 lambda、
     // 旧路径 lambda 产物等）保持 auto——值非 CallableObj，不得按 CallableObj 类型
     // 绑定（否则模板 lambda 无法向 CallableObj<…>* 转换，坏 C++）。
+    // feature-12 批次 1（方案 F，C′ 2026-09-14）：泛型闭包（__GcUClosure_N）let
+    // 根化第 6 路——判据改用 **Sema**（`gcULetVarNames_`，由上方 Sema 判据登记），
+    // **不再依赖生成顺序**。
+    //
+    // ⚠️ 类型串从此不需要：F 的值类型由 C++ 自行推导——生成
+    //    auto g_raw = <init>;
+    //    GcRootHandle<decltype(g_raw)> g(g_raw, ThreadLocal);
+    // 而非显式写 `__GcUClosure_N<...>*`（后者需要跨函数传递类型串 = 顺序依赖之源）。
+    if (gcULetVarNames_.count(safeName(decl.name))
+        && !decl.type && !init.empty()) {
+        // 标记为「按 decltype 定型」——由下方统一生成（见 funValueLetDecltype 之后的尾段）
+        gcULetDecltypeVars_.insert(safeName(decl.name));
+    } else if (lastClosureIsGcU_ && !lastClosureGcUBase_.empty() && !init.empty()
+               && decl.initializer
+               && dynamic_cast<const FunExpr*>(decl.initializer.get())) {
+        // 字面量闭包（同函数内直接写 fun(...) {...}）：实例化类型已知，直接定型
+        type = lastClosureGcUBase_ + "*";
+        // ⚠️ 不清信号：下方 CallableObj 路径（initIsNewClosure 分支）亦读该信号。
+        //
+        // feature-12 批次 2（2026-09-15，桥落地期暴露）：**必须加「init 是 FunExpr
+        // 字面量」守卫** —— `lastClosureIsGcU_` / `lastClosureGcUBase_` 是
+        // 「**最近一次**闭包生成」的信号（`genGcUClosure` 回填），只在**函数入口**清零
+        //（DeclFun.cpp:237），函数体内不清。若 let 的 init 是**内含闭包的调用**
+        //（如 `let r1 = b.useCb(5)`，方法默认参数闭包在 init 求值期生成并回填信号），
+        // 该信号会**残留**到外层 let → 误把 `r1`（实际返回 int）定型为
+        // `__GcUClosure_N*` → 生成 `__GcUClosure_1* r1_raw = ...(返回 int)` → 坏 C++。
+        // 收紧后：仅当 init **本身**就是闭包字面量时才用该信号定型。
+    }
+
     bool funValueLetDecltype = false;
     if (!decl.type && decl.inferredType && !init.empty()
         && dynamic_cast<const FuncSemType*>(decl.inferredType)) {
@@ -462,6 +523,15 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                 auto rtIt = declaredFunRetTypes_.find(cid->name);
                 if (rtIt != declaredFunRetTypes_.end())
                     initIsCallableObjFnCall = rtIt->second.find("aura_rt::CallableObj<") == 0;
+                // feature-12 批次 1（缺陷 B 修复）：签名降 auto 的**形参透传**函数
+                // （`fun pick(f: Transform<T>) -> Transform<T> { return f }`）——产物
+                // 是形参承载的 CallableObj 指针（实测：体内裸 `return f;`，非 F 产物）。
+                // 其 declaredFunRetTypes_ 为 "auto"（isGenClosureRet 命中）故上方
+                // 判据漏判 → 这里按「函数名在 aliasRetTransparentFns_」补判，
+                // 使其走 CallableObj 静态类型根化（mapSemType），而非 F 的 decltype。
+                if (!initIsCallableObjFnCall
+                    && aliasRetTransparentFns_.count(cid->name))
+                    initIsCallableObjFnCall = true;
             }
         // record fun 字段读取（let back = box.f → box.get()->f）：值即字段槽内的
         // CallableObj 指针（record desc 追踪该槽，compact 会重写）——栈上副本须按
@@ -498,7 +568,12 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
             // 类型单源取 genFunExprCallableObj 回填的基类 C++ 类型（协程 =
             // CallableObj<task<T>, A...>，非协程 = 与 mapSemType 一致）——消除协程闭包
             // mapSemType(FuncSemType) 产出内层签名与对象基类不一致的双源漂移。
-            if (initIsNewClosure && lastClosureCppBaseIsCoro_ && !lastClosureCppBase_.empty()) {
+            if (lastClosureIsGcU_ && !lastClosureGcUBase_.empty()) {
+                // feature-12 批次 1（F）：具名模板 struct 产物的 C++ 类型为
+                // 「实例化后」的 __GcUClosure_N<槽型...>（非模板待推，同工具点回填）
+                // ——单源取 lastClosureGcUBase_，消除 mapSemType 与对象类型双源漂移。
+                type = lastClosureGcUBase_ + "*";
+            } else if (initIsNewClosure && lastClosureCppBaseIsCoro_ && !lastClosureCppBase_.empty()) {
                 type = lastClosureCppBase_ + "*";   // 协程形态：task 签名基类（唯一权威源）
             } else if (semTypeIsConcrete(fst)) {
                 type = mapSemType(*fst);   // 具体签名 → 静态类型 → isGcPointerType 根化
@@ -568,12 +643,15 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
         std::string sf = callableObjToStdFunction(type);
         writeLine(cpp, sf + " " + varName + ";");
         writeLine(cpp, varName + " = " + init + ";");
-    } else if ((genericListDecl || funValueLetDecltype) && !init.empty()) {
+    } else if ((genericListDecl || funValueLetDecltype
+                || gcULetDecltypeVars_.count(varName)) && !init.empty()) {
         // #55：未绑定泛型元素列表 → auto 声明 + GcRootHandle<decltype> 包装。
         // decltype(arr_raw) 在 T 实例化后为 Array<X>*（继承 GcObject），模板实参合法、
         // 无假根；gcRootTypes_ 用 decltype 形态与 DeclFun.cpp:55 / StmtMatch.cpp:186 先例一致。
         // feature-06：泛型上下文函数值 let（CallableObj<U,U>* 模板参数形态）同款——
         // decltype(raw) 为 CallableObj<U,U>*（恒 GcObject 派生指针），无假根。
+        // feature-12（方案 F，C′）：F 家族多态闭包 let（__GcUClosure_N<...>*）同款——
+        // **defer 到 C++ 自行推导类型**，根化不依赖任何跨函数类型串（顺序无关）。
         writeLine(cpp, "auto " + varName + "_raw = " + init + ";");
         writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + varName + "_raw)> " + varName
                   + "(" + varName + "_raw, aura_rt::GcRootScope::ThreadLocal);");
@@ -645,6 +723,15 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     if (!init.empty() && init.find("Channel<") != std::string::npos) {
         channelVarNames_.insert(varName);
     }
+
+    // feature-12 批次 1（方案 F）：GcUClosure 生成信号的【单点】清除。
+    // 该信号由 genGcUClosure 在生成点回填（lastClosureIsGcU_ /
+    // lastClosureGcUBase_），本函数内有两处消费者（uClosureVars_ 登记 +
+    // 根化类型推导）；若任一消费者提前清空，后续消费者恒假 → 变量既不登记
+    // 也不根化（T3/T4 缺口的根因）。故统一在此处收尾清除。
+    lastClosureIsGcU_ = false;
+    lastClosureGcUBase_.clear();
+    gcULetDecltypeVars_.clear();
 }
 
 void CodeGenerator::genConstStmt(std::ostream& cpp, const ConstDecl& decl) {

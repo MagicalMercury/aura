@@ -225,6 +225,18 @@ std::string CodeGenerator::genNoneLiteral() {
     return "aura_rt::None";
 }
 
+// feature-12 批次 3（5.1）：receiver 映射的【值/指针】形态判定。
+// 接口默认方法 receiver 是栈上视图【值】（DeclGen.cpp 生成 ViewRoot 包裹 + 句柄
+// `_self_root`），`_self_root.get()` 产出的是视图值拷贝 —— 成员访问必须用 `.`；
+// record 等方法 receiver 是 GC 指针，入口句柄 `.get()` 产出指针 —— 用 `->`。
+// genIdentifier 的 receiver 分支只负责产出取值表达式，成员访问运算符由调用方
+// （genMethodCall / genFieldAccess）按本判定选择。
+bool CodeGenerator::receiverMapsToViewValue() const {
+    if (!currentClosureThisHandle_.empty()) return false;   // 闭包句柄 → 指针形态
+    if (currentReceiverName_.empty()) return false;
+    return isIfaceViewTypeName(currentReceiverCppType_);
+}
+
 std::string CodeGenerator::genIdentifier(const Identifier& e) {
     // 方法/构造函数体内的接收者名（如 self, p）映射为 C++ 的 this
     if (!currentReceiverName_.empty() && e.name == currentReceiverName_) {
@@ -239,7 +251,9 @@ std::string CodeGenerator::genIdentifier(const Identifier& e) {
         if (!currentClosureThisHandle_.empty())
             return currentClosureThisHandle_ + ".get()";
         // #56：方法体直引 self → 入口句柄 "_this.get()"（GC 后取最新地址）。
-        // 不设句柄的上下文（接口默认方法）保持 "this"（视图 this 值语义，预存在行为）
+        // feature-12 批次 3（5.1）：接口默认方法现也设 currentMethodThisHandle_
+        //（"_self_root"），取值为视图值（视图恒定 {fnPtr, self}；self 由 ViewRoot
+        // 内部 GcRootHandle 保活/重定位）。
         if (!currentMethodThisHandle_.empty())
             return currentMethodThisHandle_ + ".get()";
         return "this";

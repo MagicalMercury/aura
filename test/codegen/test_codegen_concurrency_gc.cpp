@@ -215,7 +215,15 @@ TEST(CodeGen, GenericRecordMethodDefaultArgsFilled) {
         diag);
     EXPECT_FALSE(diag.hasErrors());
     // useCb(5) 补默认闭包实参（模板 lambda，外层 T 无遮蔽；调用点 2 实参）
-    EXPECT_CONTAINS(unit.impl, "[]<typename T>(T x) -> T");
+    // feature-12 批次 2（bug-83 修复，2026-09-15）：默认闭包实参由「模板 lambda」
+    // 改为 F 家族具名 struct（genGcUClosure）——泛型域闭包统一走文件作用域
+    // 模板 struct + 成员函数模板 operator()（多态值语义保留）。
+    // 产物形态（used/探针实证）：
+    //   struct __GcUClosure_0 final : aura_rt::CallableObjBase {
+    //       template <typename T> T operator()(T x) { return x; } ... };
+    EXPECT_CONTAINS(unit.header, "struct __GcUClosure_0 final : aura_rt::CallableObjBase");
+    EXPECT_CONTAINS(unit.header, "template <typename T>");
+    EXPECT_CONTAINS(unit.header, "T operator()(T x)");
     EXPECT_CONTAINS(unit.impl, "useCb(_a1_1, _a1_2)");
     // useAll(1) 补 int 默认值 7（调用点 2 实参）
     EXPECT_CONTAINS(unit.impl, "useAll(_a2_1, _a2_2)");

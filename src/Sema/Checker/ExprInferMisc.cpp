@@ -188,7 +188,14 @@ std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
     if (noneReturnValue && isAssignable(*targetTy, *valueTy)) {
         error(e, "cannot bind 'None' return value in assignment; use a union annotation like 'int | None'");
     } else if (!isAssignable(*targetTy, *valueTy)) {
-        error(e, "assignment type mismatch: cannot assign '" + valueTy->toString() + "' to '" + targetTy->toString() + "'");
+        // UX（bug-80 结案）：联合类型值赋给非联合目标（同 let/const 声明的收窄场景）
+        // 追加 match 提取指引；普通不匹配保持原样。仅改诊断文本，判定不动。
+        if (dynamic_cast<const UnionSemType*>(valueTy.get())) {
+            error(e, "assignment type mismatch: cannot assign '" + valueTy->toString() + "' to '" + targetTy->toString() + "'",
+                  "the value has a union type; extract the desired variant first with a 'match' expression");
+        } else {
+            error(e, "assignment type mismatch: cannot assign '" + valueTy->toString() + "' to '" + targetTy->toString() + "'");
+        }
     }
     // 目标类型有效但值仍含不可解析元素（如赋值目标自身类型错误时目标为 error 类型，
     // 此时由目标的 undefined identifier 等错误主导，不再叠加）→ 干净报错拦截 error_type 泄漏

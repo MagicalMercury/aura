@@ -270,6 +270,30 @@ CoroDecision CodeGenerator::decideCoro(const MethodDecl& decl) {
     return CoroDecision::Plain;
 }
 
+// feature-12 批次 3 · 5.1b（2026-09-16）：接口默认方法体协程判定。
+// 接口默认方法在视图 struct 内是普通成员函数（非协程），但体内若含 sync/spawn
+// （其生成产物含 `co_await`）→ 必须协程化（返回 aura_rt::task<R>），否则生成坏 C++。
+// 复用与具名函数/方法同源的 CoroScanner 判据。
+// feature-12 批次 3 · 5.1b（2026-09-16）：按方法名反查接口名。
+// 调用点（ExprMethodCall 的协程判定）在 receiver 的 inferredType 缺失时，
+// 无法从 SemType 推出接口名；此处改从 program 的 InterfaceDecl 表
+// 反查（与 allIfaces_ 同源，含内置接口）。方法名在同一接口集内唯一；
+// 若多个接口同名方法，只需其一已登记协程即可（coroutineFunctions_ 按键查）。
+std::string CodeGenerator::ifaceNameForMethod(const std::string& methodName) const {
+    for (auto* iface : allIfaces_) {
+        if (!iface) continue;
+        for (auto& m : iface->methods) {
+            if (m.name == methodName) return iface->name;
+        }
+    }
+    return std::string();
+}
+
+bool CodeGenerator::decideCoro(const BlockStmt& body) {
+    CoroScanner scanner(coroutineFunctions_, ioSync_, /*skipClosure=*/false);
+    return scanner.scan(body);
+}
+
 // bug-78：闭包体「是否含挂起点」判定（genFunExpr 的 closureIsCoro 用）。
 // 复用 CoroScanner（与具名函数/方法同源判据），并注入闭包侧信号集：
 //   - closureTaskVars_ / coroClosureNames_：调用其它协程闭包（co_await d(...)）

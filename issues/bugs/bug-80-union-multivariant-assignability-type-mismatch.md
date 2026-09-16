@@ -1,9 +1,9 @@
 ---
 type: bug_report
 module: Sema
-sub_module: Assignability（3+ 变体联合的赋值兼容性判定）：多 record 变体联合接收 record 值时误报 type mismatch: cannot assign 'int' to 'int'
+sub_module: "诊断文案 UX（Sema 赋值/声明收窄失败）--联合类型不可隐式收窄，原登记判定为误报（编译器行为正确），本次仅改进提示语"
 status:
-  - pending_fix
+  - rejected
 severity:
   - medium
 discover_date: 2026-09-12
@@ -16,9 +16,9 @@ tags:
   - type-mismatch
 ---
 
-# 【3+ 变体联合赋值兼容性误报】`let h: H = { w = o }`（H.w: `int | Point | Other`，o: Other）→ Sema 报 `type mismatch: cannot assign 'int' to 'int'`
+# 【联合收窄失败的诊断 UX（原登记「3+ 变体联合赋值兼容性误报」）】`let bad: int = h.w`（h.w: `int | Point | Other`）→ 编译器正确拒绝隐式收窄；本次改进提示语（原登记为误报）
 
-[ ] **主标题：Sema 对 3 个及以上变体的联合类型做赋值兼容性判定时误报——两个 record 变体同名字段类型相同时，联合整体被误判为单个 `int` 变体，导致对合法 record 值的赋值被拒（`cannot assign 'int' to 'int'`，两侧显示同名却判不等价）**
+[x] **结案（误登记）：原登记「3+ 变体联合赋值兼容性误报」经实证核查**不成立**——`h.w` 的类型确为三变体联合 `int | Point | Other`，**不能隐式收窄**为 `int`，编译器报错完全正确。真正的问题是**诊断文案 UX**：报错文本两侧「看起来同名/同形」易被误读为判定错误，且缺少「该怎么办」的指引。本次已落地 UX 改进（新增 `= help: ... match ...` 提示行），判定语义零改动。**
 
 > **一句话摘要**：`type H = { w: int | Point | Other }` 且 `Point.x` / `Other.x` 同为
 > `int` 时，向 `H.w` 赋 `Other` 值报 `type mismatch: cannot assign 'int' to 'int'`——
@@ -88,5 +88,91 @@ tags:
 ## 7. 附加资源与产物
 - **复现目录**：`example/used/leakcheck/_repro/bug68/bug68_t5_three.aura`
 
+## 8. 结案记录
+
+**结案时间**：2026-09-13　**裁决**：rejected（误登记；编译器行为正确，UX 已改进）
+
+### 8.1 实测报错文本（修正笔记原记录）
+
+笔记 §1/§2 原记报错为 cannot assign 'int' to 'int' —— **该记录不准确**。经复现（example/test.aura，let bad: int = h.w）实测输出为：
+
+    error: type mismatch: cannot assign 'int | { x: int, y: int } | { x: int, z: int }' to 'int'
+      --> example/test.aura:7:5
+       |
+     7 |     let bad: int = h.w
+       |                    ^
+       = help: the value has a union type; extract the desired variant first with a 'match' expression
+
+即：**来源侧类型是完整三变体联合**（int | { x:int, y:int } | { x:int, z:int }），而非笔记所记的 'int' to 'int'。
+原「两侧同名却判不等价」的推断由此证伪——文本信息本来就是完整且准确的。
+
+### 8.2 判定正确性
+
+- h.w 的静态类型 = H.w 的声明类型 = 三变体联合 int | Point | Other。
+- Aura 无隐式解箱/联合收窄；联合值必须**显式 match 提取**才能得到单个变体。
+- 目标 int 不是联合：isAssignable(target=int, source=union) 走的是「联合作为 source、非联合作为 target」路径；
+  Assignability.cpp 的联合分支（L195）只在 **target 为联合**时命中。
+- → **编译器拒绝是正确的**，不存在「合法 record 值被误拒」（原登记的核心主张不成立）。
+
+### 8.3 两形态实证（原登记声称「3+ 变体复现、2 变体不复现」）
+
+| 形态 | 用例 | 结果 |
+| :--- | :--- | :--- |
+| 纯赋值形态（let h: H = { w = o }，o: Other） | example/used/leakcheck/_repro/bug68/bug68_bug80_pure.aura | ✅ 编译通过（无联合收窄，合法） |
+| 字段访问形态（let got: int = h.w.x） | example/used/leakcheck/_repro/bug68/bug68_t5_three.aura | ✅ 编译通过（bug-68 修复时一并解决） |
+| 收窄形态（let bad: int = h.w） | 本次复现（example/test.aura） | ✅ 正确报错 + 新增 match 提示 |
+
+**结论**：赋值本身合法（前两形态通过）；只有「拿联合值去当 int 用」才报错，这是正确行为。
+原登记把「赋值合法」与「收窄非法」混为一谈，故判为误报。
+
+### 8.4 是否 bug-68 引入？
+
+- 结论：**与 bug-68 无关**。
+- 依据：bug68_bug80_pure.aura（纯赋值形态）与 bug68_t5_three.aura（h.w.x 形态）**均编译通过**，
+  说明 bug-68 的字段访问分派修复没有问题；h.w 报错来自「联合值收窄到 int」这一独立语义路径
+  （Assignability 的联合 source 分支），bug-68 未触碰该逻辑。
+- 原「无法判定是否 bug-68 引入」的悬置项就此关闭。
+
+### 8.5 UX 改进（本任务落地）
+
+**问题**：报错信息完整但**缺少「该怎么办」的指引**——用户看到 cannot assign A to B 时，
+不会立即想到「需要用 match 提取变体」；且两侧「看起来同名/同形」的文本易被误读为判定出错。
+
+**改动**（仅诊断文本/提示语；isAssignable 判定语义零改动）：
+
+| 文件:行 | 场景 | 改动 |
+| :--- | :--- | :--- |
+| src/Sema/Checker/StmtChecker.cpp:135 | let 声明收窄失败 | 来源为 UnionSemType → 追加 help 提示；否则原样 |
+| src/Sema/Checker/StmtChecker.cpp:254 | const 声明收窄失败 | 同上（type mismatch in const 文案不变） |
+| src/Sema/Checker/ExprInferMisc.cpp:190 | 赋值语句收窄失败 | 同上（assignment type mismatch 文案不变） |
+| src/Sema/SemAnalyzer.h:53 / .cpp:27 | —— | 新增 error(node, msg, hint) 重载（补齐 DiagnosticEngine 已有的同形态；3 参数无默认值，无重载歧义） |
+| test/framework/test_helpers.h | —— | 新增断言辅助 hasErrorHintContaining(diag, substr) |
+
+**零噪音保证**：非联合的不匹配（let x: int = str）走原 error(...) 分支，fixHint 为空
+→ 输出**与改进前逐字节一致**（已实测比对）。
+
+**提示语文案**：the value has a union type; extract the desired variant first with a match expression
+→ 渲染为括号内 help 一行，复用 DiagnosticEngine::print 既有的 fixHint 机制。
+该机制此前**全项目零调用**，本次为首个消费者，因此**无需扩展诊断引擎结构**（最小方案）。
+
+### 8.6 验证统计
+
+- **全量单测**：1315 → **1319 tests / 1319 passed / 0 failed**（新增 4 条）。
+  - 新增：SemaListOptional.UnionNarrowLetHint / UnionNarrowAssignHint / UnionNarrowConstHint
+    （断言 hasErrorHintContaining(diag, match)）；PlainMismatchNoUnionHint
+    （断言**不含** match 提示 → 锁死零噪音）。
+  - **无需同步任何既有断言**：既有测试全部使用 hasErrorContaining（子串匹配），
+    追加 help 行不影响判定结果。
+- **used/1-6.aura**：6/6 编译运行通过。
+- **不回归**：r1 / r2 / r3 / r4 + r5_bug79_capture_after_compact 各 20 轮 → 0 失败。
+- **主用例**：let bad: int = h.w 仍报错（语义不变）+ 提示可见；
+  普通不匹配 let x: int = str 报错文本**与改进前一致**。
+
+### 8.7 台账与索引更新
+
+- frontmatter：status: pending_fix → **rejected**；标题 [ ] → **[x]**（结案）。
+- sub_module 修正为「诊断文案 UX（Sema 赋值/声明收窄失败）」——本条的真实价值在 UX 而非判定。
+- **索引提示**：本条**不是**待修缺陷，已从 pending_fix 清单移出（extract_pending_fix.ps1 不再列出）。
+
 ---
-**当前状态**：`2026-09-12` bug-68 修复验证期附带发现登记（待定位根因 / 回溯基线）
+**当前状态**：2026-09-13 **结案（rejected / 误登记）**——判定正确，UX 改进已落地（1319/1319 全绿）。

@@ -580,6 +580,12 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
         std::set<std::string> viewCaptures;
         for (auto& cn : captures)
             if (viewRootVarNames_.count(cn)) viewCaptures.insert(cn);
+        // feature-12 批次 3（5.1）：接口默认方法 receiver 也是【视图值】——
+        // DeclGen.cpp 默认方法分支把 "self" 注册进 viewRootVarNames_/viewRootTypes_，
+        // 但 receiver 不在 captures（needsThisCapture 单独承载），此处按需补入
+        // viewCaptures，使 cap_recv 槽走视图值槽分支（ExprClosureCallableObj.cpp）。
+        if (needsThisCapture && viewRootVarNames_.count(currentReceiverName_))
+            viewCaptures.insert(currentReceiverName_);
         bool hasRecursiveCapture = !currentLetName_.empty()
             && std::find(captures.begin(), captures.end(), currentLetName_) != captures.end();
         const FuncSemType* inferFst = dynamic_cast<const FuncSemType*>(e.inferredType);
@@ -607,9 +613,41 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
         // 判断依据从「闭包自身泛型」剥离：hasGeneric 不再计入 callableParamIndices。
         // feature-07 Step 4: 协程闭包（closureIsCoro）不再排除——走新路径（__invoke 返回
         // aura_rt::task<T>）。签名可静态映射仍为前提（形参/返回类型均合法 C++ 类型）。
-        bool useCallableObj = sigMappable && genInfo.genericParams.empty()
-            && genInfo.returnOnlyGenerics.empty()
-            && !(needsThisCapture && currentReceiverCppType_.empty())
+        // feature-12 批次 1（方案 F）：判据 1/2（genericParams / returnOnlyGenerics）
+        // 不再排除——这两类形态改走 F（具名模板 struct + 成员函数模板
+        // operator()），多态值语义保留。仍排除：接口默认方法 receiver（批次 3）、
+        // 形参自身含未绑定泛型（funcTypeHasOwnUnboundGeneric，仍走旧路径）。
+        // feature-12 批次 2（bug-83 修复，2026-09-15）：条件 2 从「
+        // callableParamIndices 非空即否决」细化为「其中任一形参自身含未绑定泛型才否决」。
+        // 依据（主 Agent 探针实测 used/2 / r3 / probe_g6 三例完全一致）：
+        // callableParamIndices 收的是【所有】FunctionType 形参，而「具体函数类型形参」
+        //（如 fun(int,int)->int）已可由 CallableObj<U,T>* 承载，不应被否决；
+        // 被否决时会落旧路径，而旧路径参数侧 F<idx> 发射不受 hasGeneric 门控
+        //（模板头 L107-111 受门控）→ 发射 F0 形参而模板头未声明 = bug-83。
+        // ⚠️ feature-12 批次 1 修复（2026-09-13，GLM5.3 指令 ①）：判据回退——
+        // 不是「凡 needsThisCapture 一律排除」（那会把 record receiver 闭包也推出
+        // CallableObj 路径，破坏 feature-07 既有行为），而是恢复原判据：
+        // 仅【接口默认方法】（receiver C++ 类型为空）排除——它需要 [this] 裸捕获
+        // 语义（视图地址稳定 + ViewRoot 保活），F/CallableObj 路径都不支持。
+        // 逐形参精确判定：callableParamIndices 中任一形参自身含未绑定泛型 → 才否决
+        //（此时该形参确实无法由 CallableObj 的静态签名承载）。其 SemType 在
+        // inferFst->paramTypes[ci] 直接可取（与 e.params 同序，同为 FuncSemType）。
+        auto hasUnboundGenericCallableParam = [&]() -> bool {
+            if (!inferFst) return false;
+            for (size_t ci : genInfo.callableParamIndices) {
+                if (ci >= inferFst->paramTypes.size()) continue;
+                if (auto* pfs = dynamic_cast<const FuncSemType*>(inferFst->paramTypes[ci].get()))
+                    if (funcTypeHasOwnUnboundGeneric(pfs)) return true;
+            }
+            return false;
+        };
+        // feature-12 批次 3（5.1）：条件 3（`needsThisCapture && currentReceiverCppType_
+        // .empty()` 否决）已移除——接口默认方法分支（DeclGen.cpp）现已设
+        // currentReceiverCppType_（接口视图裸名）+ currentMethodThisHandle_（_self_root），
+        // receiver 捕获走【视图值槽】，逃逸安全（含 compact 压实）。仍保留形态：
+        // sigMappable（签名需静态可映射）+ 未绑定泛型形参/闭包自身泛型（F 域）。
+        bool useCallableObj = sigMappable
+            && !hasUnboundGenericCallableParam()
             && !(inferFst && funcTypeHasOwnUnboundGeneric(inferFst));
         // feature-07 Step 1：递归自引用捕获不再排除——hasRecursiveCapture 传入新路径
         // （cap_self 槽 + IIFE 尾部自填），消灭 `&f` 按引用捕获（栈帧绑定/不可逃逸/
@@ -619,7 +657,50 @@ std::string CodeGenerator::genFunExpr(const FunExpr& e, bool isCoroutine) {
                                           hasRecursiveCapture, viewCaptures, closureIsCoro});
     }
 
-    // === 4. 生成 C++ lambda（提取到 genOldPathLambda） ===
-    return genOldPathLambda(e, capInfo, genInfo, needsMutable, calledCaptures, closureIsCoro);
+    // === 4. 生成 C++ 闭包（feature-12 批次 1 修复：双分支）===
+    // feature-12 批次 1（GLM5.3 指令 ②③）：F 只服务【泛型域】——闭包自身泛型
+    //（genericParams / returnOnlyGenerics）非空时走 genGcUClosure（具名模板 struct
+    // + header 通道 + 多态值保留）。
+    //
+    // ⚠️ feature-12 批次 3 · 5.2（2026-09-16）：判据**合并为单点** `isFClosureDomain`
+    // （与 genGcUClosure 的入口守卫共调），消除"两处拷贝、改动需双改"的隐患。
+    // 该单点现含【形参含未绑定泛型】（方案 D 扩展）——这类签名无法由 CallableObj
+    // 静态承载，改由 F 的成员函数模板表达；若签名引用了外层模板参数（如
+    // `fun (self Box<A>)` 的 A），F 通过「借用参数」（类模板参数）处理，见 genGcUClosure。
+    if (isFClosureDomain(genInfo, dynamic_cast<const FuncSemType*>(e.inferredType)))
+        return genGcUClosure(e, capInfo, genInfo, needsMutable, calledCaptures, closureIsCoro);
+    // ============================================================
+    // feature-12 批次 3 · 5.2 收口完成（2026-09-16）：旧路径 `genOldPathLambda`
+    // 已**正式删除**（415 行）。此处为**永久防御性断言**：若未来有形态落到这里，
+    // 干净报错并打印触发原因，而非静默产出坏 C++。
+    //
+    // 归零证据（2026-09-16 实测，三重）：
+    //   ① 全量回归零触发：1322 单测 + 100 个 .aura 用例（used/1-6 / f07_verify /
+    //      f12_batch3 / f12_defectB）；
+    //   ② 产物逐字比对：删除态 vs 注释态 **94/94 一致、0 差异**；
+    //   ③ 最后一个形态（函数式类型别名引入外层模板参数，`Mapper<A,U>`）已由
+    //      **方案 D「借用参数」**迁入 F 域（见 genGcUClosure）。
+    // ============================================================
+    (void)calledCaptures;
+    {
+        const FuncSemType* dbgFst = dynamic_cast<const FuncSemType*>(e.inferredType);
+        std::string why = "unknown";
+        if (dbgFst) {
+            bool cpiGen = false;
+            for (size_t ci : genInfo.callableParamIndices) {
+                if (ci >= dbgFst->paramTypes.size()) continue;
+                if (auto* pfs = dynamic_cast<const FuncSemType*>(dbgFst->paramTypes[ci].get()))
+                    if (funcTypeHasOwnUnboundGeneric(pfs)) cpiGen = true;
+            }
+            if (cpiGen) why = "callableParamIndices with unbound generic";
+            else if (funcTypeHasOwnUnboundGeneric(dbgFst)) why = "closure own unbound generic";
+            else why = "signature not statically mappable (auto fallback)";
+        }
+        error(e, "internal: closure reached the removed old-path generator "
+                 "(feature-12 batch 3 · 5.2 收口). Trigger: " + why +
+                 ". Please report this .aura source — it should be routed to "
+                 "CallableObj (useCallableObj) or GcUClosure (isFClosureDomain).");
+    }
+    return "";   // 不可达（error 已记录）；返回空串防未定义行为
 }
 } // namespace Aura
