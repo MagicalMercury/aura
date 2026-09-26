@@ -108,7 +108,7 @@ tags:
   - **配套 B**（`ExprClosure.cpp:686-695` currentReturnCppType_ 覆写）：与主方案同构去 None 跳过——推断 None → `currentReturnCppType_ = "aura_rt::NoneType"`，使闭包体内 genReturnStmt 可感知 NoneType 上下文（配套 C 的前提）。
   - **配套 C**（`src\CodeGen\StmtControl.cpp:142-151` genReturnStmt）：新增分支 `closureBodyDepth_ > 0 && currentReturnCppType_=="aura_rt::NoneType" && (isCoroutine ? currentCoroTaskRetCpp_=="aura_rt::NoneType" : true)` → 生成 `return aura_rt::NoneType{};`（替代裸 `return;`，堵「NoneType lambda 中裸 return; 非法」缺口）。**关键设计**：仅闭包内生效——顶层函数/方法 None 返回已映射为 void 签名（funSignature:272 / methodSignature:506），裸 `return;` 合法不得改写；协程闭包仅 task<NoneType>（显式 `-> None`）补 `co_return aura_rt::NoneType{};`，task<void>（推断 None）保持 `co_return;`（bug-39）。为此在 `CodeGen.h` 新增 `int closureBodyDepth_` + `std::string currentCoroTaskRetCpp_`（genFunExpr 进闭包体 ++ / 退出 --，协程 task 内层返回类型嵌套保存/恢复）。
 - **bug-34 顺带修复**：显式 `-> None` 闭包 + 体含显式 `return;`（此前 NoneType lambda + 裸 return → g++ 坏 C++）由配套 C 自动修复，实测 `repro_explicit_none_ret.aura` ✅ 编译运行，已同步更新 bug-34 笔记 [x]。
-- **新发现并顺带修复（规则 #5）**：协程闭包显式 `-> None`（task<NoneType>）+ 体含裸 `return;` → `co_return;` 坏 C++（promise 无 return_void）——配套 C 扩展（`currentCoroTaskRetCpp_` 区分 task<NoneType>/task<void>）同批修复，已登记 [[bug-39-coro-closure-none-ret]] [x]。
+- **新发现并顺带修复（规则 \#5）**：协程闭包显式 `-> None`（task<NoneType>）+ 体含裸 `return;` → `co_return;` 坏 C++（promise 无 return_void）——配套 C 扩展（`currentCoroTaskRetCpp_` 区分 task<NoneType>/task<void>）同批修复，已登记 [[bug-39-coro-closure-none-ret]] [x]。
 - **验证统计**（2026-08-30，重新编译 aurac + 逐文件 aurac→g++→运行）：
   - `repro_closure_none_implicit`（体无 return）✅、`repro_closure_none_implicit_ret`（体有 return;）✅（生成 `-> aura_rt::NoneType` + `return aura_rt::NoneType{};`）
   - 三类回归场景（现状合法程序未变坏）：无标注裸闭包体无 return ✅ / 体含 `return;` ✅ / 内联传参调用不赋值 ✅（均 main ran）

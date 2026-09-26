@@ -8,6 +8,7 @@
 #include "string.h"
 #include "error.h"   // make_value_error（错误转换工厂）
 #include "../gc.h"
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <climits>
@@ -685,9 +686,16 @@ namespace {
     // 线程间缓存不一致不影响正确性：L1 未命中走全局锁 double-check
     // ============================================================
     struct InternCacheEntry { const char* key; size_t keyLen; GcString* val; };
+    // [FIX-B86-2] GC compaction 代次：任何线程完成 compact 后自增。
+    //   线程局部 L1 缓存里的 val 是【裸指针】，compact 搬运 intern 对象后必须作废；
+    //   原实现只在 GC initiator 自己的线程调用 clear_intern_cache()，
+    //   其他线程的缓存不会被清 -> 命中悬垂指针 -> concat_multi SIGSEGV（bug-86 形态②）。
+    //   改为全局代次：查找时比对，代次不符即整表作废（惰性、无需跨线程遍历）。
+    [[gnu::init_priority(105)]] std::atomic<uint64_t> g_internCacheGen{0};
     static thread_local struct {
         InternCacheEntry entries[64];
         size_t count;
+        uint64_t gen;   // 本缓存填充/校验时所见的 g_internCacheGen
     } tl_internCache;
 
     // L1 缓存插入（LRU 淘汰：新条目放头部，满则淘汰末尾）
@@ -727,6 +735,12 @@ GcString* intern_string(const char* s, size_t len) {
     // 0. L1 线程局部缓存查找（无锁，热点字面量快速命中）
     {
         auto& cache = tl_internCache;
+        // [FIX-B86-2] 代次校验：任何线程 compact 后全局代次自增，本线程旧缓存整表作废
+        const uint64_t curGen = g_internCacheGen.load(std::memory_order_acquire);
+        if (cache.gen != curGen) {
+            cache.count = 0;      // 缓存作废：裸指针可能已被 compact 搬运
+            cache.gen   = curGen;
+        }
         for (size_t i = 0; i < cache.count; ++i) {
             auto& e = cache.entries[i];
             if (e.keyLen == len && std::memcmp(e.key, s, len) == 0) {
@@ -783,7 +797,10 @@ GcString* intern_string(const char* s) {
 // 下次 intern_string 未命中后从全局池获取正确指针并重新填充。
 // ============================================================
 void clear_intern_cache() {
+    // [FIX-B86-2] 本地清空 + 全局代次自增（使所有线程的 L1 缓存在下次查找时作废）。
+    // 原实现只清本线程 tl_internCache，跨线程 compact 时其他线程仍命中悬垂裸指针。
     tl_internCache.count = 0;
+    g_internCacheGen.fetch_add(1, std::memory_order_acq_rel);
 }
 
 // ============================================================

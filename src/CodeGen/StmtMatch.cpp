@@ -283,7 +283,9 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
 
         if (c.body) {
             if (auto* b = dynamic_cast<const BlockStmt*>(c.body.get())) {
-                genBlock(cpp, *b, isCoroutine);
+                // feature-14 U5：match 分支体生成了自己的 `{}`（上方 branchIntro `{`）
+                // → opensScope=true，块内声明的 future 在该分支块尾驱动。
+                genBlock(cpp, *b, isCoroutine, /*opensScope=*/true);
             } else {
                 std::string bodyExpr = genExpr(*c.body, isCoroutine);
                 writeLine(cpp, bodyExpr + ";");

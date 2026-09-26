@@ -160,7 +160,7 @@ fun demo() {
 ## 7. 相关资源与参考（References）
 
 - **下游**：[[feature-09-annotator]]（L1 注解器变量消费 Phase 1+3）；[[feature-10-reflection-library]]（编译期 TypeInfo 消费 Phase 2）。
-- **业界调研**（2026-09-12 子 Agent 网络调研，8 家对比存档于本笔记讨论链）：Zig comptime（双用模型+类型一等值的单一心智）、Rust const 三层（按目标平台解释、transient allocation）、Jai #run（宏=带 Code 参数的普通函数——L2 契约参照；IO 全开不采纳）、D CTFE（上下文触发双用）、Nim static[T] 分层、C++ constexpr→consteval 演进（渐进路线 + 「双态语义是最大坑」教训）、Carbon checked generics、Pony RFC-53 撤回（无边界 CTFE 难落地的教训）。
+- **业界调研**（2026-09-12 子 Agent 网络调研，8 家对比存档于本笔记讨论链）：Zig comptime（双用模型+类型一等值的单一心智）、Rust const 三层（按目标平台解释、transient allocation）、Jai `#run`（宏=带 Code 参数的普通函数——L2 契约参照；IO 全开不采纳）、D CTFE（上下文触发双用）、Nim static[T] 分层、C++ constexpr→consteval 演进（渐进路线 + 「双态语义是最大坑」教训）、Carbon checked generics、Pony RFC-53 撤回（无边界 CTFE 难落地的教训）。
 - **关键决策记录**：解释器型（✅ 主流共识）；编译运行型（❌）；字符串 mixin（❌）；IO 白名单（❌ v1 永久禁，未来构建编排走独立进程不进语言）。
 
 ---

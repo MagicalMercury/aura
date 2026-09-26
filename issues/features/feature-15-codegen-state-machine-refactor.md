@@ -125,4 +125,45 @@ CodeGen 的控制流 = 一个巨大的 `CodeGenerator` 类（CodeGen.h 中数百
 
 ---
 
-**当前状态**：`2026-09-16` 登记（用户 2026-09-16 定：方案 B 入 feature-13；CodeGen 状态机化立 **feature-15**——f13 之后实施，与 f13 解耦）。**待评审**——评审通过后进 plan 细化（Phase S1 待 f13 C1 产出后启动）。
+## 8. 细化实施方案（2026-09-18，GLM-5.3 细化 + 只读清点支撑）
+
+> **前提状态**：f13 已实施完成（C0-C4 done；CodeGen 每模块独立实例、并行安全已实证；产物 md5 比对手法已建）。本细化据此收敛——**f15 真正要消灭的是「跨函数信号」，不是全链重写**。
+
+### 8.1 关键实证（清点结论）
+
+- **跨函数泄漏实锤**：`DeclFun.cpp:60-65` —— `lastClosureIsCoro_` 必须**函数入口手动重置**，否则「上一函数闭包状态泄漏到下一函数的 let 绑定」；
+- **信号族本质**：闭包生成点（`ExprClosure*.cpp`）回填 flag → 紧邻的 `genLetStmt`（StmtLet.cpp:370-410/486-495）消费登记 → 单点清除（StmtLet.cpp:727-732）——信息「随调用序列传递」而非「随表达式传递」。
+
+### 8.2 三分类（信息源决定处置——不做全链重写）
+
+| 成员族 | 信息源 | 处置 |
+|---|---|---|
+| **信号族** `lastClosureIsCoro_/IsCoroTask_/IsGcU_/GcUBase_` | 闭包体属性（挂起/多态基类型），**生成点才知道** | **窄接口化**：`genFunExpr` 返回 `ExprResult{ code, isCoro, isCoroTask, isGcU, gcUBase }`，只改 **genFunExpr→genLet 一条接口**，闭包属性随绑定表达式走，**不落成员**（非全链重写——其余 gen* 仍返回 string）|
+| **上下文族** `currentReceiver*_ / currentTParams_ / currentLetName_ / currentFunctionIsCoroutine_ / insideSpawn_ / inSyncThreadBlock_` | 词法上下文（一次性/栈式）| **GenContext 参数化**（`ClosureGenSpec` 先例推广）：收进传入上下文对象/栈，替代成员 |
+| **计数族** `*Counter_` / **注册表族** `*Vars_` 等 | 模块内唯一命名 / 真跨 let 登记 | **不动**——计数类每模块独立实例（f13 已证并行安全）；注册表是数据非噪声（insert/count 即为数据流）|
+
+### 8.3 分期（每期「删成员 + 全量回归 + 产物 md5」，行为等价机器证明）
+
+```
+S1 泄漏止血：lastClosure* 家族 RAII Guard（进入函数保存、返回恢复）——独立收益、零风险、即插即停
+S2 窄接口化：ExprResult 带回闭包属性（genFunExpr→genLet 接口 + 两侧消费）
+           → 删 lastClosureIsCoro_/IsCoroTask_/IsGcU_/GcUBase_ 成员
+S3 上下文参数化：GenContext 收编 current*/insideSpawn_/inSyncThreadBlock_（机械套壳，ClosureGenSpec 推广）
+S4 判据/散落收敛 + 计数/注册表「不动」复审 + 全量复验 + 文档
+```
+
+### 8.4 验收（规范级，收敛自 §6）
+
+- [ ] S1 后：泄漏用例（无 RAII 时的跨函数错位）负例转正；产物 md5 逐字一致；
+- [ ] S2 后：`rg "lastClosureIsCoro_|lastClosureIsGcU_|lastClosureGcUBase_" src/CodeGen` 零命中；
+- [ ] S3 后：上下文族成员归零（仅注册表/计数保留）；每期全量回归 + used/1-6 + GC 压测绿；
+- [ ] S4 后：判据单点复查（`isFClosureDomain`/`funcTypeHasOwnUnboundGeneric` 全仓唯一实现）。
+
+### 8.5 风险（补充 §7 视角）
+
+- S2 的窄接口是**行为敏感点**（genFunExpr 消费方不止 genLet）——Phase 0 探针先 grep `genFunExpr` 全部调用点，确认 ExprResult 接入不改动其它消费语义；
+- S3 的 GenContext 化需逐成员核对「是否有闭包嵌套跨层共享」——嵌套闭包（外层生成中生成内层）时上下文栈必须正确压/弹。
+
+---
+
+**当前状态**：`2026-09-18` 细化实施（§8 已落：三分类 + S1-S4 分期 + 验收/风险；f13 前置已满足）。**待评审**——审查通过后 S1（RAII 泄漏止血）可先行派发。

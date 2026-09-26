@@ -71,6 +71,7 @@ set(AURA_SOURCES
     src/Sema/Checker/StmtChecker.cpp
     src/Sema/Checker/StmtFlow.cpp
     src/Sema/Checker/StmtSync.cpp
+    src/Sema/Checker/CallGraph.cpp
     src/Sema/Checker/ExprInfer.cpp
     src/Sema/Checker/CallInfer.cpp
     src/Sema/Checker/ExprInferMisc.cpp

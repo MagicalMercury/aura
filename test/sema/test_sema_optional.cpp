@@ -544,7 +544,7 @@ TEST(SemaOptional, ExplicitOptGenericIfaceSomeRecord) {
         " fun (self P impl Comparable<P>) cmp(other: P) -> int { return self.x - other.x }"
         " fun main(io: Io) { let p: P = { x = 1 }; let o: Optional<Comparable<P>> = some(p) }", diag);
     EXPECT_FALSE(diag.hasErrors());
-    EXPECT_CONTAINS(unit.impl, "make_optional<Comparable<P*>>");
+    EXPECT_CONTAINS(unit.impl, "make_optional<aura_rt::Comparable<P*>>");
 }
 
 TEST(SemaOptional, ExplicitOptFuncSomeLambda) {
@@ -1035,7 +1035,7 @@ TEST(SemaOptional, NoAnnotLetOptionalValueElemsStillOk) {
     EXPECT_FALSE(diag.hasErrors());
     EXPECT_CONTAINS(unit.impl, "aura_rt::Optional<aura_rt::Array<int32_t>*>* a_raw = make_list();");
     EXPECT_CONTAINS(unit.impl, "aura_rt::Optional<aura_rt::Iterator<int32_t>>* b_raw = make_iter();");
-    EXPECT_CONTAINS(unit.impl, "aura_rt::Optional<Stringer>* c_raw = make_iface();");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Optional<aura_rt::Stringer>* c_raw = make_iface();");
 }
 
 // ============================================================
@@ -1282,6 +1282,12 @@ TEST(SemaOptional, NestedSomeRecordTripleNoInferError) {
 
 TEST(SemaOptional, NestedSomeViewAnonymousRecordCleanError) {
     // p10 翻转：Optional<Optional<Stringer>> = some(some({..}))——匿名 record 元素赋
+// bug-85（方案 B3，2026-09-18）：内置接口 Stringer/Comparable 的 C++ 形态从产物裸名迁入
+        //   runtime 公共头（builtin/interfaces.h，带 aura_rt:: 命名空间）。对应的 Sema 反解方向
+        //   （semTypeFromCppName）同步补上内置接口 C++ 名分支，否则 elemTypeOf 会把
+        //   "aura_rt::Stringer" 误判为未知 record 占位 → Assignability 的 tIsIface=false
+        //   → 「匿名 record → Optional<视图>」本应报错的形态被放行（实测回归于 B3
+        //   前约束）。故此处断言不变。
     // 接口视图应干净报错（修复前 Sema 放行 → CodeGen 生成 designated init 坏 C++）
     Aura::DiagnosticEngine diag;
     analyzeSource(
@@ -1500,6 +1506,7 @@ const char* kMainStart = " fun main(io: Io) { ";
 
 TEST(SemaOptional, SomeAnonRecordToOptionalViewCleanError) {
     // 主线：Optional<Stringer> = some({..})——匿名 record 元素 → 视图目标干净报错
+// bug-85（方案 B3，2026-09-18）：内置接口 Stringer/Comparable 的 C++ 形态从产物裸名迁入
     Aura::DiagnosticEngine diag;
     analyzeSource(
         std::string(kPersonImplStringer) + kMainStart +

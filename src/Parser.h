@@ -23,8 +23,28 @@ public:
     // 获取词法错误列表
     const std::vector<std::string>& errors() const { return diag_.errorMessages(); }
 
+    // feature-13 C2（2026-09-17）：声明级扫描入口 —— 产出「只含声明骨架、无函数体」的 AST。
+    // 语义：与 parse() 结果逐节点同构，唯一差异是 FunDecl/MethodDecl/InterfaceMethodSig 的
+    //       body/defaultBody 一律为 nullptr（函数体 token 被【跳过】而非【不消费】）。
+    // 用途：为 DeclUnit 提供「扫描产物 == 完整解析的声明部分」的可比对基准。
+    // ⚠️ 独立性：不复用 noBody_（.aurai 语义是「不消费 body token」，与「跳配对」不同，
+    //       混用会造成两种语义纠缠）——使用独立成员 scanOnly_，见其声明处说明。
+    [[nodiscard]] std::unique_ptr<Program> parseDeclarationsOnly();
+
 private:
     bool noBody_ = false;  // .aurai 模式：跳过函数体
+    // feature-13 C2（2026-09-17）：声明级扫描模式。
+    // 与 noBody_ 【并列但不复用】——两者语义不同：
+    //   noBody_  = 「不解析 body」：token 停在 body 的 '{' 处（.aurai 专用，配合 '...'）
+    //   scanOnly_= 「跳过 body」 : 数 { } 配对把整个 body 消费掉，token 停在下一个声明起始。
+    // 混用一个标志会让 parseAurai 的既有行为（token 停在 '{'）与扫描行为纠缠，
+    // 故独立成员；既有路径（parse/parseAurai）不读本标志 → 行为逐字不变。
+    bool scanOnly_ = false;
+    // feature-13 C0（2026-09-17）：「module」声明的软关键字支持 + 位置约束。
+    // module 是【软关键字】（非 TokType::Module）——保持 `let module = 1` 可用
+    //（向后兼容红线，探针 1 实测）。识别方式与既有 `as` 同款：Identifier + 文本比对。
+    bool seenImport_ = false;   // 已见 import/声明 → 迟到的 module 声明报错
+    bool sawModuleDecl_ = false; // 已见 module 声明 → 重复声明报错
     // --- 辅助 ---
     Token& advance();
     Token& peek();
@@ -36,6 +56,8 @@ private:
     void error(const std::string& msg);
     void setNodePos(ASTNode* node, const Token& tok);
     static bool isKeywordIdent(TokType t) { return t >= TokType::Fun && t <= TokType::None; }
+    // 软关键字判定：当前 token 是 Identifier 且文本等于 kw
+    bool peekSoftKeyword(const char* kw);
 
     // --- 错误恢复 ---
     void synchronize();                // 跳到下一个安全恢复点
@@ -43,6 +65,10 @@ private:
 
     // --- 解析声明 ---
     std::unique_ptr<Decl> parseDecl();
+    // feature-13 C2：跳过一对配对花括号（不建任何 AST 节点）。
+    // 仅数 LBrace/RBrace 深度；字符串/注释内的花括号由 Lexer 吞掉（不产 token），
+    // 故配对安全（探针 3 实测）。当前 token 不是 '{' 时原样返回（如 '...' 桥接形态）。
+    void skipBlockTokens();
     std::unique_ptr<FunDecl> parseFunDecl();
     std::unique_ptr<LetDecl> parseLetDecl();
     std::unique_ptr<ConstDecl> parseConstDecl();
@@ -50,6 +76,8 @@ private:
     std::unique_ptr<InterfaceDecl> parseInterfaceDecl();
     std::unique_ptr<MethodDecl> parseMethodDecl();
     std::unique_ptr<ImportDecl> parseImportDecl();
+    // feature-13 C0：`module <ident>` 声明（文件首行、import 之前；缺失时回落文件 stem）
+    std::unique_ptr<ModuleDecl> parseModuleDecl();
     std::unique_ptr<Decl> parseConfigDecl();
 
     // --- 解析语句 ---

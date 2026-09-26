@@ -17,7 +17,69 @@ import path
 import path as p          // 可起别名
 ```
 
-## 12.2 `Io` 能力对象
+## 12.2 模块声明（`module`）
+
+文件**可选**用 `module` 声明指定模块名。**不声明时，模块名回落为文件名（不含扩展名）**——存量代码无需改动。
+
+```aura
+// mymod.aura —— 显式声明模块名
+module mymod
+
+pub fun greet() -> string { return "hi" }
+```
+
+### 12.2.1 位置约束
+
+`module` 声明必须**位于文件最前**（在首个 `import` 之前）：
+
+```aura
+module utils          // ✅ 正确：最前
+import "a.aura"
+
+import "a.aura"       // ❌ 错误：'module' declaration must appear
+module utils          //     before any import statement
+
+module a
+module b              // ❌ 错误：duplicate 'module' declaration
+```
+
+**注**：`module` 是**软关键字**——它仍可作普通标识符使用（`let module = 1` 合法），
+只有在文件顶部、后跟标识符时才被识别为模块声明。
+声明前可以有注释和空行。
+
+### 12.2.2 同名多文件共享命名空间
+
+**多个文件声明同一个模块名时，它们共享同一个产物命名空间**（每个文件仍是独立的编译单元，
+导入关系仍按文件路径解析——**声明只影响产物命名空间，不合并模块、不互相可见**）：
+
+```aura
+// shapes/circle.aura
+module shapes
+pub fun area_circle(r: float) -> float { return 3.14159 * r * r }
+
+// shapes/square.aura
+module shapes
+pub fun area_square(a: float) -> float { return a * a }
+
+// main.aura —— 分别按路径导入，各自用别名访问
+import "shapes/circle.aura" as circle
+import "shapes/square.aura" as square
+
+fun main(io: Io) throws {
+    io.println(str(circle.area_circle(1.0) + square.area_square(2.0)))
+}
+```
+
+**要点**：
+
+1. 同 `module` 名 → 产物落在**同一个 C++ 命名空间**（`aura_mod_shapes`），两个文件产出的公共
+   定义在该命名空间内共存；
+2. **导入仍按文件路径**：`import "shapes/circle.aura"` 导入的是那个**文件**，不是"整个 module"；
+3. 同 module 的文件之间**互相不自动可见**——要跨文件用，照常 `import`；
+4. **不同目录下的同名文件**（未声明 `module`，即按文件名回落）会**产出同名命名空间**——
+   此时须用 `module` 显式区分。
+
+## 12.3 `Io` 能力对象
 
 `main` 函数接收 `io: Io`。所有 I/O 操作必须通过 `io` 调用：
 
@@ -29,7 +91,7 @@ fun main(io: Io) throws {
 }
 ```
 
-## 12.3 路径与字符串的隐式转换
+## 12.4 路径与字符串的隐式转换
 
 `Io` API 中接受 `Path` 参数的方法（如 `io.read_file`、`io.write_file`）可以直接传入字符串字面量或字符串变量——编译器自动进行 `string` 到 `Path` 的隐式转换。
 
@@ -39,7 +101,7 @@ io.write_file(path.join(path.new("dir"), "file.txt"), content)!
                                   // Path + string 混合 → Path
 ```
 
-## 12.4 可见性（pub）
+## 12.5 可见性（pub）
 
 可见性按**模块级策略**控制导出：
 

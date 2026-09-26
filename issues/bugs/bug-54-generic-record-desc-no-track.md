@@ -112,7 +112,7 @@ tags:
 - **依赖顺序**：bug-30 修复后 T=string/record 形态**仍崩**（`control30_record_string_field` 实证 exit=-1073741819）——**bug-54 是 bug-30 真正生效的前提**。
 - **判定条件一致**：bug-30 包装层 `std::is_convertible_v<decltype(fv), GcObject*>` 与 bug-54 desc 层 `std::is_convertible_v<T, GcObject*>` 同一哲学，T=int 双不处理、T=GcString* 双处理，行为一致。
 - **bug-29（列表字面量）无 desc 层问题**：`Array<T>::desc()`（array.tcc:923）自身按元素类型 per-instantiation 判定，包装层修复后列表路径即完整。
-- **批次 8 顺序调整**：#29 → #30（包装层）→ **#54（desc 层）** → #32（闭包入口保护，独立）。
+- **批次 8 顺序调整**：#29 → \#30（包装层）→ **\#54（desc 层）** → \#32（闭包入口保护，独立）。
 
 ### 5.6 复现设计（补充，目录 `example\used\leakcheck\_repro\batch8_gc_root_family\`）
 | 用例 | 形态 | 验证点 |

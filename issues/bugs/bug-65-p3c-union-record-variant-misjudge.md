@@ -48,7 +48,7 @@ tags:
 
 ## 4. 实测复现矩阵（Validation Matrix）
 
-| 测试文件 | 测试场景描述 | 预期结果（修复方向裁决后） | 当前实际结果（修复后 #49） | 状态/备注 |
+| 测试文件 | 测试场景描述 | 预期结果（修复方向裁决后） | 当前实际结果（修复后 \#49） | 状态/备注 |
 | :--- | :--- | :--- | :--- | :--- |
 | `method_optional_boxing_key\repro_union_T.aura`（重建） | 泛型方法 Union(Point\|T) + 裸值 9（b: Box\<int\>，主线） | 编译运行（bug-05 时代行为） | ❌ 干净报错 `union contains GC heap variant '{ x: int, y: int }' not GC-safe`（P3c，aurac 1 error） | 本条目 |
 | `method_optional_boxing_key\probe65_union_nongen_control.aura`（新建） | 非泛型 record 方法 Union(Point\|int) + 裸值 9 | 编译运行 | ✅ 编译运行 done（Variant\<Point\*, int32_t\> 装箱） | 对照（不一致坐实） |

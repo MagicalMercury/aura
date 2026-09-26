@@ -28,7 +28,7 @@ tags:
 - **影响范围**：凡返回 None 的函数/方法调用 + record 字面量字段 / 赋值语句（目标为 int|None / Optional 等含 None 形态）→ 坏 C++。let/const 声明形态已由 #63 修复干净拒绝（非本缺陷）。
 
 ## 2. 根因分析（Root Cause Analysis）
-> **关键链条**：None 返回调用（clean() -> None）推断为纯 NoneSemType → isAssignable（Assignability.cpp L144-150 Optional/Union target 分支）对 NoneSemType source 放行（设计：None 可作 None 变体值）→ #33/#63 的拒绝（cannot bind 'None' return value）仅挂在 `checkLetDecl`/`checkConstDecl` 声明提交点（StmtChecker.cpp）→ record 字面量字段值（inferNamedRecordExpr 字段期望）与赋值语句（赋值 target 期望）无对应拦截 → Sema 放行 → CodeGen 对 `int|None`（int 非堆 → std::variant<int32_t, NoneType> 全值 variant）做 make_variant 装箱，初始化/赋值表达式为 void 调用 → `_w0_1.f = (void 调用);` / `x = (void 调用);` g++ `no match for 'operator=' ... 'void'` 坏 C++。
+> **关键链条**：None 返回调用（clean() -> None）推断为纯 NoneSemType → isAssignable（Assignability.cpp L144-150 Optional/Union target 分支）对 NoneSemType source 放行（设计：None 可作 None 变体值）→ \#33/#63 的拒绝（cannot bind 'None' return value）仅挂在 `checkLetDecl`/`checkConstDecl` 声明提交点（StmtChecker.cpp）→ record 字面量字段值（inferNamedRecordExpr 字段期望）与赋值语句（赋值 target 期望）无对应拦截 → Sema 放行 → CodeGen 对 `int|None`（int 非堆 → std::variant<int32_t, NoneType> 全值 variant）做 make_variant 装箱，初始化/赋值表达式为 void 调用 → `_w0_1.f = (void 调用);` / `x = (void 调用);` g++ `no match for 'operator=' ... 'void'` 坏 C++。
 
 ### 2.1 代码路径追踪
 - **Sema 主根因**：拒绝逻辑（isNoneValueInitializer + NoneSemType 判定）仅存在于 checkLetDecl/checkConstDecl 有标注分支（#63 修复点，StmtChecker.cpp L122-145/L226-260）与无标注分支（#33，L162-171/L255-260）；**record 字段与赋值语句的提交点无同款判定**。

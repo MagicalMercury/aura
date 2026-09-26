@@ -141,20 +141,63 @@ TEST(SemaModules, PubImportRejected) {
 }
 
 // ============================================================
-// 内置模块别名（实现限制：当前不支持）
+// 内置模块别名（feature-13 C0-5，2026-09-17 起支持）
+//
+// 行为变更：此前内置模块别名不被注册（Sema 直接查 BuiltinRegistry 用字面名
+// "path.new"，别名 "p" 无符号 -> `undefined identifier 'p'`）。现由
+// SemAnalyzer::registerBuiltinImportAliases 收集 `import <builtin> as <alias>`
+// 映射，inferMethodCall 在查 BuiltinRegistry 前把别名还原为真实模块名。
+// 故原 ImportPathAliasNotSupported / ImportMathAliasNotSupported 两条
+// 「固化不支持现状」的断言（EXPECT_TRUE(hasErrors)）改为正向断言。
 // ============================================================
-TEST(SemaModules, ImportPathAliasNotSupported) {
-    // 规范支持 import path as p，但当前实现不注册别名（记录现状）
+TEST(SemaModules, ImportPathAliasSupported) {
     Aura::DiagnosticEngine diag;
     analyzeSource(
         "import path as p fun main(io: Io) { let x = p.new(\"/a\") }", diag);
-    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_FALSE(diag.hasErrors());
 }
 
-TEST(SemaModules, ImportMathAliasNotSupported) {
+TEST(SemaModules, ImportMathAliasSupported) {
     Aura::DiagnosticEngine diag;
     analyzeSource(
         "import math as m fun main(io: Io) { let s = m.sqrt(16.0) }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// 对照：无别名的既有形态不受影响（防别名机制误伤裸模块名）
+TEST(SemaModules, BuiltinImportWithoutAliasStillWorks) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "import path fun main(io: Io) { let x = path.new(\"/a\") }", diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// 别名 + 多函数/方法链：别名还原须覆盖同一模块的全部可见符号
+TEST(SemaModules, ImportPathAliasWithMultipleSymbols) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "import path as p fun main(io: Io) {"
+        " let a = p.new(\"/a/b.md\");"
+        " let b = p.join(a, \"c\");"
+        " let n = a.file_name(); }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// 负例：别名已识别但模块无此符号 -> 报「模块无该导出」而非 undefined identifier
+TEST(SemaModules, ImportPathAliasUnknownSymbolRejected) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "import path as p fun main(io: Io) { let x = p.nosuchmethod(\"/a\") }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+}
+
+// 负例：非内置模块的别名不被吞掉（仍报未定义标识符）
+TEST(SemaModules, NonBuiltinAliasStillRejected) {
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "import nosuchmodule as n fun main(io: Io) { let x = n.foo(1) }", diag);
     EXPECT_TRUE(diag.hasErrors());
 }
 

@@ -162,8 +162,8 @@ target=32 ⇒ threadRootLists_=33 = 32 池 worker（hardware_concurrency=32，16
 
 ### 9.5 决定性下一步（诊断优先，取代盲改）
 
-1. **超时 dump（最小侵入，强烈建议先做）**：waitForRootThreadsStopped abort 前打印——(a) registered_threads_.size() 与 threadRootLists_.size() 差值（区分假说 A 的两段 target 差）；(b) 每个 root list 的线程 id + **每线程 last_safepoint 心跳时间戳**（GcRootHandle/safepoint 入口记录 thread_local 时间戳，dump 时遍历）——直接回答"3 个是谁、卡了多久"；(c) 当前 phase（区分 #1/#2 超时）。
-2. **AURA_GC_LOG 细化**：concurrent GC 打印 #1/#2 两段 wait 的分项耗时（现有 phase 行只有合计 finalize wait）——确认超时发生在根扫描段还是 Finalize 段。
+1. **超时 dump（最小侵入，强烈建议先做）**：waitForRootThreadsStopped abort 前打印——(a) registered_threads_.size() 与 threadRootLists_.size() 差值（区分假说 A 的两段 target 差）；(b) 每个 root list 的线程 id + **每线程 last_safepoint 心跳时间戳**（GcRootHandle/safepoint 入口记录 thread_local 时间戳，dump 时遍历）——直接回答"3 个是谁、卡了多久"；(c) 当前 phase（区分 \#1/#2 超时）。
+2. **AURA_GC_LOG 细化**：concurrent GC 打印 \#1/#2 两段 wait 的分项耗时（现有 phase 行只有合计 finalize wait）——确认超时发生在根扫描段还是 Finalize 段。
 3. **stress 统计**：test.exe 连跑 ≥50 次记录 abort 率 + 成功案例 finalize wait 分布（若中位数 15ms 但 P99 接近秒级 → 假说 C 调度尾部；若成功案例 wait 都很快而失败是硬卡 → 假说 A/B）。
 4. 修复方向保持 §8.4，但**在诊断数据落地前不动 safepoint.cpp 协议代码**。
 
@@ -185,7 +185,7 @@ parked=26 / rootLists=33 (stopped=26)   ← parked 与 stopped 完美相等：�
 
 1. worker 调 `gc_force()` → `gcPending_=true` → safepoint() 抢到 initiator（`gc_in_progress_=true`）。
 2. **第一阶段 STW 按 registered_threads_ 快照**（当时池线程还在创建，仅 ~10 个注册）等 9 个——很快凑齐（enter 行 stopped=9/12 实证）。
-3. **safepoint() L178 `gcPending_.store(false)` 在 `startConcurrentGc()` 之前执行** → 进入 #1（根扫描完整停靠）时 `phase==Idle && gcPending==false`。
+3. **safepoint() L178 `gcPending_.store(false)` 在 `startConcurrentGc()` 之前执行** → 进入 \#1（根扫描完整停靠）时 `phase==Idle && gcPending==false`。
 4. #1 按 threadRootLists_ **实时 size**（33）等 32 个：26 个"侥幸者"是 L147→L178 窗口内（gcPending 尚 true）调 safepoint 的线程（落入 else 分支停靠）；**6 个空闲池 worker 每 ~5ms 被 cv 超时唤醒 → workerLoop L145 调 gc_safepoint() → safepoint() L86 `if (!gcPending_.load()) return;` 早退**——心跳新鲜（证明在调）却永不停靠计数 → stopped 永差 6 → 超时 abort。
 5. **间歇性 = 26/6 的划分纯靠窗口时序**（哪些线程恰在窗口内调过 safepoint）；"2s 超时"实测 ~6.4s（400 × 5ms wait_for 在 Windows 15.6ms 定时器量子下）。
 6. §8.2 假说 1（L527 复位吞计数）**排除**（parked==stopped 完美相等，计数零丢失）；§9.4 假说 A 的 cycling 变体**确认**；上一轮的"6.4s 卡死线程"实为 initiator 本身（设计使然）——**不存在真正卡死的线程**。

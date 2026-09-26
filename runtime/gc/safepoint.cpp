@@ -21,6 +21,27 @@
 
 namespace aura_rt {
 
+// [FIX-86] gc_in_progress_ release ownership token (bug-86).
+// Measured (ordered ring, 3/3 stable repro): safepoint()'s initiator branch (old L248)
+// and startConcurrentGc() (old L573) BOTH wrote gc_in_progress_ = false, but one GC
+// transaction is owned by safepoint()'s initiator branch; startConcurrentGc() is only
+// its middle section. A single transaction therefore released the flag twice, and in
+// that released-but-unfinished window a third thread won the initiator role:
+//   WIN(68096) -> WAIT(68096) -> L248(66348) -> WIN(38476)
+// Two live initiators then parked in the same wait loop, making the target
+// (threadCount-1) unreachable -> STW DEADLOCK, with the other initiator hanging
+// forever in all_stopped_cv_.wait_for.
+// Fix: (1) startConcurrentGc() no longer releases (release belongs to the caller);
+//      (2) release sites verify ownership; a non-owner release is a no-op.
+static std::atomic<unsigned> g_gc_owner_tid{0};
+static inline unsigned gcOwnerSelfTid() {
+#ifdef _WIN32
+    return static_cast<unsigned>(GetCurrentThreadId());
+#else
+    return static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+}
+
 // ============================================================
 // 写屏障 — 维护记忆集
 // ============================================================
@@ -169,6 +190,7 @@ void GcHeap::safepoint() {
 
     // 多线程场景：本线程尝试成为 GC 执行者
     if (!gc_in_progress_.exchange(true)) {
+        g_gc_owner_tid.store(gcOwnerSelfTid(), std::memory_order_release);  // [FIX-86] claim ownership
         // 抢到 GC 锁：等待其他线程到达 safepoint
         // cv 化（阶段 1）：notify_all 精确唤醒，超时兜底；1s 超时 abort 语义不变
         // 注：历史 GCC 11 TSan 对 pthread_cond_timedwait 的 mutex 释放/重获追踪有 bug，
@@ -245,7 +267,11 @@ void GcHeap::safepoint() {
         {
             std::lock_guard<std::mutex> lk(all_stopped_m_);
             stopped_threads_ = 0;
-            gc_in_progress_ = false;
+            // [FIX-86] 只允许持有者释放（陈旧复位会放进第二个 initiator）
+            if (g_gc_owner_tid.load(std::memory_order_acquire) == gcOwnerSelfTid()) {
+                gc_in_progress_ = false;
+                g_gc_owner_tid.store(0, std::memory_order_release);
+            }
             gc_epoch_.fetch_add(1);       // 递增代次，唤醒所有等待者
             all_stopped_cv_.notify_all();
         }
@@ -566,11 +592,16 @@ void GcHeap::startConcurrentGc() {
     auto tEnd = std::chrono::steady_clock::now();
     uint64_t usEnd = std::chrono::duration_cast<std::chrono::microseconds>(tEnd.time_since_epoch()).count();
     recordGcEvent(4, us0, usRoots, usMark, usWait, usEnd, liveBefore, bytesBefore);
-    // 清标志 + 唤醒（Finalize 等待者恢复；gc_in_progress_ 重置供下次 GC 抢权）
+    // 唤醒（Finalize 等待者恢复）；gc_in_progress_ 的释放归调用方（[FIX-86]）
     {
         std::lock_guard<std::mutex> lk(all_stopped_m_);
         stopped_threads_.store(0);
-        gc_in_progress_.store(false);
+        // [FIX-86] 释放权归属"事务所有者"＝ safepoint() 的 initiator 分支。
+        // startConcurrentGc() 是本事务的中段，不得在此释放 gc_in_progress_：
+        // 否则 L573 -> 调用方 L248 之间出现"已释放但事务未结束"的窗口，
+        // 第三个线程会在该窗口抢到 initiator 角色 -> 两个 initiator 并存 ->
+        // 等待目标 threadCount-1 不可达 -> STW DEADLOCK（实测有序环三复现）。
+        // 释放改由调用方（safepoint initiator 分支 / 单线程路径的结果收尾）完成。
         gc_epoch_.fetch_add(1);
         all_stopped_cv_.notify_all();
     }

@@ -160,6 +160,47 @@ bool CodeGenerator::isUnionHeapVariant(const SemType* t) const {
 // ============================================================
 
 std::string CodeGenerator::genExpr(const ASTNode& expr, bool isCoroutine) {
+    // feature-14 P2（§3.5 隐式 future）——**消费点收口**。
+    //
+    // 为什么收口在 genExpr 入口而不是散落各生成分支：future 变量「被当值消费」
+    // 的形态极多（实参传递、str()、字段访问基址、二元运算、索引、返回……），
+    // 逐分支插 co_await 必漏（Phase 0 §5.1 实测 ExprCall 的 prefix 被 8 个分支
+    // 复用；ExprMethodCall 另有一套）。在总调度处统一处理 = 「消费即兑现」。
+    //
+    // ⚠️ 唯一例外：作为赋值/管道/条件/错误传播的**左值或惰性承载者**时不得兑现——
+    //    那是「转运 future」而不是「消费 future」，见下方 skipAsNonValue 判定。
+    // ⚠️ 只在协程上下文兑现（isCoroutine）：非协程上下文根本没有 co_await 可用，
+    //    且 future 变量只在协程函数体内生成（sync 块体 isCoroutine=true）。
+    // ⚠️ 还原：本函数返回后 insideSyncBlock_ 不变（消费点不改变域归属）。
+    if (isCoroutine) {
+        if (auto* id = dynamic_cast<const Identifier*>(&expr)) {
+            std::string src = resolveFutureVar(safeName(id->name));
+            if (!src.empty()) {
+                // 兑现：先把 co_await 提到**当前语句外层**（hoist），再在表达式位置
+                // 返回这个临时变量的裸名。
+                //
+                // ⚠️ 为什么必须 hoist（实测 p3 报错，这是本改造最关键的一处）：
+                //    调用点大量被包进 `[&]() -> auto { ... }()` IIFE（genGcRootedArgs
+                //    的实参保护路径）。IIFE 的返回类型是 **deduced return type**，
+                //    C++ 标准明令禁止在「返回类型推导」的函数体内出现 co_await
+                //    （g++: "co_await cannot be used in a function with a deduced
+                //    return type"）。消费点直接返回 "co_await a" 会落进那个 IIFE。
+                //    → 用项目既有的 hoist 机制（genGcRootedArgs 的 outer 前缀同款，
+                //      CodeGen.h 的 hoistPrefixPending_ / flushHoistPrefix）把
+                //      `auto _awN = (co_await t);` 提升为语句，表达式位置只留变量名。
+                //
+                // ⚠️ 命名解析走 resolveFutureVar（源头变量名）而非原始名——别名形态
+                //    `let t2 = t` 里 t2 只是拷贝名，承载 task 的是 t。
+                // ⚠️ task<T> 是**值**（非 GC 指针）→ 不加 .get()。
+                clearFutureVar(safeName(id->name));
+                std::string avName = "_aw" + std::to_string(awaitHoistCounter_++) + "_"
+                                   + safeName(src);
+                hoistPrefixPending_ += "auto " + avName + " = (co_await "
+                                     + safeName(src) + ");\n";
+                return avName;
+            }
+        }
+    }
     if (auto* e = dynamic_cast<const IntLiteral*>(&expr))
         return genIntLiteral(*e);
     if (auto* e = dynamic_cast<const FloatLiteral*>(&expr))

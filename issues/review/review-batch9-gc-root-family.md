@@ -47,19 +47,19 @@ tags:
 
 ## 2. 源码映射审查（逐项比对）
 
-| 步骤编号                                 | 目标文件                                                 | 比对结果           | 详细备注                                                                                                                                                                                                  |
-| :----------------------------------- | :--------------------------------------------------- | :------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| #56·根因（入口只包 params）                  | `DeclFun.cpp:592-614`                                | ✅ 一致           | 实证：入口区只生成参数的 GcRootHandle/ViewRoot，this 无保护                                                                                                                                                           |
-| #56·修改点 2/3/4（入口句柄/清理/genIdentifier） | DeclFun/CodeGen.h/ExprGen                            | ✅ 成立           | isCoro 在入口区可用（L592 区已有状态）；三字段插入点与清理配对成立；分支顺序（闭包句柄 → 方法句柄 → "this"）正确                                                                                                                                  |
-| #56·修改点 5（闭包统一去协程限定）                 | `ExprClosure.cpp:593-619`                            | ✅ 成立           | thisAsHandle 判定现状实证仅协程；去掉 `currentFunctionIsCoroutine_` 后非协程闭包走 init-capture，接口默认方法（currentReceiverCppType\_ 空）不触发保持 `[this]` ✓；与 #56 的 `_this` 可见性论证成立（闭包体内 self 恒经 currentClosureThisHandle\_ 优先分支） |
-| **#56·spawn/sync 兄弟落点**              | `StmtSpawn.cpp:34-63/128-164`、`StmtSync.cpp:116-155` | ❌ **覆盖缺口**     | 见 §3 第 1 条（本轮核心发现）                                                                                                                                                                                    |
-| #57·根因                               | `StmtLet.cpp:54-62`                                  | ✅ 一致           | typeAliasTemplateParams\_ 排除 → type="auto" 实证                                                                                                                                                         |
-| #57·放行条件                             | `TypeResolution.cpp:281-307`                         | ⚠️ **边界描述不成立** | 见 §3 第 2 条                                                                                                                                                                                            |
-| #57·注册链                              | `StmtLet.cpp:385-406`                                | ✅ 成立           | isGcPointerType("Tree<...>\*")=true → `_raw`+`GcRootHandle`+注册，全套预存在零改动                                                                                                                               |
-| #52·根因                               | `DeclFun.cpp:661-685`                                | ✅ 一致           | `fullType* self = gc_alloc...` + `return self` 裸指针实证                                                                                                                                                  |
-| #52·gcRootVarNames\_ 注册方案            | `ExprClosure.cpp:627-640`                            | ✅ 成立           | init-capture 取 `gcRootTypes_[name]` 类型串——方案 `fullType + "*"` 满足「闭包作用域可见」要求 ✓；双重捕获排除成立（needsThisCapture 依赖 currentReceiverName\_ 非空，ctor 不设 → 不触发；captures 中 self 单走 gcRootVarNames\_ init-capture 分支） |
-| #52·清理                               | `DeclFun.cpp:14-20`                                  | ✅ 成立           | clearVarTrackingState 实证清 gcRootVarNames\_/gcRootTypes\_                                                                                                                                              |
-| #52·嵌套闭包传播                           | `ExprClosure.cpp:757-773`                            | ✅ 成立           | gcRoot 状态 save/restore 预存在，内层闭包 init-capture `GcRootHandle<T>(self.get(), Global)` 在外层闭包作用域合法（与 let 变量同机制）                                                                                            |
+| 步骤编号                                  | 目标文件                                                 | 比对结果           | 详细备注                                                                                                                                                                                                  |
+| :------------------------------------ | :--------------------------------------------------- | :------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| \#56·根因（入口只包 params）                  | `DeclFun.cpp:592-614`                                | ✅ 一致           | 实证：入口区只生成参数的 GcRootHandle/ViewRoot，this 无保护                                                                                                                                                           |
+| \#56·修改点 2/3/4（入口句柄/清理/genIdentifier） | DeclFun/CodeGen.h/ExprGen                            | ✅ 成立           | isCoro 在入口区可用（L592 区已有状态）；三字段插入点与清理配对成立；分支顺序（闭包句柄 → 方法句柄 → "this"）正确                                                                                                                                  |
+| \#56·修改点 5（闭包统一去协程限定）                 | `ExprClosure.cpp:593-619`                            | ✅ 成立           | thisAsHandle 判定现状实证仅协程；去掉 `currentFunctionIsCoroutine_` 后非协程闭包走 init-capture，接口默认方法（currentReceiverCppType\_ 空）不触发保持 `[this]` ✓；与 #56 的 `_this` 可见性论证成立（闭包体内 self 恒经 currentClosureThisHandle\_ 优先分支） |
+| **\#56·spawn/sync 兄弟落点**              | `StmtSpawn.cpp:34-63/128-164`、`StmtSync.cpp:116-155` | ❌ **覆盖缺口**     | 见 §3 第 1 条（本轮核心发现）                                                                                                                                                                                    |
+| \#57·根因                               | `StmtLet.cpp:54-62`                                  | ✅ 一致           | typeAliasTemplateParams\_ 排除 → type="auto" 实证                                                                                                                                                         |
+| \#57·放行条件                             | `TypeResolution.cpp:281-307`                         | ⚠️ **边界描述不成立** | 见 §3 第 2 条                                                                                                                                                                                            |
+| \#57·注册链                              | `StmtLet.cpp:385-406`                                | ✅ 成立           | isGcPointerType("Tree<...>\*")=true → `_raw`+`GcRootHandle`+注册，全套预存在零改动                                                                                                                               |
+| \#52·根因                               | `DeclFun.cpp:661-685`                                | ✅ 一致           | `fullType* self = gc_alloc...` + `return self` 裸指针实证                                                                                                                                                  |
+| \#52·gcRootVarNames\_ 注册方案            | `ExprClosure.cpp:627-640`                            | ✅ 成立           | init-capture 取 `gcRootTypes_[name]` 类型串——方案 `fullType + "*"` 满足「闭包作用域可见」要求 ✓；双重捕获排除成立（needsThisCapture 依赖 currentReceiverName\_ 非空，ctor 不设 → 不触发；captures 中 self 单走 gcRootVarNames\_ init-capture 分支） |
+| \#52·清理                               | `DeclFun.cpp:14-20`                                  | ✅ 成立           | clearVarTrackingState 实证清 gcRootVarNames\_/gcRootTypes\_                                                                                                                                              |
+| \#52·嵌套闭包传播                           | `ExprClosure.cpp:757-773`                            | ✅ 成立           | gcRoot 状态 save/restore 预存在，内层闭包 init-capture `GcRootHandle<T>(self.get(), Global)` 在外层闭包作用域合法（与 let 变量同机制）                                                                                            |
 
 ## 3. 全链路风险分析（End-to-End）
 
@@ -72,7 +72,7 @@ tags:
 7. **#52** **`return self.get()`** **与 ctor 体字段赋值（✓）**：`self.f = v` → `self.get()->f = v`（gcRootVarNames\_ 命中 genIdentifier `.get()` 预存在路径）；构造期间嵌套 alloc 触发 GC 时 self 安全——连带收益论证成立。
 8. **#52 与 #56 互斥性（✓）**：ctor 不设 currentReceiverName\_（genConstructor 实证无该字段设置）→ needsThisCapture 恒 false → 走 gcRootVarNames\_ 路径；方法设 → 走 needsThisCapture 路径；两机制无交叠，同批落地无冲突。
 9. **#57 与 #55 互斥（✓）**：ListSemType vs RecordSemType 分支互斥。
-10. **执行顺序表述矛盾（小问题）**：§0 开头「执行顺序：#56 → #57 → #52」与括号内「#57 改动最小可先行热身」并存——统一为一种（建议保持 #56 → #57 → #52，因 #56 的 genIdentifier 分支是 #52 验证的前置语境）。
+10. **执行顺序表述矛盾（小问题）**：§0 开头「执行顺序：#56 → #57 → \#52」与括号内「#57 改动最小可先行热身」并存——统一为一种（建议保持 #56 → #57 → \#52，因 #56 的 genIdentifier 分支是 #52 验证的前置语境）。
 
 ## 4. 已知限制评估
 
@@ -90,7 +90,7 @@ tags:
 
 * [ ] 通过（Approve）
 
-* [x] **需修改（Changes Requested）** — #52/#57 机制推演成立可直接实施；#56 主体成立但存在 spawn/sync lambda 坏 C++ 硬伤。具体修改点：
+* [x] **需修改（Changes Requested）** — \#52/#57 机制推演成立可直接实施；#56 主体成立但存在 spawn/sync lambda 坏 C++ 硬伤。具体修改点：
   1. **补 spawn/sync 兄弟落点方案（硬性）**：StmtSpawn.cpp 两处（L34-63 显式传参 / L128-164 freeVars）+ StmtSync.cpp 一处（L116-155 sync thread for）的 lambda 捕获改为 init-capture `GcRootHandle<Recv*>(this, Global)`（推荐 (a) 方案），体内 self 经专属句柄名映射；补 `repro56_method_spawn_self.aura` / `repro56_sync_for_self.aura` 复现用例（方法内 spawn/sync 引用 self）。**不得采用 save/clear 方案 (b)**（保留裸 this 悬垂面）。
   2. **改写 #57 边界论述（硬性）**：放行条件实际覆盖「Tree<T>」（泛型上下文，含未绑定形参）——行为正确但须改写 §2.2 注释与 §6 风险表第 5 行的理由；补泛型上下文 gc\_force 用例验证模板形参形态句柄正确。
   3. **核实闭包内 spawn 引用 self 现状**（§3 第 3 条）：实测 + 与修改点 1 同机制处置。

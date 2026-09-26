@@ -2,7 +2,8 @@
 type: todo_feature
 kind: refactor
 module: Runtime
-status: planned
+status:
+  - finished
 priority: P2
 estimated_effort: M
 blocked_by: []

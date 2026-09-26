@@ -461,7 +461,18 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
     // 内置模块函数调用（如 path.new(...), path.join(...)）
     // 这些函数的对象是内置模块名，不在符号表中，直接查 BuiltinRegistry。
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
-        std::string fqName = id->name + "." + e.method;
+        // feature-13 C0-5 (2026-09-17): builtin import alias support.
+        // `import path as p` records "p" -> "path"; translate the receiver
+        // before the BuiltinRegistry lookup so `p.new(...)` hits "path.new".
+        // Empty lookup (no aliased builtin import) keeps the raw name.
+        std::string moduleName = id->name;
+        bool isAliasedBuiltin = false;
+        if (auto aliasIt = builtinModuleAliases_.find(id->name);
+            aliasIt != builtinModuleAliases_.end()) {
+            moduleName = aliasIt->second;
+            isAliasedBuiltin = true;
+        }
+        std::string fqName = moduleName + "." + e.method;
         if (auto* fn = BuiltinRegistry::get().findFunction(fqName, (int)e.args.size())) {
             checkThrowsContext(e, e.method, fn->throws);
             // 对参数进行类型推断，设置 args 的 inferredType
@@ -470,6 +481,16 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
                 if (arg) (void)inferExpr(*arg);
             }
             return semTypeFromBuiltinReturn(fn->returns);
+        }
+        // feature-13 C0-5 (2026-09-17): the receiver was a recognised builtin
+        // import alias but the module exposes no such symbol. Report it against
+        // the module rather than falling through to the generic
+        // "undefined identifier '<alias>'" - an unaliased call never produces
+        // that error either, since the module name is not a symbol.
+        if (isAliasedBuiltin) {
+            error(e, "module '" + moduleName + "' has no exported symbol '"
+                     + e.method + "'");
+            return ErrorSemType::make();
         }
     }
 

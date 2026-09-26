@@ -10,7 +10,13 @@ std::unique_ptr<Decl> Parser::parseDecl() {
     bool isPublic = match(TokType::Pub);
 
     std::unique_ptr<Decl> decl;
-    if (check(TokType::Hash))       decl = parseConfigDecl();
+    // feature-13 C0：`module <ident>` 软关键字分支。
+    // 必须在最前（module 是文件首行声明）；用软关键字判定（非 TokType::Module），
+    // 故 `let module = 1` 等既有用法不受影响。
+    if (peekSoftKeyword("module")) {
+        decl = parseModuleDecl();
+    }
+    else if (check(TokType::Hash))       decl = parseConfigDecl();
     else if (check(TokType::Fun)) {
         if (peekNext().type == TokType::LParen) {
             decl = parseMethodDecl();
@@ -22,13 +28,48 @@ std::unique_ptr<Decl> Parser::parseDecl() {
     else if (check(TokType::Const))    decl = parseConstDecl();
     else if (check(TokType::Type))     decl = parseTypeDecl();
     else if (check(TokType::Interface)) decl = parseInterfaceDecl();
-    else if (check(TokType::Import))   decl = parseImportDecl();
+    else if (check(TokType::Import))   { seenImport_ = true; decl = parseImportDecl(); }
     else {
         error("expected declaration");
         return nullptr;
     }
 
     if (decl) decl->isPublic = isPublic;
+    return decl;
+}
+
+// feature-13 C0（2026-09-17）：软关键字判定 —— 当前 token 是 Identifier 且文本匹配。
+// 与既有 `as` 的处理同款（DeclParser.cpp 的 parseImportDecl 内）。
+bool Parser::peekSoftKeyword(const char* kw) {
+    if (atEnd()) return false;
+    const Token& t = peek();
+    return t.type == TokType::Identifier && t.lexeme == kw;
+}
+
+// feature-13 C0：`module <ident>` 声明解析。
+// 约束（§2.1）：文件首行、首个 import 之前；重复声明 → 错误。
+// 缺失时回落文件 stem（由 ModuleManager 侧兜底，Parser 不负责）。
+std::unique_ptr<ModuleDecl> Parser::parseModuleDecl() {
+    auto tok = advance();   // 'module'（Identifier）
+    auto decl = std::make_unique<ModuleDecl>();
+    setNodePos(decl.get(), tok);
+
+    // 位置约束：必须在任何 import/声明之前（seenImport_ 由 parseDecl 的 Import 分支置位；
+    // 此处只需保证 module 自身不重复出现——重复由 ModuleManager 侧或本函数计数判定）
+    if (seenImport_) {
+        error("'module' declaration must appear before any import statement");
+    }
+    if (sawModuleDecl_) {
+        error("duplicate 'module' declaration");
+    }
+    sawModuleDecl_ = true;
+
+    if (!check(TokType::Identifier)) {
+        error("expected module name after 'module'");
+        return decl;
+    }
+    decl->name = advance().lexeme;
+    match(TokType::Semicolon);
     return decl;
 }
 
@@ -61,6 +102,14 @@ std::unique_ptr<FunDecl> Parser::parseFunDecl() {
     // '...'：C++ 桥接标记（.aurai 声明文件用，aura 无实现 c++ 有实现）
     if (match(TokType::Ellipsis)) {
         decl->hasCppImpl = true;
+    } else if (scanOnly_) {
+        // feature-13 C2：声明级扫描模式 —— 跳过整个 body（消费 token，不建节点）。
+        // 与 noBody_ 的区别：noBody_ 之后 token 停在 body 的 { 处（.aurai 路径）；
+        // 此处必须把 body 消费掉，否则后续 parseDecl 从 body 内部继续 → 必然错位。
+        // feature-13 C2：注册「本声明有实体 body」
+        // （body 节点不建，但 FuncSkeleton.hasBody 需要这个信息）。
+        decl->bodySkippedByScan = true;
+        skipBlockTokens();
     } else if (!noBody_) {
         decl->body = parseBlock();
     }
@@ -93,7 +142,14 @@ std::unique_ptr<TypeDecl> Parser::parseTypeDecl() {
     }
 
     // .aurai 模式下：type Name 可作为前向声明（无 = TypeExpr）
-    if (noBody_) {
+    //
+    // feature-13 C2（第二轮修正）：扫描态（scanOnly_）同样允许「无 = 的 type」。
+    // 理由：声明级扫描面向的是「一个模块文件的声明骨架」，而
+    // .aurai 声明文件（如 builtins/path.aurai 的 type Path）同样是模块文件。
+    // 扫描若不接受这一形态，就会在 .aurai 上报错，而 C3 合并阶段
+    // 正是要把 .aura 与 .aurai 放到同一套骨架里比对。
+    // 注意：这里只放宽「无 = 也合法」，不改完整解析路径（noBody_）的行为。
+    if (noBody_ || scanOnly_) {
         if (match(TokType::Assign)) {
             decl->type = parseType();
         }
@@ -203,6 +259,11 @@ std::unique_ptr<MethodDecl> Parser::parseMethodDecl() {
     // '...'：C++ 桥接标记（.aurai 声明文件用，aura 无实现 c++ 有实现）
     if (match(TokType::Ellipsis)) {
         decl->hasCppImpl = true;
+    } else if (scanOnly_) {
+        // feature-13 C2：声明级扫描模式 —— 跳过整个方法体（同 parseFunDecl）
+        // feature-13 C2：同 parseFunDecl，记录实体 body 存在。
+        decl->bodySkippedByScan = true;
+        skipBlockTokens();
     } else if (!noBody_) {
         decl->body = parseBlock();
     }

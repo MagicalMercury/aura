@@ -43,14 +43,33 @@ bool CodeGenerator::isGcPointerType(const std::string& cppType) const {
 //   - 用户接口名 / 内置接口名（Stringer / Comparable<...> / Greetable 等）
 // 视图是值类型（{ 方法Fn, self }），非 GC 指针；record 字段含视图时注册 self 子偏移
 bool CodeGenerator::isIfaceViewTypeName(const std::string& cppType) const {
+    // 内置接口的 C++ 形态带 aura_rt:: 命名空间（定义在 runtime 公共头）：
+    //   - Iterator<T>   → aura_rt::Iterator<T>（builtin/iterator.h）
+    //   - Stringer      → aura_rt::Stringer（builtin/interfaces.h）
+    //   - Comparable<T> → aura_rt::Comparable<T>（builtin/interfaces.h）
+    // bug-85（方案 B3）：三者统一，均以 aura_rt:: 前缀 + 可选 "<" 判定。
     if (cppType.rfind("aura_rt::Iterator<", 0) == 0) return true;
+    // ⚠️ 长度常量必须 = 前缀串的【实际字符数】（否则越界/误判）：
+    //   "aura_rt::Stringer"   = 17（aura_rt:: 9 + Stringer 8）
+    //   "aura_rt::Comparable" = 19（aura_rt:: 9 + Comparable 10）
+    //   裸名（size == 前缀长）→ 命中；带实参（如 aura_rt::Comparable<Point>）
+    //   → 下一字符必为 '<' → 命中；否则（如 aura_rt::StringerXxx）→ 不命中。
+    // bug-85 修复（2026-09-18）：原写 18/20（各多 1），使裸名走 `cppType[N]` 越界
+    // → libstdc++ _GLIBCXX_ASSERTIONS 下 basic_string::operator[] 断言 abort
+    //（现象：单测在 InterfaceDefaultMethod* 处进程崩溃，非普通失败）。
+    if (cppType.rfind("aura_rt::Stringer", 0) == 0
+        && (cppType.size() == 17 || cppType[17] == '<'))
+        return true;
+    if (cppType.rfind("aura_rt::Comparable", 0) == 0
+        && (cppType.size() == 19 || cppType[19] == '<'))
+        return true;
     for (auto& in : interfaceNames_) {
         if (cppType == in || cppType.rfind(in + "<", 0) == 0) return true;
     }
     // 内置接口（interfaces.aurai：Stringer/Comparable）不在 interfaceNames_（仅 program.decls 收集）
     for (auto& i : BuiltinRegistry::get().auraiInterfaces()) {
         const std::string& in = i->name;
-        if (in == "Iterator") continue;   // 已在上方处理
+        if (in == "Iterator" || in == "Stringer" || in == "Comparable") continue;  // 已在上方处理
         if (cppType == in || cppType.rfind(in + "<", 0) == 0) return true;
     }
     return false;
@@ -397,9 +416,17 @@ std::string CodeGenerator::finalizeCppElem(const std::string& elem) {
 }
 
 std::string CodeGenerator::mapNamedType(const std::string& name) {
-    // 内置 Iterator：C++ 形态为 16B 值视图（aura_rt::Iterator<T>，无 *）。
-    // 必须在 BuiltinRegistry 命中前特判（registry 存的是旧指针形态 "aura_rt::Iterator*"）
+    // 内置接口：C++ 形态为 16B 值视图（无 *），定义在 runtime 公共头。
+    // 必须在 BuiltinRegistry 命中前特判（registry 存的是旧指针形态，如
+    // "aura_rt::Iterator*"）。
+    //   - Iterator   → builtin/iterator.h  （aura_rt::Iterator<T>）
+    //   - Stringer   → builtin/interfaces.h（aura_rt::Stringer）
+    //   - Comparable → builtin/interfaces.h（aura_rt::Comparable<T>）
+    // bug-85（方案 B3）：Stringer/Comparable 与 Iterator 同源，不再是产物内裸名，
+    // 故所有引用点统一带 aura_rt:: 命名空间。
     if (name == "Iterator") return "aura_rt::Iterator";
+    if (name == "Stringer") return "aura_rt::Stringer";
+    if (name == "Comparable") return "aura_rt::Comparable";
 
     // 先查 BuiltinRegistry（内置类型）
     if (auto* ti = Aura::BuiltinRegistry::get().findType(name)) {
@@ -555,8 +582,13 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
     if (auto* is = dynamic_cast<const InterfaceSemType*>(&semType)) {
         // P1：接口 → 值视图类型名。泛型接口实例化（Comparable<Point>）时用 typeArgs
         // 生成完整 C++ 名 Comparable<Point*>（实参经 mapSemType：record → 指针）。
-        if (is->typeArgs.empty()) return is->name;
-        std::string result = is->name + "<";
+        // 内置接口（Stringer / Comparable / Iterator）的 C++ 形态定义在 runtime 公共头
+        // → 带 aura_rt:: 命名空间（bug-85 方案 B3；与 mapNamedType 同一映射）。
+        std::string baseName = is->name;
+        if (baseName == "Iterator" || baseName == "Stringer" || baseName == "Comparable")
+            baseName = "aura_rt::" + baseName;
+        if (is->typeArgs.empty()) return baseName;
+        std::string result = baseName + "<";
         for (size_t i = 0; i < is->typeArgs.size(); ++i) {
             if (i > 0) result += ", ";
             result += is->typeArgs[i] ? mapSemType(*is->typeArgs[i]) : "void";

@@ -563,6 +563,12 @@ void ImportDecl::print(std::ostream& os, int indent) const {
     os << '\n';
 }
 
+// feature-13 C0：module 声明的 AST 打印
+void ModuleDecl::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "ModuleDecl: " << name << '\n';
+}
+
 void ConfigDecl::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << "ConfigDecl: #" << ns << "." << key << " = " << value << '\n';

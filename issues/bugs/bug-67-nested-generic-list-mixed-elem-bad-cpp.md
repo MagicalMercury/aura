@@ -34,7 +34,7 @@ tags:
 ### 2.1 代码路径追踪
 - **Sema 主根因**：`src\Sema\Checker\ExprInfer.cpp` inferListExpr 收紧判定（#58 修复）条件仅覆盖 elemType 为顶层裸 GenericSemType 形态；ListSemType（含嵌套泛型元素）走原 isAssignable 递归。
 - **放行机制**：`src\Sema\Assignability.cpp` L20-29 未绑定泛型 target（递归进入元素级比较时）恒 true。
-- **CodeGen 侧**：与 #58 同源——elemType="[T]"（listElemCppOf 递归 #55）→ 实例化 append 类型不匹配坏 C++。
+- **CodeGen 侧**：与 #58 同源——elemType="[T]"（listElemCppOf 递归 \#55）→ 实例化 append 类型不匹配坏 C++。
 
 ### 2.2 关键逻辑细节
 - **为何不并入 #58**：方向 1 顶层判定精准最小，扩递归会波及嵌套合法形态 `[[T], [T]]` 与 `[[T]]`/`[[string]]`（元素为具体匹配的嵌套列表）——需单独设计「ListSemType 元素含裸泛型时同规则收紧」的递归判定并充分验证合法形态不误伤，故登记独立缺陷（review 限制 2 明示）。

@@ -331,3 +331,162 @@ TEST(SemaSpawn, ArgsSameNameShadowingOk) {
         diag);
     EXPECT_FALSE(diag.hasErrors());
 }
+
+// ============================================================
+// feature-14 U1：显式捕获强制（自由变量未列入捕获名单）
+//
+// 背景：此前只拒「完全无参数列表」的 spawn（ImplicitCaptureRejected），
+// 但「有参数列表、只是漏了一个名字」的形态一路放行到 CodeGen，
+// 生成裸标识符 -> g++ "'k' was not declared"（静默坏 C++）。
+// 下方各条各针对一个断言点。
+// ============================================================
+TEST(SemaSpawn, BodyUsesUncapturedOuterVarRejected) {
+    // 正例：body 引用 k，捕获名单只有 m -> 必须报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let k = 7; let m = 9"
+        " sync { spawn (m: int) { io.println(str(k) + str(m)) } } }",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    bool msgFound = false;
+    for (auto& m : diag.errorMessages())
+        if (m.find("spawn body references 'k'") != std::string::npos) msgFound = true;
+    EXPECT_TRUE(msgFound);
+}
+
+TEST(SemaSpawn, BodyAllOuterVarsCapturedOk) {
+    // 对照：同一段代码把 k 补进捕获名单 -> 应通过
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let k = 7; let m = 9"
+        " sync { spawn (k: int, m: int) { io.println(str(k) + str(m)) } } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaSpawn, BodyLocalDeclNotReported) {
+    // body 自己声明的局部变量不是自由变量 -> 不得报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let m = 1; sync {"
+        " spawn (m: int) { let t = m + 1; io.println(str(t)) } } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaSpawn, BodyBuiltinAndLoopVarNotReported) {
+    // 内置函数名 str / 循环变量 i 都不属于「未捕获外层变量」——
+    // 前者不捕获（BuiltinRegistry），后者是 body 内声明。
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let m = 1; sync {"
+        " spawn (m: int) { for i in range(m) { io.println(str(i)) } } } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaSpawn, BodyNestedSpawnParamNotReported) {
+    // 内层 spawn 的形参名（g）在外层 body 不是自由变量 -> 不得报错
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) { let n = 3; sync {"
+        " spawn (n: int) { spawn (g: int) { io.println(str(g)) }(n) } } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+TEST(SemaSpawn, CallFormNotAffectedByCaptureCheck) {
+    // 调用形态 spawn func(args) 无闭包体，不走捕获检查
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun worker(io: Io, n: int) { io.println(str(n)) }"
+        " fun main(io: Io) { let total = 3"
+        " sync { spawn worker(io, total) } }",
+        diag);
+    EXPECT_FALSE(diag.hasErrors());
+}
+
+// ============================================================
+// feature-14 P3：spawn 约束改「函数级可达性」
+//
+// 语义：函数体内含 spawn 合法 ⟺ 该函数可被 sync 块经调用链（直接/传递）
+//       可达，或该函数自身体内词法含 sync 块（自身根）。
+// 边界：本组只覆盖 **Sema 的 E018**。CodeGen 侧另有 `ioInScope_` 闸门
+//       （spawn 需外层作用域有 io），本组用例一律让相关函数带 io 形参或
+//       不触发该闸门，避免与 E018 混淆。
+// ============================================================
+
+TEST(SemaSpawnP3, CalleeReachableFromSync) {
+    // ① sync { f() }，f 内含 spawn → 合法（P3 放行；P3 前报 E018）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun f(io: Io) throws { spawn (io: Io) { io.println(\"t\") } }"
+        " fun main(io: Io) throws { sync { f(io) } }",
+        diag);
+    EXPECT_FALSE(hasErrorCode(diag, Aura::DiagCode::E018_SpawnOutsideSync));
+}
+
+TEST(SemaSpawnP3, TwoLevelChainReachableFromSync) {
+    // ② 两级链 sync → f → g（g 含 spawn）→ 合法
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun g(io: Io) throws { spawn (io: Io) { io.println(\"g\") } }"
+        " fun f(io: Io) throws { g(io) }"
+        " fun main(io: Io) throws { sync { f(io) } }",
+        diag);
+    EXPECT_FALSE(hasErrorCode(diag, Aura::DiagCode::E018_SpawnOutsideSync));
+}
+
+TEST(SemaSpawnP3, NotReachableStillReportsE018) {
+    // ③ 无 sync 可达（main 不被 sync 调用）→ 仍报 E018
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun f(io: Io) throws { spawn (io: Io) { io.println(\"t\") } }"
+        " fun main(io: Io) throws { f(io) }",
+        diag);
+    EXPECT_TRUE(hasErrorCode(diag, Aura::DiagCode::E018_SpawnOutsideSync));
+}
+
+TEST(SemaSpawnP3, SelfSyncBlockIsRoot) {
+    // ④ 规则 1 验收：fun f() { sync { spawn } } 自身 sync → 合法（自身根）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun f(io: Io) throws { sync { spawn (io: Io) { io.println(\"t\") } } }"
+        " fun main(io: Io) throws { f(io) }",
+        diag);
+    EXPECT_FALSE(hasErrorCode(diag, Aura::DiagCode::E018_SpawnOutsideSync));
+}
+
+TEST(SemaSpawnP3, SyncThreadIsRoot) {
+    // ⑤ U3 验收：sync thread { f() } 同样是 SyncContext 域 → 入根集
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun f(io: Io) throws { spawn (io: Io) { io.println(\"t\") } }"
+        " fun main(io: Io) throws { sync thread { f(io) } }",
+        diag);
+    EXPECT_FALSE(hasErrorCode(diag, Aura::DiagCode::E018_SpawnOutsideSync));
+}
+
+TEST(SemaSpawnP3, ClosureBodySpawnCountsAsContaining) {
+    // ⑥ U1 验收：闭包体内含 spawn → 外层函数算「含 spawn」（穿透闭包体），
+    //    外层被 sync 可达 → 合法
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun f(io: Io) throws { let cb = fun (io2: Io) throws {"
+        " spawn (io: Io) { io.println(\"t\") }(io2) }; cb(io) }"
+        " fun main(io: Io) throws { sync { f(io) } }",
+        diag);
+    EXPECT_FALSE(hasErrorCode(diag, Aura::DiagCode::E018_SpawnOutsideSync));
+}
+
+TEST(SemaSpawnP3, UndecidableCallExemptsE018) {
+    // 规则 2 兜底（R4）：含 spawn 的函数体内存在「静态不可判调用」→ 一律不报 E018
+    // （闭包变量调用 cb()；宁漏勿误，最高危风险是误报阻塞合法代码）
+    Aura::DiagnosticEngine diag;
+    analyzeSource(
+        "fun f(io: Io) throws { let cb = fun () { }; cb();"
+        " spawn (io: Io) { io.println(\"t\") } }"
+        " fun main(io: Io) throws { f(io) }",
+        diag);
+    EXPECT_FALSE(hasErrorCode(diag, Aura::DiagCode::E018_SpawnOutsideSync));
+}

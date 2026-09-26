@@ -183,6 +183,50 @@ std::unique_ptr<SemType> SemAnalyzer::semTypeFromCppName(const std::string& cppN
     std::string bare = cppName;
     if (!bare.empty() && bare.back() == '*') bare.pop_back();
     if (!bare.empty()) {
+        // 6a) 内置接口 C++ 名反解（bug-85 B3 配套，2026-09-18）：
+        //     B3 将 Stringer/Comparable 的 C++ 形态从产物裸名迁入 runtime
+        //     公共头（带 aura_rt:: 命名空间）。反解方向若不同步，elemTypeOf 会将
+        //     "aura_rt::Stringer" 误判为「未知 record 占位」GenericSemType →
+        //     Assignability 的 tIsIface 为 false → 「匿名 record → Optional<视图>」
+        //     本应报 type mismatch 的形态被放行（SemaOptional.*AnonRecord
+        //     ToOptionalViewCleanError 群）。Comparable<T> 带实参：基名拿到 Interface
+        //     SemType 后再递归反解 <...> 内实参（与 CodeGen mapSemType 的
+        //     InterfaceSemType 分支同源）。内置 Iterator 走上方方案 2
+        //     （GenericSemType{name=="Iterator"}），不在此列。
+        {
+            static const char* kBuiltinIfaces[] = { "Stringer", "Comparable" };
+            for (const char* ifn : kBuiltinIfaces) {
+                std::string pfx = std::string("aura_rt::") + ifn;
+                if (bare.rfind(pfx, 0) != 0) continue;
+                if (bare.size() != pfx.size() && bare[pfx.size()] != '<') continue;
+                auto* isym = symtab_.lookup(ifn);
+                if (!isym || isym->kind != SymKind::Interface) continue;
+                auto t = std::make_unique<InterfaceSemType>();
+                t->name = ifn;
+                // ⚠️ bug-85 修复（2026-09-18）：必须填 methods（同本文件 L421-430
+                // 的接口分支）。只设 name 会让 InterfaceSemType::methods 为空 →
+                // 接口方法查找失败 → 误报 "interface 'Stringer' has no method
+                // 'to_string'"（实测：DoubleBoxNestedOptionalView /
+                // NoAnnotLetOptionalValueElemsStillOk 两例编译报错）。
+                for (auto& m : isym->interfaceMethods) {
+                    InterfaceSemType::MethodSig ms;
+                    ms.name = m.name;
+                    for (auto& pt : m.paramTypes)
+                        ms.paramTypes.push_back(pt ? pt->clone() : nullptr);
+                    ms.returnType = m.returnType ? m.returnType->clone() : nullptr;
+                    ms.throws = m.throws;
+                    ms.hasDefault = m.hasDefault;
+                    ms.hasCppImpl = m.hasCppImpl;
+                    t->methods.push_back(std::move(ms));
+                }
+                auto lt = bare.find('<');
+                auto rt = bare.rfind('>');
+                if (lt != std::string::npos && rt != std::string::npos && rt > lt)
+                    for (auto& a : splitTopLevelArgs(bare.substr(lt + 1, rt - lt - 1)))
+                        t->typeArgs.push_back(semTypeFromCppName(a));
+                return t;
+            }
+        }
         auto named = resolveNamedType(bare);
         if (!dynamic_cast<const ErrorSemType*>(named.get()))
             return named;
@@ -277,8 +321,17 @@ std::string SemAnalyzer::semTypeToCppName(const SemType& t) const {
     // bug-17 引入 semTypeToCppName 作为 materializeCanonicalName 的实参拼接函数后，
     // 接口实参（Optional<Stringer> 的 Stringer）必须返回视图名而非兜底 "auto"。
     if (auto* is = dynamic_cast<const InterfaceSemType*>(&t)) {
-        if (is->typeArgs.empty()) return is->name;
-        std::string result = is->name + "<";
+        // bug-85（方案 B3）：内置接口 Stringer/Comparable 的 C++ 形态移入
+        // runtime 公共头（builtin/interfaces.h）→ 带 aura_rt:: 命名空间，与
+        // CodeGen mapNamedType / mapSemType 的映射保持一致（不一致会让适配器
+        // 模板实参与视图类型名失配）。
+        // 注：Iterator 不在本处特判（其 C++ 名由调用方直接拼 "aura_rt::Iterator<...>"，
+        // 见 CallInfer.cpp；本函数对 Iterator 维持原裸名行为，避免波及既有路径）。
+        std::string baseName = is->name;
+        if (baseName == "Stringer" || baseName == "Comparable")
+            baseName = "aura_rt::" + baseName;
+        if (is->typeArgs.empty()) return baseName;
+        std::string result = baseName + "<";
         for (size_t i = 0; i < is->typeArgs.size(); ++i) {
             if (i > 0) result += ", ";
             result += is->typeArgs[i] ? semTypeToCppName(*is->typeArgs[i]) : "void";

@@ -136,4 +136,52 @@ std::unique_ptr<Program> Parser::parseAurai() {
     return prog;
 }
 
+// ============================================================
+// feature-13 C2（2026-09-17）：声明级扫描
+// ============================================================
+
+// 跳过一对配对花括号（不建任何 AST 节点）。
+// 参照 parseBlock（StmtParser.cpp）的循环形状，但不调用 parseStmt：
+// 只数 LBrace/RBrace 深度。字符串（scanString）与注释（skipWhitespaceAndComments）
+// 在词法阶段已被吞掉、不产出花括号 token → 数配对安全（探针 3 + 补测实测）。
+// 当前 token 不是 { 时原样返回（例：.aurai 的 ... 桥接形态已由调用方消费）。
+void Parser::skipBlockTokens() {
+    if (!check(TokType::LBrace)) return;
+
+    int depth = 0;
+    do {
+        if (check(TokType::LBrace))      ++depth;
+        else if (check(TokType::RBrace)) --depth;
+        advance();
+    } while (!atEnd() && depth > 0);
+}
+
+// 声明级扫描入口。
+// 与 parse() 逐行同构，唯一差异：置 scanOnly_ → parseFunDecl / parseMethodDecl
+// 遇到 body 改为「跳配对」（skipBlockTokens），而不建 BlockStmt。
+// 既有路径（parse / parseAurai）不读本标志 → 行为逐字不变（C2 零回归前提）。
+std::unique_ptr<Program> Parser::parseDeclarationsOnly() {
+    scanOnly_ = true;
+    auto prog = std::make_unique<Program>();
+    while (!atEnd()) {
+        auto decl = parseDecl();
+        if (decl) {
+            prog->decls.push_back(std::move(decl));
+        } else {
+            // 错误恢复：跳到下一个声明（与 parse() 同款）
+            while (!atEnd() &&
+                   !check(TokType::Fun) && !check(TokType::Let) &&
+                   !check(TokType::Const) && !check(TokType::Type) &&
+                   !check(TokType::Interface) && !check(TokType::Import)) {
+                advance();
+            }
+        }
+    }
+    scanOnly_ = false;
+    if (!diag_.hasErrors()) {
+        setNodePos(prog.get(), tokens_.front());
+    }
+    return prog;
+}
+
 } // namespace Aura

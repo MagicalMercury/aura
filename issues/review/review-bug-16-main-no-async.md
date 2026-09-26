@@ -19,7 +19,7 @@ tags:
 
 # 【审查】[ ] **Plan 审查报告：bug-16-main-no-async.md**
 
-> **一句话摘要**：根因与修复方案**全部实证成立**——分派键（函数键=decl.name）与 funSignature 同一查表、genMainEntry 调用（L290）在协程判定（L123-154）之后时序安全、**bug-02 固定点迭代已在当前源码落地**（依赖已就绪，报告「依赖批次 1 的 #2」表述过时），裁决通过（附两个非阻塞登记建议）。
+> **一句话摘要**：根因与修复方案**全部实证成立**——分派键（函数键=decl.name）与 funSignature 同一查表、genMainEntry 调用（L290）在协程判定（L123-154）之后时序安全、**bug-02 固定点迭代已在当前源码落地**（依赖已就绪，报告「依赖批次 1 的 \#2」表述过时），裁决通过（附两个非阻塞登记建议）。
 
 ## 1. Search Agent 检索摘要（证据总览）
 
@@ -32,27 +32,27 @@ tags:
 
 - **关键源码定位表**：
 
-| 文件路径 | 定位行号区间 | 当前源码片段摘要（关键逻辑） |
-| :--- | :--- | :--- |
-| `src\CodeGen\DeclFun.cpp` | L649-L669 | genMainEntry：L657-660 ioSync_ 同步分支（`callPrefix(io); return 0;`）/ L661-665 异步分支 ✅ 报告引 :639-659/:647/:652-655 偏移约 10 行，**内容一致**（ioSync_ 而非协程判定分派属实；伪代码的同步分支生成物与现状 L657-660 逐字符一致） |
-| `src\CodeGen\CodeGen.cpp` | L123-L154 | **重要状态更新**：第二遍协程判定**已是固定点迭代**（L130 `kMaxCoroPasses=16`，注释明写「固定点迭代，bug-02」）——bug-02 已实施落地 ✅ 报告「依赖批次 1 的 #2」的前置条件**已满足** |
-| `src\CodeGen\CodeGen.cpp` | L134-L141 | 函数协程键 = `f->name`（L139 `coroutineFunctions_.insert(f->name)`）✅ 修复伪代码 `coroutineFunctions_.count(mainDecl.name)`（mainDecl.name=="main"）与 funSignature L228 `count(decl.name)` **同一查表**，报告声称属实 |
-| `src\CodeGen\CodeGen.cpp` | L284-L294 | genMainEntry 调用点（L290，footer 生成阶段）在协程判定（L123-154）**之后**、同函数内顺序执行 ✅ 「coroutineFunctions_ 在第二遍已填充完毕，genMainEntry 查表时序安全」实证成立 |
-| `src\CodeGen\DeclFun.cpp` | L228 / L273-L275 | funSignature 协程分派：L228 `coroutineFunctions_.count(decl.name)`；L273 main→aura_main；L275 非协程 retType / 协程 task\<retType\> ✅ 报告引 :275 精确 |
-| `src\CodeGen\CoroDecide.cpp` | L169-L211 | isSuspending：io 异步方法 ioSync_ 下不判协程（L176-177）；**channel send/receive 与协程函数/方法传播不豁免 ioSync_**（L183-209）⚠️ 用于 §3 附注 1 |
-| `src\CodeGen\ExprClosure.cpp` | L320 | `closureIsCoro = isCoroutine && !ioSync_ && ...`——ioSync_ 全局抑制闭包协程化（旁证 ioSync_ 语义边界） |
+| 文件路径                          | 定位行号区间           | 当前源码片段摘要（关键逻辑）                                                                                                                                                                               |
+| :---------------------------- | :--------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src\CodeGen\DeclFun.cpp`     | L649-L669        | genMainEntry：L657-660 ioSync_ 同步分支（`callPrefix(io); return 0;`）/ L661-665 异步分支 ✅ 报告引 :639-659/:647/:652-655 偏移约 10 行，**内容一致**（ioSync_ 而非协程判定分派属实；伪代码的同步分支生成物与现状 L657-660 逐字符一致）              |
+| `src\CodeGen\CodeGen.cpp`     | L123-L154        | **重要状态更新**：第二遍协程判定**已是固定点迭代**（L130 `kMaxCoroPasses=16`，注释明写「固定点迭代，bug-02」）——bug-02 已实施落地 ✅ 报告「依赖批次 1 的 \#2」的前置条件**已满足**                                                                      |
+| `src\CodeGen\CodeGen.cpp`     | L134-L141        | 函数协程键 = `f->name`（L139 `coroutineFunctions_.insert(f->name)`）✅ 修复伪代码 `coroutineFunctions_.count(mainDecl.name)`（mainDecl.name=="main"）与 funSignature L228 `count(decl.name)` **同一查表**，报告声称属实 |
+| `src\CodeGen\CodeGen.cpp`     | L284-L294        | genMainEntry 调用点（L290，footer 生成阶段）在协程判定（L123-154）**之后**、同函数内顺序执行 ✅ 「coroutineFunctions_ 在第二遍已填充完毕，genMainEntry 查表时序安全」实证成立                                                                   |
+| `src\CodeGen\DeclFun.cpp`     | L228 / L273-L275 | funSignature 协程分派：L228 `coroutineFunctions_.count(decl.name)`；L273 main→aura_main；L275 非协程 retType / 协程 task\<retType\> ✅ 报告引 :275 精确                                                        |
+| `src\CodeGen\CoroDecide.cpp`  | L169-L211        | isSuspending：io 异步方法 ioSync_ 下不判协程（L176-177）；**channel send/receive 与协程函数/方法传播不豁免 ioSync_**（L183-209）⚠️ 用于 §3 附注 1                                                                           |
+| `src\CodeGen\ExprClosure.cpp` | L320             | `closureIsCoro = isCoroutine && !ioSync_ && ...`——ioSync_ 全局抑制闭包协程化（旁证 ioSync_ 语义边界）                                                                                                         |
 
 ## 2. 源码映射审查（逐项比对）
 
-| 步骤编号 | 目标文件 | 比对结果 | 详细备注 |
-| :--- | :--- | :--- | :--- |
-| 根因·genMainEntry 分派 | `DeclFun.cpp:639-659` | ⚠️ 行号微偏移 | 实际 L649-669（±10 行），「ioSync_ 而非协程判定分派、ioSync_=false 恒走异步分支」内容一致 |
-| 根因·funSignature 分派 | `DeclFun.cpp:275` | ✅ 一致 | 行号精确；非协程 main → void |
-| 根因·decideCoro 无挂起点判 Plain | `CoroDecide.cpp:231-252` | ✅ 采信 | 上一轮 bug-02 审查已核对该区间；固定点迭代已落地后「真无挂起点」形态判定不变 |
-| 修复·分派键 | `coroutineFunctions_.count(mainDecl.name)` | ✅ 一致 | 函数键=f->name（L139）实证；与 funSignature:228 同查表属实 |
-| 修复·时序 | 第二遍填充 → genMainEntry 查表 | ✅ 一致 | L123-154 → L290，顺序执行实证 |
-| 修复·伪代码 | `if (ioSync_ || !mainIsCoro)` | ✅ 一致 | ioSync_ 分支生成物与现状 L657-660 一致（行为保持）；非协程分支 `callPrefix(io); return 0;` 对 void 返回合法 |
-| 配套·bug-02 | 「依赖批次 1 的 #2」 | ⚠️ 表述过时 | 固定点迭代已在源码落地（L123-154 注释明写 bug-02）——依赖**已就绪**，非待修前置 |
+| 步骤编号                      | 目标文件                                       | 比对结果     | 详细备注                                                           |      |                                                                                  |
+| :------------------------ | :----------------------------------------- | :------- | :------------------------------------------------------------- | ---- | -------------------------------------------------------------------------------- |
+| 根因·genMainEntry 分派        | `DeclFun.cpp:639-659`                      | ⚠️ 行号微偏移 | 实际 L649-669（±10 行），「ioSync_ 而非协程判定分派、ioSync_=false 恒走异步分支」内容一致 |      |                                                                                  |
+| 根因·funSignature 分派        | `DeclFun.cpp:275`                          | ✅ 一致     | 行号精确；非协程 main → void                                           |      |                                                                                  |
+| 根因·decideCoro 无挂起点判 Plain | `CoroDecide.cpp:231-252`                   | ✅ 采信     | 上一轮 bug-02 审查已核对该区间；固定点迭代已落地后「真无挂起点」形态判定不变                     |      |                                                                                  |
+| 修复·分派键                    | `coroutineFunctions_.count(mainDecl.name)` | ✅ 一致     | 函数键=f->name（L139）实证；与 funSignature:228 同查表属实                   |      |                                                                                  |
+| 修复·时序                     | 第二遍填充 → genMainEntry 查表                    | ✅ 一致     | L123-154 → L290，顺序执行实证                                         |      |                                                                                  |
+| 修复·伪代码                    | `if (ioSync_                               |          | !mainIsCoro)`                                                  | ✅ 一致 | ioSync_ 分支生成物与现状 L657-660 一致（行为保持）；非协程分支 `callPrefix(io); return 0;` 对 void 返回合法 |
+| 配套·bug-02                 | 「依赖批次 1 的 \#2」                             | ⚠️ 表述过时  | 固定点迭代已在源码落地（L123-154 注释明写 bug-02）——依赖**已就绪**，非待修前置             |      |                                                                                  |
 
 ## 3. 全链路风险分析（End-to-End）
 

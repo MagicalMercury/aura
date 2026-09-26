@@ -516,7 +516,8 @@ private:
                                                        const std::vector<std::string>& tparams = {});
 
     // --- 函数体 ---
-    void genBlock(std::ostream& cpp, const BlockStmt& block, bool isCoroutine);
+    void genBlock(std::ostream& cpp, const BlockStmt& block, bool isCoroutine,
+                  bool opensScope = false);
     void genFunctionPrologue(std::ostream& cpp, const FunDecl& decl);
     void genFunctionEpilogue(std::ostream& cpp, const FunDecl& decl);
 
@@ -1044,6 +1045,91 @@ private:
     // 当前是否在 sync thread 块内（控制 spawn 生成分派到 genSpawnAsThread）
     bool inSyncThreadBlock_ = false;
 
+    // feature-14 P2：当前是否在「sync 系块」内（sync { } / sync(max=N) / sync for）。
+    //
+    // 用途（change.md §3.5 隐式 future 的块内/块外分界）：
+    //   块内 + 调用协程函数 → 不立即 co_await（登记 futureVars_，交给消费点）
+    //   块外              → 保持现状（调用点立即 co_await）
+    //
+    // ⚠️ 与既有两标记的区别（P2 Phase 0 实测，CodeGen.h 无第三个等价成员）：
+    //   insideSpawn_       = 「在 spawn lambda 体内」，不是「在 sync 块内」
+    //   inSyncThreadBlock_ = 只覆盖 sync thread 形态（且其块体 isCoroutine=false）
+    //   insideSyncBlock_   = 真·「在 sync 系块内」，只覆盖 sync { }/sync(max=N)/sync for
+    //
+    // ⛔ 不在 genSyncThreadStmt 置位（sync thread 块体 isCoroutine=false，隐式 future
+    //    的「让出等待」这一支没有宿主 —— change.md §0 P2 范围切割）。
+    // ⛔ spawn lambda 体不继承（StmtSpawn.cpp 置 insideSpawn_ 处显式清 false）。
+    bool insideSyncBlock_ = false;
+
+    // feature-14 P2（§3.5 隐式 future）：sync 块内「绑定协程调用返回值」的 let 变量名。
+    //
+    // 登记点 = genLetStmt（不是 ExprCall —— 表达式生成期不知道自己在不在 let
+    // 初始化位置，change.md §3.3 落点修正）。命中后的两个效果：
+    //   1. 变量的 C++ 类型取 task<...>*（承载 lazy task，而不是 co_await 后的完成值）；
+    //   2. 变量本身走 GcRootHandle 根化（task 帧是 GC 堆，compact 会搬运）。
+    // 消费点（genExpr 入口）据此插 co_await 并就地兑现成裸值。
+    //
+    // ⚠️ 键 = safeName(decl.name)。块外不登记 → 块外协程调用保持「调用点立即
+    //    co_await」现状（change.md §8.3 约束 1：f14 与 feature-17 的分界线）。
+    std::set<std::string> futureVars_;
+    // 别名链：let t2 = t（t 是 future）→ t2 也是 future（change.md §3.5-2）。
+    // 存「别名 → 源头 future 变量名」，消费点沿链解析到源头再取 co_await 目标。
+    std::map<std::string, std::string> futureAliasOf_;
+    // 登记（值形态 future）与注销（新值覆盖同名变量）的统一入口，见 CodeGen.cpp。
+    void registerFutureVar(const std::string& name);
+    void clearFutureVar(const std::string& name);
+    // 沿别名链解析到「真正承载 task 的那个变量名」；不在 future 集内返回空串。
+    std::string resolveFutureVar(const std::string& name) const;
+    // ============================================================
+    // feature-14 U5（change.md §3.5「U5 驱动语句生成」）：块作用域栈
+    //
+    // 语义：`sync { let a = worker(io) }` 中 a 是 lazy task；块内若从未消费它，
+    // 它会在块尾被 ~task() 直接 destroy —— 协程从未运行即被销毁。
+    // U5 在「声明了 future 的那个 C++ 块的块尾」补驱动语句 `co_await a;`，
+    // 保证块退出前协程跑完（推论 A 的第二个等待条件）。
+    //
+    // ⚠️ 与 futureVars_ 的分工（change.md §3.5 有原文）：
+    //    futureVars_    = 「此刻活跃的 future」（消费点即 clear）→ 供消费点插 co_await
+    //    futureBlock... = 「本块声明过的全部 future」（不管是否已消费）→ 供块尾驱动
+    //    驱动幂等（task::operator co_await 的 await_ready() 已判 done()），
+    //    故「声明过但已消费」的名字重复驱动无害。
+    //
+    // 每层帧 = {本块声明过的 future 名, 本块是否真的开了 C++ `{}`}。
+    // 只有 opensScope=true 的帧才在块尾生成驱动；否则名字**并入外层帧**
+    // （裸块在 genStmt 里直接展开、不生成 `{}`，其声明提升到外层作用域，
+    //   驱动必须压到外层块尾 —— 见 change.md §3.5 铁律 2）。
+    // ============================================================
+    struct FutureBlockFrame {
+        std::vector<std::string> names;
+        bool opensScope = false;
+    };
+    std::vector<FutureBlockFrame> futureBlockStack_;
+    // 当前 sync 块的 (乙1) 异常收集变量命名后缀（空 = 无 future 驱动的 sync 块）。
+    // 嵌套 sync 用唯一后缀防变量遮蔽（change.md §3.5 铁律 3）。
+    std::string u5ErrSuffix_;
+    int u5ErrCounter_ = 0;
+    // 进入本 sync 块前的外层后缀（块尾重抛后恢复，供嵌套块尾驱动正确寻址）。
+    std::string savedU5Suffix_;
+    // 登记本块声明过的 future（供块尾驱动；与 registerFutureVar 并行调用）。
+    void registerFutureForDrive(const std::string& name);
+    // 块尾：生成本帧收集到的 future 的驱动语句（含 (乙1) try/catch 包裹）。
+    void genFutureDrive(std::ostream& cpp, const FutureBlockFrame& frame);
+    // sync 块首：生成本块的 (乙1) 异常收集变量（GC 根化形态，见 change.md §3.5）。
+    // 返回本块的后缀（空串 = 本块无 future 驱动，无需收集/重抛）。
+    // ⚠️ 延迟生成：先占后缀，块尾若真有驱动才补声明 → 「无 future 的 sync 块
+    //    不产生空声明」（change.md §3.5「只在有 future 驱动时才生成」）。
+    std::string genU5ErrDecls(std::ostream& cpp);
+    // 块首写出收集器声明（`_ctx`/`_sync` 之后）——嵌套块尾驱动与块尾重抛都引用它们。
+    void emitU5ErrDecls(std::ostream& cpp, const std::string& sfx);
+    // 并在 sync 块尾、wait_all + 全部驱动之后生成重抛。
+    void genU5ErrRethrow(std::ostream& cpp, const std::string& suffix);
+    // 生成一个 sync 块的「块体」到临时流，返回产物。用于两段式：
+    //   先跑一遍拿「本块是否真有驱动」，再决定块首是否写收集器声明。
+    std::string genSyncBodyBuffered(const BlockStmt& body, bool isCoroutine, bool& hasDrive);
+    // sync 块内 + 调用目标是协程 → 该调用应「不立即 co_await」（判据单一来源，
+    // ExprCall / ExprMethodCall / genLetStmt 三处共用，防双源漂移）。
+    bool isDeferredCoroutineCall() const { return insideSyncBlock_; }
+
     // 列表表达式计数器 — 生成唯一的临时变量名
     int listCounter_ = 0;
     int recordAllocCounter_ = 0;
@@ -1064,6 +1150,10 @@ private:
     //（单表达式），多语句前缀在此缓冲；writeLine 与语句边界输出点先 flush 再写语句，
     // 使 outer 变量声明先于其引用（消除 let/return 拼多语句进表达式的坏 C++）。
     std::string hoistPrefixPending_;
+    // feature-14 P2（§3.5 隐式 future）：消费点 co_await 提升后的临时变量编号
+    //（`_awN_<var>`）——与 argHandleCounter_ 等既有计数器分离，避免扰动既有
+    // 生成编号（既有单测断言的 _hN_/_aN_ 序号保持稳定）。
+    int awaitHoistCounter_ = 0;
     // 将缓冲中的 outer 前缀语句写入输出流并清空
     void flushHoistPrefix(std::ostream& os);
 

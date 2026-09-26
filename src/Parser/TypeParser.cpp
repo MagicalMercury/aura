@@ -240,6 +240,23 @@ Param Parser::parseParam() {
         p.type = parseType();
         // 默认参数：name: type = expr
         if (match(TokType::Assign)) {
+            // feature-13 C2（第二轮修正）：默认值改用真实表达式解析，与完整解析路径同构。
+            //
+            // 旧做法（已废）：扫描态调 trySkipValueTokens() 跳 token。实测失败 ——
+            // 该函数为防向逆吞声明，显式拒绝把 Fun 当作值的首 token，
+            // 而默认值恰好可以是闭包字面量 fun() -> int { ... }，
+            // 所以该迴避策略对这一形态天然不成立。
+            //
+            // 为何用 parseExpr：默认值的结束边界（逗号 / 右括号）是语法
+            // 事实，只有真实语法分析器能全面覆盖；自写跳 token 近似实现
+            // 必然在新形态上翻车。默认值属声明签名的一部分（不知道它
+            // 从哪里结束就无法确定参数列表的边界），与「扫描跳过
+            // body」并不矛盾：不建 body 节点依然由 parseFunDecl/
+            // parseMethodDecl 的 skipBlockTokens() 分支保证。
+            //
+            // 不再区分 scanOnly_ 的理由：存下 defaultExpr 对扫描产物无害
+            // （FuncSkeleton 只取参数类型串），且保留了两条路径对同一源
+            // 码产出相同 params 这一性质。
             p.defaultExpr = parseExpr();
         }
     }
@@ -276,8 +293,15 @@ InterfaceMethodSig Parser::parseInterfaceMethodSig() {
     //   ...      → C++ 桥接方法（CppBridge，aura 无实现 c++ 有实现）
     //   无       → 纯虚（record 必须实现）
     if (check(TokType::LBrace)) {
-        sig.bodyKind = InterfaceMethodSig::BodyKind::DefaultAura;
-        sig.defaultBody = parseBlock();
+        if (scanOnly_) {
+            // feature-13 C2：声明级扫描 —— 默认方法体只跳过，不建 AST。
+            // bodyKind 保持 Pure：扫描段的用途是「声明骨架」（接口名/方法名/签名），
+            // 默认方法体本身不属于骨架；C3 汇总段需要 body 时走完整解析路径。
+            skipBlockTokens();
+        } else {
+            sig.bodyKind = InterfaceMethodSig::BodyKind::DefaultAura;
+            sig.defaultBody = parseBlock();
+        }
     } else if (match(TokType::Ellipsis)) {
         sig.bodyKind = InterfaceMethodSig::BodyKind::CppBridge;
     }

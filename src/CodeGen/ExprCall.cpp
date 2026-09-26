@@ -470,9 +470,15 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
         // closureTaskVars_ 为 needAwait 信号源。⚠️ 必须用 calleeName（裸标识符名，L267-269）
         // 而非 calleeExpr：根化变量的 calleeExpr == "c.get()"，与登记键
         // safeName(decl.name) == "c" 恒不命中（复审 P5）。
-        needAwait = coroutineFunctions_.count(calleeExpr) > 0
-                 || coroClosureNames_.count(calleeExpr) > 0
-                 || (!calleeName.empty() && closureTaskVars_.count(calleeName) > 0);
+        bool isCoroCall = coroutineFunctions_.count(calleeExpr) > 0
+                       || coroClosureNames_.count(calleeExpr) > 0
+                       || (!calleeName.empty() && closureTaskVars_.count(calleeName) > 0);
+        // feature-14 P2（§3.5 隐式 future）：sync 块内不再「调用点立即 co_await」——
+        // 调用只返回 lazy task，真正的等待由消费点（genExpr 对 future 变量做 co_await）
+        // 兑现。块外保持现状（change.md §8.3 约束 1：f14 与 feature-17 的分界线）。
+        // ⚠️ 范围：本判据只关掉「等待」，不关掉「调用」——实参与 callee 物化路径
+        //    （genGcRootedArgs / IIFE 包装）照旧生成。
+        needAwait = isCoroCall && !isDeferredCoroutineCall();
     }
 
     // 接口参数自动包装（双源：具体 record → 适配器；闭包 → IfaceFunc；接口变量 → 透传）

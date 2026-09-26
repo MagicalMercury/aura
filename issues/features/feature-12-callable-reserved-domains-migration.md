@@ -2,7 +2,8 @@
 type: todo_feature
 kind: refactor
 module: CodeGen
-status: planned
+status:
+  - finished
 priority: P3
 estimated_effort: L
 blocked_by: []

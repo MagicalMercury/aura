@@ -30,7 +30,8 @@ CodeGenerator::collectClosureCaptures(const FunExpr& e) {
     std::set<std::string> paramNames;
     for (auto& p : e.params) paramNames.insert(p.name);
 
-    std::set<std::string> builtins = {"_tasks"};
+    // feature-14 P2：_tasks 内部名已整体退役（spawn 不再有该形参），排除集清空。
+    std::set<std::string> builtins = {};
     std::vector<std::string> captures;
     // bug-24：方法体内闭包引用 receiver（self）→ 不按普通变量捕获；receiver 由
     // genIdentifier 映射为 this / GcRootHandle（协程形态），捕获列表显式输出 [this]。

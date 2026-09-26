@@ -11,8 +11,13 @@ namespace Aura {
 SemAnalyzer::SemAnalyzer(DiagnosticEngine& diag) : diag_(diag) {}
 
 bool SemAnalyzer::analyze(const Program& program) {
+    registerBuiltinImportAliases(program);
     declareTopLevel(program);
     checkProgram(program);
+    // 第 3 遍：feature-14 P3 —— 调用图 + spawn 函数级可达性判定
+    // （必须在 checkProgram 之后：判定依赖第 2 遍跑完的 inferredType / 符号表；
+    //  同时 checkSpawnStmt 的 E018 词法判定已退役，改由本遍统一报错）
+    applySpawnReachability(program);
     return !diag_.hasErrors();
 }
 
@@ -192,6 +197,29 @@ void SemAnalyzer::checkStmt(const Stmt& stmt) {
 // ============================================================
 
 // 导入一个导出函数/构造函数为 Function 符号（importExports 辅助）
+// feature-13 C0-5 (2026-09-17): `import <builtin> as <alias>` support.
+//
+// Builtin modules (`import path` / `import math`) are not registered in the
+// symbol table: `inferMethodCall` resolves `<module>.<fn>` straight from
+// BuiltinRegistry, keyed by the literal declaration name in `builtins/*.aurai`
+// (e.g. "path.new", "math.sqrt"). An alias therefore produced
+// `undefined identifier 'p'` because nothing translated `p` back to `path`.
+//
+// This collects the translation table. Only aliases whose target is a real
+// builtin module (per BuiltinRegistry::hasModulePrefix) are recorded;
+// `import foo as f` for an unknown module is left alone so the downstream
+// diagnostics stay unchanged.
+void SemAnalyzer::registerBuiltinImportAliases(const Program& program) {
+    for (auto& d : program.decls) {
+        if (!d) continue;
+        auto* imp = dynamic_cast<const ImportDecl*>(d.get());
+        if (!imp) continue;
+        if (!imp->isBuiltin || imp->alias.empty()) continue;
+        if (!BuiltinRegistry::get().hasModulePrefix(imp->path)) continue;
+        builtinModuleAliases_[imp->alias] = imp->path;
+    }
+}
+
 void SemAnalyzer::importFuncSymbol(const std::string& name, const FuncExport& f,
                                     const std::string& alias) {
     Symbol sym;

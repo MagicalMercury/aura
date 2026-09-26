@@ -23,12 +23,10 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
     }
 
     // === 显式传参模式（spawn (io: Io, n: int) { ... }） ===
-    // 检查用户是否已声明 io / _tasks
+    // 检查用户是否已声明 io（feature-14 P2：_tasks 形参已整体退役，不再检测）
     bool hasIo = false;
-    bool hasTasks = false;
     for (auto& p : stmt.params) {
         if (p.name == "io") hasIo = true;
-        if (p.name == "_tasks") hasTasks = true;
     }
 
     // bug-24：spawn 绑定列表引用 receiver（self/p）→ 该参数是 this 别名（body 内经
@@ -39,12 +37,18 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
         if (!currentReceiverName_.empty() && p.name == currentReceiverName_)
             needsThisCapture = true;
 
-    // 整条 _tasks.push_back(...) 先写入缓冲 out：显式实参需经 genGcRootedArgs 包装
-    // （bug-42）保护，须在实参求值前备好完整调用串（占位符 {i}）；同名自动绑定路径
-    // 无堆临时值风险，直接透出缓冲。
+    // 整条 requireSync()->addTask(...) 先写入缓冲 out：显式实参需经
+    // genGcRootedArgs 包装（bug-42）保护，须在实参求值前备好完整调用串
+    // （占位符 {i}）；同名自动绑定路径无堆临时值风险，直接透出缓冲。
+    //
+    // feature-14 P2：spawn 产物不再经词法 _tasks 形参传递，改为「生成时刻求值
+    // 最近的 sync 域」——requireSync() 在无域时运行时 panic（change.md §3.1 / Q5），
+    // SyncContext::addTask 内部绑定 SpawnTask{body, owner}（GC-4 创建时绑定）。
+    // ⚠️ 收尾括号配对：本行多一层 '(' （addTask( ），故下方 ":161 的 \"))\" 必须同步
+    //    改为 \")\" —— 那行不含 _tasks，grep 不命中，漏改即坏 C++。
     std::ostringstream out;
     // 生成 lambda 签名为显式参数
-    out << indentStr() << "_tasks.push_back([";
+    out << indentStr() << "aura_rt::requireSync()->addTask([";
     // #56 §1.8：方法上下文 spawn lambda 引用 receiver → init-capture 专属句柄
     //（Global 根：spawn 跨线程/跨挂起逃逸；_sp_this 避免与 _this/_this_root 冲突）。
     // 缺口 3：capture-init 源不写裸 this——闭包/spawn 体内（this 不可见）取外层句柄
@@ -77,9 +81,9 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
                     "add an 'io: Io' parameter to the enclosing function");
         return;
     }
-    // 自动追加 io（仅 body 实际引用 io 时，按需）和 _tasks（如果用户未声明）
+    // 自动追加 io（仅 body 实际引用 io 时，按需）
+    // feature-14 P2：_tasks 形参不再追加（域归属改由 requireSync() 运行时解析）
     if (!hasIo && bodyRefsIo) out << ", aura_rt::Io& io";
-    if (!hasTasks) out << ", std::vector<aura_rt::task<void>>& _tasks";
     out << ") -> aura_rt::task<void> {\n";
     insideSpawn_ = true;
     // #56 §1.8：spawn lambda 体生成期间隔离外层闭包/方法句柄映射（外层闭包内再
@@ -157,7 +161,11 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
         }
     }
     if (!hasIo && bodyRefsIo) out << ", io";   // #46：仅 body 实际引用 io 时传 io
-    if (!hasTasks) out << ", _tasks";
+    // feature-14 P2：实参不再追加 _tasks。
+    // ⚠️ 收尾括号必须是 "))" —— 两层：
+    //    ① 闭合任务体 lambda 的立即调用 `}(io`  → 一个 ')'
+    //    ② 闭合 L47/L51 的 `addTask(`             → 一个 ')'
+    //    （曾误改为单个 ")" → 生成 `}(io);` 少一层 → g++ 报 "expected ')' before ';'"）
     out << "))";
 
     if (!stmt.args.empty()) {
@@ -178,8 +186,8 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
 }
 
 // 调用形态（协程 sync 块内）：spawn func(args)
-// 生成：_tasks.push_back([](auto fv..., Io& io, taskvec& _tasks)
-//           -> task<void> { 调用; co_return; }(fv..., io, _tasks));
+// 生成：aura_rt::requireSync()->addTask(
+//           [](auto fv..., Io& io) -> task<void> { 调用; co_return; }(fv..., io));
 void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt) {
     // 1. 自由变量 = 调用表达式中所有 Identifier - 函数/类型名 - 内置
     std::set<std::string> allRefs;
@@ -187,7 +195,8 @@ void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt)
     idCol.collectExpr(*stmt.callExpr);   // 含 callee + args
     // #46：callExpr 是否实际引用 io（builtins 排除前记录——io 不进 freeVars）
     bool refsIo = allRefs.count("io") > 0;
-    std::set<std::string> builtins = {"io", "_tasks"};
+    // feature-14 P2：_tasks 已从闭包自由变量排除集移除（不再有该内部名）
+    std::set<std::string> builtins = {"io"};
     std::vector<std::string> freeVars;
     // bug-24：调用表达式引用 receiver（self/p）→ 不进 freeVars（this 别名），lambda 改 [this] 捕获
     bool needsThisCapture = false;
@@ -212,16 +221,27 @@ void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt)
     // 2. 协程 lambda：引用 receiver 时 init-capture 专属句柄 _sp_this（#56 §1.8，
     //    Global 根跨线程/跨挂起；capture-init 源同 genSpawnStmt——缺口 3 取外层句柄
     //    .get() / 入口句柄 .get()，不写裸 this）
-    cpp << indentStr() << "_tasks.push_back([";
+    cpp << indentStr() << "aura_rt::requireSync()->addTask([";
     if (needsThisCapture)
         cpp << "_sp_this = aura_rt::GcRootHandle<" << currentReceiverCppType_
             << "*>(" << receiverThisSourceExpr() << ", aura_rt::GcRootScope::Global)";
     cpp << "](";
-    for (auto& v : freeVars)
-        cpp << "auto " << safeName(v) << ", ";
-    if (refsIo) cpp << "aura_rt::Io& io, ";   // #46：callExpr 实际引用 io 才追加
-    cpp << "std::vector<aura_rt::task<void>>& _tasks"
-        << ") -> aura_rt::task<void> {\n";
+    // feature-14 P2：_tasks 形参已移除。原尾部为 `..., Io& io, taskvec& _tasks)`
+    // 或 `..., taskvec& _tasks)`；去掉 _tasks 后逗号归属重新计算（trailing 参数的前
+    // 导逗号）、再补 ")" —— 避免生成 `Io& io, )` 或 `auto fv, )` 坏 C++。
+    bool firstParamDone = false;
+    for (auto& v : freeVars) {
+        if (firstParamDone) cpp << ", ";
+        cpp << "auto " << safeName(v);
+        firstParamDone = true;
+    }
+    if (refsIo) {   // #46：callExpr 实际引用 io 才追加
+        if (firstParamDone) cpp << ", ";
+        cpp << "aura_rt::Io& io";
+        firstParamDone = true;
+    }
+    (void)firstParamDone;
+    cpp << ") -> aura_rt::task<void> {\n";
     indentLevel_++;
     insideSpawn_ = true;
     // #56 §1.8：spawn lambda 体生成期间隔离外层闭包/方法句柄映射；体后恢复
@@ -254,10 +274,20 @@ void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt)
     writeLine(cpp, "co_return;");
     indentLevel_--;
     cpp << indentStr() << "}(";
-    for (auto& v : freeVars)
-        cpp << safeName(v) << ", ";
-    if (refsIo) cpp << "io, ";   // #46：追加了 io 参数才传 io
-    cpp << "_tasks));\n";
+    // feature-14 P2：_tasks 实参已移除；逗号归属重新计算 + 收尾 ")" 配对 addTask(
+    bool firstArgDone = false;
+    for (auto& v : freeVars) {
+        if (firstArgDone) cpp << ", ";
+        cpp << safeName(v);
+        firstArgDone = true;
+    }
+    if (refsIo) {   // #46：追加了 io 参数才传 io
+        if (firstArgDone) cpp << ", ";
+        cpp << "io";
+        firstArgDone = true;
+    }
+    (void)firstArgDone;
+    cpp << "));\n";
 }
 
 // bug-73：调用形态 spawn 的目标是否为协程函数（具名函数 / 协程闭包 / 协程方法）。
@@ -301,7 +331,7 @@ void CodeGenerator::genSpawnCallAsThread(std::ostream& cpp, const SpawnStmt& stm
     std::set<std::string> allRefs;
     IdRefCollector idCol(allRefs);
     idCol.collectExpr(*stmt.callExpr);
-    std::set<std::string> builtins = {"io", "_tasks"};
+    std::set<std::string> builtins = {"io"};   // feature-14 P2: _tasks 退役
     std::vector<std::string> freeVars;
     bool ioUsed = false;
     // bug-24：调用表达式引用 receiver（self/p）→ 不进 freeVars（this 别名），lambda 改 [this] 捕获

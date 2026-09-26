@@ -2,7 +2,8 @@
 type: todo_feature
 kind: tech_debt
 module: Runtime
-status: planned
+status:
+  - finished
 priority: P1
 estimated_effort: S
 blocked_by: []

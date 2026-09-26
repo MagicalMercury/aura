@@ -83,7 +83,12 @@ TEST(CodeGen, MethodSyncBlockMakesCoro) {
     EXPECT_FALSE(diag.hasErrors());
     EXPECT_CONTAINS(unit.header, "aura_rt::task<void> run(aura_rt::Io io);");
     EXPECT_CONTAINS(unit.impl, "aura_rt::task<void> Point::run(aura_rt::Io io)");
-    EXPECT_CONTAINS(unit.impl, "when_all");
+    // feature-14 P2 同步：sync 块任务等待由 when_all(_tasks) 改为本块 SyncContext
+    //（SyncContextScope + requireSync()->addTask + co_await _ctx.wait_all()），
+    // 本用例意图「方法体内 sync{spawn} 使方法成为协程」不变，故换锚到新等待形态。
+    EXPECT_CONTAINS(unit.impl, "aura_rt::SyncContextScope _scope(");
+    EXPECT_CONTAINS(unit.impl, "co_await _ctx.wait_all();");
+    EXPECT_NOT_CONTAINS(unit.impl, "when_all");
 }
 
 TEST(CodeGen, GenericMethodIoCallMakesCoro) {

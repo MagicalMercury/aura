@@ -22,6 +22,112 @@ void CodeGenConfig::setConfig(const SemAnalyzer& sema) {
 CodeGenerator::CodeGenerator(DiagnosticEngine& diag) : diag_(diag) {
 }
 
+// ============================================================
+// feature-14 P2（§3.5 隐式 future）——future 变量登记 / 别名链解析
+//
+// 语义：sync 块内 `let a = workerA(io)` 不立即等待——a 绑定 lazy task，
+// 真正的等待推迟到「a 被当值消费」的那一刻（消费点就地 co_await）。
+// 见 change.md §3.5 与 §8.3 约束 1（块外保持现状）。
+// ============================================================
+
+void CodeGenerator::registerFutureVar(const std::string& name) {
+    if (name.empty()) return;
+    // 重新登记同一名字 → 抹掉旧的别名边（避免 t2 仍指向已换值的源头）
+    clearFutureVar(name);
+    futureVars_.insert(name);
+}
+
+void CodeGenerator::clearFutureVar(const std::string& name) {
+    if (name.empty()) return;
+    // `name = <新值>` 覆盖同名变量 → 该名字不再是 future（load-store 值语义，
+    // 与 map 的 key-only set 语义一致；GC-2 下析构已完成的帧无副作用）。
+    futureAliasOf_.erase(name);
+    for (auto it = futureAliasOf_.begin(); it != futureAliasOf_.end(); ) {
+        if (it->second == name) it = futureAliasOf_.erase(it);
+        else ++it;
+    }
+}
+
+// ============================================================
+// feature-14 U5（change.md §3.5「U5 驱动语句生成」）
+//
+// 登记 / 块尾驱动生成。与 registerFutureVar 的关系见 CodeGen.h 的注释：
+//   futureVars_         = 此刻活跃（消费点即 clear）
+//   futureBlockStack_   = 本块声明过的全部（块尾驱动用）
+// ============================================================
+
+void CodeGenerator::registerFutureForDrive(const std::string& name) {
+    if (name.empty()) return;
+    if (futureBlockStack_.empty()) return;   // 防御：块外登记不产生驱动
+    auto& names = futureBlockStack_.back().names;
+    for (auto& n : names) if (n == name) return;   // 已登记（同名重声明）→ 幂等
+    names.push_back(name);
+}
+
+void CodeGenerator::genFutureDrive(std::ostream& cpp,
+                                   const FutureBlockFrame& frame) {
+    if (frame.names.empty()) return;
+
+
+    // (乙1) 异常语义（change.md §3.5「未消费 future 的异常语义」）：
+    //   驱动**全部** future 到完成（强保证，不因首个异常中断），
+    //   记录**首个** aura_rt::Error 值，其余仅 stderr 记录，末尾重抛。
+    //
+    // GC 根化：Error 内嵌 GcString*（runtime/types.h 的 kind/message），而协程帧
+    //   不在 GC 保守扫描范围（registerStackRoots 全仓仅 task.cpp 一处 = 仅 main 帧）
+    //   → 跨驱动语句存活期间必须显式根化，否则驱动下一个 future 时若触发 compact，
+    //     搬运走的 message 会让 _u5msg 悬垂，末尾 throw 出悬垂指针 → 用户 try-catch UAF。
+    //   形态对齐既有做法 src/CodeGen/StmtTry.cpp（那里三处已为 kind/message/extra
+    //   生成 GcRootHandle）。kind 理论安全（intern_string 注册为全局根），
+    //   但保持一致根化，防将来 kind 来源变化。
+    //
+    // ⚠️ 不用 std::optional<Error> 直存：GcRootHandle 的 Ref 模式绑定**变量地址**，
+    //    optional 未 engaged 时 _u5err->message 的地址无效 → 必须拆成独立标量。
+    // ⚠️ 无 sync 上下文（u5ErrSuffix_ 为空：理论上仅 sync 块内会声明 future，
+    //    此处兜底为「裸驱动，不做异常包裹」，避免生成引用未声明变量的代码）。
+    std::string sfx = u5ErrSuffix_;
+    if (!sfx.empty()) {
+        writeLine(cpp, "try { co_await " + frame.names[0] + "; } catch (const aura_rt::Error& _u5e" +
+                       sfx + ") {");
+        indentLevel_++;
+        writeLine(cpp, "if (!_u5has" + sfx + ") { _u5has" + sfx + " = true; _u5msg" + sfx +
+                       " = _u5e" + sfx + ".message; _u5kind" + sfx + " = _u5e" + sfx + ".kind; }");
+        writeLine(cpp, "else std::fprintf(stderr, \"[aura_rt] additional sync error\\n\");");
+        indentLevel_--;
+        writeLine(cpp, "}");
+    } else {
+        writeLine(cpp, "co_await " + frame.names[0] + ";");
+    }
+    for (size_t i = 1; i < frame.names.size(); ++i) {
+        if (!sfx.empty()) {
+            writeLine(cpp, "try { co_await " + frame.names[i] + "; } catch (const aura_rt::Error& _u5e" +
+                           sfx + ") {");
+            indentLevel_++;
+            writeLine(cpp, "if (!_u5has" + sfx + ") { _u5has" + sfx + " = true; _u5msg" + sfx +
+                           " = _u5e" + sfx + ".message; _u5kind" + sfx + " = _u5e" + sfx + ".kind; }");
+            writeLine(cpp, "else std::fprintf(stderr, \"[aura_rt] additional sync error\\n\");");
+            indentLevel_--;
+            writeLine(cpp, "}");
+        } else {
+            writeLine(cpp, "co_await " + frame.names[i] + ";");
+        }
+    }
+}
+
+std::string CodeGenerator::resolveFutureVar(const std::string& name) const {
+    if (name.empty() || !futureVars_.count(name)) return std::string();
+    // 沿别名链走到源头；带步数上限防环（正常登记不会成环，防御性）
+    std::string cur = name;
+    for (int guard = 0; guard < 64; ++guard) {
+        auto it = futureAliasOf_.find(cur);
+        if (it == futureAliasOf_.end()) break;
+        if (!futureVars_.count(it->second)) break;   // 链尾已被注销
+        if (it->second == cur) break;
+        cur = it->second;
+    }
+    return cur;
+}
+
 CompileUnit CodeGenerator::generate(const Program& program,
                                      const std::string& moduleName,
                                      const std::vector<CodeGenImport>& imports,
@@ -276,10 +382,14 @@ CompileUnit CodeGenerator::generate(const Program& program,
         }
     }
 
-    // 内置接口基类（interfaces.aurai，Stringer/Comparable）不在 program.decls 中。
-    // 必须在第三遍 A（函数前向声明）之前生成：函数返回/参数类型引用内置接口时
-    // （如 `-> Stringer | None` → aura_rt::Variant<Stringer, NoneType>*）要求
-    // Stringer 先声明，否则模板实参未声明 → g++ 编译失败（P1-2）。
+    // 内置接口（interfaces.aurai：Stringer/Comparable/Iterator）不在 program.decls 中。
+    // 此遍历仍必须在第三遍 A（函数前向声明）之前：genInterfaceDecl 的 A 遍会注册
+    // 接口方法形参 C++ 类型（methodParamCppTypes_ / methodInterfaceParams_），调用点
+    // 可能先于接口声明生成。
+    // 注（bug-85 方案 B3）：自 Iterator/Stringer/Comparable 的 C++ 视图定义移入
+    // runtime 公共头（via #include "aura_rt.h"）后，本处对这些内置接口不再产出
+    // struct 文本（见 genInterfaceDecl 的内置接口 return），产物中亦不再有
+    // 「先声明否则模板实参未声明」问题（P1-2 由 runtime 头承接）。
     for (auto& i : BuiltinRegistry::get().auraiInterfaces())
         genInterfaceDecl(header, *i);
 

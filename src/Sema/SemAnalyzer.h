@@ -40,6 +40,13 @@ public:
     void importExports(const std::string& alias, const ModuleExports& exports);
     [[nodiscard]] ModuleExports extractExports() const;
 
+    // feature-13 C0-5 (2026-09-17): register `import <builtin> as <alias>`
+    // mappings so that alias-qualified calls (`p.new(...)`, `m.sqrt(...)`)
+    // resolve to the real builtin module. Builtin modules are not registered
+    // in the symbol table (see inferMethodCall's BuiltinRegistry branch), so
+    // the alias must be translated to the real module name at that query.
+    void registerBuiltinImportAliases(const Program& program);
+
     // importExports 辅助：将一个导出函数/构造函数导入为 Function 符号
     void importFuncSymbol(const std::string& name, const FuncExport& f,
                           const std::string& alias = "");
@@ -240,6 +247,38 @@ private:
     void checkSyncStmt(const SyncStmt& stmt);
     void checkSyncForStmt(const SyncForStmt& stmt);
     void checkSpawnStmt(const SpawnStmt& stmt);
+    // ============ feature-14 P3：spawn 约束改「函数级可达性」 ============
+    //
+    // 语义变更：spawn 的合法性判定从「词法必须在 sync 块内」（insideSync_，
+    // 第 2 遍 checkSpawnStmt 内）改为「所在函数可被某个 sync 块（直接或经调用链）
+    // 可达」。判定延后到第 3 遍 applySpawnReachability（analyze() 内
+    // checkProgram 之后）——此时第 2 遍已跑完，符号表全、AST 全在手。
+    //
+    // 三条设计要点（见 scripts/f14_p3_survey_report.md Q4/Q5/Q6）：
+    //   ① 自身根：函数体词法含 SyncStmt → 直接入根集（否则
+    //      `fun f() { sync { spawn ... } }` 会被误杀 E018）；
+    //   ② 保守放行：任何「静态不可判」调用（函数指针 / Callable / functor /
+    //      闭包变量 / 接口动态分派 / 跨模块 / 未登记键）不产生边，且使所在
+    //      函数整体豁免 E018（宁漏勿误，最高危风险是误报阻塞合法代码）；
+    //   ③ 边界：只放宽 E018。CodeGen 的 `ioInScope_` 闸门是另一条独立约束
+    //      （spawn 需要 io 才能做异步 I/O），P3 不触碰。
+    void applySpawnReachability(const Program& program);
+    // 键格式与 CodeGen 同源：函数/方法用裸名（coroutineFunctions_ 口径），
+    // 跨模块导入符号用 qualified(alias::name)（与 sync 根集两侧一致）。
+    void buildCallGraph(const Program& program);
+
+    // 调用图：调用者键 → 被调者键集合（仅收录「静态可判定」的边）
+    std::map<std::string, std::set<std::string>> callGraph_;
+    // 函数体内（穿透闭包体 / spawn 体）词法含 spawn 的函数键
+    std::set<std::string> spawnContainingFns_;
+    // 函数体内「首个」spawn 语句指针 —— 报错定位用（与现状指向 spawn 语句一致）
+    std::map<std::string, const SpawnStmt*> spawnStmtOf_;
+    // 函数体内出现过「静态不可判调用」的函数键（Rule 2 豁免集）
+    std::set<std::string> hasIndirectCall_;
+    // sync 根集：其函数体词法含 sync 块，或经调用链被 sync 可达
+    std::set<std::string> syncRoots_;
+    // 固定点传播结果（含自身根）
+    std::set<std::string> reachable_;
     void checkLockStmt(const LockStmt& stmt);   // lock (m) { } 块语句
     void checkExprStmt(const ExprStmt& stmt);
 
@@ -259,6 +298,22 @@ private:
     // sync 系 max 表达式类型检查（"sync" / "sync thread" / "sync for"）
     void checkSyncMax(const ASTNode& maxExpr, const std::string& kindName);
 
+    // ============ feature-14 U1：spawn 闭包自由变量捕获校验 ============
+    //
+    // 「body 引用了未被捕获的外层变量」此前静默通过 Sema，生成产物里该名字是裸标识符
+    // -> 到 g++ 才报 "'k' was not declared"（用户拿到坏 C++ 才知道）。
+    // 本组设施在 Sema 层做与 CodeGen 同口径的自由变量分析，提前干净报错。
+    //
+    // ⚠️ 口径必须与 CodeGen 一致，否则「Sema 放行、CodeGen 也不捕获」的静默坏码
+    //    仍会漏网；反之「Sema 拦下 CodeGen 本会按需追加的名字」会造成误报。
+    //    两边共同的判定骨架：idRefs - declared - params - 类型名 - 内置函数名 - io。
+    //
+    // 自由变量收集器重用 src/ASTWalker.h 的 StmtWalker/ExprWalker
+    // 框架（与 CodeGen.h 的 IdRefCollector 同底层），避免自造重复的
+    // dynamic_cast 分发链。
+
+    // spawn 闭包形态的自由变量校验（U1 主体，定义在 Checker/StmtSync.cpp）
+    void checkSpawnClosureCaptures(const SpawnStmt& stmt);
     // ============ 表达式类型推断 ============
     // expected: 期望类型（借用指针，仅同步透传不存储；nullptr = 纯自底向上）
     [[nodiscard]] std::unique_ptr<SemType> inferExpr(const ASTNode& expr,
@@ -310,7 +365,10 @@ private:
     std::unique_ptr<SemType> currentReturnType_;
     bool currentFunctionThrows_ = false;
     int  loopDepth_ = 0;      // 循环嵌套深度（替代 insideLoop_ 的 bool，配合同步块边界栈判定 break/continue 跨出）
-    bool insideSync_ = false; // spawn 仅在 sync 块内合法
+    // feature-14 P3：**已不再用于 spawn 合法性判定**（改由第 3 遍函数级可达性
+    // 判定，见 applySpawnReachability）。变量保留：仍是 sync/sync thread/sync for
+    // 系块上下文标记，4 处 ScopedValue 设置点（StmtSync.cpp）照旧维护。
+    bool insideSync_ = false;
     bool inSyncThreadBlock_ = false;  // sync thread 块内（禁止嵌套 / 无参 spawn）
     bool inLockBlock_ = false;        // lock 块内（禁止 return/break/continue 跨出）
     int  insideTry_  = 0;    // try 块嵌套深度（>0 时 ! 不报 non-throwing）
@@ -475,6 +533,11 @@ private:
     // 本模块声明），而 importedMethods_ 由 importExports 注入且须在 analyze 全程存活，
     // 否则跨模块 record 方法调用被 bug-01 E013 误伤。
     std::map<std::string, std::vector<InterfaceSemType::MethodSig>> importedMethods_;
+
+    // feature-13 C0-5 (2026-09-17): builtin import alias -> real module name
+    // (e.g. "p" -> "path"), filled by registerBuiltinImportAliases from
+    // `import path as p` declarations. Empty when no aliased builtin import.
+    std::map<std::string, std::string> builtinModuleAliases_;
     // 第 1 遍末尾统一构建（resolveType 安全时刻）
     void buildTypeMethods(const Program& program);
     // receiverType 规范名（查符号表 RecordSemType.canonicalName）

@@ -69,7 +69,14 @@ void GcHeap::compact(CompactScope scope) {
     relocateGlobalRootPtrs();           // 重定位堆内 globalRoots rootPtr + 对象内 ptr_ref_ 槽位（方案 P）
     savedDescs_.clear();
     compactEntries_.clear();
-    rebuildPageList(scope);
+    rebuildPageList(scope);             // 释放旧页
+    // [FIX-B86-2] compact 完成之后再次作废 L1 intern 缓存。
+    // 根因：safepoint() 入口的 clear_intern_cache()（L128）在 compact **之前**执行，
+    // 线程若在该次 bump 之后、compact 之前填充过缓存，其 cache.gen 就等于当时的全局代次，
+    // 于是 compact 搬走对象 + rebuildPageList() MEM_RELEASE 卸载旧页之后，该缓存
+    // 仍"代次相符"而逃过作废 → 命中已卸载页 → concat_multi SIGSEGV（bug-86 形态②）。
+    // 在 compact 真正完成之后补一次全局代次自增，使所有线程的缓存在下次查找时作废。
+    clear_intern_cache();
 }
 
 void GcHeap::computeForwardingAddresses(CompactScope scope) {

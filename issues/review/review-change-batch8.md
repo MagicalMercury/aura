@@ -22,7 +22,7 @@ tags:
   - implementation_review
 ---
 
-# 【审查】[ ] **Plan 审查报告：change.md（批次 8：#55 / #29 / #30 / #54 / #32）**
+# 【审查】[ ] **Plan 审查报告：change.md（批次 8：#55 / #29 / #30 / #54 / \#32）**
 
 > **一句话摘要**：执行顺序拓扑、公共辅助提取、#29/#30 修改点行号与生成代码、#32 方向 1 全链路结构、#54 per-instantiation 先例（optional.h desc() 同构）**全部核实成立**；但存在**三个硬伤**——#54 的延迟字段检测条件 `dynamic_cast<GenericTypeRef*>` 对 `val: T` **恒 false**（裸 T 解析为 NamedType，仅 `<T>` 语法产 GenericTypeRef——修复按此实施完全无效）；#55 只修 let 声明侧**未修 genListExpr 的 elemType int32_t 默认兜底**（T=string 实例化 IIFE 内部仍坏 C++，§7 预期不可达）；嵌套 `[[T]]` 列表在 #55 判定与 elemType 两层均不覆盖（repro29_list_nested_T 在复现集内却无法被修复）；另有 §7 文件名与实际 batch8 文件夹大面积错位（repro54_\* 4 个不存在），裁决需修改。
 

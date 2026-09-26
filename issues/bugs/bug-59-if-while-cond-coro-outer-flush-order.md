@@ -78,7 +78,7 @@ tags:
   - else-if 探针：`auto _a7_1 = (cb);` 在 if 链前独立行 → `} else if ((co_await ... > 40)) {` 链结构完整。
 - **验证统计**（2026-09-03，aurac 常规模式重编）：
   - `repro59_if_while_cond_coro_outer_flush`：编译运行 **big / n=3 / done** ✅（多次直跑稳定；Normal_Test.ps1 首跑显示 done 先于 n=3 系其 PowerShell 异步流捕获竞态，直跑顺序稳定与代码一致）。
-  - 批次 11 回归：#31 全形态（`repro_coro_let_return_outer_decl` r=101、`repro31_coro_outer_mixed` r1=40 r2=80、`control_coro_outer_branch_int` done、`repro_coro_outer_branch_generic` r=42 done）+ #45（`repro_nested_spawn_same_name` sum=10）+ #46（`repro46_no_io_spawn` sum=10、`repro46_closure_inner_spawn_io` nested-io=42）全部 ✅。
+  - 批次 11 回归：#31 全形态（`repro_coro_let_return_outer_decl` r=101、`repro31_coro_outer_mixed` r1=40 r2=80、`control_coro_outer_branch_int` done、`repro_coro_outer_branch_generic` r=42 done）+ \#45（`repro_nested_spawn_same_name` sum=10）+ \#46（`repro46_no_io_spawn` sum=10、`repro46_closure_inner_spawn_io` nested-io=42）全部 ✅。
   - else-if 位点探针（`_b59_tmp_elseif`，用后已删）：编译运行 big/done ✅。
   - 全量：aura_tests **1217 → 1219**（+2 bug-59 单测）0 failed；`used/1-6.aura`（1-6 六文件）全 PASS；`example/test.aura` ALL TESTS PASSED。
 - **单测**（test\codegen\test_codegen.cpp 查重后新增，位于批次 11 章节后）：

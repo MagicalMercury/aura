@@ -345,6 +345,11 @@ struct FunDecl : Decl {
     std::unique_ptr<TypeExpr> returnType;
     std::unique_ptr<BlockStmt> body;
     bool hasCppImpl = false;    // '...'：aura 无实现，c++ 有实现（.aurai 声明文件用）
+    // feature-13 C2：声明级扫描（parseDeclarationsOnly）专用。
+    // 扫描态下 body 被「跳配对」消费掉、不建节点（body 恒为 nullptr），
+    // 但声明骨架仍需知道「源码里到底有没有实体 body」（FuncSkeleton.hasBody）。
+    // 故由扫描路径置位；完整解析路径不读不写 → 既有行为逐字不变。
+    bool bodySkippedByScan = false;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<FunDecl>();
@@ -354,6 +359,7 @@ struct FunDecl : Decl {
         if (returnType) n->returnType.reset(static_cast<TypeExpr*>(returnType->clone().release()));
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
         n->hasCppImpl = hasCppImpl;
+        n->bodySkippedByScan = bodySkippedByScan;
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
@@ -466,6 +472,22 @@ struct ImportDecl : Decl {
     }
 };
 
+// feature-13 C0（2026-09-17）：`module <ident>` 模块声明。
+// 位置：文件首行、首个 import 之前（迟到 = 报错）；缺失时回落文件 stem（向后兼容）。
+// 语义（D12）：显式同 module 名 = 只共享产物 namespace（不合并调度、不互见）；
+//             隐式回落 stem 同名 = 冲突（报错/哈希防撞）。
+struct ModuleDecl : Decl {
+    std::string name;       // 模块逻辑名（符号前缀 + 产物 namespace 来源）
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<ModuleDecl>();
+        n->name = name;
+        n->isPublic = isPublic;
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
 // #config 编译器指令： #namespace.key = value
 struct ConfigDecl : Decl {
     std::string ns;      // 命名空间（如 "io"）
@@ -496,6 +518,8 @@ struct MethodDecl : Decl {
     std::unique_ptr<TypeExpr> returnType;
     std::unique_ptr<BlockStmt> body;
     bool hasCppImpl = false;    // '...'：aura 无实现，c++ 有实现（.aurai 声明文件用）
+    // feature-13 C2：声明级扫描专用，语义同 FunDecl::bodySkippedByScan。
+    bool bodySkippedByScan = false;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<MethodDecl>();
@@ -512,6 +536,7 @@ struct MethodDecl : Decl {
         if (returnType) n->returnType.reset(static_cast<TypeExpr*>(returnType->clone().release()));
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
         n->hasCppImpl = hasCppImpl;
+        n->bodySkippedByScan = bodySkippedByScan;
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;

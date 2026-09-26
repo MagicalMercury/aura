@@ -2,7 +2,8 @@
 type: todo_feature
 kind: new_feature
 module: CodeGen
-status: planned
+status:
+  - finished
 priority: P3
 estimated_effort: L
 blocked_by: []
@@ -73,7 +74,7 @@ tags:
   - 泛型 ctor 形参 `int|T`（probe1_same_union_field.aura，同型 union 字段赋值绕开 Sema 拦截）：产物 `Box<T>* Box_ctor(aura_rt::Variant<int32_t, T>* init)`——**堆封装** + 字段 `Variant<int32_t, T>* tag` 同型 + 调用点 `make_variant<int32_t, Point*>(1, &_bhx0.get())` 装箱 + 写屏障。
   - 泛型 method 形参 `int|T`（probe3_method_param_touchless.aura）：`Box<T>::check(aura_rt::Variant<int32_t, T>* init_raw)` + 入口 `GcRootHandle<decltype(init_raw)> init(init_raw)` 根包装——**堆封装 + 形参已保护**。
   - 代码证据：`isHeapSemType`（ExprGen.cpp L49-56）对 GenericSemType 仅 Iterator 特判 false，其余默认 **true** → `isUnionHeapVariant = isHeapSemType || isIfaceView`（L102-103）判堆 → mapType L213-215 inferredType 短路不产生 by-value；§3.5 L59"GenericSemType{T} 判非堆"推断有误（v_n2_union2.gen.cpp 留存产物为修复前）。
-- **新缺陷（bug-69，同域真实悬垂）**：ctor（泛型/非泛型皆然）的 GC 指针形参（record `Point*`、Union 堆封装 `Variant<...>*`）**无入口 GcRootHandle 包装**（genConstructor DeclFun.cpp L653-718 只包装 receiver self #52；对照 genFunDecl L197-208 "Bug B"）→ ctor 体内 `gc_force()`（compact 移动对象）后形参旧地址悬垂 → 存入字段后外部解引用 **0xC0000005 崩溃**——probe5b 8/8、probe5f 5/5、probe5g 5/5；method 同场景（probe5e）3/3 正常。压测统计见 `...\gc_pressure\runs\*.crash.txt`。→ 登记 `[[bug-69-ctor-param-gc-root-dangling-crash]]`。
+- **新缺陷（bug-69，同域真实悬垂）**：ctor（泛型/非泛型皆然）的 GC 指针形参（record `Point*`、Union 堆封装 `Variant<...>*`）**无入口 GcRootHandle 包装**（genConstructor DeclFun.cpp L653-718 只包装 receiver self \#52；对照 genFunDecl L197-208 "Bug B"）→ ctor 体内 `gc_force()`（compact 移动对象）后形参旧地址悬垂 → 存入字段后外部解引用 **0xC0000005 崩溃**——probe5b 8/8、probe5f 5/5、probe5g 5/5；method 同场景（probe5e）3/3 正常。压测统计见 `...\gc_pressure\runs\*.crash.txt`。→ 登记 `[[bug-69-ctor-param-gc-root-dangling-crash]]`。
 - **GC 压测统计**（探针 `...\feature03_union_gc_probe\gc_pressure\probes\`）：
   | 探针 | 形态 | 压力 | 轮次/现象 |
   | :--- | :--- | :--- | :--- |
@@ -81,13 +82,13 @@ tags:
   | probe5_generic_ctor_gc | 泛型 ctor `int\|T` T=Point + ctor 内 GC 窗口（150 分配+gc_force×2） | 400 轮+线程 | 2/2 崩（0xC0000005，同 bug-69） |
   | pa_gc / pb_gc（既有先例复跑） | 形态 A/B（泛型 record 名 / 具体 record 名变体字段） | 500 轮 | 各 1/1 exit=0 err=0（合计历史 16/16 + 本轮 2/2 稳定） |
 - **match 泛型模式限制确认（任务点 5）**：① 带实参泛型类型模式 `Box<Point> bb =>`：Parser 报 `expected '=>' in match case (got "<")`（probe6 实证，与 §3.5 L60 一致）；② 裸泛型变体模式 `T t =>`：Parser 接受（无 `<`），但泛型函数体内 match 含 T 变体 union 无法通过 Sema return-on-all-paths（probe2/probe2b：加 `_` 兜底仍报 `must return a value on all paths (missing explicit return)`）——**泛型体内无法 match 提取 T 变体**（语言缺口，比 §3.5 L60 记录更广：不止带实参泛型，裸 T 变体 union 的泛型体内 match 整体不可用）。
-- **§3.5 表格/结论修订**：原"by-value 残留（#42/bug-60 域，风险窄）"观察项 → **替换为 bug-69（ctor 形参根保护缺失，真实可复现悬垂崩溃）**；本笔记 scope 重新评估维持"泛型 record 名变体缺口不存在"，Step 2-5 仍暂缓，但**新增 bug-69 修复依赖**（若 bug-69 与 #42/DeclFun 形参包装同域，可并入下一批修复）。
+- **§3.5 表格/结论修订**：原"by-value 残留（#42/bug-60 域，风险窄）"观察项 → **替换为 bug-69（ctor 形参根保护缺失，真实可复现悬垂崩溃）**；本笔记 scope 重新评估维持"泛型 record 名变体缺口不存在"，Step 2-5 仍暂缓，但**新增 bug-69 修复依赖**（若 bug-69 与 \#42/DeclFun 形参包装同域，可并入下一批修复）。
 
 ## 4. 依赖与前置条件（Dependencies）
 - **基础设施依赖**：
-  - #42（mapType 保守判堆框架 + isBareAuraName lambda）——扩展判据而非新机制。
-  - #65（P3c 放宽 + variant.h descForI 指针变体追踪确认）。
-  - #54（per-instantiation desc）——模板期 Variant desc 依赖。
+  - \#42（mapType 保守判堆框架 + isBareAuraName lambda）——扩展判据而非新机制。
+  - \#65（P3c 放宽 + variant.h descForI 指针变体追踪确认）。
+  - \#54（per-instantiation desc）——模板期 Variant desc 依赖。
 - **被阻塞的子任务**：特性 2（异构列表 Union 提升）若元素含泛型 record 变体可共享封装机制。
 - **外部依赖**：无。
 

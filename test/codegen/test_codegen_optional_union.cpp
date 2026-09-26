@@ -258,7 +258,7 @@ TEST(CodeGen, OptionalViewArgRecordToViewBoxing) {
         diag);
     EXPECT_FALSE(diag.hasErrors());
     EXPECT_CONTAINS(unit.impl, "aura_rt::gcConstruct<UserStringer>");
-    EXPECT_CONTAINS(unit.impl, "aura_rt::make_optional<Stringer>");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::make_optional<aura_rt::Stringer>");
     // bug-61 补修：Stringer（内置接口）不再被 collectMaterializedFromType 误判为待绑
     // 泛型形参名 → 形参 Optional<Stringer> 不得被裸词替换成 Optional<User*>（修复前坏 C++）
     EXPECT_NOT_CONTAINS(unit.impl, "Optional<User*>");
@@ -823,8 +823,10 @@ TEST(CodeGen, DoubleBoxNestedOptionalView) {
         " let o: Optional<Optional<Stringer>> = some(r)"
         " io.println(str(o.unwrap().unwrap().to_string())) }", diag);
     EXPECT_FALSE(diag.hasErrors());
-    EXPECT_CONTAINS(unit.impl, "aura_rt::make_optional<aura_rt::Optional<Stringer>*>(_ohx");
-    EXPECT_CONTAINS(unit.impl, "aura_rt::make_optional<Stringer>");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::make_optional<aura_rt::Optional<aura_rt::Stringer>*>(_ohx");
+    // bug-85（方案 B3，2026-09-18）：内层视图类型名随 B3 迁入 runtime 公共头，
+    // 由裸名 "Stringer" 变为 "aura_rt::Stringer"（与上一行同源，此前漏改此行）。
+    EXPECT_CONTAINS(unit.impl, "aura_rt::make_optional<aura_rt::Stringer>");
 }
 
 TEST(CodeGen, DoubleBoxNoRegressionSingleLayer) {

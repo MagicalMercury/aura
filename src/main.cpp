@@ -240,25 +240,36 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
     // 0. 加载内置 .aurai 接口声明（始终加载 io.aurai）
     mgr.loadBuiltinAurai();
 
-    // 1. 加载所有模块
-    if (!mgr.loadAll(opts.inputPath)) {
+    // 1. 声明级扫描（feature-13 C3/C4：依赖发现在完整解析【之前】完成——f13 真增量）
+    //    替代旧 loadAll：scanAll 只做声明级扫描（跳过函数体），产出扫描表 scanUnits_。
+    if (!mgr.scanAll(opts.inputPath)) {
         std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
         diag.print(std::cerr);
         return 1;
     }
 
-    // 2. 循环检测
-    if (mgr.hasCycle()) {
+    // 2. 汇总段（全部读扫描表，不需完整解析）：
+    //    module 名冲突（D12）+ 环检测 + 入口验证
+    if (mgr.checkModuleConflicts()) {
         diag.print(std::cerr);
         return 1;
     }
+    if (mgr.hasCycleOn()) {
+        diag.print(std::cerr);
+        return 1;
+    }
+    // 3. 第二段：完整解析扫描表中的每个单元 → modules_（C4 loadAllScanned；A2 决策）
+    if (!mgr.loadAllScanned()) {
+        std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
+        diag.print(std::cerr);
+        return 1;
+    }
+    // 拓扑分层（基于扫描表，path 分组）——供 Sema/CodeGen 按层调度
+    auto layers = mgr.topologicalLayersOn();
 
-    // 3. 拓扑分层
-    auto layers = mgr.topologicalLayers();
-
-    // 4. 入口点验证
+    // 入口点验证（扫描表 hasMain）
     std::string entryModulePath;
-    if (!mgr.validateEntry(entryModulePath)) {
+    if (!mgr.validateEntryOn(entryModulePath)) {
         diag.print(std::cerr);
         return 1;
     }
@@ -290,7 +301,9 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
     for (auto& layer : layers) {
         // 收集本层任务（非 builtin 且 AST 非空）；每模块独立 diag 并绑定源码视图
         std::vector<Aura::ModuleInfo*> tasks;
-        for (auto* mod : layer) {
+        for (auto& path : layer) {
+            auto* mod = mgr.moduleAt(path);
+            if (!mod) continue;
             if (mod->isBuiltin) continue;
             if (!mod->ast) continue;
             tasks.push_back(mod);
@@ -401,18 +414,20 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
         auto unit = cg.generate(*mod->ast, mod->moduleName, cgImports, mod->nsName,
                                 Aura::CodeGenConfig(), crossDefaults, crossParamSemTypes);
 
-        // 写出头文件
-        std::string hdrPath = outDir + "/" + mod->moduleName + ".aura.h";
+        // 写出头文件（feature-13 C4：文件名用源文件 stem——同 module 多文件产物互不覆盖；
+        // 无 module 声明时 moduleName==stem，文件名与旧路径逐字一致（存量零变化））
+        std::string modStem = Aura::stemOf(mod->sourcePath);
+        std::string hdrPath = outDir + "/" + modStem + ".aura.h";
         {
             std::ostringstream hdr;
             hdr << unit.header;
             Aura::writeFile(hdrPath, hdr.str());
         }
         // 写出实现文件
-        std::string cppPath = outDir + "/" + mod->moduleName + ".aura.cpp";
+        std::string cppPath = outDir + "/" + modStem + ".aura.cpp";
         {
             std::ostringstream implCpp;
-            implCpp << "#include \"" << mod->moduleName << ".aura.h\"\n";
+            implCpp << "#include \"" << modStem << ".aura.h\"\n";
             implCpp << unit.impl;
             if (!unit.footer.empty()) implCpp << "\n" << unit.footer;
             Aura::writeFile(cppPath, implCpp.str());
@@ -422,11 +437,15 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
         return res;
     };
 
-    // 收集所有非内置模块任务
+    // 收集所有非内置模块任务（feature-13 C4：按扫描表 path 层）
     std::vector<Aura::ModuleInfo*> cgTasks;
-    for (auto& layer : layers)
-        for (auto* mod : layer)
-            if (!mod->isBuiltin) cgTasks.push_back(mod);
+    for (auto& layer : layers) {
+        for (auto& path : layer) {
+            auto* mod = mgr.moduleAt(path);
+            if (!mod || mod->isBuiltin) continue;
+            cgTasks.push_back(mod);
+        }
+    }
 
     std::map<std::string, CgResult> cgResults;  // key = mod->sourcePath
     int cgN = parallelJobs(opts, cgTasks.size());
@@ -443,8 +462,9 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
 
     // 主线程按"层序 + 层内序"收集 cppPath + 汇总诊断 + 打印（顺序确定）
     for (auto& layer : layers) {
-        for (auto* mod : layer) {
-            if (mod->isBuiltin) continue;
+        for (auto& path : layer) {
+            auto* mod = mgr.moduleAt(path);
+            if (!mod || mod->isBuiltin) continue;
             auto& res = cgResults[mod->sourcePath];
             diag.mergeFrom(*res.diag);
             if (!res.cppPath.empty()) allCppPaths.push_back(res.cppPath);
@@ -487,13 +507,13 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
         return 1;
     }
 
-    // 清理中间文件
+    // 清理中间文件（feature-13 C4：与落盘一致——按源文件 stem）
     if (!keepIntermediate) {
         for (auto& cpp : allCppPaths)
             std::filesystem::remove(cpp);
         for (auto& [path, info] : mgr.modules()) {
             if (!info.isBuiltin) {
-                std::string hdr = outDir + "/" + info.moduleName + ".aura.h";
+                std::string hdr = outDir + "/" + Aura::stemOf(info.sourcePath) + ".aura.h";
                 std::filesystem::remove(hdr);
             }
         }

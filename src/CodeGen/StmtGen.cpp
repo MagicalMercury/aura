@@ -2,6 +2,7 @@
 #include "../Sema/BuiltinRegistry.h"
 #include "../Sema/SemType.h"
 #include <sstream>
+#include <algorithm>
 
 namespace Aura {
 
@@ -10,9 +11,39 @@ namespace Aura {
 // ============================================================
 
 void CodeGenerator::genBlock(std::ostream& cpp, const BlockStmt& block,
-                              bool isCoroutine) {
+                              bool isCoroutine, bool opensScope) {
+    // feature-14 U5（change.md §3.5「U5 驱动语句生成」）：块作用域帧。
+    //
+    // ⚠️ 为什么不复用 futureVars_：它只跟踪「此刻活跃的 future」（消费点即 clear），
+    //    而块尾驱动需要「本块声明过的全部」（驱动幂等，已消费的重复驱动无害）。
+    //    二者语义不同，故并行维护。
+    futureBlockStack_.push_back(FutureBlockFrame{});
+    futureBlockStack_.back().opensScope = opensScope;
+
     for (auto& s : block.stmts) {
         if (s) genStmt(cpp, *s, isCoroutine);
+    }
+
+    FutureBlockFrame frame = std::move(futureBlockStack_.back());
+    futureBlockStack_.pop_back();
+
+    if (opensScope) {
+        // 本块真的开了 C++ `{}` → 块尾（调用方的 `}` 之前、变量析构之前）驱动。
+        // 铁律 1：必须在变量析构之前，否则读悬垂句柄（UB）。
+        // 无 future → 不生成，避免空声明污染产物。
+        if (frame.names.empty()) return;
+        genFutureDrive(cpp, frame);
+    } else {
+        // 裸块（genStmt 的 BlockStmt 分支）不生成 `{}` → 其声明提升到外层作用域，
+        // 驱动必须压到外层块尾（change.md §3.5 铁律 2）→ 名字并入外层帧。
+        if (!frame.names.empty()) {
+            if (futureBlockStack_.empty()) return;   // 防御：宁可不驱动也不生成非法 co_await
+            auto& outer = futureBlockStack_.back().names;
+            for (auto& n : frame.names) {
+                if (std::find(outer.begin(), outer.end(), n) == outer.end())
+                    outer.push_back(n);
+            }
+        }
     }
 }
 

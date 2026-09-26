@@ -1,4 +1,5 @@
 #include "Sema/SemAnalyzer.h"
+#include "ASTWalker.h"
 
 namespace Aura {
 
@@ -116,13 +117,287 @@ void SemAnalyzer::checkSyncForStmt(const SyncForStmt& stmt) {
     symtab_.exitScope();
 }
 
-void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
-    if (!insideSync_) {
-        error(stmt, DiagCode::E018_SpawnOutsideSync,
-          "'spawn' can only be used inside a 'sync' block",
-          "wrap the spawn statement in 'sync { ... }'");
-        return;
+// ============================================================
+// feature-14 U1 — spawn 闭包自由变量分析
+//
+// 为何 Sema 侧要自己写：CodeGen 的 IdRefCollector / DeclaredCollector 是
+// CodeGenerator 的**私有嵌套类**（CodeGen.h:164/217），Sema 侧不可见；
+// 且它们的判定依赖 registeredTypes_ 等 CodeGen 状态（Sema 无此状态）。
+// 因此复用底层的 StmtWalker/ExprWalker 框架（src/ASTWalker.h）
+// 而不重造遍历分发链——同时与 CodeGen 口径对齐。
+//
+// 口径（必须与 CodeGen genSpawnStmt 的 freeVars 一致）：
+//   自由变量 = idRefs(body) - body 内局部声明 - stmt.params -
+//              内置函数名 - 外层可见类型名
+//   （io 单独处理：它由 CodeGen 按需追加为 lambda 形参，不隔离则会误报）
+//
+// 策略：宁漏勿误。只在「该名字在 Sema 符号表中可见为外层变量」时才报错；
+// 任何不确定（不在符号表、未知类型名、内置名、对象属性、方法名）
+// 一律不报——不可能因 U1 产生新误报。
+// ============================================================
+
+namespace {
+
+// 代码块内局部声明收集器（对应 CodeGen.h 的 DeclaredCollector）。
+struct DeclaredNameCollector {
+    std::set<std::string>& out;
+    bool collectStmt(const Stmt& st) { return StmtWalker<DeclaredNameCollector>::walk(st, *this); }
+    bool collectExpr(const ASTNode& e) { return ExprWalker<DeclaredNameCollector>::walk(e, *this); }
+
+    bool visit(const LetDecl& n, DeclaredNameCollector& self) {
+        out.insert(n.name);
+        for (auto& x : n.names) out.insert(x);
+        if (n.initializer) self.collectExpr(*n.initializer);
+        return false;
     }
+    bool visit(const ConstDecl& n, DeclaredNameCollector& self) {
+        out.insert(n.name);
+        for (auto& x : n.names) out.insert(x);
+        if (n.initializer) self.collectExpr(*n.initializer);
+        return false;
+    }
+    bool visit(const ForStmt& n, DeclaredNameCollector& self) {
+        out.insert(n.itemName);
+        if (n.iterable) self.collectExpr(*n.iterable);
+        if (n.body) for (auto& x : n.body->stmts) if (x) self.collectStmt(*x);
+        return false;
+    }
+    bool visit(const SyncForStmt& n, DeclaredNameCollector& self) {
+        out.insert(n.itemName);
+        if (n.iterable) self.collectExpr(*n.iterable);
+        if (n.body) for (auto& x : n.body->stmts) if (x) self.collectStmt(*x);
+        return false;
+    }
+    bool visit(const TryCatchStmt& n, DeclaredNameCollector& self) {
+        out.insert(n.catchVar);
+        if (n.tryBody) for (auto& x : n.tryBody->stmts) if (x) self.collectStmt(*x);
+        if (n.catchBody) for (auto& x : n.catchBody->stmts) if (x) self.collectStmt(*x);
+        return false;
+    }
+    bool visit(const MatchStmt& n, DeclaredNameCollector& self) {
+        for (auto& c : n.cases)
+            if (auto* tp = dynamic_cast<const TypePattern*>(c.pattern.get()))
+                if (!tp->varName.empty()) out.insert(tp->varName);
+        if (n.expr) self.collectExpr(*n.expr);
+        for (auto& c : n.cases)
+            if (c.body) {
+                if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) self.collectStmt(*cb);
+                else self.collectExpr(*c.body);
+            }
+        return false;
+    }
+    bool visit(const BlockStmt& n, DeclaredNameCollector& self) {
+        for (auto& x : n.stmts) if (x) self.collectStmt(*x);
+        return false;
+    }
+    bool visit(const IfStmt& n, DeclaredNameCollector& self) {
+        if (n.condition) self.collectExpr(*n.condition);
+        if (n.thenBranch) self.collectStmt(*n.thenBranch);
+        for (auto& ei : n.elseIfs) {
+            if (ei.condition) self.collectExpr(*ei.condition);
+            if (ei.body) self.collectStmt(*ei.body);
+        }
+        if (n.elseBranch) self.collectStmt(*n.elseBranch);
+        return false;
+    }
+    bool visit(const WhileStmt& n, DeclaredNameCollector& self) {
+        if (n.condition) self.collectExpr(*n.condition);
+        if (n.body) self.collectStmt(*n.body);
+        return false;
+    }
+    bool visit(const LoopStmt& n, DeclaredNameCollector& self) {
+        if (n.body) self.collectStmt(*n.body);
+        return false;
+    }
+    bool visit(const SyncStmt& n, DeclaredNameCollector& self) {
+        if (n.body) for (auto& x : n.body->stmts) if (x) self.collectStmt(*x);
+        return false;
+    }
+    bool visit(const SpawnStmt& n, DeclaredNameCollector& self) {
+        for (auto& p : n.params) out.insert(p.name);
+        if (n.callExpr) return self.collectExpr(*n.callExpr);
+        for (auto& x : n.body) if (x) self.collectStmt(*x);
+        return false;
+    }
+    bool visit(const ReturnStmt& n, DeclaredNameCollector& self) { if (n.expr) self.collectExpr(*n.expr); return false; }
+    bool visit(const ThrowStmt& n, DeclaredNameCollector& self) { if (n.expr) self.collectExpr(*n.expr); return false; }
+    bool visit(const ExprStmt& n, DeclaredNameCollector& self) { if (n.expr) self.collectExpr(*n.expr); return false; }
+    bool visit(const BreakStmt&, DeclaredNameCollector&) { return false; }
+    bool visit(const ContinueStmt&, DeclaredNameCollector&) { return false; }
+
+    // 深入内层闭包：内层参数/体内声明对外层而言是「不可见的”名字」。
+    // ⚠️ 但它们也不应该被报「未捕获」——所以下方筛选时对
+    // 「出现在内层闭包参数上的名字」一律跳过（见 nestedClosureParams）。
+    bool visit(const FunExpr& n, DeclaredNameCollector& self) {
+        for (auto& p : n.params) out.insert(p.name);
+        if (n.body) for (auto& x : n.body->stmts) if (x) self.collectStmt(*x);
+        return false;
+    }
+
+    bool visit(const BinaryExpr& n, DeclaredNameCollector& self) { if (n.left) self.collectExpr(*n.left); if (n.right) self.collectExpr(*n.right); return false; }
+    bool visit(const UnaryExpr& n, DeclaredNameCollector& self) { if (n.operand) self.collectExpr(*n.operand); return false; }
+    bool visit(const CallExpr& n, DeclaredNameCollector& self) { if (n.callee) self.collectExpr(*n.callee); for (auto& a : n.args) if (a) self.collectExpr(*a); return false; }
+    bool visit(const MethodCallExpr& n, DeclaredNameCollector& self) { if (n.object) self.collectExpr(*n.object); for (auto& a : n.args) if (a) self.collectExpr(*a); return false; }
+    bool visit(const MemberAccessExpr& n, DeclaredNameCollector& self) { if (n.object) self.collectExpr(*n.object); return false; }
+    bool visit(const IndexExpr& n, DeclaredNameCollector& self) { if (n.object) self.collectExpr(*n.object); if (n.index) self.collectExpr(*n.index); return false; }
+    bool visit(const AssignExpr& n, DeclaredNameCollector& self) { if (n.target) self.collectExpr(*n.target); if (n.value) self.collectExpr(*n.value); return false; }
+    bool visit(const ErrorPropagationExpr& n, DeclaredNameCollector& self) { if (n.expr) self.collectExpr(*n.expr); return false; }
+    bool visit(const PipeExpr& n, DeclaredNameCollector& self) { if (n.left) self.collectExpr(*n.left); if (n.right) self.collectExpr(*n.right); return false; }
+    bool visit(const ConditionalExpr& n, DeclaredNameCollector& self) { if (n.cond) self.collectExpr(*n.cond); if (n.thenBranch) self.collectExpr(*n.thenBranch); if (n.elseBranch) self.collectExpr(*n.elseBranch); return false; }
+    bool visit(const ListExpr& n, DeclaredNameCollector& self) { for (auto& e : n.elements) if (e) self.collectExpr(*e); return false; }
+    bool visit(const RecordExpr& n, DeclaredNameCollector& self) { for (auto& f : n.fields) if (f.value) self.collectExpr(*f.value); return false; }
+    bool visit(const Identifier&, DeclaredNameCollector&) { return false; }
+    bool visit(const IntLiteral&, DeclaredNameCollector&) { return false; }
+    bool visit(const FloatLiteral&, DeclaredNameCollector&) { return false; }
+    bool visit(const StringLiteral&, DeclaredNameCollector&) { return false; }
+    bool visit(const BoolLiteral&, DeclaredNameCollector&) { return false; }
+    bool visit(const NoneLiteral&, DeclaredNameCollector&) { return false; }
+};
+
+// 标识符引用 + 内层闭包形参名收集器（一遍遍历同时做两件事）。
+//
+// nestedClosureParams：spauwn body 内嵌套的语言闭包/fun 表达式的形参名。
+//   这些名字在外层 body 不可见（不是自由变量），但它们不是「未捕获」
+//   —— 因此需要单独排除，否则会误报。
+struct SpawnBodyScanner {
+    std::set<std::string>& refs;
+    std::set<std::string>& nestedClosureParams;
+
+    bool collectStmt(const Stmt& st) { return StmtWalker<SpawnBodyScanner>::walk(st, *this); }
+    bool collectExpr(const ASTNode& e) { return ExprWalker<SpawnBodyScanner>::walk(e, *this); }
+
+    bool visit(const Identifier& n, SpawnBodyScanner&) { refs.insert(n.name); return false; }
+    bool visit(const FunExpr& n, SpawnBodyScanner& self) {
+        for (auto& p : n.params) self.nestedClosureParams.insert(p.name);
+        if (n.body) for (auto& x : n.body->stmts) if (x) self.collectStmt(*x);
+        return false;
+    }
+    bool visit(const SpawnStmt& n, SpawnBodyScanner& self) {
+        for (auto& p : n.params) self.nestedClosureParams.insert(p.name);
+        if (n.callExpr) return self.collectExpr(*n.callExpr);
+        for (auto& x : n.body) if (x) self.collectStmt(*x);
+        return false;
+    }
+
+    bool visit(const BlockStmt& n, SpawnBodyScanner& self) { for (auto& x : n.stmts) if (x) self.collectStmt(*x); return false; }
+    bool visit(const ReturnStmt& n, SpawnBodyScanner& self) { if (n.expr) self.collectExpr(*n.expr); return false; }
+    bool visit(const ThrowStmt& n, SpawnBodyScanner& self) { if (n.expr) self.collectExpr(*n.expr); return false; }
+    bool visit(const ExprStmt& n, SpawnBodyScanner& self) { if (n.expr) self.collectExpr(*n.expr); return false; }
+    bool visit(const IfStmt& n, SpawnBodyScanner& self) {
+        if (n.condition) self.collectExpr(*n.condition);
+        if (n.thenBranch) self.collectStmt(*n.thenBranch);
+        for (auto& ei : n.elseIfs) {
+            if (ei.condition) self.collectExpr(*ei.condition);
+            if (ei.body) self.collectStmt(*ei.body);
+        }
+        if (n.elseBranch) self.collectStmt(*n.elseBranch);
+        return false;
+    }
+    bool visit(const WhileStmt& n, SpawnBodyScanner& self) { if (n.condition) self.collectExpr(*n.condition); if (n.body) self.collectStmt(*n.body); return false; }
+    bool visit(const ForStmt& n, SpawnBodyScanner& self) { if (n.iterable) self.collectExpr(*n.iterable); if (n.body) self.collectStmt(*n.body); return false; }
+    bool visit(const LoopStmt& n, SpawnBodyScanner& self) { if (n.body) self.collectStmt(*n.body); return false; }
+    bool visit(const TryCatchStmt& n, SpawnBodyScanner& self) {
+        if (n.tryBody) self.collectStmt(*n.tryBody);
+        if (n.catchBody) self.collectStmt(*n.catchBody);
+        return false;
+    }
+    bool visit(const SyncStmt& n, SpawnBodyScanner& self) { if (n.body) self.collectStmt(*n.body); return false; }
+    bool visit(const SyncForStmt& n, SpawnBodyScanner& self) { if (n.iterable) self.collectExpr(*n.iterable); if (n.body) self.collectStmt(*n.body); return false; }
+    bool visit(const MatchStmt& n, SpawnBodyScanner& self) {
+        if (n.expr) self.collectExpr(*n.expr);
+        for (auto& c : n.cases)
+            if (c.body) {
+                if (auto* cb = dynamic_cast<const BlockStmt*>(c.body.get())) self.collectStmt(*cb);
+                else self.collectExpr(*c.body);
+            }
+        return false;
+    }
+    bool visit(const LetDecl& n, SpawnBodyScanner& self) { if (n.initializer) self.collectExpr(*n.initializer); return false; }
+    bool visit(const ConstDecl& n, SpawnBodyScanner& self) { if (n.initializer) self.collectExpr(*n.initializer); return false; }
+    bool visit(const BreakStmt&, SpawnBodyScanner&) { return false; }
+    bool visit(const ContinueStmt&, SpawnBodyScanner&) { return false; }
+
+    bool visit(const BinaryExpr& n, SpawnBodyScanner& self) { if (n.left) self.collectExpr(*n.left); if (n.right) self.collectExpr(*n.right); return false; }
+    bool visit(const UnaryExpr& n, SpawnBodyScanner& self) { if (n.operand) self.collectExpr(*n.operand); return false; }
+    bool visit(const CallExpr& n, SpawnBodyScanner& self) { if (n.callee) self.collectExpr(*n.callee); for (auto& a : n.args) if (a) self.collectExpr(*a); return false; }
+    bool visit(const MemberAccessExpr& n, SpawnBodyScanner& self) {
+        // ⚠️ 只收集 object，不收集 field 名——字段名不是变量引用。
+        if (n.object) self.collectExpr(*n.object);
+        return false;
+    }
+    bool visit(const IndexExpr& n, SpawnBodyScanner& self) { if (n.object) self.collectExpr(*n.object); if (n.index) self.collectExpr(*n.index); return false; }
+    bool visit(const AssignExpr& n, SpawnBodyScanner& self) { if (n.target) self.collectExpr(*n.target); if (n.value) self.collectExpr(*n.value); return false; }
+    bool visit(const ErrorPropagationExpr& n, SpawnBodyScanner& self) { if (n.expr) self.collectExpr(*n.expr); return false; }
+    bool visit(const PipeExpr& n, SpawnBodyScanner& self) { if (n.left) self.collectExpr(*n.left); if (n.right) self.collectExpr(*n.right); return false; }
+    bool visit(const ConditionalExpr& n, SpawnBodyScanner& self) { if (n.cond) self.collectExpr(*n.cond); if (n.thenBranch) self.collectExpr(*n.thenBranch); if (n.elseBranch) self.collectExpr(*n.elseBranch); return false; }
+    bool visit(const ListExpr& n, SpawnBodyScanner& self) { for (auto& e : n.elements) if (e) self.collectExpr(*e); return false; }
+    bool visit(const RecordExpr& n, SpawnBodyScanner& self) { for (auto& f : n.fields) if (f.value) self.collectExpr(*f.value); return false; }
+    bool visit(const IntLiteral&, SpawnBodyScanner&) { return false; }
+    bool visit(const FloatLiteral&, SpawnBodyScanner&) { return false; }
+    bool visit(const StringLiteral&, SpawnBodyScanner&) { return false; }
+    bool visit(const BoolLiteral&, SpawnBodyScanner&) { return false; }
+    bool visit(const NoneLiteral&, SpawnBodyScanner&) { return false; }
+
+    // MethodCallExpr：只收集 object 与 args（method 名不是变量）
+    bool visit(const MethodCallExpr& n, SpawnBodyScanner& self) {
+        if (n.object) self.collectExpr(*n.object);
+        for (auto& a : n.args) if (a) self.collectExpr(*a);
+        return false;
+    }
+};
+
+} // namespace
+
+// spawn 闭包形态：检查 body 引用的外层变量是否都在捕获名单内。
+//
+// ⚠️ 必须在 symtab_.enterScope()（参数作用域）**之前**调用——
+//    否则 body 中的「未捕获名」会因参数已入符号表而被当成「已声明」。
+void SemAnalyzer::checkSpawnClosureCaptures(const SpawnStmt& stmt) {
+    // 捕获名单 = params（显式列出的都算捕获）+ args 中的同名形参（已经在上方校验过）
+    std::set<std::string> captured;
+    for (auto& p : stmt.params) captured.insert(p.name);
+
+    // 空 body（刚只有 spawn (x: int) {}）无需检查
+    if (stmt.body.empty()) return;
+
+    std::set<std::string> idRefs;
+    std::set<std::string> nestedClosureParams;
+    SpawnBodyScanner scanner{idRefs, nestedClosureParams};
+    for (auto& s : stmt.body)
+        if (s) scanner.collectStmt(*s);
+
+    std::set<std::string> declared;
+    DeclaredNameCollector declCol{declared};
+    for (auto& s : stmt.body)
+        if (s) declCol.collectStmt(*s);
+
+    for (auto& name : idRefs) {
+        if (name.empty()) continue;
+        if (captured.count(name)) continue;        // 已在捕获名单内
+        if (declared.count(name)) continue;        // body 内局部声明
+        if (nestedClosureParams.count(name)) continue;  // 内层闭包形参（非自由变量）
+        if (name == "io") continue;                // CodeGen 按需追加为 lambda 形参
+        // 内置函数名（str / range / Iterator 等）不捕获——与 CodeGen 同口径
+        if (BuiltinRegistry::get().hasFunctionName(name)) continue;
+        // 不在符号表：可能是类型名 / 未知名。
+        // 只报「可确认是外层变量」的——宁漏勿误。
+        auto* sym = symtab_.lookup(name);
+        if (!sym) continue;
+        if (sym->kind != SymKind::Variable && sym->kind != SymKind::Parameter) continue;
+
+        error(stmt, "spawn body references '" + name
+              + "' which is not in the capture list: add it as 'spawn ("
+              + name + ": <type>, ...)'");
+    }
+}
+
+void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
+    // feature-14 P3：原「词法必须在 sync 块内」（insideSync_）判定**已退役** ——
+    // 约束改判「所在函数经调用链被 sync 可达」，由第 3 遍
+    // SemAnalyzer::applySpawnReachability（Checker/CallGraph.cpp，analyze() 内
+    // checkProgram 之后）统一报 E018。
+    // ⚠️ 这里不再判合法性，但下面 lock / 参数 / 捕获校验与可达性无关，全部保留。
+    // ⚠️ insideSync_ 变量本身保留（仍是 sync 系块上下文标记，另有他用）。
 
     // L6: lock 块内禁止 spawn（spawn 不应持锁）
     if (inLockBlock_) {
@@ -149,11 +424,14 @@ void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
     // 同名自动绑定校验：无显式实参列表（stmt.args 为空）时，CodeGen 按参数名引用
     // 外层同名变量（genSpawnStmt 同名自动绑定 / genSpawnAsThread 捕获列表）。若外层
     // 无该变量，生成的裸标识符落到 g++ "'x' was not declared"（坏 C++）——此处提前
-    // 干净报错。io/_tasks 由 CodeGen 特殊追加实参（StmtSpawn.cpp L82-83），不参与
-    // 同名绑定，跳过校验（避免误伤 `spawn (io: Io, i: int)` 循环变量绑定形态）。
+    // 干净报错。io 由 CodeGen 特殊追加实参（StmtSpawn.cpp），不参与同名绑定，跳过
+    // 校验（避免误伤 `spawn (io: Io, i: int)` 循环变量绑定形态）。
+    // feature-14 P2：_tasks 分支删除——CodeGen 侧已不再追加该形参，`p.name == "_tasks"`
+    // 成为永不命中的死逻辑（Phase 0 §6.4 修正的「清理死逻辑」而非「避免 argument
+    // count mismatch」；后者机制不成立：下方数量校验只比用户源码里的 args/params）。
     if (stmt.args.empty()) {
         for (auto& p : stmt.params) {
-            if (p.name == "io" || p.name == "_tasks")
+            if (p.name == "io")
                 continue;
             if (!symtab_.lookup(p.name)) {
                 error(stmt, "cannot bind spawn parameter '" + p.name
@@ -170,7 +448,8 @@ void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
     // 作用域后，与参数同名的实参标识符会被遮蔽 → 误报（control_coro_args_same_name
     // 验证外层求值是正确语义）。
     if (!stmt.args.empty()) {
-        // 1. 数量校验：spawn 无默认参数、严格相等；io/_tasks 也占参数位
+        // 1. 数量校验：spawn 无默认参数、严格相等；io 也占参数位
+        //（feature-14 P2：_tasks 已退役，不再有内部参数位）
         if (stmt.args.size() != stmt.params.size()) {
             error(stmt, "spawn argument count mismatch: "
                   + std::to_string(stmt.args.size()) + " args for "
@@ -182,8 +461,9 @@ void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
             std::unique_ptr<SemType> argTy;
             std::unique_ptr<SemType> paramTy;
             const Param& p = stmt.params[i];
-            // _tasks 为内部类型（无法 resolveType），跳过类型校验（仍占数量位）
-            if (p.type && p.name != "_tasks")
+            // feature-14 P2：_tasks 跳过分支已删（该内部参数不再生成，
+            //   `p.name != "_tasks"` 成为永不命中的死逻辑）
+            if (p.type)
                 paramTy = resolveType(*p.type);
             // 匿名 record 字面量实参需期望类型才能解析（决策 A，与 checkCallArgs 对齐）
             if (paramTy && isRecordLiteralArg(*stmt.args[i]))
@@ -196,6 +476,11 @@ void SemAnalyzer::checkSpawnStmt(const SpawnStmt& stmt) {
             }
         }
     }
+
+    // ⚠️ 位置约束：必须在下方 enterScope() 之前调用。
+    //    一旦参数进入符号表，body 中同名的“未捕获”引用会被 lookup 命中，
+    //    检查就失效了。
+    checkSpawnClosureCaptures(stmt);
 
     // 显式传参：将参数注册到 spawn 作用域（参数只读）
     symtab_.enterScope();

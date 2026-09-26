@@ -2,7 +2,8 @@
 type: todo_feature
 kind: refactor
 module: Runtime
-status: done
+status:
+  - finished
 priority: P1
 estimated_effort: XL
 blocked_by: []
@@ -26,7 +27,7 @@ tags:
 - **当前短板**：
   - 可调用对象表示散乱 5 形态（§plan 2.1）：闭包 C++ lambda+捕获手工根包装、函数值 &fname、XFunc desc 硬编码 `{size,0,nullptr}` 捕获对 GC 不可见、方法值 `p.next` 不可用、接口 Fn 槽。
   - 闭包值语义（std::function 深拷贝）三重 GC 税：根增殖 / 堆内盲区（捕获不可见）/ compact 手术段 relocateGlobalRootPtrs 与编译器布局显式耦合。
-  - 缺陷族 #14/#24/#32/#52/#55 均为手工根包装缺口；std::function 捕获对 GC 不可见。
+  - 缺陷族 \#14/#24/\#32/#52/#55 均为手工根包装缺口；std::function 捕获对 GC 不可见。
 - **预期收益**：单表示 + origins 编译期检查（动态校验仅剩 3 个 erased 边界）；拷贝语义=引用语义（与 record/string/list 主流一致）；捕获槽 desc 追踪与 record 字段同构（mark/compact 免费）；**机制性消灭缺陷族**；可叠加 union 起源/异构容器（feature-02）底座。
 
 ## 2. 预期行为与规范设计（What & How）
@@ -53,7 +54,7 @@ tags:
 ## 4. 依赖与前置条件（Dependencies）
 - **基础设施依赖**：
   - desc 驱动追踪/重写完备（mark_sweep/compact 既有）；Variant 装箱通道（variant.h descForI）；TypeDescriptor 模型——均就绪。
-  - 批次 13 已闭环（2026-09-04，plan 依赖解除）；缺陷族 #14/#24/#32/#52/#55 笔记为负例转正素材。
+  - 批次 13 已闭环（2026-09-04，plan 依赖解除）；缺陷族 \#14/#24/#32/#52/#55 笔记为负例转正素材。
 - **被阻塞的子任务**：本特性落地后 feature-02（异构列表元素 Callable/Union）与 bug-24/52 族负例转正直接受益；erased 边界报错基建为 P0 验证项。
 - **外部依赖**：无（零外部依赖原则，std::function 保留仅作 C++ 桥，渐进迁移）。
 
@@ -73,16 +74,16 @@ tags:
   赋值/传参/存储到 fun(A)->R/Callable → CallableObj；直呼快路径保留（热路径零回归）；XFunc 收敛为 CallableObj 特化（desc 0→实际追踪）；fnCallbackParams_ 表退化；union 起源调用 sigId switch（N 个编译期已知 case）；接口 Fn 槽接线。
   ✅ 阶段 B/C 完成：ExprCall 单路径化 + XFunc 收敛（DeclGen.cpp L285+）+ genErasedWrap/Invoke/InitValue（ExprClosure.cpp L1360+）+ StmtLet 空列表修复（bug-04 子串判定收紧）；直呼零回归（1271/1271）。
 - [x] **Step P3：拆旧 + 收益兑现**  
-  删闭包 GcRootHandle init-capture 路径（ExprClosure 捕获过滤循环）、#24 _this_root/#56 捕获类场景（#56 方法体执行期 this 保护独立机制保留）、删 relocateGlobalRootPtrs（compact.cpp L420-461）；缺陷族负例 #14/#24/#32/#52/#55 全量转正；README。
+  删闭包 GcRootHandle init-capture 路径（ExprClosure 捕获过滤循环）、#24 _this_root/#56 捕获类场景（#56 方法体执行期 this 保护独立机制保留）、删 relocateGlobalRootPtrs（compact.cpp L420-461）；缺陷族负例 \#14/#24/#32/#52/#55 全量转正；README。
   ✅ 阶段 D 完成（2026-09-09）：MapIter/filter/from 回调装载迁移 CallableObj 指针槽（MapFnIter/FilterFnIter/FuncFnIter，desc 追踪，map/filter/from 的 Global 根转发 lambda 退役）；缺陷族负例由批次 8-9 补入单测覆盖复跑 + D1 GC 压实专项验证。
   ⚠️ 部分延后（登记已知限制，feature-07 迁移域）：泛型/协程/ViewRoot/递归闭包仍走旧 lambda 路径 → ExprClosure init-capture 分支与 compact.cpp relocateGlobalRootPtrs 保留（ViewRoot 等 Global 根场景仍存在，实证见 change.md §7 阶段 D 记录）。
 
 ## 6. 验收标准与回归清单（Acceptance Criteria）
 - [x] **功能验收**：第 2/3 层用例（函数名/闭包/方法值 `p.next`/Callable 裸/`[Callable]` 列表/union 起源 `all[0](1)`）编译运行；三态派生行为正确（单一静态、union 编译期、erased 运行时 sigId 校验）。
-  ✅ example/test.aura 全形态验收（single/copy/union=8/union1=12/方法值 gc_force 前后 42/functor=107/erased run/run2/w1/w2）ALL TESTS PASSED（2026-09-08，主 Agent 验收时修复 [Callable] 空列表误判回归）。
+  ✅ example/test.aura 全形态验收（single/copy/union=8/union1=12/方法值 gc_force 前后 42/functor=107/erased run/run2/w1/w2）ALL TESTS PASSED（2026-09-08，主 Agent 验收时修复 `[Callable]` 空列表误判回归）。
 - [x] **语义验收（v2 定案）**：收窄赋值 `let f: fun(int)->int = all[0]`（origins 不兼容）编译期报错；拷贝语义=引用语义（拷贝后原/副本调用一致 + GC 压实后双引用有效）；构造器引用一等化（P0 定案后细化）。
   ✅ 阶段 C 语义单测（CallableNarrowRejected / 拷贝语义用例）；构造器引用经 P0 实证（TypeAlias 分支改写）。
-- [x] **GC 验收**：捕获含堆指针闭包 gc_force 压实后捕获槽重写正确（缺陷族负例 #14/#24/#32/#52/#55 转正）；自引用闭包（Y combinator）desc 追踪正确；callable 跨 co_await / 跨 spawn（GC 压力）。
+- [x] **GC 验收**：捕获含堆指针闭包 gc_force 压实后捕获槽重写正确（缺陷族负例 \#14/#24/#32/#52/#55 转正）；自引用闭包（Y combinator）desc 追踪正确；callable 跨 co_await / 跨 spawn（GC 压力）。
   ✅ ClosureCallableObjCaptureGcSafe / XFuncCaptureTracked 等单测 + used/6.aura P2.2 C1（ViewRoot 捕获）+ 阶段 D 专项（map 捕获 string 回调 gc_force 压实 p100/p104、链式 map+filter 压实）全过。自引用/跨 spawn 归 feature-07 迁移域（递归闭包仍走旧路径）。
 - [x] **不误伤验收**：直呼/方法直调生成物不变（生成 C++ 断言）；`fun(A)->R` 语法与 FuncSemType 推断链不变；存量单测（std::function/XFunc 断言迁移同步）+ used/1-6.aura + example/test.aura 红线；性能哨兵（直呼零回归基准/闭包构造分配数/union switch vs 单态直调）。
   ✅ aura_tests 1271/1271 + used/1-6.aura 6/6 ALL TESTS PASSED + example/test.aura ALL TESTS PASSED；直呼快路径生成物不变（生成 C++ 抽查）。
@@ -99,6 +100,6 @@ tags:
 ---
 **当前状态**：`2026-09-09` **已完成（done）**——阶段 A（runtime callable.h，2026-09-07）/ B（第 2 层 CallableObj 化 + XFunc 收敛，2026-09-07）/ C（第 3 层 Callable + origins + 三态派生 + 方法值/构造器/functor 一等化，2026-09-08）/ D（拆旧：MapIter/filter/from 回调装载 CallableObj 指针槽 + 文档，2026-09-09）全部落地并验证（aura_tests 1271/1271、红线全过，详见 change.md §7 进度记录）。
 
-**机制性消灭记录**：缺陷族 #14/#24/#32/#52/#55 的非泛型非协程闭包路径根因（手工 GcRootHandle 包根 / std::function 捕获 GC 盲区）已被机制性消灭——闭包统一为 GC 堆 `CallableObj`（捕获槽 desc 追踪、类型驱动 GC 保护、拷贝=引用语义）。各笔记已加"机制性消灭（feature-06）"标注（fixed 状态保留）。
+**机制性消灭记录**：缺陷族 \#14/#24/#32/#52/#55 的非泛型非协程闭包路径根因（手工 GcRootHandle 包根 / std::function 捕获 GC 盲区）已被机制性消灭——闭包统一为 GC 堆 `CallableObj`（捕获槽 desc 追踪、类型驱动 GC 保护、拷贝=引用语义）。各笔记已加"机制性消灭（feature-06）"标注（fixed 状态保留）。
 
 **已知限制（feature-07 迁移域）**：泛型闭包 / 协程闭包 / ViewRoot 捕获闭包 / 递归闭包仍走旧 C++ lambda 路径（GcRootHandle init-capture + 手工包根），compact.cpp `relocateGlobalRootPtrs`（方案 P 手术段）因 ViewRoot/协程 Global 根场景仍存在而**延后删除**——已登记 feature-07，不属本特性范围。

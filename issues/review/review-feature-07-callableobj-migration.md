@@ -207,7 +207,7 @@ tags:
 
 ## 7. 复审追记（2026-09-10，针对 change.md v2 修订版）
 
-**复审结论**：v2 对 B1/B2/B3/G1/G2/G3 + N1-N5 的响应**逐项属实、落实到位**（附录 B 响应表与实际改动核对无误：`closureTaskVars_` 三件套 + 7 处消费点表、`genConstStmt` 消费点 #7、`if (!closureIsCoro) clear()`、双判据同源、白名单二次防御、两阶段删除、StmtSync 全集 11 处）。**但 G2 的修法本身引入一处新的阻塞级缺陷 P1，已实测坐实。**
+**复审结论**：v2 对 B1/B2/B3/G1/G2/G3 + N1-N5 的响应**逐项属实、落实到位**（附录 B 响应表与实际改动核对无误：`closureTaskVars_` 三件套 + 7 处消费点表、`genConstStmt` 消费点 \#7、`if (!closureIsCoro) clear()`、双判据同源、白名单二次防御、两阶段删除、StmtSync 全集 11 处）。**但 G2 的修法本身引入一处新的阻塞级缺陷 P1，已实测坐实。**
 
 ### P1（🔴 新增阻塞）：`decltype(VT{}.self)` 对值槽是硬编译错误
 
@@ -263,6 +263,6 @@ tags:
 - **后果**：`count` **恒为 0** → needAwait 仍 false → **B1 原症状（协程静默不执行 / task 立即析构）原封不动**，改造 #1 等于未改。
 - **独立佐证**：交叉复核子 Agent 亦指出「核对项 1 用 `calleeExpr`、2-4 用 `calleeName`」的 key 差异（两处 key 并存：L467-471 用 calleeExpr，L642/655/697 用 calleeName）。
 - **修法**：改用 `closureTaskVars_.count(calleeName) > 0`（`calleeName` 定义于 `ExprCall.cpp:267-269`，为 Identifier 裸名，与登记键同源）。**已直接修订 change.md §5.4 表 #1**。
-- **附带核查**：改造 #2/#3/#4（"不动"项）本身用 `calleeName`，不受影响 ✓；改造 #5（StmtLet 登记 `safeName(decl.name)`）✓；改造 #6/#7（`lastClosureCppBase_ + "*"`）✓。
+- **附带核查**：改造 \#2/#3/#4（"不动"项）本身用 `calleeName`，不受影响 ✓；改造 \#5（StmtLet 登记 `safeName(decl.name)`）✓；改造 \#6/#7（`lastClosureCppBase_ + "*"`）✓。
 
 **复审二轮裁决**：**changes_requested（仅 P5）**。P5 已直接修正（单点字符串替换）；修正后 change.md v3.1 满足"进入 Step 1 实施"条件。

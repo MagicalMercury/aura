@@ -49,7 +49,7 @@ TEST(CodeGen, ListOfStringerViewRecordToView) {
         " let s: [Stringer] = [u1, u2] }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
-    EXPECT_CONTAINS(unit.impl, "aura_rt::Array<Stringer>*");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Array<aura_rt::Stringer>*");
     EXPECT_CONTAINS(unit.impl, "aura_rt::gcConstruct<UserStringer>");
     EXPECT_CONTAINS(unit.impl, "UserStringer::view");
     // 视图元素是值类型 → 不生成 GcRootHandle<视图>
@@ -67,7 +67,7 @@ TEST(CodeGen, ListOfGenericIfaceViewRecordToView) {
         " let c: [Comparable<Point>] = [p1, p2] }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
-    EXPECT_CONTAINS(unit.impl, "aura_rt::Array<Comparable<Point*>>*");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Array<aura_rt::Comparable<Point*>>*");
     EXPECT_CONTAINS(unit.impl, "aura_rt::gcConstruct<PointComparable>");
     EXPECT_CONTAINS(unit.impl, "PointComparable::view");
 }
@@ -100,7 +100,7 @@ TEST(CodeGen, NestedListOfIfaceView) {
         " let nested: [[Stringer]] = [n1, n2] }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
-    EXPECT_CONTAINS(unit.impl, "aura_rt::Array<aura_rt::Array<Stringer>*>*");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Array<aura_rt::Array<aura_rt::Stringer>*>*");
 }
 
 TEST(CodeGen, ListOfOptionalIfaceView) {
@@ -115,7 +115,7 @@ TEST(CodeGen, ListOfOptionalIfaceView) {
         " let o: [Optional<Stringer>] = [some(u1), some(u2)] }",
         diag);
     EXPECT_FALSE(diag.hasErrors());
-    EXPECT_CONTAINS(unit.impl, "aura_rt::Array<aura_rt::Optional<Stringer>*>*");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::Array<aura_rt::Optional<aura_rt::Stringer>*>*");
     EXPECT_CONTAINS(unit.impl, "aura_rt::gcConstruct<UserStringer>");
 }
 

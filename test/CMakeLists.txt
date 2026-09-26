@@ -46,6 +46,7 @@ set(AURA_LIB_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/StmtChecker.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/StmtFlow.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/StmtSync.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/CallGraph.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/ExprInfer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/CallInfer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/ExprInferMisc.cpp
@@ -78,9 +79,42 @@ ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprClosureOldPath.cpp
 )
 
 # 测试用例（按模块分组，每个文件一个套件，保持小文件）
+# runtime sources (feature-14 P1: SyncContext unit tests call runtime directly)
+# Kept in sync with the aura_rt STATIC source list in runtime/CMakeLists.txt.
+set(AURA_RT_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/types.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/task.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/thread_pool.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/win_iocp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/gc.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/gc_interrupt.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/alloc.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/tlab.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/roots.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/safepoint.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/mark_sweep.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/parallel_mark.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/compact.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/los.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/builtin/io.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/builtin/string.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/builtin/mutex.cpp
+)
+
+# Platform-specific interrupt primitive (Linux SIGURG / Windows APC + IOCP fake completion)
+if(WIN32)
+    list(APPEND AURA_RT_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/safepoint_interrupt_win.cpp)
+else()
+    list(APPEND AURA_RT_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/gc/safepoint_signal_linux.cpp)
+endif()
 set(AURA_TEST_SOURCES
     # ---- 测试基础设施 ----
     framework/test_main.cpp
+
+    # ---- runtime (feature-14 P1: SyncContext domain stack) ----
+    rt/test_sync_context.cpp
 
     # ---- 词法分析 ----
     lexer/test_toktype.cpp
@@ -130,15 +164,17 @@ set(AURA_TEST_SOURCES
 
     # ---- 模块管理 ----
     module/test_module.cpp
+    module/test_module_scan.cpp
 
     # ---- 端到端集成测试 ----
     integration/test_examples.cpp
 )
 
-add_executable(aura_tests ${AURA_TEST_SOURCES} ${AURA_LIB_SOURCES})
+add_executable(aura_tests ${AURA_TEST_SOURCES} ${AURA_LIB_SOURCES} ${AURA_RT_SOURCES})
 
 target_include_directories(aura_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}
 )

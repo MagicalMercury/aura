@@ -2,7 +2,8 @@
 type: todo_feature
 kind: new_feature
 module: CodeGen
-status: planned
+status:
+  - finished
 priority: P2
 estimated_effort: XL
 blocked_by: []

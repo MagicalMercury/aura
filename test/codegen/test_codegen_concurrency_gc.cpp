@@ -751,11 +751,13 @@ TEST(CodeGen, Batch56SyncForCoroSelfSpThisMaterialized) {
         "   let ch: channel<int> = channel(10); c.run(io, ch) }", diag);
     EXPECT_FALSE(diag.hasErrors());
     EXPECT_CONTAINS(unit.impl,
-        "push_back([_sp_this = aura_rt::GcRootHandle<Counter*>(_this.get(), aura_rt::GcRootScope::Global)](auto i,");
+        "requireSync()->addTask([_sp_this = aura_rt::GcRootHandle<Counter*>(_this.get(), aura_rt::GcRootScope::Global)](auto i,");
     EXPECT_CONTAINS(unit.impl,
         "aura_rt::GcRootHandle<Counter*> _sp_this_f(_sp_this.get(), aura_rt::GcRootScope::Global);");
     EXPECT_CONTAINS(unit.impl, "_sp_this_f.get()->base");
+    // feature-14 P2：登记载体已由 push_back 改为 addTask → 裸 this 守卫同步换锚
     EXPECT_NOT_CONTAINS(unit.impl, "push_back([this]");
+    EXPECT_NOT_CONTAINS(unit.impl, "addTask([this]");
 }
 
 TEST(CodeGen, Batch56ThreadSpawnCallFormSelfSpThis) {
@@ -962,7 +964,7 @@ TEST(CodeGen, Batch11CoroOuterExprStmtNoBadCpp) {
 }
 
 TEST(CodeGen, Batch11SyncWhenAllNoStdMove) {
-    // #45：无界 sync 收尾 when_all 引用收参——生成 when_all(_tasks)（无 std::move）。
+    // #45：无界 sync 收尾等待任务集合（feature-14 P2 前为 when_all(_tasks)，现为本块 _ctx.wait_all()）。
     // 修复前 when_all(std::move(_tasks)) 按值 move 后，外层 spawn 任务体内内层 spawn
     // push 落已 move-from 本地容器 → 内层任务孤儿化永不执行（文本锚；语义由端到端
     // 复现 repro_nested_spawn_same_name/_tmp_nested_io_probe sum=10/5 行打印验证）
@@ -971,8 +973,9 @@ TEST(CodeGen, Batch11SyncWhenAllNoStdMove) {
         "fun main(io: Io) {"
         "  sync { spawn (io: Io) { io.println(\"x\") } } }", diag);
     EXPECT_FALSE(diag.hasErrors());
-    EXPECT_CONTAINS(unit.impl, "co_await aura_rt::when_all(_tasks);");
-    EXPECT_NOT_CONTAINS(unit.impl, "when_all(std::move");
+    EXPECT_CONTAINS(unit.impl, "co_await _ctx.wait_all();");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::requireSync()->addTask(");
+    EXPECT_NOT_CONTAINS(unit.impl, "when_all(");
 }
 
 TEST(CodeGen, Batch46NoIoFnSpawnPureDataOmitsIoParam) {
@@ -1016,7 +1019,8 @@ TEST(CodeGen, Batch46SpawnIoKeepsParam) {
     EXPECT_FALSE(diag.hasErrors());
     // 显式 io 参数（值参 aura_rt::Io io）保持追加在 spawn lambda 签名
     EXPECT_CONTAINS(unit.impl,
-        "aura_rt::Io io, std::vector<aura_rt::task<void>>& _tasks");
+        "aura_rt::Io io) -> aura_rt::task<void>");
+    EXPECT_NOT_CONTAINS(unit.impl, "_tasks");
 }
 
 // ============================================================
@@ -1147,10 +1151,10 @@ TEST(CodeGen, Bug72CrossThreadGcRootCaptureGlobalRoot) {
         "&io]() mutable");
     EXPECT_NOT_CONTAINS(unit.impl, "_stx.submit([p, &io]()");
     // 协程 sync for：形参 auto p 不变，实参改传 Global 根临时值（auto 推导同型）
-    EXPECT_CONTAINS(unit.impl, "](auto i, auto p, aura_rt::Io& io,");
+    EXPECT_CONTAINS(unit.impl, "](auto i, auto p, aura_rt::Io& io) -> aura_rt::task<void> {");
     EXPECT_CONTAINS(unit.impl,
         "}(i, aura_rt::GcRootHandle<Point*>(p.get(), aura_rt::GcRootScope::Global), "
-        "io, _tasks));");
+        "io));");
     // lambda 体内形态不变（同名 init-capture 遮蔽外层 → .get() 仍指向最新地址）
     EXPECT_CONTAINS(unit.impl, "p.get()->x");
 }
@@ -1207,7 +1211,7 @@ TEST(CodeGen, Bug73SyncThreadSpawnPlainCalleeNotWrapped) {
 }
 
 TEST(CodeGen, Bug73CoroSyncBlockSpawnCallNotWrapped) {
-    // 对照：协程 sync 块内调用形态 spawn 走 _tasks + when_all（task 被 co_await 等待）
+    // 对照：协程 sync 块内调用形态 spawn 登记进本块 SyncContext（addTask + wait_all）
     // → 不得额外包 run_to_completion（该路径修复前就正常）
     Aura::DiagnosticEngine diag;
     auto unit = compileSource(
@@ -1216,7 +1220,7 @@ TEST(CodeGen, Bug73CoroSyncBlockSpawnCallNotWrapped) {
         "   sync(max = 2) { spawn work(io, k) }"
         "   io.println(\"D done\") }", diag);
     EXPECT_FALSE(diag.hasErrors());
-    EXPECT_CONTAINS(unit.impl, "_tasks.push_back(");
+    EXPECT_CONTAINS(unit.impl, "aura_rt::requireSync()->addTask(");
     EXPECT_NOT_CONTAINS(unit.impl, "run_to_completion");
 }
 

@@ -198,10 +198,19 @@ void CodeGenerator::genInterfaceDecl(std::ostream& h,
         }
     }
 
-    // 内置 Iterator：C++ 形态来自 runtime/builtin/iterator.h（aura_rt::Iterator<T>），
-    // 不在此生成视图（避免与 runtime 的 Iterator<T> 重复/冲突）。
-    // interfaces.aurai 中的声明仅供 Sema（方法签名），record impl 适配器走 genIfaceAdapter 特判。
-    if (name == "Iterator") return;
+    // 内置接口：C++ 形态来自 runtime 公共头，不在此生成视图
+    //（避免与 runtime 的定义重复/冲突）。
+    //   - Iterator<T>    → runtime/builtin/iterator.h（aura_rt::Iterator<T>）
+    //   - Stringer       → runtime/builtin/interfaces.h（aura_rt::Stringer）
+    //   - Comparable<T>  → runtime/builtin/interfaces.h（aura_rt::Comparable<T>）
+    // interfaces.aurai 中的声明仅供 Sema（方法签名），record impl 适配器走
+    // genIfaceAdapter（基类名带 aura_rt:: 前缀，见其 baseType 计算）。
+    //
+    // bug-85（方案 B3）：此前仅 Iterator 走 runtime，Stringer/Comparable 逐模块生成。
+    // 显式同 module 名（C0 D12）使多文件共享同一产物 namespace 时，逐模块生成的
+    // 同名视图落在同一 namespace → redefinition。三者统一移入 runtime 公共头后，
+    // 产物不再含内置接口视图定义，共享 namespace 内不再有该符号。
+    if (name == "Iterator" || name == "Stringer" || name == "Comparable") return;
 
     // 接口视图结构体引用用户 record（Wrapper* / Transform<T>*），而 record struct 完整
     // 定义在第三遍 B 才生成 → 此处输出 C++ 前向声明（problem.txt「接口声明中引用后置
@@ -441,8 +450,12 @@ void CodeGenerator::genIfaceAdapter(std::ostream& h,
     // 同时构建"泛型形参名 → 具体 C++ 类型"映射（T → Point*），
     // 适配器无模板上下文，方法签名中的泛型引用必须替换为具体类型
     std::map<std::string, std::string> tmap;
-    // 内置 Iterator：C++ 形态来自 runtime（aura_rt::Iterator<T>），基类名需带命名空间
-    std::string baseType = (iface.name == "Iterator") ? "aura_rt::Iterator" : iface.name;
+    // 内置接口：C++ 形态来自 runtime 公共头，基类名需带 aura_rt:: 命名空间
+    //（Iterator<T> → builtin/iterator.h；Stringer / Comparable<T> → builtin/interfaces.h）。
+    // 用户接口仍在产物内定义（裸名）。
+    std::string baseType =
+        (iface.name == "Iterator" || iface.name == "Stringer" || iface.name == "Comparable")
+            ? ("aura_rt::" + iface.name) : iface.name;
     if (!iface.typeParams.empty()) {
         auto recIt = interfaceImplementations_.find(recordName);
         if (recIt != interfaceImplementations_.end()) {

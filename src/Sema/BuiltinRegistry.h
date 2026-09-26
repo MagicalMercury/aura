@@ -187,6 +187,21 @@ public:
     // 列出已加载的 .aurai 文件（用于调试）
     const std::set<std::string>& loadedAurai() const { return loadedAurai_; }
 
+    // feature-13 C0-5 (2026-09-17): builtin module alias support.
+    // Reports whether `prefix` is a loaded builtin module name, i.e. some
+    // .aurai declaration registered a function literally named
+    // "<prefix>.<name>" (see doLoadAurai).
+    // Used by Sema to resolve the alias of `import path as p` back to the
+    // real module name `path`. Does not depend on ModuleManager: the .aurai
+    // loading path already injects module functions by literal name.
+    bool hasModulePrefix(const std::string& prefix) const {
+        if (prefix.empty()) return false;
+        const std::string dot = prefix + ".";
+        for (auto& f : functions_)
+            if (f.name.compare(0, dot.size(), dot) == 0) return true;
+        return false;
+    }
+
     // 内置接口声明（interfaces.aurai），SemAnalyzer::declareTopLevel 注册符号用
     const std::vector<std::unique_ptr<InterfaceDecl>>& auraiInterfaces() const {
         return auraiInterfaces_;

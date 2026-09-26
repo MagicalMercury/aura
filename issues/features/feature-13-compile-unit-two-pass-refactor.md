@@ -2,7 +2,8 @@
 type: todo_feature
 kind: refactor
 module: Parser/Sema/CodeGen/Module
-status: designing
+status:
+  - in_progress
 priority: P2
 estimated_effort: XL
 blocked_by: []

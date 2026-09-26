@@ -291,7 +291,7 @@ reflect.call("Player", "heal", [Any.of(p), Any.of(10)])   // -> Any
 ## 8. 相关资源与参考
 
 - **上游**：[[feature-08-configurator-reflection]]（`#` 语法族 v1 骨架）、[[feature-09-annotator]]（注解生产端）、[[feature-11-compile-time-functions]]（编译期函数）。
-- **依赖**：[[feature-05]]（Variant → Any）、[[feature-06-unified-callable-origins]]（CallableObj / CallableErased）、[[feature-07-callableobj-remaining-forms-migration]]（协程闭包 = `CallableObj<task<R>,A...>`，使协程动态调用可行）、bug-79 修复（GcRootHandle Value）。
+- **依赖**：[[feature-05-unify-variant-replace-std-variant]]（Variant → Any）、[[feature-06-unified-callable-origins]]（CallableObj / CallableErased）、[[feature-07-callableobj-remaining-forms-migration]]（协程闭包 = `CallableObj<task<R>,A...>`，使协程动态调用可行）、bug-79 修复（GcRootHandle Value）。
 - **代码锚点**：
   - `runtime/builtin/callable.h:37/56/76/111` —— `CallableObj` / `CallArg` / `CallableErased` / 适配 lambda
   - `runtime/types.h:107-122` —— `TypeDescriptor`（GC 布局，**无名字**——反射表要补的正是这个名字维度）

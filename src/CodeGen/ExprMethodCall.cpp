@@ -388,7 +388,30 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
             needAwait = true;
     }
 
-    std::string prefix = needAwait ? "co_await " : "";
+    // feature-14 P2（§3.5 隐式 future）：**第二套独立 needAwait**（P2 Phase 0 §5.2
+    // 实测的文档遗漏改造面）——方法调用必须与函数调用同步分流，否则「同步块内
+    // 函数调用并行、方法调用串行」的语义分裂。
+    //
+    // ⚠️ 与本文件上面三处 needAwait 判据（Io 异步方法 / 协程 channel / 用户自定义
+    //    协程方法）的关系：这里只统一做一次「块内延迟」的收口，不改判据本身。
+    //    Io 异步方法与 channel 的 send/receive **不延迟**——它们不是「返回值被当值消费
+    //    的协程调用」，而是内建挂起点（sync 块内若延迟就成了未消费的 task，语义错）。
+    bool deferredBySyncBlock = false;
+    if (needAwait && isCoroutine && isDeferredCoroutineCall()) {
+        bool isBuiltinAsync = isIoCall
+            && BuiltinRegistry::get().methodHasAsync("Io", e.method);
+        bool isCoroChannel = false;
+        if (e.method == "send" || e.method == "receive") {
+            if (auto* cid = dynamic_cast<const Identifier*>(e.object.get()))
+                if (channelVarNames_.count(cid->name)) isCoroChannel = true;
+            if (!isCoroChannel && e.object->inferredType) {
+                if (auto* g = dynamic_cast<const GenericSemType*>(e.object->inferredType))
+                    if (g->name == "channel") isCoroChannel = true;
+            }
+        }
+        deferredBySyncBlock = !isBuiltinAsync && !isCoroChannel;
+    }
+    std::string prefix = (needAwait && !deferredBySyncBlock) ? "co_await " : "";
 
     // 判断是命名空间限定下的构造调用：math.Pair(...) → math::Pair_ctor(...)
     // 检查条件：对象是导入的命名空间 + (方法名是本地注册的堆类型 或 以大写开头(跨模块类型))

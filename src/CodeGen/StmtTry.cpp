@@ -95,7 +95,8 @@ void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
     writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".message)> _eh_msg(" + cv + ".message);");
     writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".extra)> _eh_extra(" + cv + ".extra);");
     valueTypeVarNames_.insert(cv);
-    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine);
+    // feature-14 U5：catch 体在 `} else {` 之后，有自己的 `{}` → opensScope=true。
+    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine, /*opensScope=*/true);
     valueTypeVarNames_.erase(cv);
     indentLevel_--;
     cpp << indentStr() << "} else {\n";
@@ -161,7 +162,8 @@ void CodeGenerator::genTryCatchNoSetupIIFE(std::ostream& cpp,
     writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".message)> _eh_msg(" + cv + ".message);");
     writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".extra)> _eh_extra(" + cv + ".extra);");
     valueTypeVarNames_.insert(cv);
-    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine);
+    // feature-14 U5：catch 体在 `if (holds_alternative<Error>) {` 之内 → opensScope=true。
+    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine, /*opensScope=*/true);
     valueTypeVarNames_.erase(cv);
     indentLevel_--;
     cpp << indentStr() << "}\n";
@@ -174,7 +176,8 @@ void CodeGenerator::genTryCatchRaw(std::ostream& cpp,
                                     const TryCatchStmt& stmt,
                                     bool isCoroutine) {
     cpp << indentStr() << "try {\n";
-    if (stmt.tryBody) genBlock(cpp, *stmt.tryBody, isCoroutine);
+    // feature-14 U5：try 体在 `try {` 之内 → opensScope=true。
+    if (stmt.tryBody) genBlock(cpp, *stmt.tryBody, isCoroutine, /*opensScope=*/true);
     std::string cv = safeName(stmt.catchVar);
     cpp << indentStr() << "} catch (aura_rt::Error& " << cv << ") {\n";
     indentLevel_++;
@@ -185,7 +188,8 @@ void CodeGenerator::genTryCatchRaw(std::ostream& cpp,
     writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".message)> _eh_msg(" + cv + ".message);");
     writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".extra)> _eh_extra(" + cv + ".extra);");
     valueTypeVarNames_.insert(cv);
-    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine);
+    // feature-14 U5：catch 体在 `} catch (...) {` 之内 → opensScope=true。
+    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine, /*opensScope=*/true);
     valueTypeVarNames_.erase(cv);
     indentLevel_--;
     cpp << indentStr() << "}\n";

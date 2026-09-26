@@ -6,21 +6,21 @@ Aura 提供两种 `sync` 并发：
 
 | 语句 | 执行模型 | 适用场景 |
 |:---|:---|:---|
-| `sync { spawn { ... } }` | 协程（单线程协作式） | I/O 密集，异步 I/O 完成后自动恢复 |
-| `sync thread { spawn { ... } }` | 真线程（多核并行） | CPU 密集，需要真正并行（见 §11.5） |
+| `sync { spawn (io: Io) { ... } }` | 协程（单线程协作式） | I/O 密集，异步 I/O 完成后自动恢复 |
+| `sync thread { spawn (io: Io) { ... } }` | 真线程（多核并行） | CPU 密集，需要真正并行（见 §11.5） |
 
 ## 11.1 基本使用（协程级）
 
 ```aura
 sync {
-    spawn { io.println("Task A") }
-    spawn { io.println("Task B") }
+    spawn (io: Io) { io.println("Task A") }
+    spawn (io: Io) { io.println("Task B") }
     // 此处可写同步代码
 }
 // 所有 spawn 任务完成后才继续
 ```
 
-若子任务抛异常，`sync` 等待所有任务终止后抛出聚合异常。
+`sync` 内**未被消费**的 future 若抛异常，编译器会驱动完全部 future、记录**首个**异常、并在块尾重新抛出它；其余异常仅记录到 stderr。由 `spawn` 启动的任务则是**首个异常即中断**（见 §3.5 的 (乙1) 语义）。
 
 ### 11.1.1 有界并发控制 `sync(max=N)`
 
@@ -122,8 +122,62 @@ fun main(io: Io) throws {
 
 ## 11.4 `spawn` 约束
 
-- `spawn` 只能在 `sync` 块内使用。
-- `spawn` 启动的闭包通过**显式传参**访问外部变量，而非闭包捕获。
+`spawn` 有三条编译期约束 + 一条运行时兜底：
+
+1. **sync 可达**：`spawn` 所在函数必须被 `sync` 块**可达地调用**（直接，或经调用链 `sync → f → g`）。不再要求 `spawn` 词法上写在 `sync` 块内。
+2. **显式捕获**：`spawn` 闭包体引用的外部变量必须出现在参数列表中（缺则编译报错）。
+3. **`io` 在作用域内**：`spawn` 需要作用域内可见的 `io` 变量（缺则编译报错）。
+4. **运行时兜底**：若运行时确实不在任何 `sync` 域内，`spawn` 抛 `Error`。
+
+### 约束 1：sync 可达（函数级，非词法）
+
+`spawn` 可以写在 `sync` 块外的函数体里，只要该函数能被某个 `sync` 块可达地调用：
+
+```aura
+fun worker(io: Io) throws {
+    spawn (io: Io) { io.println("x") }
+}
+
+fun main(io: Io) throws {
+    sync { worker(io) }        // ✅ 合法：worker 被 sync 可达调用
+}
+```
+
+调用链可以跨多层（`sync { f(io) }` → `f` → `g`），`sync thread` / `sync for` 同样是合法根。
+
+**反例**（仍报错）：含 `spawn` 的函数全程无 `sync` 可达：
+
+```aura
+fun f() throws {
+    spawn (io: Io) { io.println("t") }   // ❌ E018
+}
+fun main() throws {
+    f()                                   // 不在任何 sync 块内调用
+}
+```
+
+```
+error[E018]: 'spawn' in function 'f' requires the enclosing function to be called
+(directly or transitively) from a 'sync' block
+```
+
+**间接调用保守放行**：函数指针 / 闭包变量 / 接口动态分派 / 跨模块调用等**静态不可判**的调用形态，编译器不产生调用边、并让所在函数整体豁免 `E018`（宁漏勿误）。这类位置若运行时确实没有 `sync` 域，由**约束 4** 在运行期兜底。
+
+### 约束 2：显式捕获（强制）
+
+`spawn` 闭包体引用的外部变量**必须**出现在参数列表中；否则编译报错：
+
+```aura
+let k = 42
+sync {
+    spawn (io: Io) { io.println(str(k)) }   // ❌ k 不在捕获列表
+}
+```
+
+```
+error: spawn body references 'k' which is not in the capture list:
+add it as 'spawn (k: <type>, ...)'
+```
 
 ### 语法
 
@@ -135,10 +189,10 @@ spawn (io: Io, n: int) {
 }
 ```
 
-**参数必须显式标注类型**（与函数声明一致）。`spawn` 闭包体内引用的变量必须出现在参数列表中——**不允许隐式捕获外部变量**。
+**参数必须显式标注类型**（与函数声明一致）。无参数列表的旧写法 `spawn { ... }` **已被移除**，会报解析错误：
 
 ```aura
-// ❌ 不允许（隐式捕获）
+// ❌ 已移除的旧语法（缺参数列表）
 let io = Io()
 spawn {
     io.println("hello")
@@ -175,10 +229,59 @@ spawn (io: Io) {
 
 | 规则 | 说明 |
 |------|------|
-| 不允许隐式捕获 | `spawn` 闭包体内的外部变量必须出现在参数列表中 |
+| sync 可达 | `spawn` 所在函数必须被 `sync` 块（传递）可达调用 |
+| 显式捕获 | `spawn` 闭包体内的外部变量必须出现在参数列表中，缺失则编译报错 |
+| 参数列表必需 | 无参数列表的 `spawn { ... }` 旧语法已移除 |
 | 同名自动绑定 | 参数名匹配外部变量名时自动传参 |
 | 类型必须标注 | `spawn` 参数须显式标注类型 |
 | 参数只读 | `spawn` 参数在闭包体内为只读 |
+| `io` 在作用域内 | 作用域内必须有可见的 `io` 变量 |
+
+### `io` 约束（第二道闸门）
+
+`spawn` 除上述可达性与捕获约束外，还要求**当前作用域内有可见的 `io` 变量**（供异步 I/O 使用）。这是**独立于 `E018` 的第二道检查**——可达性已放行的函数仍可能撞到它。
+
+```aura
+fun plain() throws {
+    spawn (io: Io) { io.println("y") }   // ❌ 函数没有 io 形参
+}
+fun main(io: Io) throws {
+    sync { plain() }                      // sync 可达：不报 E018
+}
+```
+
+```
+error: codegen: spawn requires an 'io' variable in the enclosing scope;
+add an 'io: Io' parameter to the enclosing function
+```
+
+修法：给所在函数加 `io: Io` 形参，并把它列入 `spawn` 的参数列表。
+
+### `sync` 块内的协程调用 = 隐式 future
+
+在 `sync` 块内直接调用协程函数，不会立即等待；它启动一个**隐式 future**，直到该值被**消费**时才等待。因此多个协程调用会先全部启动，再按消费顺序等待：
+
+```aura
+sync {
+    let a = fetchUser(io)     // 启动，不立即等待
+    let b = fetchOrder(io)    // 同时启动
+    io.println(a.user)        // 消费 a → 此处才等待
+    io.println(b.id)          // 消费 b
+}
+```
+
+→ **并行收益**：两个请求同时发起，而非串行。
+
+**未被消费的 future 也会被驱动完成**：块内声明但从未使用的 future，编译器会在**其所在块的末尾**自动驱动（`co_await`），保证协程真正跑完，而不是被直接销毁。若 future 声明在嵌套块（`if` / `for` / `while`）内，驱动点在该嵌套块的末尾。
+
+```aura
+sync {
+    fetchUser(io)                    // 声明后未消费
+    io.println("in block")           // 先执行这句
+}                                    // 块尾自动驱动 fetchUser 直到完成
+```
+
+⚠️ 注意：把 future 赋值给新变量（如 `let t2 = t`）会在该处**立即消费**它（编译器就地求值并解包为真正的值），因此别名不再是"延迟句柄"。
 
 ### `sync thread` 块内的额外约束
 
@@ -188,9 +291,9 @@ spawn (io: Io) {
 - 原因：真线程间不共享栈，闭包捕获的栈变量在线程切换后会失效，必须按值拷贝
 
 ```aura
-// ❌ sync thread 内不允许（无参数列表）
+// ❌ sync thread 内不允许（无参数列表，旧语法已移除）
 sync thread {
-    spawn { io.println("x") }   // 缺少 (io: Io) 参数
+    spawn { io.println("x") }   // 缺参数列表且缺 io 捕获
 }
 
 // ✓ 正确
@@ -200,6 +303,18 @@ sync thread {
     }
 }
 ```
+
+### 运行时兜底
+
+若间接调用绕过了编译期的 `sync` 可达检查，且运行时确实没有任何 `sync` / `sync thread` 块处于活跃状态，`spawn` 会抛出 `Error`：
+
+```
+[aura_rt] spawn requires a sync context: 'spawn' was reached at runtime while no
+'sync' / 'sync thread' block was active on this thread (the enclosing function
+must itself be called from a sync domain).
+```
+
+这是**最后防线**：正常代码应在上面的编译期检查中被拦下。
 
 ## 11.5 `sync thread` — 真线程并发
 
@@ -222,7 +337,7 @@ sync thread {
 |:---|:---|:---|
 | 执行模型 | C++20 协程，单线程协作式 | OS 线程，全局线程池调度 |
 | 并行性 | ❌ 协作式调度，无真正并行 | ✅ 多核真正并行 |
-| 阻塞点 | `co_await when_all` | `thread_pool::wait_all()` |
+| 阻塞点 | `co_await _ctx.wait_all()` | `thread_pool::wait_all()` |
 | spawn 参数 | 可同名自动绑定 | **必须显式传参** |
 | 适合场景 | I/O 密集（异步 I/O 完成后自动恢复） | CPU 密集（计算、并行 map） |
 | GC 协作 | 栈根 `GcRootHandle` 直接可见 | 每线程独立分配缓冲 + STW 暂停 |

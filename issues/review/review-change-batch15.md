@@ -144,7 +144,7 @@ tags:
 
 ### 派发要求（按工作流约定）
 
-1. 顺序：#63（纯验证+单测+闭环）→ #64（ExprBinary+TypeMap）→ #58（ExprInfer + repro29 结构调整），一次一个子 Agent。
+1. 顺序：#63（纯验证+单测+闭环）→ \#64（ExprBinary+TypeMap）→ \#58（ExprInfer + repro29 结构调整），一次一个子 Agent。
 2. 简报必含：预判 A（repro29 双 T 值形态调整——推荐方案）、预判 C（嵌套 Optional 形态实测回填）、预判 D（同族残留实测登记约定）、isNoneCallExpr 直接可用（勿重复实现）。
 3. 单测查重：#63 豁免用例与 u6 族（test_sema_optional L225-240）近邻；#64 与 return none() 既有断言查重。
 4. 红线：used/1（泛型 record 方法 + Optional）、used/5、used/6 + 全量 aura_tests（基线 1246/1246 以实际输出为准）+ example/test.aura。

@@ -2,12 +2,14 @@
 type: feature_progress
 feature: feature-07
 status:
-  - in_progress
+  - finished
 current_step: 5
 updated: 2026-09-11
 tags:
   - progress
   - callableobj
+related_issues:
+  - "[[feature-07-callableobj-remaining-forms-migration]]"
 ---
 
 # feature-07 实施进度追踪（断点续传锚点）

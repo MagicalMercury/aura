@@ -231,16 +231,19 @@ void CodeGenerator::genIfStmt(std::ostream& cpp, const IfStmt& stmt,
         condN.push_back(genExpr(*ei.condition, isCoroutine));
     flushHoistPrefix(cpp);
     cpp << indentStr() << "if (" << cond0 << ") {\n";
-    if (stmt.thenBranch) genBlock(cpp, *stmt.thenBranch, isCoroutine);
+    // feature-14 U5：if/while/for/match 的每个分支体都**生成了自己的 `{}`**
+    // → opensScope=true，块内声明的 future 在该分支块尾驱动（铁律 2：块尾 =
+    //   声明所在的那个 `{}` 的闭合点，不是 sync 块尾）。
+    if (stmt.thenBranch) genBlock(cpp, *stmt.thenBranch, isCoroutine, /*opensScope=*/true);
     cpp << indentStr() << "}";
     for (size_t i = 0; i < stmt.elseIfs.size(); ++i) {
         cpp << " else if (" << condN[i] << ") {\n";
-        if (stmt.elseIfs[i].body) genBlock(cpp, *stmt.elseIfs[i].body, isCoroutine);
+        if (stmt.elseIfs[i].body) genBlock(cpp, *stmt.elseIfs[i].body, isCoroutine, /*opensScope=*/true);
         cpp << indentStr() << "}";
     }
     if (stmt.elseBranch) {
         cpp << " else {\n";
-        genBlock(cpp, *stmt.elseBranch, isCoroutine);
+        genBlock(cpp, *stmt.elseBranch, isCoroutine, /*opensScope=*/true);
         cpp << indentStr() << "}";
     }
     cpp << '\n';
@@ -254,7 +257,7 @@ void CodeGenerator::genWhileStmt(std::ostream& cpp, const WhileStmt& stmt,
     std::string condW = genExpr(*stmt.condition, isCoroutine);
     flushHoistPrefix(cpp);   // #31：while 条件内协程调用的 outer 前缀先落盘
     cpp << indentStr() << "while (" << condW << ") {\n";
-    if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+    if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine, /*opensScope=*/true);
     writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint：长循环可被 GC 暂停
     cpp << indentStr() << "}\n";
 }
@@ -286,7 +289,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
                     << "; " << var << " < " << end
                     << "; " << var << " += " << step << ") {\n";
             }
-            if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+            if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine, /*opensScope=*/true);
             writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
             cpp << indentStr() << "}\n";
             return;
@@ -343,7 +346,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
         writeLine(cpp, "auto _opt = _it.get().next();");
         writeLine(cpp, "if (_opt->is_none()) break;");
         writeLine(cpp, "auto " + var + " = _opt->unwrap();");
-        if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+        if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine, /*opensScope=*/true);
         writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
         indentLevel_--;
         cpp << indentStr() << "}\n";
@@ -407,7 +410,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
             writeLine(cpp, "auto _opt = " + chName + "->receive();");
             writeLine(cpp, "if (_opt->is_none()) break;");
             writeLine(cpp, "auto " + var + " = _opt->unwrap();");
-            if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+            if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine, /*opensScope=*/true);
             writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
             indentLevel_--;
             cpp << indentStr() << "}\n";
@@ -426,7 +429,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
             writeLine(cpp, "auto _opt = " + chName + "->receive();");
             writeLine(cpp, "if (_opt->is_none()) break;");
             writeLine(cpp, "auto " + var + " = _opt->unwrap();");
-            if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+            if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine, /*opensScope=*/true);
             writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
             indentLevel_--;
             cpp << indentStr() << "}\n";
@@ -438,7 +441,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
         indentLevel_++;
         writeLine(cpp, "if (" + chName + "->is_done()) break;");
         writeLine(cpp, "auto " + var + " = co_await " + chName + "->receive();");
-        if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+        if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine, /*opensScope=*/true);
         writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
         indentLevel_--;
         cpp << indentStr() << "}\n";
@@ -461,7 +464,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
     if (elemIsFun) callableObjVars_.insert(itemVar);
     cpp << indentStr() << "for (auto " << itemVar
         << " : *" << iter << ") {\n";
-    if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+    if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine, /*opensScope=*/true);
     writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
     cpp << indentStr() << "}\n";
     if (savedElemIsFun) callableObjVars_.erase(itemVar);
@@ -470,7 +473,7 @@ void CodeGenerator::genForStmt(std::ostream& cpp, const ForStmt& stmt,
 void CodeGenerator::genLoopStmt(std::ostream& cpp, const LoopStmt& stmt,
                                  bool isCoroutine) {
     cpp << indentStr() << "while (true) {\n";
-    if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine);
+    if (stmt.body) genBlock(cpp, *stmt.body, isCoroutine, /*opensScope=*/true);
     writeLine(cpp, "aura_rt::gc_safepoint();");  // L2 safepoint
     cpp << indentStr() << "}\n";
 }

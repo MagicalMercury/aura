@@ -63,6 +63,14 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
     // Bug 2-B: 函数入口重置闭包协程标记——genFunExpr 在 return 语句中不会被
     // genLetStmt 消费 lastClosureIsCoro_，残留会污染下一个函数的 let 绑定
     lastClosureIsCoro_ = false;
+    // feature-14 P2（§3.5）：future 表**按函数隔离**。
+    // ⚠️ 这是实测暴露的必需项（首轮探针 p3 报错）：同名变量在函数 A 的 sync 块内
+    //    被登记为 future 后，函数 B 里的同名 let 会被消费点误判成 future →
+    //    对已是完成值的变量再插一次 co_await（g++: "awaitable type 'int32_t'
+    //    is not a structure"）。future 是**词法作用域内**的属性，不是函数级属性，
+    //    更不是模块级属性 —— 入口清空是最粗粒度也最安全的隔离点。
+    futureVars_.clear();
+    futureAliasOf_.clear();
 
     std::vector<std::string> tparams = collectFunTParams(decl);
     currentTParams_ = tparams;
@@ -532,6 +540,9 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
     currentFunctionIsCoroutine_ = isCoro;
     // Bug 2-B: 方法入口同样重置闭包协程标记（防跨函数泄漏，见 genFunDecl）
     lastClosureIsCoro_ = false;
+    // feature-14 P2（§3.5）：future 表按方法隔离（同 genFunDecl，实测必需）
+    futureVars_.clear();
+    futureAliasOf_.clear();
 
     std::vector<std::string> tparams = collectMethodTParams(decl);
     currentTParams_ = tparams;

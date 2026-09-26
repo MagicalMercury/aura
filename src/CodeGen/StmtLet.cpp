@@ -80,6 +80,9 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
     std::string viewRootType;
     std::string type;
     bool genericListDecl = false;   // #55：未绑定泛型元素列表声明（走 auto + decltype 包装）
+    // feature-14 P2（§3.5 隐式 future）：本 let 承载 lazy task → 走
+    // auto raw + GcRootHandle<decltype(raw)> 根化（同 #55 / F 家族的 decltype 路）。
+    bool taskLetDecltype = false;
     if (decl.type) {
         type = mapType(*decl.type);
     } else {
@@ -410,6 +413,109 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                         gcULetVarNames_.insert(safeName(decl.name));
                     }
         }
+        // ============================================================
+        // feature-14 P2（§3.5 隐式 future）——**登记点**（change.md §3.3 落点修正：
+        // 登记必须在 let 赋值点，ExprCall 不知道自己在不在 let 初始化位置）。
+        //
+        // 命中条件（全部满足）：
+        //   ① 在 sync 系块内（insideSyncBlock_）——块外保持「调用点立即 co_await」；
+        //   ② 当前函数体是协程（currentFunctionIsCoroutine_）——否则没有 co_await；
+        //   ③ 初始化器是「调用型」CoroutineCall：具名协程函数 / 协程闭包值 / 协程方法；
+        //   ④ 该调用确实被延迟了（未生成 co_await 前缀）——防「判据命中但实际已经
+        //      立即等待」的双源漂移（如 Io 异步方法 / channel 这类内建挂起点）。
+        //
+        // 效果：变量类型改为 task<T>*（承载 lazy task），并登记 futureVars_，
+        //       使它后续作为值消费时由 genExpr 收口处 co_await 兑现。
+        // ============================================================
+        bool initIsCoroCall = false;
+        if (decl.initializer
+            && dynamic_cast<const CallExpr*>(decl.initializer.get())) {
+            auto* ce = static_cast<const CallExpr*>(decl.initializer.get());
+            std::string cName;
+            if (auto* cid = dynamic_cast<const Identifier*>(ce->callee.get()))
+                cName = cid->name;
+            std::string cExpr = cName;   // 具名函数/闭包名（不根化，与 ExprCall 判定同源）
+            if (!cName.empty()
+                && (coroutineFunctions_.count(cExpr) > 0
+                    || coroClosureNames_.count(cExpr) > 0
+                    || closureTaskVars_.count(cName) > 0))
+                initIsCoroCall = true;
+        } else if (decl.initializer
+                   && dynamic_cast<const MethodCallExpr*>(decl.initializer.get())) {
+            auto* mc = static_cast<const MethodCallExpr*>(decl.initializer.get());
+            if (mc->object && mc->object->inferredType) {
+                std::string recvKey;
+                if (auto* r = dynamic_cast<const RecordSemType*>(mc->object->inferredType)) {
+                    recvKey = r->canonicalName;
+                    size_t lt = recvKey.find('<');
+                    if (lt != std::string::npos) recvKey = recvKey.substr(0, lt);
+                } else if (auto* is = dynamic_cast<const InterfaceSemType*>(
+                               mc->object->inferredType)) {
+                    recvKey = is->name;
+                }
+                if (!recvKey.empty()
+                    && coroutineFunctions_.count(recvKey + "." + mc->method))
+                    initIsCoroCall = true;
+            }
+        }
+        // ④ 防御：初始化器确实是本次延迟的协程调用 —— 用 init 里是否已经出现
+        //    co_await 前缀反证（延迟态生成的调用串不含 co_await）。
+        if (initIsCoroCall && insideSyncBlock_ && currentFunctionIsCoroutine_
+            && !init.empty()
+            && init.find("co_await ") == std::string::npos) {
+            std::string fvName = safeName(decl.name);
+            registerFutureVar(fvName);
+            // feature-14 U5：同时登记到「本块声明过的 future」（块尾驱动用，
+            // 与「此刻活跃」语义不同——见 CodeGen.h 的 futureBlockStack_）。
+            registerFutureForDrive(fvName);
+            // 别名链：let t2 = t（t 是 future）→ t2 也是 future（§3.5-2）
+            if (auto* aid = dynamic_cast<const Identifier*>(decl.initializer.get())) {
+                std::string src = resolveFutureVar(safeName(aid->name));
+                if (!src.empty() && src != fvName)
+                    futureAliasOf_[fvName] = src;
+            }
+            // 承载类型：lazy task 的 C++ 类型是 task<T>，变量持有它（指针形态走
+            // GcRootHandle 根化——task 帧在 GC 堆，compact 会搬运）。T 由 Sema
+            // inferredType 映射（与 genMethodCall 协商好的 co_await 结果类型同源）。
+            if (!decl.type && decl.inferredType) {
+                std::string inner;
+                if (auto* ps = dynamic_cast<const PrimSemType*>(decl.inferredType))
+                    inner = mapSemType(*ps);
+                else if (auto* rs = dynamic_cast<const RecordSemType*>(decl.inferredType))
+                    inner = rs->canonicalName.empty() ? "" : rs->canonicalName + "*";
+                else if (dynamic_cast<const CallableSemType*>(decl.inferredType))
+                    inner = "aura_rt::CallableErased*";
+                else if (auto* ls = dynamic_cast<const ListSemType*>(decl.inferredType))
+                    inner = mapSemType(*ls);
+                else if (auto* os = dynamic_cast<const OptionalSemType*>(decl.inferredType))
+                    inner = mapSemType(*os);
+                // ⚠️ **不带 '*'**：aura_rt::task<T> 是**值类型**（唯一成员是协程
+                //    句柄 handle_，task.h），不是 GC 堆指针——g++ 实测
+                //    `task<int32_t>* a_raw = <返回 task<int32_t> 的表达式>` 直接
+                //    "cannot convert 'task<int>' to 'task<int>*'"。
+                //    故承载形态 = 值绑定 + 下方新增的 taskLetDecltype 分支
+                //    （auto raw + GcRootHandle<decltype(raw)>）根化。
+                // ⚠️ **不做变量级根化**（与其它 GC 堆类型不同）：
+                //    ① task<T> 是 move-only（task.h:143 删除拷贝）→
+                //       GcRootHandle<task<T>> 的按值构造直接 "use of deleted
+                //       function task(const task&)"，实测编译失败；
+                //    ② 也不带 '*'（task<T> 是值不是 GC 指针，见上一段注释）；
+                //    ③ 不需要根化：协程帧内每个 GC 变量都有自己的 GcRootHandle
+                //       挂 threadRootLists_（gc.h:80-82 / mark_sweep.cpp:80-97），
+                //       变量级根化对「帧内引用」是冗余的（见 aura-language-dev 的
+                //       gc-root-protection-map）。
+                //    → 故走**普通值绑定**分支（type + " " + var + " = " + init）。
+                if (!inner.empty())
+                    type = "aura_rt::task<" + inner + ">";
+                taskLetDecltype = false;
+            }
+            // 已有类型标注形态（let a: int = worker(io)）：标注是「消费后的值类型」，
+            // 但变量现在承载 task → 不能直接用标注。此时不做类型改写（type 保持
+            // 标注映射），由下方分支按原类型生成；语义上等价于「标注形态不延迟」
+            // —— 见报告的未闭合项（标注形态 P2 未纳入隐式 future）。
+            if (decl.type)
+                clearFutureVar(safeName(decl.name));
+        }
         currentLetName_.clear();
     }
 
@@ -643,7 +749,7 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
         std::string sf = callableObjToStdFunction(type);
         writeLine(cpp, sf + " " + varName + ";");
         writeLine(cpp, varName + " = " + init + ";");
-    } else if ((genericListDecl || funValueLetDecltype
+    } else if ((genericListDecl || funValueLetDecltype || taskLetDecltype
                 || gcULetDecltypeVars_.count(varName)) && !init.empty()) {
         // #55：未绑定泛型元素列表 → auto 声明 + GcRootHandle<decltype> 包装。
         // decltype(arr_raw) 在 T 实例化后为 Array<X>*（继承 GcObject），模板实参合法、

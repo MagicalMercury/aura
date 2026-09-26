@@ -20,7 +20,7 @@ tags:
   - coroutine
 ---
 
-# 【审查】[ ] **Plan 审查报告：change.md（批次 11：#31 / #45 / #46）**
+# 【审查】[ ] **Plan 审查报告：change.md（批次 11：#31 / #45 / \#46）**
 
 > **一句话摘要**：三方案机制**全部源码核实成立**——#31 方案 P 的 writeLine 参数求值序保证（参数求值先序于函数体 → hoist 进缓冲 → 体内 flush 先落盘 → 语句后输出）机制性正确，直接流式位点实测仅 4 处（比文档暗示的审计面更小）；#45 when_all 引用收参的全部调用点实测仅 src 两处（runtime/test 零按值调用残留，无编译失败面）+ 再入安全论证完整；#46 的 IdRefCollector 对 SpawnStmt **穿透 body**（CodeGen.h L170 实证）使「闭包捕获穿透 + ioInScope_ 继承外层」组合自洽——裁决通过，附 5 个实施注意项（其中 #46 的 genFunExpr 隐式依赖须显式化，防实施者画蛇添足或漏验证）。
 
@@ -80,11 +80,11 @@ tags:
 
 ## 4. 已知限制评估
 
-- **#31「outer 作用域扩大（表达式内 → 所在块）」**：✅ 自知且评估正确——GcRootHandle 注册窗口延长到块结束，GC 根多余但语义正确、开销可忽略；变量名 argHandleCounter_ 唯一。
-- **#31「方向 2（outer 移入 IIFE）不可行」的三点论证**：✅ 成立（co_await 不能进 auto 返回 lambda——C++20 限制与 genGcRootedArgs L38-39 现有注释互证；非堆实参 IIFE 内绑定悬垂窗口——懒启动 suspend_always）。
-- **#45「任务无法逃逸」前提**：✅ 成立（Aura 无引用类型、spawn 参数只读、return/break/continue 禁跨 sync/spawn 块——`_tasks` 生命周期覆盖 when_all 全程）。
-- **#46「纯报错方案误伤合法形态」**：✅ 评估正确（spawn 闭包不用 io + 外层无 io 是合法纯数据任务）——按需追加为主、报错仅兜底的分层正确。
-- **#46「不用 IoDetector」**：✅ 正确（IoDetector 只认 io.xxx 方法调用、Stmt-only，漏 f(io) 传参——IdRefCollector 全 Identifier 收集更完备）。
+- **\#31「outer 作用域扩大（表达式内 → 所在块）」**：✅ 自知且评估正确——GcRootHandle 注册窗口延长到块结束，GC 根多余但语义正确、开销可忽略；变量名 argHandleCounter_ 唯一。
+- **\#31「方向 2（outer 移入 IIFE）不可行」的三点论证**：✅ 成立（co_await 不能进 auto 返回 lambda——C++20 限制与 genGcRootedArgs L38-39 现有注释互证；非堆实参 IIFE 内绑定悬垂窗口——懒启动 suspend_always）。
+- **\#45「任务无法逃逸」前提**：✅ 成立（Aura 无引用类型、spawn 参数只读、return/break/continue 禁跨 sync/spawn 块——`_tasks` 生命周期覆盖 when_all 全程）。
+- **\#46「纯报错方案误伤合法形态」**：✅ 评估正确（spawn 闭包不用 io + 外层无 io 是合法纯数据任务）——按需追加为主、报错仅兜底的分层正确。
+- **\#46「不用 IoDetector」**：✅ 正确（IoDetector 只认 io.xxx 方法调用、Stmt-only，漏 f(io) 传参——IdRefCollector 全 Identifier 收集更完备）。
 - **三缺陷编辑顺序**：✅ #31 独立先行；#45/#46 区域不同（收尾行 vs 签名/实参）顺序实施无冲突。
 
 ## 5. 最终裁决（Final Verdict）
