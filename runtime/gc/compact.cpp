@@ -397,6 +397,16 @@ void GcHeap::updateAllReferences(CompactScope scope) {
         updatePtr(tmp);
         oomError_.message = static_cast<GcString*>(tmp);
     }
+    if (oomError_.file) {
+        GcObject* tmp = static_cast<GcObject*>(oomError_.file);
+        updatePtr(tmp);
+        oomError_.file = static_cast<GcString*>(tmp);
+    }
+    if (oomError_.stack) {
+        GcObject* tmp = reinterpret_cast<GcObject*>(oomError_.stack);
+        updatePtr(tmp);
+        oomError_.stack = reinterpret_cast<Array<uint64_t>*>(tmp);
+    }
 
     // 8. 重建 rememberedSet_（All 模式 old 对象可能移动）
     if (scope == CompactScope::All) {
@@ -858,6 +868,16 @@ void GcHeap::updateMediumPageReferences() {
         GcObject* tmp = static_cast<GcObject*>(oomError_.message);
         updatePtr(tmp);
         oomError_.message = static_cast<GcString*>(tmp);
+    }
+    if (oomError_.file) {
+        GcObject* tmp = static_cast<GcObject*>(oomError_.file);
+        updatePtr(tmp);
+        oomError_.file = static_cast<GcString*>(tmp);
+    }
+    if (oomError_.stack) {
+        GcObject* tmp = reinterpret_cast<GcObject*>(oomError_.stack);
+        updatePtr(tmp);
+        oomError_.stack = reinterpret_cast<Array<uint64_t>*>(tmp);
     }
 
     // 更新 rememberedSet_

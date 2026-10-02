@@ -68,7 +68,7 @@ tags:
 - **测试覆盖**：✅ 基本成立。「现有测试无 `-> None` 方法 → 无回归风险」与 grep 证据一致（DeclFun/CodeGen 中 NoneType 命中点均为映射/装箱逻辑，无方法用例）；但报告回归清单**缺少两个必测项**：(a) 修复后 struct 内声明与定义的 C++ 编译一致性（M1 漏改收集侧时会在该项暴露）；(b) 接口（iface）方法若含 `-> None`，接口侧签名生成与 record 实现侧的匹配性（本次检索未覆盖接口签名生成对 None 的处理，标注为边界验证点）。
 - **异常与回退**：⚠️ 需补充。核心风险即 M1 的隐藏改动面：
   1. **M1 只改定义侧 → C++ 编译错误**：pendingMethods_（CodeGen.cpp:184）非协程方法声明保留 `aura_rt::NoneType`，定义侧改为 `void` → `aura_rt::NoneType Point::zero()` 与类内声明 `aura_rt::NoneType zero();` 返回类型不匹配，g++ 直接报错。修复必须同步修改 CodeGen.cpp:184（或在 L207-211 协程判定前无条件先映射 void）。
-  2. **M2 的语义分裂**：函数侧 funSignature:272 已无条件映射 void，且 bug-25 修复方向（项目状态 4.1 #7：genFunDecl:219 改补 `return;`）终态为「void + return;」；M2 让方法保留 NoneType 签名 → 项目内并存「函数 void / 方法 NoneType / 闭包 fallback」三种形态，与报告自述「建议同批统一语义」相悖。
+  2. **M2 的语义分裂**：函数侧 funSignature:272 已无条件映射 void，且 bug-25 修复方向（项目状态 4.1 \#7：genFunDecl:219 改补 `return;`）终态为「void + return;」；M2 让方法保留 NoneType 签名 → 项目内并存「函数 void / 方法 NoneType / 闭包 fallback」三种形态，与报告自述「建议同批统一语义」相悖。
   3. **M1 的连锁利好**：genReturnStmt（StmtControl.cpp:12+）无 NoneType 特判，现状 NoneType 签名方法体内显式 `return;` 本就处于类型不合法边缘（对照组 control_return_void.aura 实测通过，依赖 genReturnStmt 兜底路径）；M1 改 void 后 `return;` 天然合法，自洽性提升。
   4. **调用点兼容**：ExprAccess.cpp:68-70 已把 NoneType 按 void 处理（IIFE `-> void`、不取返回值），签名改为 void 后调用点零改动 ✅。
 

@@ -90,6 +90,6 @@ tags:
 ### 8.4 新发现回归（→ 已闭环：2026-09-04 批次 13 补修落地，详见 bug-60/61/62 笔记）
 - **bug-61（新登记，已闭环）**：collectMaterializedFromType Optional\<T\> 镜像分支判据漏查**内置接口**（Stringer 不在 registeredTypes_/interfaceNames_/findType）→ `Optional<Stringer>` 被误判为泛型形参 → fnCallMat 误绑 Stringer→User\* → 装箱裸词替换把形参 Stringer 换成 User\* → OptionalViewArgRecordToViewBoxing 坏 C++ 回归。
 - **bug-62（新登记，已闭环）**：collectMaterializedFromSemType 剥壳分支把**具体元素的 C++ 名**（"int32_t"）误判为裸泛型词绑定 → cmMat 非空触发「替换后仍含裸词 → 不装箱」防御 → 跨模块具体 Optional\<int\>（bug-06 附注 3）不再装箱 → CrossModuleOptionalParamBoxed 坏 C++ 回归。
-- 全量：aura_tests 1232 tests 中 2 failed = 上述两存量测试；test.aura ALL TESTS PASSED；used/6.aura 因 bug-60（#42 判堆误伤，非 #48）编译失败。
+- 全量：aura_tests 1232 tests 中 2 failed = 上述两存量测试；test.aura ALL TESTS PASSED；used/6.aura 因 bug-60（#42 判堆误伤，非 \#48）编译失败。
 - **闭环复核（2026-09-04）**：bug-60/61/62 补修落地后 aura_tests **1233/1233**（含新增 `FullValueUnionAnnotByValueVariantNoHeap`），used/1-6 + test.aura 全绿。
 

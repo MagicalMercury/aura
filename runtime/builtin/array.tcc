@@ -204,8 +204,16 @@ ArrayChunk<T>* Array<T>::createChunk(int32_t desiredCap, int32_t minCap,
         }
     }
     if (!c) {
-        throw Error{make_string("OutOfMemoryError"),
-                    make_string("array chunk alloc failed")};
+        // 🔴 bug-96 修复（2026-10-02，按主人方案）：原先在此 `throw Error{make_string(…), make_string(…)}`
+        //    —— 2 参直构 ⇒ `throwSite` 取默认 `kThrowSiteUnknown` ⇒ `shouldCaptureStack` 返 true
+        //    ⇒ Error 构造体内 `captureLogicalStack()` **要分配**，而**同一个表达式里的两条
+        //    `make_string` 也要分配** ⇒ **在已经 OOM 的路径上再开 3 个分配窗口**，与
+        //    `error.h` 明文契约「OOM 路径必须不解构栈（采集要分配 ⇒ 二次失败）」相悖。
+        //    ⇒ 改为抛出 GC **预缓存的** OOM 错误（`ensureOomError()` 启动/首次 tryAlloc 时
+        //      用 `intern_string` 预 intern ⇒ 抛它**零分配**；`stack` 恒 `nullptr`）。
+        //    ⚠️ 代价：`message` 由 "array chunk alloc failed" 变为通用文案
+        //      "memory exhausted after GC"（换取 OOM 时零分配）。见 bug-96 笔记 §6。
+        GcHeap::instance().throwOutOfMemory();
     }
     // tryCap 是实际分配的 cap（可能因 OOM 降级）
     if (updateLastCap) normal_.last_chunk_cap = tryCap;
@@ -866,7 +874,10 @@ const TypeDescriptor& ArrayChunk<T>::desc() {
         offsetof(ArrayChunk, next),
         offsetof(ArrayChunk, prev)
     };
+#pragma GCC diagnostic pop   // ← 配平共享段（原实现 1 push + 3 pop ⇒ clang 报 -Wunknown-pragmas）
     if constexpr (std::is_pointer_v<T>) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
         // 指针元素数组：元素本身是 GC 指针，inlineArrayField 扫 data 区整体指针
         //（isPtrArray=true 快路径，elemGCOffset=-1）
         static const InlineArrayField inlineFields[] = {
@@ -881,6 +892,8 @@ const TypeDescriptor& ArrayChunk<T>::desc() {
 #pragma GCC diagnostic pop
         return d;
     } else if constexpr (is_iface_view_v<T>) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
         // #7：接口视图元素数组（如 Array<Stringer> / Array<Iterator<int>>）——
         // 元素是值视图 { 方法Fn..., GcObject* self }，is_pointer_v=false 但含 GC 指针 self。
         // 注册子偏移 inlineArrayField（isPtrArray=false, elemGCOffset=offsetof(T, self)），
@@ -905,7 +918,8 @@ const TypeDescriptor& ArrayChunk<T>::desc() {
             2, ptrOffsets,
             0, nullptr
         };
-#pragma GCC diagnostic pop
+        // 值元素数组：无 offsetof，无需 pragma（原实现在此处误留一个 pop，
+        // 与前置 push 不配对 ⇒ clang 报 -Wunknown-pragmas）
         return d;
     }
 }

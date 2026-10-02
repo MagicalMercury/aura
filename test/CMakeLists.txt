@@ -50,6 +50,8 @@ set(AURA_LIB_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/ExprInfer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/CallInfer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Sema/Checker/ExprInferMisc.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/MetaCollect.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/MetaEmit.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/CodeGen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/TypeMap.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/DeclGen.cpp
@@ -116,6 +118,14 @@ set(AURA_TEST_SOURCES
     # ---- runtime (feature-14 P1: SyncContext domain stack) ----
     rt/test_sync_context.cpp
 
+    # ---- runtime (bug-86 回归：STW 死锁 + concat_multi 并发 GC 越界) ----
+    rt/test_gc_bug86.cpp
+
+    rt/test_error_stack.cpp        # feature-18 P1
+    rt/test_logical_stack.cpp      # feature-18 P1
+    rt/test_logical_stack_p4a.cpp  # feature-18 P4a 批 4（T1–T3：FrameGuard 配平 / 真递归 300 帧不变量 / setFrameLine 只改栈顶）
+    rt/test_coro_snapshot_p4b1.cpp # feature-18 P4b-1 批（T4–T8 / T13–T15：快照往返、64 截断、空栈、baseDepth 随快照（含跨线程）、覆盖非 push、无 entry、entry 生命周期 + B0/B1 联动）
+
     # ---- 词法分析 ----
     lexer/test_toktype.cpp
     lexer/test_lexer.cpp
@@ -158,6 +168,10 @@ set(AURA_TEST_SOURCES
     codegen/test_codegen_iface_view.cpp
     codegen/test_codegen_closure.cpp
     codegen/test_codegen_concurrency_gc.cpp
+    codegen/test_codegen_try.cpp             # feature-18 P2
+    codegen/test_codegen_meta.cpp            # feature-18 P3（符号元数据表 + aura.meta；⑩ 为 long-running：真调 g++）
+    codegen/test_codegen_frames_p4a.cpp      # feature-18 P4a 批 4（T9–T12 编号 + C1–C11/C-新/C-新2 生成码形态）
+    codegen/test_codegen_frames_p4b1.cpp     # feature-18 P4b-1（C6–C8 匿名帧四处注入 + 匿名帧区形态 + 门控 OFF 零注入）
 
     # ---- 诊断引擎 ----
     diag/test_diag.cpp

@@ -504,10 +504,21 @@ void GcHeap::ensureOomError() {
     // 避免 make_string 在 OOM 时分配再次失败/触发递归
     oomError_.kind    = intern_string("OutOfMemoryError");
     oomError_.message = intern_string("memory exhausted after GC");
+    oomError_.file    = nullptr;   // feature-18：OOM 路径不承载源位置（防御性显式初始化）
+    oomError_.line    = 0;
+    oomError_.stack   = nullptr;   // 永不解构（kThrowSiteNoStack 语义；此处显式兜底）
     oomInit_.store(false);
 }
 
 void GcHeap::throwOutOfMemory() {
+    // 🔴 bug-96 加固（2026-10-02）：本函数**对外公开**（`gc.h:219-220` 注释：「供外部
+    //    tryAlloc 降级路径使用」），但原先只写 `throw oomError_;` —— 而 `oomError_`
+    //    仅在 `ensureOomError()` 里初始化，后者**只在 `tryAlloc`（`alloc.cpp:43`）被调**。
+    //    ⇒ 任何**未先分配过**就调用本函数的外部路径，会抛出 `kind == nullptr` 的 Error
+    //      ⇒ 下游一旦解引用（`e.kind->…`）即 UB。
+    //    ⇒ 此处自保证：`ensureOomError()` 幂等（fast path `if (oomError_.kind) return;`
+    //      + 递归防护），正常路径零开销。
+    ensureOomError();
     throw oomError_;
 }
 

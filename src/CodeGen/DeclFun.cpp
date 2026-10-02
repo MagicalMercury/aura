@@ -222,12 +222,27 @@ void CodeGenerator::genFunDecl(std::ostream& h, std::ostream& cpp,
                 << varName << "(" << varName << "_raw);\n";
         }
     }
+    // ---- 🔴 feature-18 P4a 批 2（A7a，change.md §3.2 / §3.1.3）：函数体入口注入逻辑栈帧 ----
+    // 位置 = 形参 for 循环闭合 `}` 之后、`genBlock` 之前（**不是**循环体内的 `}` —— 照那插
+    //   会每个形参生成一个 FrameGuard ⇒ 变量重复定义 + 帧重复 push）。
+    // 编号：全局 index 在 MetaMerger::finalize() 才分配（晚于本注入点）⇒ 注入
+    //   (throwSiteModuleIdx_, frameSeqOf_[decl.name]) 二元组，运行期由 aura_rt::meta::symbolIndexAt 换算。
+    // ⚠️ 只在真函数体路径注入（decl.body 非空才 genBlock）；A 遍 declarationsOnly 已在
+    //   `:163-165` 早退，不触及本行 ⇒ R3（不得插到 declarationsOnly 路径上）。
+    if (decl.body)
+        emitEntryFrame(out, decl.name, static_cast<uint32_t>(decl.line), decl);
     if (decl.body) genBlock(out, *decl.body, isCoro);
     bool lastIsReturn = decl.body && !decl.body->stmts.empty()
         && dynamic_cast<const ReturnStmt*>(decl.body->stmts.back().get());
+    // bug-88：[FIX-B88] 末语句为 `throw`（必然抛出体）时控制流到不了函数末尾，
+    // 不得补 co_return —— `task<T>` 的 promise 只有 return_value，而 `co_return;`
+    // 要求 return_void ⇒ 会生成坏 C++（no member named 'return_void'）。
+    // 这依赖「被判为协程 ⇒ 体内必有挂起点（spawn/sync/io 等 ⇒ 生成 co_await）」这一判据。
+    bool lastIsThrow = decl.body && !decl.body->stmts.empty()
+        && dynamic_cast<const ThrowStmt*>(decl.body->stmts.back().get());
     // 协程函数末尾无 return 时补 co_return，确保 C++20 将其识别为协程
     if (isCoro) {
-        if (!lastIsReturn)
+        if (!lastIsReturn && !lastIsThrow)
             out << "  co_return;\n";
     } else if (!lastIsReturn && decl.returnType
                && mapType(*decl.returnType) == "aura_rt::NoneType") {
@@ -720,13 +735,23 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
                 << varName << "(" << varName << "_raw);\n";
         }
     }
+    // ---- 🔴 feature-18 P4a 批 2（A7b，change.md §3.2）：方法体入口注入逻辑栈帧 ----
+    // 同 genFunDecl；键 = `ReceiverType.method`（与 A 遍钩子 CodeGen.cpp:748 的 rec.name 同源）。
+    // ⚠️ 构造器**不走此处**：`:524-542` 的 `if (decl.isConstructor) { …; return; }` 已早退
+    //   ⇒ 不得为构造器补注入（红线 R6 / change.md §3.1.2 缺口 D，留 P4b）。
+    if (decl.body)
+        emitEntryFrame(out, decl.receiverType + "." + decl.name,
+                       static_cast<uint32_t>(decl.line), decl);
     if (decl.body) genBlock(out, *decl.body, isCoro);
     bool lastIsReturn = decl.body && !decl.body->stmts.empty()
         && dynamic_cast<const ReturnStmt*>(decl.body->stmts.back().get());
+    // bug-88：[FIX-B88] 同函数侧 —— 末语句为 `throw` 时不补 co_return（控制流到不了末尾）
+    bool lastIsThrow = decl.body && !decl.body->stmts.empty()
+        && dynamic_cast<const ThrowStmt*>(decl.body->stmts.back().get());
     // 协程方法末尾无 return 时补 co_return（对齐函数侧 genFunDecl：task<void> 走
     // return_void；仅依赖体内 co_await 也可被识别为协程，但显式 co_return 更稳健）
     if (isCoro) {
-        if (!lastIsReturn)
+        if (!lastIsReturn && !lastIsThrow)
             out << "  co_return;\n";
     } else if (!lastIsReturn && decl.returnType
                && mapType(*decl.returnType) == "aura_rt::NoneType") {

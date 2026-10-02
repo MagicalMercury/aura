@@ -22,6 +22,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gc.h"        // feature-18 G-2：GcRootHandle / GcRootScope（间隔引入 types.h → Error）
+#include "types.h"     // feature-18 G-2：Error 完整类型
+
 namespace aura_rt {
 
 class ThreadPool {
@@ -77,9 +80,45 @@ private:
     std::mutex groupM_;
     std::condition_variable groupCv_;
     // groupId → (未完成任务数, 异常列表)
+    // ── G-2（GLM 审查 2026-09-28）：`vector<Error>` 的元素在 C++ 堆 ⇒ **GC 不可达** ──
+    //  窗口：worker `push_back` 后**其他 worker 继续跑任务并分配 → compact** ⇒ 元素内 5 指针失效；
+    //        直到 waitGroup 才 `throw`，中间无人保护。
+    //  修法：每个错误配一个「**根化槽**」；槽用 **Value + Global** 句柄持有 5 个指针副本
+    //        （Global 而非 ThreadLocal：槽由 group 线程持有、worker 线程写入与析构，
+    //         跨线程必须 Global —— bug-72 教训：ThreadLocal 句柄跨线程析构会摘错根链表）。
+    //  注：**GcRootHandle 没有 set()/赋值**（operator= 被 delete，gc.h:100）⇒ 槽必须在**构造时**
+    //      用错误值初始化句柄（形态即下方 ctor-init），不能先建后填。
+    struct GroupErrorSlot {
+        aura_rt::Error e{};                                        // 值备份
+        aura_rt::GcRootHandle<GcString*>        kindH_;
+        aura_rt::GcRootHandle<GcString*>        msgH_;
+        aura_rt::GcRootHandle<GcObject*>        extraH_;
+        aura_rt::GcRootHandle<GcString*>        fileH_;
+        aura_rt::GcRootHandle<Array<uint64_t>*> stackH_;
+
+        explicit GroupErrorSlot(const aura_rt::Error& err)
+            : e(err),
+              kindH_(err.kind,    aura_rt::GcRootScope::Global),
+              msgH_(err.message,  aura_rt::GcRootScope::Global),
+              extraH_(err.extra,  aura_rt::GcRootScope::Global),
+              fileH_(err.file,    aura_rt::GcRootScope::Global),
+              stackH_(err.stack,  aura_rt::GcRootScope::Global) {}
+
+        // 读取：把 compact 后的**当前值**从句柄同步回 e（Value 模式不会原位更新 e 本体）
+        aura_rt::Error take() const {
+            aura_rt::Error out = e;
+            out.kind    = *kindH_;
+            out.message = *msgH_;
+            out.extra   = *extraH_;
+            out.file    = *fileH_;
+            out.stack   = *stackH_;
+            return out;
+        }
+    };
+
     struct GroupState {
         std::atomic<int> pending{0};
-        std::vector<std::exception_ptr> excs;
+        std::vector<std::unique_ptr<GroupErrorSlot>> excs;   // 槽不移动（unique_ptr）⇒ 句柄绑定地址稳定
         std::mutex excsM;
     };
     std::unordered_map<uint64_t, std::unique_ptr<GroupState>> groups_;

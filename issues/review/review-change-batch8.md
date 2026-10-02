@@ -93,7 +93,7 @@ tags:
 ## 5. 最终裁决（Final Verdict）
 
 - [ ] 通过（Approve）
-- [x] **需修改（Changes Requested）** — 拓扑与 #29/#30/#32 主体成立，但 #54 检测条件致命失效、#55/#29 elemType 双缺口使两个复现预期不可达、§7 名录错位使验证方案不可执行。具体修改点：
+- [x] **需修改（Changes Requested）** — 拓扑与 \#29/\#30/#32 主体成立，但 #54 检测条件致命失效、#55/#29 elemType 双缺口使两个复现预期不可达、§7 名录错位使验证方案不可执行。具体修改点：
   1. **#54 检测条件修正（硬性）**：§5.1 的 `dynamic_cast<const GenericTypeRef*>` 改为「`dynamic_cast<const NamedType*>` 且 `typeArgs.empty()` 且 `nt->name ∈ tparams`（cppType 裸名 ∈ tparams 双重确认）」——否则修复完全无效（val: T 恒 NamedType，TypeParser 实证）。
   2. **补 elemType 修复（硬性，#55/#29 联动）**：genListExpr L294-308 补「semElemType=="auto" 且元素 inferredType 未绑定泛型 → elemType = 泛型名」；否则 control29_list_string（§7 预期「编译运行」）在 IIFE 内部仍坏 C++。
   3. **补嵌套列表覆盖（硬性）**：#55 判定改递归「元素链含未绑定泛型」+ elemType 补内层泛型列表形态（"Array\<T\>\*"）——repro29_list_nested_T 在复现集内必须被覆盖。

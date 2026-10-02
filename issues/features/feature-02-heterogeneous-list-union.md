@@ -49,7 +49,7 @@ tags:
 ## 4. 依赖与前置条件（Dependencies）
 - **基础设施依赖**：
   - UnionSemType/Variant 装箱：`UnionBoxing.cpp` genUnionBoxing/genUnionBoxingImpl（单值先例）+ `variant.h` descForI（#65 已确认指针变体 GC 追踪）。
-  - #42/#65（mapType 保守判堆 / P3c 放宽）后 Union 形参/字段装箱链就绪。
+  - \#42/\#65（mapType 保守判堆 / P3c 放宽）后 Union 形参/字段装箱链就绪。
 - **被阻塞的子任务**：
   - 特性 3（feature-03 泛型 record 变体 Union 堆封装）若落地可与之共享 Union elem 装箱/desc 机制。
   - #58 方向 1 拦截的放宽依赖本特性（Step 5 决策）。

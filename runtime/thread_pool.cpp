@@ -5,6 +5,7 @@
 #include "thread_pool.h"
 #include "gc.h"
 #include "gc/gc_interrupt.h"  // gc_interruptible_sleep（P2 可中断 sleep）
+#include "builtin/string.h"   // feature-18 G-8：intern_string / make_string（值化构造）
 #include <chrono>
 
 namespace aura_rt {
@@ -113,7 +114,8 @@ void ThreadPool::waitGroup(uint64_t groupId) {
     if (statePtr) {
         std::lock_guard<std::mutex> elk(statePtr->excsM);
         if (!statePtr->excs.empty()) {
-            std::rethrow_exception(statePtr->excs.front());
+            // feature-18：抛 Error 值（原 rethrow_exception）；⚠️ 先 take() 同步句柄当前值
+            throw statePtr->excs.front()->take();
         }
     }
 }
@@ -160,17 +162,29 @@ void ThreadPool::workerLoop(size_t /*idx*/) {
 
         try {
             task.second();
-        } catch (...) {
-            // 捕获异常，存入 group 的异常列表
+        } catch (const aura_rt::Error& e) {
+            // feature-18：值化收集 + **根化槽**（原 std::current_exception()；G-2 修法）
             if (task.first != 0) {
                 std::lock_guard<std::mutex> lk(groupM_);
                 auto it = groups_.find(task.first);
                 if (it != groups_.end()) {
                     std::lock_guard<std::mutex> elk(it->second->excsM);
-                    it->second->excs.push_back(std::current_exception());
+                    it->second->excs.push_back(std::make_unique<GroupErrorSlot>(e));
                 }
             }
-            // 无 group 的异常被吞掉（不应发生在 sync thread 场景）
+        } catch (...) {
+            if (task.first != 0) {
+                std::lock_guard<std::mutex> lk(groupM_);
+                auto it = groups_.find(task.first);
+                if (it != groups_.end()) {
+                    std::lock_guard<std::mutex> elk(it->second->excsM);
+                    // G-8：同 §3.4 —— 用 kThrowSiteNoStack 显式构造（make_runtime_error 会采栈 ⇒ 双分配窗口）
+                    it->second->excs.push_back(std::make_unique<GroupErrorSlot>(
+                        aura_rt::Error{aura_rt::intern_string("RuntimeError"),
+                                       aura_rt::make_string("unknown C++ exception"),
+                                       nullptr, nullptr, 0, aura_rt::kThrowSiteNoStack}));
+                }
+            }
         }
 
         // 通知 group 完成

@@ -57,8 +57,6 @@ tags:
 
 | 文件路径 | 定位行号区间 | 当前源码片段摘要（关键逻辑） |
 
-| :--- | :--- | :--- |
-
 | `src/Sema/Checker/CallInfer.cpp` | L531-L553 | record 方法分支：formalTypes 直接取 m.paramTypes 原样，substitute 仅作用返回类型——与文档"修改前"逐字符吻合（形参面缺口坐实）。 |
 
 | `src/Sema/Checker/CallInfer.cpp` | L433-L445 | 接口分支形参面 substitute 先例：clone 形参 + substitute → checkFormal——**对称先例坐实**（文档修复方向的同构依据）。 |
@@ -86,8 +84,6 @@ tags:
 
 
 | 步骤编号 | 目标文件 | 比对结果 | 详细备注 |
-
-| :--- | :--- | :--- | :--- |
 
 | §1.2/§1.3 #49 record 方法分支 | `src/Sema/Checker/CallInfer.cpp` | ⚠️ 行号轻偏移 | 文档写 L528-556，实际 L531-553（±3 行）——锚点与代码结构完全吻合（formalTypes 原样 / substitute 仅返回面 / recSym 提取），无碍实施。 |
 
@@ -167,7 +163,7 @@ tags:
 
 ### 派发要求（按工作流约定）
 
-1. 顺序：#49 → #50 → #51，一次一个子 Agent。
+1. 顺序：#49 → #50 → \#51，一次一个子 Agent。
 2. 简报必含：预判 A（#50 回归重点：bug-05 + bug-18 全组负例复跑 + 新坏 C++ 登记约定）、预判 B（#49 收紧回归：method_optional_boxing_key 全目录）、预判 D（#51 泛型函数体内形态优先点验）、行号修正（#49 L531-553）、对照组文件现场核对提醒。
 3. 单测：两处既有断言更新（GenericConstructorTypeInference L73-85 / GenericCtorUnionAnnotTypeMismatchError L704-716）+ 新增用例查重（CtorOptionalParamInferAnnot L108-117 为近邻，避免重复覆盖）。
 4. 红线：used/5（for-in 语句块消歧）+ used/1（泛型 record 方法/闭包）+ 全量 aura_tests + example/test.aura。

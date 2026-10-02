@@ -26,8 +26,11 @@ void scheduleOnEventLoop(std::coroutine_handle<> h) {
         EventLoop::instance().schedule(h);
     } catch (...) {
         // EventLoop::schedule 内 std::queue::push 可能抛 std::bad_alloc。
-        // await_suspend 是 noexcept（C++ 协程要求），异常必须在此吞掉，
-        // 否则越过 noexcept → std::terminate（比栈溢出更恶劣）。
+        // 注：本函数（scheduleOnEventLoop）不抛，故对调用点做 OOM 吞掉是防御性的。
+        //     ⚠️ 更正（feature-18 探针 5b，2026-09-28）：C++ **并未**要求 await_suspend 必须 noexcept；
+        //     实测 await_suspend 抛异常可被协程体 try/catch 捕获、也可被 unhandled_exception 值化。
+        //     但仍须遵守 feature-18 §4.7 的两条约束：C-1（已排程恢复者之后不得再抛）、
+        //     C-2（声明 noexcept 的 await_suspend 不得抛 —— 抛即 terminate）。
         // 吞掉后该 continuation 暂时不调度（任务丢弃）——OOM 场景下的降级行为。
         std::fprintf(stderr, "[aura_rt] scheduleOnEventLoop: schedule failed (OOM), coroutine dropped\n");
     }
@@ -90,23 +93,14 @@ void EventLoop::run(task<void>& mainTask) {
                             static_cast<char*>(framePtr) + (pageEnd - frameAddr));
     gc.unregisterThread(std::this_thread::get_id());
 
-    // 主协程异常检查（如 read_file 文件不存在抛出的 io_error）
-    // 之前主协程的 exception_ 没人检查，异常被静默吞没，程序以 exit 0 退出，用户看不到错误。
-    // 此处捕获并打印错误信息，以非 0 退出码终止程序。
-    if (handle.promise().exception_) {
-        try {
-            std::rethrow_exception(handle.promise().exception_);
-        } catch (const Error& e) {
-            // Error 是 GcObject 子类，不继承 std::exception
-            // EventLoop 已停止，GC 不会移动对象，直接访问 kind/message 安全
-            const char* kind = (e.kind && e.kind->data()) ? e.kind->data() : "unknown";
-            const char* msg  = (e.message && e.message->data()) ? e.message->data() : "";
-            std::fprintf(stderr, "Unhandled error: [%s] %s\n", kind, msg);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "Unhandled error: %s\n", e.what());
-        } catch (...) {
-            std::fprintf(stderr, "Unhandled unknown error\n");
-        }
+    // 主协程异常检查（feature-18：值化 —— 原 std::exception_ptr 路径已移除）
+    if (handle.promise().has_error_) {
+        const aura_rt::Error& e = handle.promise().error_;
+        // Error 是 GcObject 子类，不继承 std::exception；EventLoop 已停止，GC 不会移动对象
+        const char* kind = (e.kind && e.kind->data()) ? e.kind->data() : "unknown";
+        const char* msg  = (e.message && e.message->data()) ? e.message->data() : "";
+        std::fprintf(stderr, "Unhandled error: [%s] %s\n", kind, msg);
+        // ⚠️ P5 接：此处按 e.stack（紧凑帧）+ FrameDesc[] 打印逻辑栈；本阶段仅判空不做输出
         std::exit(1);
     }
 }

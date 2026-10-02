@@ -253,6 +253,15 @@ std::string CodeGenerator::genGcUClosure(const FunExpr& e,
             hdr << pt << " " << safeName(e.params[i].name);
     }
     hdr << ") {\n";    // 帧推入（子先父后排序用）：本层收尾时从栈顶取出自身收集到的子定义
+    // 🔵 feature-18 P4b-1 B5 ④-b（change.md 裁定④/⑧、§9-V4）：**F 域闭包**（具名模板 struct +
+    //   成员函数模板 `operator()`）的协程上下文匿名帧。落点与 ④-a 同款理由：注入到**调用边界**
+    //   （`operator()` 体首），而非外层 IIFE（`:458` 的 `[&]() -> instType* {`，那是物化/构造）。
+    //   ⚠️ 本段文本进的是 **unit.header**（闭包 struct 定义随 header 通道落盘）⇒ 生成码的
+    //      `.h` 必须能看到 `aura_rt::meta::anonFrameIndexAt`：Inline 模式 header 有
+    //      `#include "meta.h"`（CodeGen.cpp:187）、External 模式首行 `#include "aura.meta.h"`
+    //      （其中含 meta.h）⇒ 两模式均可见（R6 的真编译验证覆盖此点）。
+    if (closureIsCoro)
+        emitAnonFrame(hdr, "closure", static_cast<uint32_t>(e.line), e);
     closureHeaderStack_.push_back(std::string());
     // ---- 闭包体生成（复用既有 body 上下文机制；捕获名经 currentClosureCaptures_
     //      映射为槽位访问 "this->cap_x"）----

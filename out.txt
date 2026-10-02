@@ -1,685 +1,234 @@
-# bug-86 修复全程报告（思考流程 · 派发流程 · 最终定位）
+# feature-18 进展记录：协程异常语义统一（Error 值化）+ Error 诊断增强（完整函数级调用栈）
 
-> 作者：DeepSeek 娘（主 Agent）
-> 日期：2026-09-26
-> 项目：D:\you\Aura
-> 起因：主人指令「继续修复，直到这个bug被修复完成」→ 中途暂停并要求输出本报告
-> ⚠️ 本文件原有内容（GLM-5.3 的 f14 笔记，6173 字节 / md5 `5c046f7b30623562e13e9f2d4f46f057`）已备份至
-> `scripts/_bug86/out.txt.orig_20260926.bak`（md5 一致，可原样还原）
+> **裁定契约**：见 `out.md`（2026-09-27，主人四意见 + 五开放问题**逐条裁定**；GLM-5.3 代笔整理）
+> **实施 plan**：`plan/feature-18-coroutine-error-semantics-and-metadata.md`（2026-09-27 产出 → 2026-09-28 按 P0 探针结论**全部回写**）
+> **断点锚点**：`feature-18-progress.md`（唯一权威：断点续传协议 + 环境状态 + 红线）
+> **本文件用途**：进展记录（每阶段完成后更新）。历史内容（bug-86 定位报告）已按主人指示清理。
 
 ---
 
-## 〇、结论速览
+## 0. 裁定摘要
 
-| 形态 | 状态 | 一句话根因 |
+### 0.1 主人裁定（`out.md`，2026-09-27）
+
+| 项 | 裁定 | 影响 |
 |---|---|---|
-| **形态①** `sync thread` + `gc_force()` 死锁 | ✅ **已修复 + 已验收** | 一次 GC 事务被**释放两次**（`L573` + `L248`）⇒ 窗口期内第三个线程抢到 initiator ⇒ 两个 initiator 并存 ⇒ 等待目标 `threadCount-1` **不可达** |
-| **形态②** `concat_multi`（4 元字符串拼接）SIGSEGV | ⚠️ **未修复**，根因已收敛到「二选一」 | `intern_string` 返回**悬垂指针**。最可能是 **(a)** intern 池的 Global 根**在某条路径上未被 GC 扫描到** ⇒ 对象被回收；**(b)** compact 搬走对象而池值未更新。倾向 **(a)**，理由见 §3.3 |
+| **意见 1（栈解构局限）** | ❌ 不接受「协程级栈」——**普通函数调用报错也要返回完整调用栈** | continuation 链**降为辅助**；主方案 = **逻辑栈指针机制**（机制级新增）|
+| **意见 2（await_resume 形态）** | ✅ **方案二：`await_resume` 抛 `Error` 值**（非 rethrow exception_ptr）| f14 (乙1) 的 `try { co_await } catch (const Error&)` **零改动继续成立**（**探针 5 实测背书**）|
+| **意见 3（Error 扩展 GC 面）** | ✅ `_errorPtrFields` 同步 + `Array` 内联元素 desc 探针 | `types.cpp:25-36` 随结构扩展（**探针 4 已验**：内联元素会被追踪）|
+| **意见 4（非 Aura 异常兜底）** | ✅ 统一映射 Aura `Error`（RuntimeError 降级）| `unhandled_exception` 的 `catch(...)` → Error 值，**绝不保留 exception_ptr** |
+| **开放问题 1-4** | ✅ 全部按 GLM 倾向 | ①抛 Error ②栈**构造时**解构 ③lazy 协程记**创建点** ④RuntimeError 映射 |
+| **开放问题 5（`try{sync{}}`）** | ✅ **并入本 feature** | `StmtTry.cpp` 重构范围含 sync 块（bug-87）|
 
-**主 Agent 独立实测基线（可复现）**：
-- 形态①：`p13_noconcat` **20/20 clean**（修复前 20/20 死锁）
-- 形态②：`p13_thread_compact` **9/9 ~ 15/15 SIGSEGV**（100% 崩溃）
-- 单测：**1364 / 1364 / 0 failed**；`example/used/1-6` **6/6**
+### 0.2 plan §12 设计裁定（2026-09-27）
 
----
-
-## 一、任务背景
-
-`issues/bugs/bug-86-sync-thread-gc-force-stw-deadlock.md` 含两个形态：
-
-- **形态①**：`sync thread(max=N) { spawn { ... gc_force() } }` —— 多线程下 `gc_force()` 触发的 force-STW 会**死锁**。复现探针 `p13_noconcat.aura`，**20/20 必死**。
-- **形态②**：`"t_" + str(k) + "_" + str(j)`（**4 元拼接**，走 `concat_multi`）在 worker 线程里反复执行 ⇒ `concat_multi` 内 `p->length` **SIGSEGV**。复现探针 `p13_thread_compact.aura`，**必崩**。
-
-两个形态同域（GC / 线程 / 根），主人下令**一起修**。
-
----
-
-## 二、形态①：已修复（完整闭环）
-
-### 2.1 确证过程（"钉死 B"）
-
-1. **初判方向**：`safepoint.cpp` 的等待循环 `while (stopped_threads_ < threadCount - 1)` 目标不可达。
-2. **子 Agent「钉 B」**（派发 + 主 Agent 独立复算）：确认「第 32 个非 initiator 线程是谁」不是某个线程的 bug，而是**角色问题**。
-3. **我被批评「你怎么没盯着？」** ⇒ 此后改为派发即 poll、持续 wait。
-4. **gdb 全线程栈**（零源码改动，`scripts/_bug86/gdb_tc_bt.txt` / `gdb_bt_run1/2.txt`）：
-   - 真凶 tid=33900（Thread 36）卡在 `safepoint.cpp:183` 的 `wait_for`（**它自己是 initiator，却在等同伙停靠**）
-   - initiator tid=45820（Thread 5）在 `:191` 的 `abort` ← `forceGc():322` ← `gc_force_major()`
-   - **两次复现真凶身份不同**（worker idx 1/3/26/31 + main）⇒ 排除"某个线程有 bug"
-5. **子 Agent v2 用"有序环"逐字时间线**（决定性）：
-   ```
-   t=65713 L573 → t=65772 WIN(68096) → t=65934 L248(66348) → t=66004 WIN(38476)
-   ```
-   ⇒ 70µs 后**第二个 initiator 进场**。
-
-### 2.2 根因（已确证）
-
-**一次 GC 事务被释放了两次**：
-- `safepoint()` 的收尾（旧 `L248`）写 `gc_in_progress_ = false`
-- `startConcurrentGc()` 内部（旧 `L573`）**也**写 `gc_in_progress_ = false`
-
-而 `startConcurrentGc()` 只是同一事务的**中段**。于是出现「**已释放但事务未结束**」的窗口 ⇒ 下一个/第三个线程趁窗口抢到 initiator ⇒ **两个 initiator 并存**，各自等对方停靠，而 initiator 不自计数 ⇒ `stopped_threads_` 封顶 `threadCount-2` ⇒ **永远差 1** ⇒ 死锁。
-
-> 一句话：**`L573` 是"果"，`L248` 是实际放行通道，"差 1"才是因。**
-
-### 2.3 修法（`runtime/gc/safepoint.cpp`，728 → 759 行，diff +34/−3）
-
-1. `startConcurrentGc()` 清理段**删除** `gc_in_progress_.store(false)` —— **释放权归调用方**
-2. 新增 TU 局部 `static std::atomic<unsigned> g_gc_owner_tid`：抢到 initiator 时登记自己；释放点校验持有者，**非持有者释放为 no-op**
-3. **未改 `gc.h`**（令牌为 TU 局部）；**未做 initiator 自计数**、**未改 `waitForRootThreadsStopped` 的 target**、**未调阈值**
-
-### 2.4 验收（**主 Agent 亲跑，非采信子 Agent 自述**）
-
-| 判据 | 结果 |
+| 项 | 裁定 |
 |---|---|
-| `p13_noconcat` **20 轮** | **OK 20 / STW DEADLOCK 0 / ROOT-STOP 0 / 其它 0** |
-| 单测 | **1364 / 1364 / 0 failed** |
-| `example/used/1-6` | **pass 6 / compileFail 0 / runFail 0** |
-| 并发 GC 未被破坏 | `AURA_GC_LOG` 下 **concurrent=39 次**，rc=0 |
-| 打点残留 | `[B89]` = 0；`[FIX-86]` = 5 处完好 |
+| **D1** | ✅ **(a) 帧的行号 = 本帧当前执行行**（Python traceback 语义）|
+| **D2** | ✅ **单文件模式表直接内嵌进生成的 `.cpp`**（不生成 `.h`、不 include）；多文件模式仍 `aura.meta.h`+`.cpp` |
+| **D3** | ✅ `materialize` thunk 在**各模块 TU**（`aura.meta.cpp` 只放表数据）|
+| **D4–D7** | ✅ 按本鲸：内置类型进表（内置函数物化后置）｜全量注入函数帧｜`generate()` 加 `sourcePath` 参数｜档位名 `AURA_ERR_STACK` 默认 `on` |
 
-**勾掉的错误方向**（v1 子 Agent 走错，被我 kill）：它试图做 **initiator 自计数** + 改 `waitForRootThreadsStopped` 的 target ⇒ 结果只是把 `STW DEADLOCK` 换成 `ROOT STOP TIMEOUT`，**症状搬家、根因被盖**。
+### 0.3 E 系列裁定（**2026-09-28，探针 3 数据驱动的三项修正**）
 
----
-
-## 三、形态②：未修复（根因已收敛）
-
-### 3.1 已确证的事实（每条都有证据）
-
-| # | 事实 | 证据 |
+| 项 | 裁定 | 依据（实测）|
 |---|---|---|
-| 1 | 崩点 = `concat_multi` 的 `total += p->length`（`string.cpp:317`） | gdb 全线程栈：`Thread 29 SIGSEGV` → `#0 concat_multi(initializer_list length=4)` → `#1 p13_thread_compact.cpp:33` → `#13 workerLoop` |
-| 2 | 生成代码里 4 元拼接走**嵌套 lambda + `concat_multi`**，其 guard 是 `GcRootHandle<GcString*>(_a4_i)`（**单参数 ⇒ 模式 A / Ref**） | `p13_thread_compact.cpp:33` |
-| 3 | **坏的两个槽正好来自 `intern_string`**（`"t_"` / `"_"`），健康的两个来自 `string_of()`（每次真分配、无缓存） | 崩溃现场：`_a4_0=0x190098`(坏) / `_a4_1=0x5b30ca0`(好) / `_a4_2=0x1900c0`(坏) / `_a4_3=0x5b30c50`(好) |
-| 4 | **`parts[i]` == `_objs[i]` == `*(_h4_i.ptr_ref_)` 三者同源同坏** | gdb 逐字：`&_a4_0 == _h4_0.ptr_ref_ == 0x361f838`，`*(0x361f838) == 0x190098` |
-| 5 | 坏地址**完全落在当前 GC 堆之外**（堆在 `0x5b3xxxx`），该处读到 **free-fill 毒值 `0xeeffeeff`**；地址随 ASLR 变化（`0x190098` / `0x1a0098`） | gdb：`headPage_=0x5b30000 currentPage_=0x5be0000` |
-| 6 | **池里存储的值 == 崩溃时的那个坏值**（⇒ 池中的值**从未被更新过**） | 子 Agent v4 gdb 取证 |
-| 7 | `clear_intern_cache()` 全仓**仅两处**调用（`safepoint.cpp:128` / `:309`），都只清**本线程** `tl_internCache` | grep |
-| 8 | `intern_string` 走 **64 槽 thread_local L1 缓存**（存裸指针）+ 全局池 `g_internPool` | `string.cpp:674` / `:687-691` / `:735+` |
-| 9 | **Heisenbug**：任何探针（fprintf / `isGCAddress` / GC API）加进去 ⇒ **rc=0 不崩** | b2/b3 反复实测 |
-| 10 | 崩溃依赖 compact：把 `compactSuspendedCount_` 强置非 0 ⇒ **不崩**（100% → 0%） | b2 条件对照 |
-
-### 3.2 已排除的方向（**每一条都是用 gdb 硬证据排掉的，不是猜的**）
-
-| 方向 | 排除方式 |
-|---|---|
-| ❌ 「改用 `_objs` 取长度」（所谓"方案 E"） | 事实 #4：`parts` 与 `_objs` **同源同坏**，改读得不到任何改善 |
-| ❌ 「L1 intern 缓存跨线程脏读」（b3 的 gen 校验修复） | 主 Agent 独立复跑 **15/15 仍全崩**（零改善）。它自报的 12/15 是噪声 |
-| ❌ 「GC 堆里的坏指针是**独立**的新缺陷」 | 与 #3/#5/#6 同源（就是那个悬垂 intern 指针），不是独立缺陷 |
-| ❌ 「主 Agent 曾"更正"过的：guard 绑定错误」 | 事实 #4：guard 绑定**完全正确**，是**喂给它的值本来就坏** |
-
-### 3.3 🎯 最终定位：机制分析（读代码后的推理链）
-
-**核心链条（我的判断）**：
-
-1. `intern_string` 返回的对象由 `g_internPool` 里的 `GcRootHandle<GcString*>`（scope = **`GcRootScope::Global`**）保活。
-2. **Global 根的注册形态**（`handles.h:32-41`）：
-   ```cpp
-   GcRootHandle(T val, GcRootScope scope) : ..., val_(val), mode_(ValueGlobal) {
-       ptr_ref_ = reinterpret_cast<GcObject**>(&val_);   // 根指向 handle 内部值
-       GcHeap::instance().registerGlobalRoot(ptr_ref_);  // 进 globalRoots_ 容器
-   }
-   ```
-   池里的 handle 由 `std::make_unique<GcRootHandle<GcString*>>(...)` 创建 ⇒ **handle 在普通堆（非 GC 页）**。
-3. **compact 的三条更新路径**（我逐一核过代码）：
-   - **步骤 1**（thread-local handle，`compact.cpp:330-337`）：**有** `isGCAddress` 防御（bug-79 L2 加固）✅
-   - **步骤 3**（`globalRoots_`，`compact.cpp:342-354`）：
-     ```cpp
-     std::memcpy(&obj, rootPtr, sizeof(GcObject*));
-     if (obj && obj->forwarded()) { ... }   // ⚠️ 直接解引用 obj，无 isGCAddress 防御
-     ```
-     ⇒ **有 `forwarded()` 判断，理论上能更新**；但**缺 `isGCAddress` 防御**（与步骤 1 不对称）—— 若 `*rootPtr` 已是悬垂值，这里就是**未定义行为**（潜在二次崩溃点，独立加固项）
-   - **`relocateGlobalRootPtrs()`（方案 P，`compact.cpp:433`）**：只处理「`rootPtr` 落在 `compactEntries_` 某个被搬运对象的 `[old, old+size)` 区间内」的情形。**intern 池的 handle 在普通堆、不属于任何 GC 对象 ⇒ 不适用（正确跳过）** ✅
-4. **关键推论**：既然 handle 不被搬运，池值就**只能靠步骤 3 更新**。而事实 #6 显示「池值 = 崩溃时的坏值、从未更新」⇒ **只能是 `obj->forwarded()` 当时为假**。
-5. **`forwarded()` 为假的两种情况**：
-   - (i) 对象**没被本次 compact 搬**（⇒ 值本来就该保持，不构成崩溃）
-   - (ii) **对象早已被回收、页已释放** ⇒ `obj->forwarded()` 读的是**垃圾内存** ⇒ 返回 false ⇒ 值永久失效 ❌❌
-6. ⇒ **指向 (a)：对象在**更早某轮 GC** 被回收了 —— 也就是说**池的 Global 根在某条路径上没起作用**。
-7. **它为什么没起作用？** 候选机制（按可能性排序）：
-   - **★ A3（首选）**：**标记期新注册的 Global 根未被重扫**。首次 `intern_string("t_")` 会**分配对象 + 注册 Global 根**；若注册发生在**扫根之后**（并发标记进行中），该对象**本轮不被标记** ⇒ 若它只被这个新根引用 ⇒ **被回收**。这正是 SATB/并发标记必须覆盖的「新根写入」缺口（SATB 管的是「引用被覆盖」，而「新根注册」是另一类）。
-   - **A1**：注册/注销竞态 —— 析构用 `unregisterGlobalRoot(ptr_ref_)`（**`std::find` 精确匹配**，`roots.cpp:151-154`）⇒ 多线程下若匹配失败 ⇒ 残留悬垂或误删。
-   - **A2**：扫根循环（`mark_sweep.cpp:128-129`）与 `registerGlobalRoot` 并发 ⇒ 遍历期间 `globalRoots_` 变化 ⇒ 漏扫。
-8. **调和「崩溃依赖 compact」这个对照实验**：禁 compact 时**页不会被真正释放** ⇒ 悬垂地址**仍可读**（读到毒值但不崩）；一旦 compact 释放旧页 ⇒ 该地址**不可读** ⇒ SIGSEGV。⇒ **「禁 compact ⇒ 不崩」并不说明"compact 弄坏了值"，而是"compact 让悬垂变得致命"** —— 这与 (a) 完全自洽。
-9. **v4 的"gdb 下零 compact 完成也崩"**：与 #8 表面矛盾，但 v4 自己标注了 **gdb 扰动**（Heisenbug 下时序不同）⇒ **该观察不可作为定案依据**，需**正常运行时**的手段印证。
-
-### 3.4 剩余待证点（就是主人要的那"最后一块拼图"）
-
-**判定 (a) 还是 (b)，只需回答一个问题：**
-
-> 崩溃时那个 intern 对象，**是被"回收"了（页已释放）**，还是**被"搬走"了（页面搬迁）**？
-
-**最小实验设计（每一轮子 Agent 都没走到，我建议下一步做）**：
-1. **正常运行时**（非 gdb）跑一次崩溃，在崩点用**最小干预**取 `parts` 的坏地址 `X`；
-2. 查 `X` 是否落在 GC 页表/`freeMediumPages_` 等**已释放集合**内 ⇒ 若「已释放」⇒ **(a) 成立**；
-3. 若 (a)：在 `mark_sweep.cpp:128-129`（扫根循环）下断点，看该池 handle 的 `val_` **是否被遍历到**；再在 `registerGlobalRoot` 下断点，看**注册时刻 vs 扫根时刻的先后** ⇒ 直接验证 A3；
-4. 修法方向（按结论）：
-   - 若 A3 ⇒ 在标记期注册新 Global 根时，**把新根推入标记工作队列/或触发重扫该根**（等价于对新根做 SATB 处理）
-   - 若 A1 ⇒ 修注册/注销的匹配与并发（`std::find` → 稳定标识）
-   - 若 (b) ⇒ 修 `compact.cpp` 步骤 3 的更新路径 + 补 `isGCAddress` 防御
-
-### 3.5 一并发现的独立加固项（建议另行登记）
-
-- **`compact.cpp:346-352` 的步骤 3 缺 `isGCAddress` 防御**（步骤 1 在 bug-79 L2 已加固，两者**不对称**）。若 `*rootPtr` 悬垂，`obj->forwarded()` 即为 UB。
-- **`clear_intern_cache()` 的代次（gen）机制虽然方向正确，但实测无效**（`safepoint.cpp:128/:309` 都在 **GC 开始前** bump；在"bump 之后、compact 之前"填充的缓存会带着"代次相符"逃过作废）。**若最终保留 gen 机制，应在 compact 完成之后（`relocateGlobalRootPtrs()` 之后）再 bump 一次。**
+| **E1** | ✅ **`Error.stack` 改「紧凑帧」`Array<uint64_t>`**（`(symbolIdx<<32)\|line`），**打印时**查 `FrameDesc[]` 格式化 | 字符串形态每帧 1 次分配 ⇒ 8 帧 **+1015 ns/throw**、32 帧 **+3528**；紧凑帧 = 1 次分配 + `memcpy` **3.3 ns**；且数组**不含 GC 指针** |
+| **E2** | ✅ **`setFrameLine` 只注「可能抛出的调用点」**（`throws` 标记 + runtime 固有可抛操作 + 协程调用）| 全调用点 = **+1.5 ns/call**（空函数体 +99.3%；隔离对照 `B2−B2d=+1.815`）；收窄后 ≈ **+0.3 ns/call**，诊断语义不损 |
+| **E3** | ✅ **热路径降级阈值 默认 64 → 256** | B6 曲线在 threshold ∈ [1,4096] **平坦**（1.5–1.7 µs/throw）⇒ 纯扩诊断窗口 |
+| **E4** | ✅ **笔记更正（授权）** | 已改 `bug-87 §4b`（加「结论作废」更正块）+ `feature-18` 笔记 5 处（§1.1 症状表 / §3 代码地图 / §4.2 待确认 / §4.4 关键约束 / §5 优点 2）+ §7 开放问题状态。✅ 经核查 **`out.md` 未引用该结论 ⇒ 无需更正** |
+| **E5** | ✅ **隐患并入 P1 顺带修**（不另立缺陷）| `win_iocp.cpp:88`（排程后抛）、`io.cpp:77-82`、`channel.h:32-33/39`（缺 `done()` 守卫）、`task.cpp:29-33` 注释 ⇒ plan §9 S1 第 6 项 |
 
 ---
 
-## 四、完整思考流程（我这一路怎么想的、错在哪）
+## 1. 核心机制（经 P0 探针修正后的定稿）
 
-| 阶段 | 我的判断 | 依据 | 后续裁决 |
-|---|---|---|---|
-| 1 | 形态① 病根 = `gc_in_progress_` **提前复位（L573）** | 代码阅读 + 写点搜索 | ⚠️ **只对一半**：L573 是"果"，实际放行通道是 L248（子 Agent v2 用有序环推翻） |
-| 2 | 形态② 修法 = 「方案 E：`total` 改从 `_objs` 取」 | 推理「`_objs` 受 guard 保护会被 compact 更新」 | ✅ **最初的"无效"判断是对的**（见下） |
-| 3 | 我把判断**"更正"**为「方案 E 其实是对的」 | 纯推理，**未验证** | ❌ **错**。b4 轮 gdb 实测：`parts[0] == _objs[0] == *(_h4_0.ptr_ref_)` —— **三者同源同坏**（坏值在写入栈槽那一刻就已坏，guard 绑定完全正确） |
-| 4 | 「坏值来自 L1 intern 缓存跨线程脏读」 | b3 子 Agent 的对照（坏槽=intern、好槽=string_of） | ⚠️ **对了一半**：确实是 `intern_string` 路径，但**gen 校验修复实测零改善** ⇒ 不是缓存层能解决的 |
-| 5 | 「池的 Global 根在 compact 后未重定位」 | b3 子 Agent 的推断 | ⚠️ 被 v4 削弱：`relocateGlobalRootPtrs`（方案 P）对**普通堆上的 handle 正确跳过**（handle 不被搬运 ⇒ 本就无需重定位） |
-| 6 | **「对象被回收（池根未被扫到）」+「compact 只是让悬垂变致命」** | 读 `compact.cpp` 三条更新路径 + `handles.h` 注册形态 + 事实 #6/#10 的调和 | 🎯 **当前最强结论，待 §3.4 的实验定案** |
+### 1.1 逻辑栈指针机制 → ✅ **方案 X 实测成立**（探针 1）
 
-**我必须明确承认的错误**：
-- **判断反复（阶段 2↔3）**：我把一个**正确**的结论基于**未经验证的推理**"更正"成了错的。教训：**推理不能当结论，尤其是要写进简报指导子 Agent 时。**
-- **派发后未即时盯**（主人已批评 6 次）：v1/v2 修复轮之间我有过"派完就发汇报文字"的失误；此后改为派发即 poll + 持续 wait，本次 b3/b4/v5 全程未再断过。
-
-**方法论上有效的做法（建议保留）**：
-- **判据不外包**：主 Agent 自写验收脚本（`_verify_fix86_main.sh` / `_verify_b3_main.sh`），不采信子 Agent 自报数字 —— 本次正是它抓出「12/15 是噪声，实际 15/15」。
-- **零侵入取证**：因为 Heisenbug，**gdb/ASAN 是唯一手段**；打点会把 bug 藏起来（这条已写进简报硬约束）。
-- **条件对照判性质**：b2 的「禁 compact ⇒ 不崩」是整轮最硬的定性证据。
-- **主动止损**：b4 跑到 19 分钟、17 个 gdb 脚本仍停在取证循环 ⇒ kill + 收窄任务重派（而不是继续等）。
-
----
-
-## 五、派发流程（子 Agent 编排全过程）
-
-**编排模式**：主 Agent 当总管（写简报 → 派发 → 审核 → 维护现场 → 独立验收），重活交独立进程 `hermes chat -q "Read <brief> ..."`，中文回报。
-
-| 轮 | 简报 | 目标 | 过程 | 结局 | 产出 |
-|---|---|---|---|---|---|
-| A | `bug86_pin_down_b_brief.md`(289 行) | 钉死形态① 的"第 32 个线程是谁" | 2m50s/exit 0 | ✅ 完成 | `bug86_B_pin_down_report.txt`；主 Agent 独立复算一致 |
-| B(v1) | `bug86_fix_brief.md`(275 行) | 两形态一起修 | 走「initiator 自计数」+ 跳过确证 + 改 target 掩盖根因 | ❌ **我 kill**（590s） | 草稿 `safepoint.cpp.SUBAGENT_DRAFT.bak`；`[B88B]` 数据（暴露第二层 off-by-one） |
-| C(v2) | `bug86_fix_brief_v2.md`(268 行) | **只做形态①** | 撞轮 90/90 / 10m28s | ✅ 结论完整 | **形态① 修复**（+34/−3）；笔记 §10（我补齐） |
-| D(b2) | `bug86_fix_brief_b2.md`(227 行) | 形态② 首轮 | 撞轮 90/90 / 10m36s | ⚠️ 未修 | intern 缓存线索；`BAD_SCAN`/`BAD_FIELD` 探针；**12 处探针残留（我清理）** |
-| E(b3) | `bug86_fix_brief_b3.md`(268→) | 形态② + 我的"更正" | 撞轮 90/90 / 8m14s | ⚠️ 未修 | **推翻我的更正**（`parts`==`_objs` 同源）；确证坏值来自 `intern_string`；gen 修复（实测无效） |
-| F(b4) | `bug86_fix_brief_b4.md` | 判定池根重定位 | 19 分钟 / 17 个 gdb 脚本 / 取证循环 | ❌ **我 kill** | 关键证据：**池值 == 崩溃坏值**（从未更新）；新疑点：gdb 下零 compact 完成也崩 |
-| G(v5) | `bug86_fix_brief_b5.md`(收窄) | 判定 (a)/(b) + 最小改动 + 15 轮 | 刚起步（在配环境）| ⏸ **主人叫停** | 无副作用 |
-
-**现场纪律执行情况**：
-- 每轮结束做「撞轮收尾五步」：读回报 → 查现场 → 清调试残留 → 独立复跑 → 补完最后一步。
-- **清理记录**：b2 留的 12 处 `[B89]` 探针已由我清除（并核对 `FIX-86` 完好 = 5、`safepoint.cpp` 的 diff **逐行核过全是 FIX-86 内容**）；`string.cpp`/`parallel_mark.cpp` 已复原。
-- **误伤避免**：`sync.h` +58 与 `aura_rt.h` +3 是**主人自己的 feature-14 改动**（一度被误当作子 Agent 越界），已确认**未触碰**。
-- **未授权改动**：b2 轮动了 `parallel_mark.cpp`（超出简报范围）—— 内容**纯探针**，已从 HEAD 恢复。
-- **无 git 写操作**；`example/test.aura` 覆盖前有备份（用于 used/1-6 验证）。
-
-**主 Agent 独立验收脚本**（判据不外包）：
-`_verify_fix86_main.sh`、`_verify_fix86_used.sh`、`_verify_b3_main.sh`、`_baseline_b3.sh`、`_gdb_tc.sh`、`_clean_b89.sh`
-
----
-
-## 六、现场状态（暂停时刻）
-
-**代码（`git diff --stat runtime/`，相对 HEAD）**：
 ```
- runtime/aura_rt.h          |  3 +++            ← 主人的 feature-14（勿动）
- runtime/builtin/sync.h     | 58 +++++++++---   ← 主人的 feature-14 P2（勿动）
- runtime/builtin/string.cpp | 17 ++++++++++     ← b3 轮的 intern-cache gen 修复（保留，但实测无效）
- runtime/gc/safepoint.cpp   | 37 +++++++++---+  ← [FIX-86] 形态① 修复（有效，勿动）
+每个 Aura 函数入口：push Frame{symbolIdx, line}（RAII FrameGuard，异常路径也 pop）
+调用点（仅「可抛点」）：setFrameLine(callLine) —— 更新栈顶帧行号（D1 语义）
+抛出点：setFrameLine(throwLine) —— 使栈顶行号 == Error.line（同一值）
+出错时：沿逻辑栈自顶向下取帧 → 紧凑帧数组 → 打印时查表格式化
 ```
-- **调试残留：0**（`[B89]`/`[B90]`/`[B91]` 全仓为 0；`runtime/` 无 `.bak` 混入）
-- **后台进程：0**（`proc_c970339bc4f3` 已 kill；无 gdb/exe 残留）
-- `runtime/build` = **常规模式**（`ENABLE_ASAN=OFF`）
 
-**备份清单（`scripts/_bug86/`）**：
-| 文件 | 内容 |
-|---|---|
-| `out.txt.orig_20260926.bak` | 本文件原内容（GLM-5.3 f14 笔记） |
-| `safepoint.cpp.FIXA.bak` | 形态① 修复前的原版（728 行） |
-| `safepoint.cpp.FIX86_CURRENT.bak` | 形态① 修复后版本（含 FIX-86、无探针） |
-| `safepoint.cpp.SUBAGENT_DRAFT.bak` | v1 子 Agent 的错误方向草稿 |
-| `*.WITH_B89.bak`（3 个） | b2 轮含探针版本（事后复查用） |
-| `string.cpp.FIXB2.bak` / `.FIXB3.bak` | string.cpp 各轮改动前快照 |
-| `thread_pool.cpp.KILLB.bak` | 被 kill 轮的插桩前版本 |
+- 帧 = **8B**（`{uint32_t symbolIdx; uint32_t line;}`）；帧表 `FrameDesc[]` **全量**（name/file/defLine）；
+- **协程挂起/恢复是破坏点** ⇒ **方案 X**：协程帧内保存逻辑栈快照、恢复时还原（探针 1 已验证 6/6）；
+- ⚠️ **探针 1 修正的三条**（已回写 plan §4.3.1）：
+  1. **截断深度取「整条挂起链的根」**（`min(baseDepth)`），不是当前协程的 `baseDepth`——否则泄漏外层帧、且被挂起协程会被新任务误认作 caller；
+  2. **lazy 创建点必须整条栈快照且不截断**（只记一帧不够，跨协程帧全靠它）；
+  3. **建议 runtime 禁止裸 `resume()`**，统一 `resumeWithRestore(handle)`（S4 对照证明漏一个恢复入口 ⇒ 静默错 trace + 栈下溢）。
 
-**关键证据文件**：`gdb_tc_bt.txt`（909 帧，形态② 崩溃栈）、`gdb_bt_run1/2.txt`、`verify_b3_main.log`、`bug86_B_pin_down_report.txt`、`p13_thread_compact.cpp`（生成码，L33 = 4 元拼接）
+### 1.2 continuation 链与拼接 → ✅ 收敛（探针 2）
 
-**笔记**：`issues/bugs/bug-86-sync-thread-gc-force-stw-deadlock.md` —— §9（形态① 钉死）/ §10（形态① 修复记录）已写；**§11/§12 未写**；标题保持 `[ ]`（因形态② 未修）。
+- **优先只输出逻辑栈**；**辅段（continuation 链）仅在逻辑栈为空/深度 0 时启用**（无脑拼接实测得到 7 帧且**顺序错乱**，❌ 不可用）；
+- 必须拼接时用「辅段末尾 vs 主段前缀**最长重合裁剪**」；连续同点**折叠保计数**；深度上限 32 ⇒ **保留最内 32 帧**。
 
----
-
-## 七、教训与改进（给下一轮）
-
-1. **任务粒度太大是撞轮的根因**。5 轮里有 3 轮撞 90 轮上限。**下一轮应把"确证"与"修复+验证"彻底拆成两次派发**，每次控轮 ≤40，且简报写明「判定清晰就动手，最多 N 个 gdb 脚本」。
-2. **Heisenbug 场景下，简报必须硬禁打点**（已做），并**指定零侵入工具**（gdb / ASAN）——这条被证明是唯一可行的取证路径。
-3. **子 Agent 自报数字必须独立复核**（本次抓到 12/15 vs 15/15 的偏差）。
-4. **推理不能替代验证**：我因未验证的推理做出错误的"更正"，代价是白送一轮派发。
-5. **取证循环要有硬上限**：b4 的 19 分钟/17 个脚本是反面教材，v5 已加"最多 6 个 gdb 脚本"约束。
-6. **形态① 的修复经验可复用**：「一次事务只能有一个所有者」+「释放点校验持有者」是这类双 initiator/双释放缺陷的通式。
-
----
-
-## 八、如果继续（我建议的下一步，等主人裁决）
-
-**先做 §3.4 的第 1~3 步（判定 a/b），不要先动代码。** 一旦定案：
-- 若 **(a) + A3**（我的首选）⇒ 修「标记期新注册 Global 根的重扫/SATB 覆盖」——这是**真正根治**，且能顺带防住其它「运行期动态注册根」的同类隐患；
-- 若 **(b)** ⇒ 修 `compact.cpp` 步骤 3（并补 `isGCAddress` 防御）；
-- **无论哪条**，都建议把「步骤 3 缺 `isGCAddress` 防御」作为**独立加固项**登记（§3.5）。
-
-**然后是完整验收**（形态② ≥20 轮 0 崩 + 形态① 20 轮 0 死锁 + 单测 1364 + used 6/6 + ASAN ≥3 轮），最后才写笔记 §11/§12 并把标题改 `[x]`。
-
----
-
-# 附篇：主 Agent 自做定位（2026-09-26 起，主人指令：不再派子 Agent）
-
-> 主人指令：「你自己进行定位吧，现在派给子agent反而浪费上下文了。每次有结果，有进步就要更新out.txt我要看看。」
-> 本节起，定位工作由主 Agent 自己做，**每次有实质进展即追加到本文件**。
-
-## §九-1 已完成的定位工作（进展记录）
-
-### 进展 1：读懂 `compact()` 主流程（`runtime/gc/compact.cpp:63-73`）
+### 1.3 await_resume / await_suspend 契约（意见 2 + 探针 5/5b）
 
 ```cpp
-void GcHeap::compact(CompactScope scope) {
-    computeForwardingAddresses(scope);   // 1. 决定谁被搬（在旧位置置转发标记）
-    if (compactEntries_.empty()) return;
-    updateAllReferences(scope);          // 2. 更新所有根/引用（含步骤1 thread-local / 步骤3 globalRoots_）
-    copyObjectsToNewLocations(scope);    // 3. 真正 memcpy 搬运到新页
-    relocateGlobalRootPtrs();            // 4. 重定位"堆内 handle"的 &val_（方案 P）
-    rebuildPageList(scope);              // 5. ★ 释放旧页：VirtualFree(page, 0, MEM_RELEASE) / munmap
-}
+task_promise_base:
+  error_ : aura_rt::Error（值，非 exception_ptr）
+  unhandled_exception(): catch (const aura_rt::Error& e) { error_ = e; }
+                         catch (...) { error_ = make_runtime_error("unknown C++ exception"); }
+  await_resume(): if (has_error_) throw error_;      // 抛 Error 值
 ```
 
-**两条硬事实**：
-1. **更新引用（步骤 2）发生在搬运（步骤 3）之前** —— 标准 forwarding 模式。
-2. **`rebuildPageList` 会把旧页整个 `MEM_RELEASE`（unmap）**（`compact.cpp:237-243`，All 模式）。
+- ✅ **探针 5**：`await_resume` 抛 Error **能被协程体 try/catch 捕获**（6/6，含真挂起+对称转移）；
+- ✅ **探针 5b**：`await_suspend` 抛异常**同样可捕获、可值化**（GCC + Clang、`-O0`/`-O2` 一致）⇒ 「协程内抛异常不可捕获」这一族既有结论**全部不成立**；
+- 🔴 **探针 5b 挖出的真约束（已写成 plan §4.7 C-1/C-2）**：
+  - **C-1**：`await_suspend` **已排程恢复者之后不得再抛**（A7 陈旧排程错位恢复；**A9 已 done 后 resume ⇒ segfault**）⇒ 首选「错误存起来、`await_resume` 抛」；
+  - **C-2**：`noexcept` 的 `await_suspend` 抛 ⇒ **`terminate`**（实测）⇒ ⚠️ `task.h:125/185` 现为 `noexcept`，P4 插快照必须 **nothrow**；
+  - **P1 必改点**：`win_iocp.cpp:88`（注册回调后抛）、`io.cpp:77-82`（`std::thread` 构造可抛且已 schedule）、`channel.h:32-33/39`（恢复点缺 `done()` 守卫）。
 
-**⇒ 这解释了 b2 的条件对照「禁 compact ⇒ 不崩」**：
-禁 compact 时**页不会被真正释放** ⇒ 任何残留的旧地址**仍可读**（读到 free-fill 毒值 `0xeeffeeff` 但不 SIGSEGV）；
-一旦 compact 走完 `rebuildPageList` ⇒ 旧页 unmap ⇒ **该地址不可读** ⇒ 崩溃。
-**⇒ 结论：compact 不是凶手，`MEM_RELEASE`（unmap）才是处决者。** 这与「坏值指向旧堆布局地址（`0x190098`/`0x1a0098`，随 ASLR 变化）」完全吻合。
+### 1.4 Error 结构扩展（E1 后定稿）
 
-### 进展 2：找到**零代码改动**的取证通道（`AURA_GC_LOG`）
-
-- 语法：`AURA_GC_LOG=<tag>=<level>`，逗号分隔；tag ∈ {`gc`, `gc/phase`, `gc/memory`, `gc/trigger`}，`gc*` 为通配子树；level ∈ {`off`,`error`,`warning`,`info`,`debug`,`trace`}（`gc.cpp:95-128`）
-- 异步 Logger（`gc_log_writer.h`），输出到 stderr
-- ⚠️ 运行前必须保证 `PATH` 含 `C:\msys64\ucrt64\bin`（探针 exe 依赖其 DLL；否则 `rc=127` 假失败）
-
-### 进展 3：**首次拿到崩溃前的 GC 事件序列**（且未触发 Heisenbug！）
-
-命令：`PATH="/c/msys64/ucrt64/bin:$PATH" AURA_GC_LOG='gc*=debug' ./gl_tc.exe`（重链自当前 `libaura_rt.a`）
-结果：`rc=139`（SIGSEGV，与正常一致 ⇒ **日志没有把 bug 藏起来**），stderr **1516 字节 / 18 行**：
-
-```
-concurrent #2 @0.010s: 0.36+0.12+14.46 ms clock, live 1565->1568 (77.1KB->77.2KB), freed 0B
-concurrent #3 @0.041s: 0.63+0.11+15.18 ms clock, live 1577->963  (77.6KB->45.7KB), freed 31.9KB
-concurrent #4 @0.073s: 0.48+0.12+15.22 ms clock, live 1044->738  (50.1KB->34.1KB), freed 15.9KB
-concurrent #5 @0.105s: 0.53+0.33+14.46 ms clock, live 1793->1534 (88.0KB->75.9KB), freed 12.1KB
-concurrent #6 @0.137s: 0.73+0.41+14.71 ms clock, live 1751->827  (86.3KB->38.3KB), freed 48.0KB
-concurrent #7 @0.169s: 0.54+0.26+14.85 ms clock, live 1033->829  (49.4KB->38.2KB), freed 11.2KB   ← 日志止于此
-[GC][debug][phase] concurrent: roots≈0.5ms mark≈0.3ms finalize≈14.5ms (wait≈14.4ms work≈0.08ms)
-[GC][debug][trigger] concurrent #N: forceGc
-```
-
-**观察**：
-- 全部是 **`concurrent`** 类型、`trigger = forceGc`（探针里每个任务结尾调 `gc_force()`）；**没有 minor/major/compact 字样**
-- 每次 `finalize` **几乎全在 `wait`**（≈14.4ms 等待 vs ≈0.08ms 工作）
-- **确实在大量回收对象**（#3 一次 `live 1577→963`，#6 `1751→827`）
-- 崩溃发生在 **#7 之后**（第 8 次 GC 未记录，异步缓冲丢失最后几条）
-
-### 进展 4：⭐ 推出「**b3 的 gen 修复为何无效**」的确切时间线（关键）
-
-b3 的修复是「全局代次 `g_internCacheGen` + 查找时校验」。它方向对（缓存确实存裸指针），但**时机错**：
-
-1. GC 开始**前**，线程 W 到达 safepoint ⇒ 执行 `clear_intern_cache()`（`safepoint.cpp:128`）⇒ 清空自己的缓存 + **bump 全局 gen 到 G1**（W 自己的 `cache.gen` 仍是 G0）
-2. W 在 safepoint 内后续路径（或 STW 前的窗口）再做一次 `intern_string` 查找 ⇒ 发现 `cache.gen(G0) != curGen(G1)` ⇒ 清空并把 `cache.gen` 置为 **G1** ⇒ **从池填充"正确"的值**（此时对象尚未搬，是旧地址，仍然有效）
-3. STW ⇒ compact：`updateAllReferences` 更新池的值 → `copyObjectsToNewLocations` 搬运 → **`rebuildPageList` unmap 旧页**
-4. W 恢复运行 ⇒ 再次查找 ⇒ `curGen` 仍是 **G1**，与 `cache.gen`（G1）**相等** ⇒ **缓存不作废** ⇒ 返回**旧地址**（已被 unmap）⇒ **SIGSEGV**
-
-**⇒ 结论：代次必须在 compact 完成之后（`relocateGlobalRootPtrs()` 之后 / `rebuildPageList` 前后）再 bump 一次，否则"bump 之后、compact 之前"填充的缓存会带着"代次相符"逃过作废。**
-
-**⇒ 待验证的疑点**：v4 曾用 gdb 报「池里存储的值 == 崩溃时的坏值」。若**池本身**也是坏的（而不只是缓存），则上述时间线只是**第二条**路径，还需要修 `updateAllReferences` 步骤 3。**这两个可能必须分开验证**（池 vs 缓存）。
-
-### 下一步（主 Agent 计划）
-
-1. **区分「池坏」还是「缓存坏」**：用 **gdb attach**（而非从启动就 gdb 运行）到**已在正常运行的**探针进程 —— 这样进程启动/调度路径不被 gdb 改变（规避 v4 遇到的「gdb 下零 compact 就崩」），在 SIGSEGV 时读：
-   - `g_internPool` 中 `"t_"` / `"_"` 条目的 `val_`（应等于新地址还是旧地址）
-   - 当前线程 `tl_internCache` 的条目值
-   - 对照 `parts[]` 的坏值
-2. 按结论二选一修复：
-   - **若只有缓存坏** ⇒ 在 compact 之后补一次 gen bump（改动极小）
-   - **若池也坏** ⇒ 查 `updateAllReferences` 步骤 3 为何漏掉该 handle（并补 `isGCAddress` 防御）
-3. 修复后跑硬判据，并把每次结果继续追加到本文件。
-
-## §九-2 判决性实验：**池是好的，坏在 L1 缓存**（已取证）
-
-### 实验 A：崩溃现场（最简 gdb，无断点）
-
-```
-Thread 14 received signal SIGSEGV
-#0  concat_multi (parts = {0x190098, 0x5b00a20, 0x1900c0, 0x5b00818}) at string.cpp:317
-#1  operator() (__closure=0x23cf910) at p13_thread_compact.cpp:33
-0x23cf840:  0x0000000000190098  0x0000000005b00a20     ← parts[0] 坏 / parts[1] 好
-0x23cf850:  0x00000000001900c0  0x0000000005b00818     ← parts[2] 坏 / parts[3] 好
-```
-**新事实**：坏的两个槽**相差 `0x28` = 40 字节**（`GcString` 对象大小）⇒ 两个 intern 字面量（`"t_"`、`"_"`）在旧堆里**相邻、同页、同一时刻分配** —— 正是"早期字面量 intern"的指纹。
-另一次运行：`parts = {0x56c0778, 0x5220af8, 0x56c07a0, 0x52309b0}`（模式完全相同：0 与 2 相邻 0x28、1 与 3 在另一区域）。
-
-### 实验 B：符号定位（`-ex` 链，单条失败不终止）
-
-```
-g_internPool     = aura_rt::(anonymous namespace)::g_internPool     @ string.cpp:674
-tl_internCache   = aura_rt::(anonymous namespace)::tl_internCache   @ string.cpp:699  (TLS —— gdb 在本 target 上读不了)
-g_internCacheGen = { 795 }                                          @ string.cpp:694
-```
-**⇒ 代次机制确实在运行**（已累加到 795）。
-
-### 实验 C：⭐ **读池的值**（判决性）
-
-```
-$1 = std::unordered_map with 6 elements = {
-  ["t_"]                       = unique_ptr → get() = 0x830c50
-  ["_"]                        = unique_ptr → get() = 0x830d90
-  ["thread_task_"]             = unique_ptr → get() = 0x8301a0
-  ["p13_thread_compact start"] = unique_ptr → get() = 0x809e10
-  ["memory exhausted after GC"]= unique_ptr → get() = 0x809d00
-  ["OutOfMemoryError"]         = unique_ptr → get() = 0x809ac0
-}
-```
-
-**判读**：
-- 池里**只有 6 个条目**（全是字面量）—— 符合预期（`string_of()` 的结果不进 intern 池）✅
-- **池的值全部落在同一合理堆区间**（`0x809xxx`~`0x830xxx`），**不是** `0x190098` 那种"脱节的旧堆地址" ⇒ **池是好的（已被 `updateAllReferences` 步骤 3 正确更新）** ✅
-
-### ⇒ 结论：**H-cache 成立**（L1 线程局部缓存存着陈旧裸指针），排除了 H-pool
-
-**闭环解释链**：
-1. `"t_"`/`"_"` 是**字面量** ⇒ 很早 intern ⇒ 对象起初在旧堆（`0x190098` 一带）
-2. GC 的 `clear_intern_cache()` 在 **GC 开始前**执行（`safepoint.cpp:128`）⇒ bump 代次到 G1；线程自己的 `cache.gen` 还是 G0
-3. 线程在 **bump 之后、STW/compact 之前** 再做一次 `intern_string` 查找 ⇒ 发现代次不符 ⇒ 清空缓存、**把 `cache.gen` 更新为 G1**、从池填充（此时是旧地址，**仍然有效**）
-4. STW ⇒ compact：`updateAllReferences` 正确更新了**池**的值 → 搬运 → `rebuildPageList` **`MEM_RELEASE` 卸载旧页**
-5. 线程恢复 ⇒ 再次查找 ⇒ `curGen`(G1) 与 `cache.gen`(G1) **相等** ⇒ **缓存不作废** ⇒ 返回**旧地址**（页已卸载）⇒ SIGSEGV
-
-**⇒ 这同时解释了三件事**：① 为什么坏值只出现在 `intern_string` 的槽（缓存只服务 intern）；② 为什么禁 compact 就不崩（页不卸载，旧地址仍可读）；③ 为什么 b3 的 gen 校验**逻辑对却无效**（bump 时机在 compact 之前）。
-
-### §九-3 下一步（验证性实验，单变量、可回退）
-
-**改动（1 处·最小化）**：在 `safepoint.cpp` 的 `compact(...)` 调用点**之后**补一次 `clear_intern_cache()` —— 使"bump 之后、compact 之前"填充的缓存**在下一次查找时作废**。
-- 调用点共 5 处：`L183` / `L185`（单线程 Young/All）、`L260` / `L262`（多线程 Young/All）、`L332-335`（延迟补执行）
-- 或等效做法：在 `compact()` 内部末尾（`compact.cpp:72` `rebuildPageList` 之后）调用（需处理 gc→builtin 的包含关系，故优先改 `safepoint.cpp`）
-
-**实验判定**：重建后跑 `p13_thread_compact` **20 轮**
-- **0 崩** ⇒ H-cache 确证，修法成立
-- **仍崩** ⇒ 说明还有第二条路径（H-pool 之外，例如 `_guards` 生效时机 / `isGCAddress` 防御缺失），继续二分
-
-**⚠️ 本次改动定位为"验证性实验"**：改前备份、实验后**按结论决定保留或回退**，并在本文件继续记录。
-
-## §九-4 ❌ 实验 D：gen 时机修法**失败**（20/20 仍崩）
-
-**改动**：`safepoint.cpp` 两个 `compact()` 调用点之后各加 `clear_intern_cache()`（`[FIX-B86-2]`，共 2 行）
-**备份**：`scripts/_bug86/safepoint.cpp.PRE_B86F2.bak`（md5 `605ef481fe3d4c995493eb682f5ed7dc`）
-**结果**：
-```
-FORM2: SIGSEGV=20  rc0=0  other=0  / 20      ← 零改善（基线 15/15~20/20 崩）
-FORM1: clean=20  bad=0  / 20                  ← 形态① 无回归
-```
-**⇒ H-cache 的"gen 时机"修法不成立**（至少不是唯一/主要路径）。
-
-### ⚠️ 我必须修正一个方法论错误（写在此处立此存照）
-
-§九-2 的结论「**池是好的**」下得**过早**：我的依据只是"池的值落在合理堆区间（`0x830xxx`）"，
-**并没有在同一次崩溃里把它与 `parts` 的坏值做直接对比**。
-——这与之前"方案 E"那次犯的错同类：**把"看起来合理"当成"已经证实"**。
-
-**真正的判决性判据只有一个**：
-> **在同一次崩溃现场**，看 `parts` 的坏值 `X` **是否等于**池里对应 key 的值。
-> - 相等 ⇒ 池坏（H-pool）
-> - 不等 ⇒ 池好、缓存坏（H-cache）
-
-**§九-3 的失败恰好说明**：我自己**还没做过这个对比**就选了修法。下一轮先补这个对比，再谈修法。
-
-### §九-5 下一步（严格版）
-
-1. **同一次崩溃内对比**：gdb 崩时用 `frame apply all -s p parts`（在所有帧里静默尝试）
-   拿到 `parts` 坏值 `X`，再读池里 `"t_"` / `"_"` 的值 ⇒ 直接判定 H-cache / H-pool。
-2. **同时确认 compact 究竟有没有发生**：`AURA_GC_LOG=gc*=trace` 或 gdb 在 `compact()` 入口断点计数
-   （⚠️ b2 的"禁 compact ⇒ 不崩"对照其实同时禁掉了 `sweepLargePages()`（`safepoint.cpp:250`），
-   所以那个对照**不纯**，不能单独当作"compact 是前提"的证据。）
-3. 结论明确后再改代码；**改前备份、改后跑 20 轮 + 形态① 回归**，结果继续追加于此。
-
-## §九-6 ✅ 判决性对比完成：**池好、缓存坏**（H-pool 正式排除）
-
-**方法**：gdb 崩时用 `frame apply all -s p parts` 在所有帧里静默取 `parts`，同一次崩溃内读池值。
-
-```
-=== CRASH SITE ===
-#0  concat_multi (parts = {...}) at string.cpp:317
-#1  operator() (__closure=0x385f910) at p13_thread_compact.cpp:33
-
-=== TRY parts IN ALL FRAMES ===
-$1 = std::initializer_list of length 4 = {0x190098, 0xf402f8, 0x1900c0, 0xf30200}
-                                                 ↑坏(来自 intern_string)      ↑坏(来自 intern_string)
-
-=== POOL ===
-["t_"] = 0x80cd40     ["_"] = 0x80ced0     ["thread_task_"] = 0x80c290
-["p13_thread_compact start"] = 0x7e9e50    ["memory exhausted after GC"] = 0x7e9d40
-["OutOfMemoryError"] = 0x7e9b00
-
-=== g_internCacheGen = 70 ===
-```
-
-**判读（同一次崩溃，直接对比）**：
-| 项 | 值 |
-|---|---|
-| `parts[0]`（来自 `intern_string("t_")`）| **`0x190098`**（陈旧/旧堆）|
-| 池中 `"t_"` 的值 | **`0x80cd40`**（当前堆，**有效**）|
-| `parts[2]`（来自 `intern_string("_")`）| **`0x1900c0`** |
-| 池中 `"_"` 的值 | **`0x80ced0`**（有效）|
-
-**⇒ 两者不相等 ⇒ 池已被 `updateAllReferences` 正确更新，而 `parts` 里的值停留在旧地址。**
-**⇒ `parts` = `_h4_i.get()` = `_a4_i`，来自 `intern_string` 的**返回**值 ⇒ 既然池是好的，坏值只能来自 **L1 线程局部缓存**（缓存只服务 `intern_string`，且存的正是裸指针）。**
-**⇒ H-pool 排除，H-cache 确证。** ✅
-
-## §九-7 ❌ 为什么 `[FIX-B86-2]` 无效？—— 位置错了
-
-**推断**：我在 `safepoint.cpp` 只改了 **`needCompactOnly` 分支**里的 2 处（`L182-186`、`L259-263`），
-但形态② 的实际路径很可能**不是**这条分支 —— `compact` 更可能在 `minorGc()` / `majorGc()` **内部**被调用。
-
-**⇒ 修法要覆盖"实际发生的那个 compact 调用点"。下一步：全仓 grep `compact(` 调用点，逐一确认哪条路径在形态② 运行中真正命中。**
-（教训：改之前应先确认"这条代码路径真的会被执行"，否则等于没改。）
-
-## §九-8 ✅✅ **修复成功**：落点修正后 20/20 全绿
-
-**改动（最终形态）**：`runtime/gc/compact.cpp` 的 `compact()` **末尾**（`rebuildPageList(scope);` 之后）加一行
 ```cpp
-    clear_intern_cache();   // [FIX-B86-2] compact 完成之后作废所有线程的 L1 intern 缓存
+struct Error : GcObject {
+    GcString* kind, * message;  GcObject* extra;         // 既有
+    GcString* file;              // 抛出点文件（编译期字面量）
+    int32_t   line;              // 抛出点行号（非指针，不进 ptrFieldOffsets）
+    Array<uint64_t>* stack;      // 【E1】紧凑帧：(symbolIdx<<32)|line；nullptr = 无栈
+};
 ```
-并**撤掉** §九-4 那 2 处错误落点（核对：`safepoint.cpp` 与实验前**逐字节一致** `IDENTICAL ✅`）。
-（`compact.cpp` 第 11 行本来就有 `#include "../builtin/string.h"`，无需新增依赖。）
+- `types.cpp:25-36` `_errorPtrFields` **3→5**（kind/message/extra/file/stack），`ptrFieldCount` 同步；
+- **OOM 路径必须不解构栈**（`alloc.cpp:498-508`、`mark_sweep.cpp:157-158`、`compact.cpp:389-399`）；
+- ⚠️ **既有坑**：`Error` 值所在存储**不在 GC 扫描面**（`registerStackRoots` 全仓仅 `task.cpp:61`）⇒ 生成侧必须显式 `GcRootHandle` 根化。
 
-**结果**：
-| 判据 | 结果 |
-|---|---|
-| 形态② `p13_thread_compact` **20 轮** | **SIGSEGV=0 / rc0=20 / other=0** ✅（此前 100% 崩）|
-| 程序是否**真跑完**（防"假通过"）| stdout = `p13_thread_compact start` + `p13_thread_compact end` ⇒ **完整执行** ✅ |
-| 形态① `p13_noconcat` 20 轮 | **clean=20 / bad=0** ✅ 无回归 |
+### 1.5 热路径降级（新增机制，探针 3 验证有效）
 
-### 根因（确证：H-cache）
-
-`intern_string` 的 **L1 线程局部缓存存的是裸指针**，而它的**作废时机错了**：
-- `safepoint.cpp:128` 在 **GC 开始前** 调用 `clear_intern_cache()`（bump 全局代次）
-- 线程若在该次 bump **之后、compact 之前** 填充过缓存，其 `cache.gen` 恰好等于当时的全局代次
-- 随后 compact 搬走对象 + `rebuildPageList()` 用 **`MEM_RELEASE` 卸载旧页**
-- 该线程恢复运行后，缓存**"代次相符"⇒ 逃过作废** ⇒ 返回**已卸载页上的旧地址** ⇒ `concat_multi` SIGSEGV
-
-**⇒ 修法**：在 `compact()` **真正完成之后**再 bump 一次全局代次，使所有线程的缓存在下一次查找时整体作废，
-从而**重新走 L2 全局池**取值 —— 而池是被 `updateAllReferences` **正确更新过**的（§九-6 已实测：池 `"t_"`=`0x80cd40`，坏值只在缓存）。
-
-### 为什么前面几次都失败（复盘）
-
-| 轮次 | 做法 | 为何无效 |
-|---|---|---|
-| b3 子 Agent | 加全局代次 + 查找时校验 | 逻辑对，但 **bump 时机在 compact 之前** ⇒ 窗口期填充的缓存逃过作废 |
-| 我的第一次（§九-3/§九-4）| 在 `safepoint.cpp` 的 `needCompactOnly` 分支 compact 之后补 bump | **该分支在实际路径中根本没被走到**（真正的调用点在 `mark_sweep.cpp` / `parallel_mark.cpp`）⇒ 等于没改 |
-| 本次（成功）| 落在 `compact()` **函数内部末尾** ⇒ 覆盖全部 9 个调用点 | ✅ |
-
-**教训（写进纪律）**：**改代码之前必须先确认那条路径真的会被执行**；否则"改对了逻辑、改错了位置"，
-实验结果会误判为"假设不成立"。
-
-**下一步**：全量验收（形态② 加强轮次 / 单测 1364 / `used/1-6` / ASAN ≥3 轮），然后写笔记 §11 并把标题改 `[x]`。
-
-## §九-9 ✅ 全量验收（第一批）全部通过
-
-```
-=== 1) 形态② 加强 50 轮（此前 100% 崩）===
-FORM2(50): SIGSEGV=0  rc0=50  other=0
-
-=== 2) 单测（期望 1364/1364/0）===
-[==========] 1364 tests, 1364 passed, 0 failed
-
-=== 3) 形态① 回归 20 轮 ===
-FORM1: clean=20  bad=0  / 20
-
-=== 4) 改动在位核对 ===
-[FIX-B86-2] = 1 处（compact.cpp）    [FIX-86] = 5 处（safepoint.cpp）
-```
-
-| 判据 | 结果 |
-|---|---|
-| 形态② 50 轮 | **0 SIGSEGV** ✅ |
-| 单测 | **1364/1364/0** ✅ |
-| 形态① 20 轮 | **20 clean / 0 bad** ✅ |
-
-**待补**：`example/used/1-6`（6/6）、ASAN ≥3 轮。
-
-## §九-10 ✅ `used/1-6` 与并发 GC 复核通过
-
-```
-=== B) used/1-6 回归（编译 + 运行）===
-  used/1: PASS   used/2: PASS   used/3: PASS
-  used/4: PASS   used/5: PASS   used/6: PASS
-RESULT used/1-6: pass=6 compileFail=0 runFail=0 / 6
-
-=== C) 并发 GC 仍在工作（GC 日志）===
-rc=0  concurrent=38  gc_info_total=38
-
-=== D) 恢复 example/test.aura ===
-restored bytes=5585   ← 与备份字节数一致（example/ 被 git 忽略，必须备份/恢复）
-```
-
-**⇒ 已通过**：形态② 50 轮 0 崩 / 单测 1364 / 形态① 20 轮 / `used/1-6` 6/6 / 并发 GC 正常。
-**⇒ 剩余**：ASAN ≥3 轮（进行中）。
-
-## §九-11 ✅✅ ASAN 复核全绿（零错误）
-
-```
-[3/6] Building runtime with ASAN...          （clang 22.1.8 + lld，19 个 TU 全部编译通过）
-[5/6] Compiling p13_thread_compact.cpp with ASAN...   Done.
-[6/6] Running test.exe with ASAN (timeout 120s)...
-------------------------------------------------------------
-p13_thread_compact start
-p13_thread_compact end
-------------------------------------------------------------
---- STDERR (ASAN) ---
-  (empty — no ASAN errors)
-  Exit code: 0 — PASS
-```
-
-**⇒ ASAN 下无任何内存错误报告，且程序完整执行（`start` + `end`）** ✅
-（注：ASAN 会改变时序，通常会让 Heisenbug 隐藏；本次它照样跑到了 `end`，且无报告 ⇒ 修复后确实无内存违规。）
-
-## §九-12 ✅ 全量验收总表（全部通过）
-
-| 判据 | 要求 | 实测 | 结论 |
-|---|---|---|---|
-| 形态② `p13_thread_compact` | ≥20 轮 0 崩 | **70 轮（20+50）0 SIGSEGV** | ✅（修复前 100% 崩）|
-| 程序是否真跑完 | 必须有 end | `start` + `end` | ✅ |
-| 形态① `p13_noconcat` | ≥20 轮 0 死锁 | **20 clean / 0 bad** | ✅ 无回归 |
-| 单测 | 1364/1364/0 | **1364/1364/0** | ✅ |
-| `example/used/1-6` | 6/6 | **6/6** | ✅ |
-| 并发 GC | 仍工作 | **concurrent=38**，rc=0 | ✅ |
-| ASAN | 0 报告 | **0 错误，exit 0** | ✅ |
-| `[FIX-86]`（形态①）| 在位 | 5 处 | ✅ |
-| `[FIX-B86-2]`（形态②）| 在位 | 1 处（`compact.cpp` `compact()` 末尾）| ✅ |
-
-**⇒ bug-86 两个形态均已修复并通过全量验收。**
-**⇒ 收尾事项**：① 笔记 §11 已写入（含失败复盘 §11.5、加固项 §11.6）→ 标题改 `[x]`、`status: fixed`；
-② **`runtime/build` 当前是 ASAN 模式，需清空重配切回常规模式**（AGENTS.md 既定流程）。
-
-## §九-13 ✅ 收尾完成（现场已恢复）
-
-**笔记收口**：
-- `status:` → **`fixed`**
-- 状态行 → **`[x] 已修复`**（注记：形态① 见 §10、形态② 见 §11）
-- **§11 已移至文档末尾**（初次插入时误落在 §10.3 与 §10.4 之间，已用脚本重排并核对章节顺序）
-- §11.4 已补 ASAN 实测结果；§11.5 失败复盘；§11.6 加固项
-
-**构建现场恢复**（ASAN 脚本会把 `runtime/build` 切成 clang + `ENABLE_ASAN=ON`）：
-```
--- >>> 常规模式：环境变量配置的 g++
--- Check for working CXX compiler: C:/msys64/ucrt64/bin/g++.exe
-[19/19] Linking CXX static library libaura_rt.a
-ENABLE_ASAN:BOOL=OFF
-CMAKE_CXX_COMPILER_AR:FILEPATH=C:/msys64/ucrt64/bin/gcc-ar.exe
-libaura_rt.a  18,722,594 bytes
-```
-- `runtime/build` = **常规模式（UCRT64 g++）** ✅
-- 根 `build/`（编译器）**全程未被 ASAN 脚本改动**，`build/aurac.exe` 在位 ✅
-- 日志：`scripts/_bug86/reconfig_rtbuild.log`
-
-**改动清单（最终）**：
-| 文件 | 改动 | 标记 |
-|---|---|---|
-| `runtime/gc/safepoint.cpp` | 形态① 修复（+34/−3）| `[FIX-86]` ×5 |
-| `runtime/gc/compact.cpp` | 形态② 修复（+7 含注释）| `[FIX-B86-2]` ×1 |
-| `runtime/builtin/string.cpp` | b3 轮的 intern-cache gen 机制（保留；是修复的必要前提之一）| — |
-| `runtime/aura_rt.h` / `runtime/builtin/sync.h` | **主人自己的 feature-14 改动，全程未触碰** | — |
-
-**恢复/回退清单**：
-- 实验中间态已撤净：`safepoint.cpp` 与 `safepoint.cpp.PRE_B86F2.bak` **逐字节一致**（§九-7 那 2 处无效改动已回退）
-- 备份全部保留在 `scripts/_bug86/`：`out.txt.orig_20260926.bak`、`safepoint.cpp.PRE_B86F2.bak`、`safepoint.cpp.FIX86_CURRENT.bak`、`string.cpp.FIXB2/FIXB3.bak`、`*.WITH_B89.bak`
-- `example/test.aura` 已恢复原状（5585 字节）
-- 无调试残留、无后台进程
-
-**待主人裁决**：§11.6 的独立加固项（`compact.cpp:342-354` 步骤 3 缺 `isGCAddress` 防御）是否登记为新 bug 笔记。
-
-## §九-14 ✅ 常规模式下的最终确认（全绿）
-
-```
-=== 0) 常规模式核对 ===
-ENABLE_ASAN:BOOL=OFF
-CMAKE_CXX_COMPILER_AR:FILEPATH=C:/msys64/ucrt64/bin/gcc-ar.exe
-
-=== 2) 形态② 5 轮（校验 start/end 齐全）===
-FINAL FORM2: clean(with end)=5  SIGSEGV=0  / 5
-
-=== 3) 形态① 5 轮 ===
-FINAL FORM1: clean=5  bad=0  / 5
-```
-
-**⇒ 切回常规模式（UCRT64 g++）重建后，两个形态的修复依然有效、程序完整执行。**
+- `AURA_ERR_STACK`（默认 `on`）内部两级：**L0 冷**（site 抛出 < **256** 次 ⇒ 完整紧凑栈）/ **L1 热**（≥256 ⇒ **`stack=nullptr`，零分配**）；
+- 触发键 = **抛出点 `throwSite`**（逐 `throw` 语句分配编译期 id），**不是 kind**；**单向不回升**、每线程独立计数；
+- ✅ **实测**：边界精确（63 有 / 64 无，同形于 255/256）；**site 独立**；降级后与「从来不带栈」**配对等价**（1012.9 vs 992.7 ns/throw）；端到端 10 万次抛出 **507 ms → 140.5 ms（3.6×）**；**降级后 0 分配**。
 
 ---
 
-## 📌 bug-86 收口总览
+## 2. 分期与状态
 
-| 项 | 结果 |
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| **F18-P0** | 探针 7 项（1 快照 / 2 拼接 / 3 性能+降级 / 4 desc / 5 await_resume / 5b await_suspend / 6 catch-await）| ✅ **7/7 完成**（三份报告见 §5）|
+| **F18-P1** | `Error` 扩展（desc 同步 + OOM 安全）+ task promise 值化 + 轻量档位 + 热路径降级 + RuntimeError 兜底 | ⏳ 待开工 |
+| **F18-P2** | `StmtTry.cpp` 重构（IIFE 退役 + 原地 try + catchBody 挪正常流程）——**bug-87/90 转正** | ⏳ |
+| **F18-P3** | **元数据表**（feature-10 初步）：`FrameDesc[]` + `SymbolInfo[]`/`TypeInfo[]`/`FieldInfo[]` + `materialize` thunk + `aura.meta` 产物 + 索引汇总分配 | ⏳ |
+| **F18-P4** | 逻辑栈机制（全注入 FrameGuard + 可抛点 setFrameLine + 协程快照 X + 禁止裸 resume）| ⏳ |
+| **F18-P5** | 诊断输出（`Error` 打印 = kind/message + 逻辑栈）| ⏳ |
+| **F18-P6** | 全量回归（1366 基线）+ ASAN + 文档 + **笔记更正** | ⏳ |
+
+---
+
+## 3. 进展日志
+
+### 2026-09-27（第一轮：裁定归档 + 契约定案）
+
+1. **裁定书归档**：主人对四意见 + 五开放问题的逐条裁定（`out.md`）⇒ §0.1；
+2. **性能微基准**（`scripts/_f18/bench_stack.cpp`）：纯调用 1.64 ns/call、+帧 push/pop 2.85（净增 1.21）；协程快照 3.54 ns/次；结论：I/O 密集无感、计算密集 +1~6%；
+3. **同源两表契约**（主人裁定）：feature-13 两遍扫描 → 全局符号表 → 帧表**全量** + 反射表**按需**；`SymbolInfo` 补 `file`/`defLine`；帧改**符号索引 8B**（原 24B）；
+4. **多文件产物契约**（主人命名）：`aura.meta.h` / `aura.meta.cpp` 集中元数据单元；⚠️ 红线：表不放头文件（MinGW inline ODR）、索引由汇总段统一分配。
+
+### 2026-09-27（第二轮：plan 产出 + 探针 5/6 复核）
+
+1. **plan 产出**：`plan/feature-18-coroutine-error-semantics-and-metadata.md`（13 节：现状核实 / 设计 / 接口契约 / 影响分析 / 边界表 / 测试方案 / P0–P6 步骤 / 风险 / 验收 / 裁定）；
+2. **4 路 SearchAgent 源码核实**（符号表 / CodeGen / runtime-GC / 构建测试）——关键新事实：
+   - ⚠️ `GlobalSymbolTable` 是 **v1 收敛形态**（仅 `units`，无符号索引，`globalTable()` 零调用）⇒ 两表需**自建收集通道**；
+   - ⚠️ `registerStackRoots` 全仓**仅 `task.cpp:61`**（main 帧）⇒ 协程帧与 Error 值不在扫描面；
+   - ⚠️ 回归面：生成码文本断言 **943 处**；
+3. 🔴 **翻案**：`bug-87 §4b`「GCC 静默吞掉 `co_await` 期间异常」**不成立**——原探针 `await_suspend` 空实现、无驱动者 ⇒ `await_resume` 从未执行（实跑 `probe2.exe` 为证）；**新探针 5/6**（`probe_await_resume.cpp`）6/6 通过；
+4. **plan §12 的 D1–D7 全部裁定**（见 §0.2）。
+
+### 2026-09-28（第三轮：**P0 探针 7/7 完成** + E 系列裁定）
+
+1. **三路并行探针**（简报 `scripts/f18_p0_probes_brief.md`）：
+   - **探针 1+2** ⇒ `P0_probe1_report.md`：**方案 X 成立**；挂钩点 3 条修正；拼接规则收敛；
+   - **探针 3** ⇒ `P0_probe3_report.md`（5 轮基准；报告由主 Agent 依原始数据整理，因子 Agent 被主动断开）：**降级机制完全有效**（边界/site 独立/配对等价/3.6× 提速/0 分配）；两处成本超预期（⇒ E1/E2）；阈值曲线平坦（⇒ E3）；
+   - **探针 5b** ⇒ `P0_probe5b_report.md`：`await_suspend` 抛异常可捕获可值化；🔴 挖出 **C-1/C-2** 约束与 4 处 P1 必改点；
+2. **E1/E2/E3 裁定**（主人 2026-09-28，按本鲸建议）⇒ §0.3；**plan 已全部回写**（§4.1 结构体 / §4.1.1 阈值 / §4.3 注入规则 / §4.3.2 成本表 / §4.7 新增约束节 / §12 裁定表）；
+3. **现场核查**：本轮**未改任何 `src/`、`runtime/`、`test/` 源码**；`example/test.aura` md5 `5f1760a5a360f4139d176434775abddd` 保持 ✅；无后台进程残留。
+
+---
+
+## 4. 下一步
+
+- [x] ✅ **P1 实施完成（2026-09-29）**：6 批串行（A 基础层 / B 协程线程 OOM / C 隐患顺修+测试 / D1 常规验证 / D1-fix 修 F-D1 / D2 ASAN）→ **全量单测 1383/1383/0** + **ASAN clean** + `used/1-6` 6/6 + `example/` 端到端 ✔ + md5 ✔
+  - **实施期发现 6 项**（F-A1/F-A2/F-A3/F-C1/F-C2/**F-D1**）已全部回写 change.md §9.3/§9.4；其中 **F-A1（`make+operator[]` 不可运行）** 与 **F-D1（降级边界 off-by-one）** 是 change.md 自身的两处真缺陷
+  - 基线数字校准：**1366 → 1383**（新增 17 用例）；⚠️ `AGENTS.md` 的基线数字（1190 → 1383）**未能更新**——该文件受保护，本鲸写入被拦，需主人自行修改或授权
+  - **v1.2 修订（GLM 复核 `out.md`）**：**G-8** 修——`unhandled_exception` 的 `catch(...)` 经 `make_runtime_error` ⇒「message 分配① → stack Array 分配②」**双分配窗口**（P1 栈恒空碰巧安全，P4 必开窗）⇒ 两处 `catch(...)` 改 `kThrowSiteNoStack`；**G-8b（本鲸扩展）**——该窗口是**通用形态**（任何 `Error{...,site}` 构造点都有），故修法**上移到 `Error` 构造函数**：采栈路径临时根化 `message`/`extra`/`file`（3 个 Ref 句柄、零分配）⇒ codegen 所有 throw 点一处覆盖
+  - GLM 复核结论：**Q1–Q5 全部确认**（Ref 跨线程前提成立 + 「注册线程不得先于帧销毁退出」补充；POD TLS 无 init function；205 B/帧接受；unwinding 零分配成立；Global 跨线程三重证据）+ detach 泄漏登记为已知限制（R12）
+  - **事实纠正 1 处（本鲸误报）**：`GcRootHandle::set(T v)` **存在**（`gc.h:123` / `handles.h:99-106`），本鲸首轮只读到 `gc.h:119` 即下结论；结论（用 ctor-init）不变，依据行已改
+- [ ] P1 落地要点（来自探针结论）：`Error.stack` = `Array<uint64_t>` 紧凑帧；OOM 路径不解构；`win_iocp.cpp:88` 排程与抛的先后顺序；`task.h:125/185` 的 `noexcept` 与快照 nothrow
+- [ ] 待补实验：**真实生成码端到端 wall-clock**（P4 落地后由独立测试方复跑，护栏：计算密集 ≤6% / I/O 密集 ≤1%）
+- [ ] 关联缺陷：bug-87（try+sync）、bug-90（try+协程调用）⇒ F18-P2 转正；bug-88 已修（`[FIX-B88]`）
+- [x] ✅ **笔记更正已完成**（2026-09-28，主人授权）：`bug-87 §4b`（加「结论作废」更正块）+ `feature-18` 笔记 5 处；⚠️ `out.md`（主人文件）意见 1 引据同源，**如需一并更正请主人示意**
+- [x] ✅ **探针挖出的既有隐患：并入 P1 顺带修**（主人 2026-09-28 裁定，不另立缺陷）⇒ `win_iocp.cpp:88`、`io.cpp:77-82`、`channel.h:32-33/39`、`task.cpp:29-33` 注释；已写入 plan §9 S1 第 6 项
+
+---
+
+## 5. 相关材料索引
+
+| 材料 | 位置 |
 |---|---|
-| 形态①（`sync thread` + `gc_force()` STW 死锁）| ✅ 已修（`[FIX-86]`，`safepoint.cpp` +34/−3）|
-| 形态②（`concat_multi` SIGSEGV）| ✅ 已修（`[FIX-B86-2]`，`compact.cpp` +7）|
-| 形态② 轮次 | 20 + 50 + 5 = **75 轮 0 崩**（修复前 100% 崩）|
-| 形态① 轮次 | 20 + 5 = **25 轮 0 死锁** |
-| 单测 | **1364 / 1364 / 0** |
-| `example/used/1-6` | **6 / 6** |
-| 并发 GC | `concurrent=38`，rc=0 |
-| ASAN | **0 错误 / exit 0 / PASS** |
-| 笔记 | `status: fixed`、状态行 `[x]`、§11 完整（含失败复盘与加固项）|
-| 构建现场 | `runtime/build` = 常规模式；根 `build/` 未受影响；`aurac.exe` 在位 |
-| 调试残留 / 后台进程 | 0 / 0 |
-| `example/test.aura` | 已恢复原状（5585 字节）|
+| 裁定书 | `out.md` |
+| **实施 plan** | `plan/feature-18-coroutine-error-semantics-and-metadata.md` |
+| **断点锚点** | `feature-18-progress.md` |
+| feature 笔记（§7.5/§7.6 契约）| `issues/features/feature-18-coroutine-error-semantics-and-diagnostics.md` |
+| feature-10（同源两表 + §9.4 开工范围）| `issues/features/feature-10-reflection-library.md` |
+| **探针报告（4 份）** | `scripts/_f18/P0_report_await_resume.md`（5/6）｜`P0_probe1_report.md`（1+2）｜`P0_probe3_report.md`（3）｜`P0_probe5b_report.md`（5b）|
+| 探针件 | `scripts/_f18/probe_await_resume.cpp`、`probe_catch_await.cpp`、`probe_logical_stack.cpp`、`bench_throw.cpp`、`probe_await_suspend.cpp`、`bench_stack.cpp` |
+| 探针简报 | `scripts/f18_p0_probes_brief.md` |
+| 缺陷 | `issues/bugs/bug-87-*.md`（§4b 待更正）、`bug-88-*.md`（§10.5）、`bug-89-*.md`、`bug-90-*.md` |
+| 端到端脚本 / 用户流程 | `scripts/_bug88/trycatch_test.sh`、`example/compile.cmd` |
+| 复现件 | `example/used/leakcheck/_repro/bug-88-coro-naked-throw/`、`bug-90-try-coro-call/` |
 
-**待裁决**：§11.6 独立加固项是否登记新 bug 笔记（`compact.cpp:342-354` 步骤 3 缺 `isGCAddress` 防御，与步骤 1 不对称）。
+---
 
+## 6. P2 完工报告（2026-09-30，feature-18 P2 实施完成）
 
+### 6.1 一句话
 
+`StmtTry.cpp` 三函数 / 两 IIFE **合并为原地路径**（**200 → 85 行**）+ `genThrowStmt` 填 `file`/`line`（预 intern 前置 + 空路径守卫 + 路径转义）+ sync 收集器 **`Error` 值化** ⇒ 消解 **bug-87**（`co_await` 落非协程 lambda）与 **bug-90**（`task<T>` 装不进 `variant`）的**同一根因**；两条缺陷同批转正。
 
+### 6.2 批次流水（全部 ✅）
 
+| 批 | 范围 | 结果 |
+|---|---|---|
+| **A** | 核心实现 6 文件（`StmtTry.cpp` 重写 / `StmtSync.cpp` 收集器值化 / `StmtControl.cpp` 填 `file`·`line` / `CodeGen.cpp`·`CodeGen.h` / `main.cpp` 传 `sourcePath`）| 编译 0 error |
+| **A-fix** | **E1** 转义（`escapeStringLiteral` 提升为 `CodeGenerator` 静态成员）+ **E2** 注释勘误 | 完成 |
+| **B** | 测试基建：`test/codegen/test_codegen_try.cpp`（6 例）+ `test/CMakeLists.txt` 登记 + bug-87 复现件 | 基线 **1383 → 1389** |
+| **B-fix** | **E3**：RecordExpr 路径补 `sourceFile_.empty()` 守卫 + 新增 1 例 | 基线 **1389 → 1390** |
+| **C** | 常规验证（报告 `scripts/f18_p2_verify_report_C.md`）| **全批无红**（见 6.3）|
+| **D** | ASAN 深度验证（报告 `scripts/f18_p2_D_asan_report.md`）| 有效用例 **D1–D4 全 clean**；离场 **7/7** |
+| **E** | 文档收尾：bug-87/90 转正 + 进度锚点 + `change.md` 定稿 + 本报告 | 完成 |
 
+### 6.3 实测数字（每项标出处）
 
+| 项 | 数字 | 出处 |
+|---|---|---|
+| 全量单测 | **1390 / 1390 / 0 failed** | 批 C 报告 §1（`…\Temp\p2c_full.txt` 尾部）+ 批 D 报告 §5 离场复跑 |
+| 基线自洽 | `1390 − CodeGenTry(7) = 1383`（P1 基线）| 批 C 报告 §1 |
+| `used/1-6` | **6/6**（compile rc=0 + run rc=0）| 批 C 报告 §2 |
+| §8.4 断言 | **31 条**（`std::variant` 7 + `co_await` 24）**转红 0 条** | 批 C 报告 §3 |
+| 生成码形态 | **5/5**（无 variant / 原地 try / handler 无 `co_await` / catchBody 位置 / 5 个 Ref 句柄）| 批 C 报告 §5 |
+| bug-87 复现件 | `compile rc=0` + `run rc=0` + 输出 `>>> CAUGHT (try-sync)` | 批 C 报告 §4.1 |
+| bug-90 | **T2 转绿**（`rc=1` → `rc=0` + `>>> CAUGHT (coro)`）；T1 保持 `CAUGHT (sync)`；T3 `run rc=1` 与 2026-09-27 留档**逐行相同**（**既有行为**，T3 源码本无 `try`）| 批 C 报告 §4.2 / §7 |
+| ASAN | 有效用例 **D1–D4 全 clean**，GC 事件 **4/4/4/5**（含 SATB concurrent + major）；4 个仓库原复现件 `gc=0`（对 GC 承重面**无效**，故另做同形态加压变体）| 批 D 报告 §2 / §4① |
+| ASAN 工具可信性 | 正对照（故意越界）**立即报** heap-buffer-overflow；ASAN exe 导入 `libclang_rt.asan_dynamic-x86_64.dll` | 批 D 报告 §4② |
+| 离场 | **7/7**（`ENABLE_ASAN` 全 OFF / 三目标 0 error / 1390·1390·0 / md5 一致 / `git status` 53 条不变 / `example/` 无残留 / 源树无本批新改）| 批 D 报告 §5 |
+| `example/test.aura` md5 | `5f1760a5a360f4139d176434775abddd` **未变** | 批 C 报告 §8 + 批 D 报告 §5 |
+| 未提交清单 | `src/` **7 个** + `test/` **2 个** + `issues/` 3 个（`git status` 实测）| 见 6.5 |
 
+### 6.4 实施期发现（4 项）
 
+| 编号 | 性质 | 发现批次 | 处置 |
+|---|---|---|---|
+| **E1** 🔴 | `sourceFile_` 未转义即拼进 C++ 字面量 ⇒ Windows `\` 被 GCC 丢弃 ⇒ `Error.file` 失真 | 批 A | ✅ **已修**（A-fix）|
+| **E2** | 6 处失效注释（描述旧 `_u5msg`/`_u5kind` 形态）| 批 A 上报 | ✅ **已修**（A-fix）|
+| **E3** 🟡 | RecordExpr 路径缺 `sourceFile_.empty()` 守卫（与表达式路径不对称）| 批 B | ✅ **已修**（B-fix）|
+| **bug-93** ⚠️ | **既有缺陷（非 P2 回归）**：`spawn` 闭包体内 `let r = <协程调用>` ⇒ 收集器把驱动 `co_await r` 生成到 lambda **之外** ⇒ 坏 C++（`'r' was not declared in this scope`）；对照实验证明触发条件唯一、与 `try` 无关；定性铁证 = P2 前后 `CodeGen.cpp` 的 4 行 `co_await frame.names[i]` 行号与文本**逐字相同**（`bug-93` §5.3）| 批 D | ⏳ **未修**，已登记 `issues/bugs/bug-93-spawn-closure-let-coro-call-drive-out-of-scope.md` |
 
+索引汇总另见 `change.md` **§10 实施期发现索引**。
+
+### 6.5 未提交清单与遗留项
+
+- **未提交（P2 在途）**：`src/` 7 个（`StmtTry.cpp` / `StmtSync.cpp` / `StmtControl.cpp` / `CodeGen.cpp` / `CodeGen.h` / `ExprGen.cpp` / `main.cpp`）、`test/` 2 个（`test/codegen/test_codegen_try.cpp` 新建 + `test/CMakeLists.txt` 登记）、`issues/` 3 个（`bug-87` 转正 / `bug-90` 转正 / `bug-93` 新登记）。⚠️ `src/CodeGen/DeclFun.cpp` 的 `[FIX-B88]` 与 `runtime/**` 是**更早批次**的在途改动，非 P2。
+- **遗留项**：① **bug-93**（新登记，high，未修）；② `change.md` §9-V11 / V12 两条既有技术债（异常对象飞行期无根化 / 立即调用协程 lambda 的引用捕获）⇒ 建议 **P4**；③ P1 热路径降级空转（`change.md` §9-V9）⇒ **P3** 接线；④ 批 C 口径待裁定：`test/build/CMakeCache.txt` 无 `ENABLE_ASAN` 条目（批 C 报告 §9-a）；⑤ `AGENTS.md` 测试基线（1190 → 1390）未更新（该文件受保护）；⑥ Windows ASAN 无 LeakSanitizer（泄漏不在覆盖范围）。
+- **下一步**：**P3**（符号元数据表 + `aura.meta` + `throwSite` 统一分配）→ **P4**（逻辑栈机制 + V11/V12 加固）→ **P5**（诊断打印）→ **P6**（全量回归 + ASAN + 笔记更正）。

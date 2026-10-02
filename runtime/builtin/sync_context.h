@@ -8,7 +8,8 @@
 // P1 范围（纯新增）：
 //   - SyncContext：域对象（tasks 收集器 + activeCoroutines 计数 + wait_all）
 //   - SpawnTask：任务条目（body + owner）
-//   - g_syncStack / currentSync()：生成线程的「最近域」判定
+//   - syncStack() / g_syncStackPtr / currentSync()：生成线程的「最近域」判定
+//     （bug-95：零初始化 TLS 指针 + 惰性创建，见下方 §thread_local 域栈）
 //   - SyncContextScope：域栈 push/pop 的 RAII
 //   ⚠️ P1 不改动任何既有 runtime 行为（sync.h / task.h / thread_pool.h 原样）。
 //      CodeGen 侧的 push/pop 与 spawn 改接属 P2。
@@ -166,11 +167,38 @@ struct SyncContext {
 //
 // ⚠️ 仅描述**创建 / 生成线程**的域栈；worker 线程栈为空，故归属一律以
 //    spawn 生成时刻为准（currentSync() 在生成线程求值后随任务携带）。
+//
+// 🔴 bug-95（2026-10-01 修复）：本栈**必须**保持「零初始化」形态 ——
+//    ⛔ 不得退回 `inline thread_local std::vector<SyncContext*> g_syncStack;`
+//    原因：`std::vector` 需要**动态初始化** ⇒ 每个包含本头的 TU 都发射一份
+//    `__tls_init`，而 **MinGW emutls 的 `__tls_init` 不做 COMDAT 合并** ⇒
+//    多文件真链接必然 `multiple definition of 'TLS init function for
+//    aura_rt::g_syncStack'`（Windows 多文件编译**全量不可用**，产品路径亦然）。
+//    判据对照（实测）：`logical_stack.h` 的 `g_throwCounts`（零初始化 POD）
+//    **不报错** ⇒ 关键是「**是否需要动态初始化**」，不是 `inline` / `thread_local`。
+//    ⛔ 也不得改成 `std::unique_ptr<...>`：它有**析构**（非平凡）⇒ 仍会发射
+//    `__tls_init` ⇒ 等于没修。
+//    完整根因链 / 否决方案见 issues/bugs/bug-95-tls-dynamic-init-gsyncstack-multiple-definition-on-windows.md。
+//
+// 取舍（已知、一次性、判断为可接受）：裸指针在线程退出时**不析构** ⇒ 泄漏一个
+//    `std::vector` 的头部（约 24B 栈对象 + 一次堆分配开销；元素是裸指针，
+//    本身**不拥有**域对象）。执行域栈在线程结束时理应已空（ScopePop 成对）⇒
+//    泄漏量极小且每线程一次性。若将来该泄漏不可接受，替代方向 = 把容器换成
+//    **零初始化 POD 定长栈**（数组 + 计数），而非引入析构。
 // ============================================================
-inline thread_local std::vector<SyncContext*> g_syncStack;
+inline thread_local std::vector<SyncContext*>* g_syncStackPtr = nullptr;   // 指针 ⇒ 零初始化 ⇒ 不发射 __tls_init
+
+// 惰性创建：首次**取用**才 new（唯一分配入口 = 本函数）
+inline std::vector<SyncContext*>& syncStack() {
+    if (!g_syncStackPtr) g_syncStackPtr = new std::vector<SyncContext*>();
+    return *g_syncStackPtr;
+}
 
 inline SyncContext* currentSync() {
-    return g_syncStack.empty() ? nullptr : g_syncStack.back();
+    // ⚠️ 只读路径**直接读指针**（不走 syncStack()）：worker 线程等无域线程
+    //    会频繁走到这里，不该为「只想知道有没有域」而触发一次分配。
+    if (!g_syncStackPtr || g_syncStackPtr->empty()) return nullptr;
+    return g_syncStackPtr->back();
 }
 
 // feature-14 P2: spawn generation-point domain accessor (called by generated code).
@@ -217,11 +245,13 @@ inline SyncContext* requireSync() {
 class SyncContextScope {
 public:
     explicit SyncContextScope(SyncContext& ctx) : ctx_(&ctx) {
-        g_syncStack.push_back(ctx_);
+        syncStack().push_back(ctx_);
     }
     ~SyncContextScope() {
         // 正常路径：栈顶即本域。异常 / 乱序路径：仍弹出栈顶，避免栈泄漏。
-        if (!g_syncStack.empty()) g_syncStack.pop_back();
+        // ⚠️ 只读 + 收尾路径**直接读指针**（不走 syncStack()）：本线程若从未
+        //    建栈（ptr 为空）就直接返回，避免为「无栈可弹」而无谓分配一个 vector。
+        if (g_syncStackPtr && !g_syncStackPtr->empty()) g_syncStackPtr->pop_back();
     }
     SyncContextScope(const SyncContextScope&) = delete;
     SyncContextScope& operator=(const SyncContextScope&) = delete;

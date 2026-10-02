@@ -236,6 +236,15 @@ std::string CodeGenerator::genFunExprCallableObj(const ClosureGenSpec& spec)
     }
     oss << ") {\n";
     indentLevel_++;
+    // 🔵 feature-18 P4b-1 B5 ④-a（change.md 裁定④/⑧、§9-V4）：**闭包**的协程上下文匿名帧。
+    //   ⚠️ **落点订正（如实登记，见回报 §6）**：change.md §3.2 的表述是「lambda 头的 `{` 之后」，
+    //      但**新路径（CallableObj）的闭包体不是 lambda** —— 它是 IIFE 内那个派生 struct 的
+    //      `static … __invoke(…) { … }`（本行就是 `__invoke` 的体首）。若按字面注入到外层
+    //      IIFE（`:221` 的 `[&]() -> base* {`）⇒ 帧会跟着**闭包对象构造**而不是**调用**
+    //      压/弹，语义错位。⇒ 本批取「**调用边界**」= `__invoke` 体首（与 P4a 的函数帧同语义）。
+    //   ⚠️ 门控：仅 `closureIsCoro`（**协程上下文**；非协程闭包不注入 ⇒ 收窄影响面）。
+    if (closureIsCoro)
+        emitAnonFrame(oss, "closure", static_cast<uint32_t>(e.line), e);
     // GC 安全（feature-06 核心 + bug-79 A 方案）：__c 局部变量由 GcRootHandle
     // **Value 模式**（ThreadLocal 作用域）包裹——句柄自持 val_，compact 原位重写 val_；
     // 句柄 non-trivial 析构使该存储在其生命周期内不可被编译器复用，机制性消灭

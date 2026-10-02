@@ -14,6 +14,10 @@ related_issues:
   - feature-13（模块两段式重构）C0/C4
   - D12（显式同 module = 共享产物 namespace）
   - "[[feature-13-compile-unit-two-pass-refactor]]"
+tags:
+  - multiple-definition
+  - module-system
+  - bad-cpp
 ---
 
 # 【同 module 多文件共享 namespace 时，各文件无条件生成的内部辅助 struct 在共享 namespace 内重定义】

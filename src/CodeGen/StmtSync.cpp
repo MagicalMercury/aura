@@ -12,13 +12,16 @@ namespace Aura {
 // ============================================================
 // feature-14 U5：sync 块的 (乙1) 异常收集变量（change.md §3.5）
 //
-// 形态（逐字对齐 §3.5 的代码块，GC 根化部分对齐 StmtTry.cpp 既有做法）：
-//   aura_rt::GcString* _u5msgN  = nullptr;
-//   aura_rt::GcRootHandle<aura_rt::GcString*> _u5msgN_h(_u5msgN, aura_rt::GcRootScope::ThreadLocal);
-//   aura_rt::GcString* _u5kindN = nullptr;
-//   aura_rt::GcRootHandle<aura_rt::GcString*> _u5kindN_h(_u5kindN, aura_rt::GcRootScope::ThreadLocal);
+// 形态（feature-18 P2：承装**完整 Error 值** + 5 个 Ref 模式根句柄；GC 根化部分对齐 StmtTry.cpp 既有做法）：
+//   aura_rt::Error _u5errN{};
+//   aura_rt::GcRootHandle<decltype(_u5errN.kind)>    _u5errN_kind_h(_u5errN.kind);
+//   aura_rt::GcRootHandle<decltype(_u5errN.message)> _u5errN_msg_h(_u5errN.message);
+//   aura_rt::GcRootHandle<decltype(_u5errN.extra)>   _u5errN_extra_h(_u5errN.extra);
+//   aura_rt::GcRootHandle<decltype(_u5errN.file)>    _u5errN_file_h(_u5errN.file);
+//   aura_rt::GcRootHandle<decltype(_u5errN.stack)>   _u5errN_stack_h(_u5errN.stack);
 //   bool _u5hasN = false;
 //
+// ⚠️ 5 个句柄是 **Ref** 模式（`GcRootHandle<T>(T& ref)`）：绑 `_u5errN` 的**成员地址**、**无 scope 参数**。
 // ⚠️ 变量**声明在 sync 块首**（有界/无界分支的 _ctx/_sync 之后），但嵌套块尾的
 //    驱动也要写入 → 必须跨块共享（铁律 3）。
 // ⚠️ 嵌套 sync 用唯一序号后缀，避免内层同名变量遮蔽外层（铁律 3）。
@@ -41,27 +44,34 @@ void CodeGenerator::emitU5ErrDecls(std::ostream& cpp, const std::string& sfx) {
     // GC 根化：Error 内嵌 GcString*（runtime/types.h 的 kind/message）。协程帧不在
     // GC 保守扫描范围（registerStackRoots 全仓仅 task.cpp 一处 = 仅 main 帧）→
     // 跨驱动语句存活期间必须显式根化，否则驱动下一个 future 时若触发 compact，
-    // 搬运走的 message 会让 _u5msg 悬垂 → 末尾 throw 出悬垂指针 → 用户 try-catch UAF。
-    // 形态对齐既有做法 src/CodeGen/StmtTry.cpp（那里三处已为 kind/message/extra 生成
-    // GcRootHandle）。kind 理论安全（intern_string 注册为全局根，永不回收），
+    // 搬运走的 message（`_u5err<sfx>.message`）会让 `_u5err<sfx>` 悬垂 → 末尾 throw 出悬垂指针 → 用户 try-catch UAF。
+    // 形态对齐既有做法 src/CodeGen/StmtTry.cpp（那里现为 `_tk_hold` + 5 个 Ref 句柄）。
+    // kind 理论安全（intern_string 注册为全局根，永不回收），
     // 但保持一致根化，防将来 kind 来源变化。
-    // ⚠️ 不用 std::optional<Error> 直存：GcRootHandle 的 Ref 模式绑定**变量地址**，
-    //    optional 未 engaged 时 _u5err->message 的地址无效 → 拆成独立标量。
-    writeLine(cpp, "aura_rt::GcString* _u5msg" + sfx + " = nullptr;");
-    writeLine(cpp, "aura_rt::GcRootHandle<aura_rt::GcString*> _u5msg" + sfx + "_h(_u5msg" + sfx +
-                   ", aura_rt::GcRootScope::ThreadLocal);");
-    writeLine(cpp, "aura_rt::GcString* _u5kind" + sfx + " = nullptr;");
-    writeLine(cpp, "aura_rt::GcRootHandle<aura_rt::GcString*> _u5kind" + sfx + "_h(_u5kind" + sfx +
-                   ", aura_rt::GcRootScope::ThreadLocal);");
+    // ⚠️ 现在**就是**用 `Error _u5err<sfx>` 直存（非 optional ⇒ 成员地址恒有效 ⇒ 可安全绑 Ref 句柄）
+    //    → 根化 `_u5err<sfx>` 的 5 个成员字段（kind/message/extra/file/stack）。
+    // feature-18 P2：改用「承装完整 Error 值 + 5 个 Ref 模式根句柄」。
+    //   为什么必须 Ref 模式：Value 模式只更新**句柄内部副本**，`_u5err` 变量自身的
+    //   kind/message 字段不会被 compact 更新 ⇒ 块尾重抛会抛旧地址（既有隐患）。
+    //   Ref 模式绑定 `_u5err` 的成员地址 ⇒ compact 原位改写 ✅
+    writeLine(cpp, "aura_rt::Error _u5err" + sfx + "{};");
+    // Ref 模式：`GcRootHandle<T>(T& ref)` —— **无 scope 参数**（Ref 恒为线程局部根，见 gc.h:50 注释与 gc.h:93 声明）
+    //   ⚠️ 不可写成 `GcRootHandle<T>(val, GcRootScope::ThreadLocal)`（那是 **Value** 模式 ⇒ 只更新句柄内部副本）
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_u5err" + sfx + ".kind)> _u5err" + sfx + "_kind_h(_u5err" + sfx + ".kind);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_u5err" + sfx + ".message)> _u5err" + sfx + "_msg_h(_u5err" + sfx + ".message);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_u5err" + sfx + ".extra)> _u5err" + sfx + "_extra_h(_u5err" + sfx + ".extra);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_u5err" + sfx + ".file)> _u5err" + sfx + "_file_h(_u5err" + sfx + ".file);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_u5err" + sfx + ".stack)> _u5err" + sfx + "_stack_h(_u5err" + sfx + ".stack);");
     writeLine(cpp, "bool _u5has" + sfx + " = false;");
 }
 
 void CodeGenerator::genU5ErrRethrow(std::ostream& cpp, const std::string& suffix) {
+    // feature-18 P2：重抛**完整** Error 值（含 extra/file/line/stack），
+    //   原实现只抛 {kind, message} ⇒ 诊断信息在 sync 边界被截断。
     // 末尾重抛：首个 Error 以 Error 值形态抛回（Aura try-catch 的捕获类型是
     // catch (const aura_rt::Error&)，故**必须抛 Error**，不能抛 exception_ptr）。
     if (suffix.empty()) return;
-    cpp << indentStr() << "if (_u5has" << suffix << ") throw aura_rt::Error{_u5kind" << suffix
-        << ", _u5msg" << suffix << "};\n";
+    cpp << indentStr() << "if (_u5has" << suffix << ") throw _u5err" << suffix << ";\n";
 }
 
 void CodeGenerator::genSyncStmt(std::ostream& cpp, const SyncStmt& stmt,
@@ -333,7 +343,7 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, b
         u5sfxFor = genU5ErrDecls(cpp);   // feature-14 U5：(乙1) 收集器后缀
     }
     // ⚠️ 位置关键（feature-14 U5 三条约束）：
-    //    ① 收集器声明（_u5msg/_u5kind/_u5has）必须物理位于 `for` 头**之前**
+    //    ① 收集器声明（_u5err<sfx> + 5 个 Ref 句柄 + _u5has<sfx>）必须物理位于 `for` 头**之前**
     //       —— 否则落进循环体 `{` 内，sync 块尾的重抛看不见它们（实测踩过）。
     //    ② 「本块是否有驱动」只能在生成循环体**之后**才知道
     //       —— 驱动由 genFutureDrive 在 genBlock 弹帧时写入。
@@ -436,6 +446,11 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, b
     if (refsIo) forBuf << ", aura_rt::Io& io";   // #46：body 实际引用 io 才追加
     // feature-14 P2：_tasks 形参已移除（本行原同时收尾 ")"，无需额外配对调整）
     forBuf << ") -> aura_rt::task<void> {\n";
+    // 🔵 feature-18 P4b-1 B5 ③（change.md 裁定④/⑧、§8.2 B0b / §6.2 C8）：
+    //   **sync-for** 的 `addTask(...)` 协程 lambda 头注入。
+    //   ⚠️ `sync { }`（`genSyncStmt`）**没有 lambda**（它是普通作用域 + `co_await`）⇒
+    //      本文件唯一的协程上下文 lambda 就在这里（与 change.md CP4 的 `:448` 锚点一致）。
+    emitAnonFrame(forBuf, "sync", static_cast<uint32_t>(stmt.line), stmt);
     indentLevel_++;
     insideSpawn_ = true;
     // 缺口 1：task body 首语句物化 frame-local 句柄（协程 lambda init-capture 存在
@@ -503,7 +518,8 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, b
         // （否则 not captured）。⚠️ 与声明**同门**：仅在真有驱动时才并入捕获列表，
         // 否则捕获名指向未声明的变量（坏 C++）。
         if (!forCap.empty()) forCap += ", ";
-        forCap += "&_u5msg" + u5sfxFor + ", &_u5kind" + u5sfxFor + ", &_u5has" + u5sfxFor;
+        // P2：只捕获承装值与标志（句柄绑定 `_u5err` 成员地址，随其一起可见 ⇒ 不需捕获句柄）
+        forCap += "&_u5err" + u5sfxFor + ", &_u5has" + u5sfxFor;
     } else {
         u5sfxFor.clear();                // 无驱动 → 不声明，块尾亦不重抛（两边同门）
     }
@@ -534,7 +550,7 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, b
     }
     // feature-14 U5：全部驱动之后、sync 块闭 `}` 之前重抛首个 Error（(乙1)）。
     // ⚠️ 必须与声明同门：仅在本块确有驱动（u5forDriven）时才生成重抛。
-    //    否则会产出引用未声明的 _u5hasN/_u5kindN/_u5msgN 的重抛（坏 C++）——
+    //    否则会产出引用未声明的 _u5err<sfx>/_u5has<sfx> 的重抛（坏 C++）——
     //    实测：u5sfxFor 非空但探测为「无驱动」时，仅写出了重抛行、声明缺失。
     if (u5forDriven) genU5ErrRethrow(cpp, u5sfxFor);
     indentLevel_--;

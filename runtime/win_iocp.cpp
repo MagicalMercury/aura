@@ -77,17 +77,20 @@ void IoCompletionPort::stop() {
 // ──────────── IoAwaitable ────────────
 
 void IoAwaitable::await_suspend(std::coroutine_handle<> cont) {
+    // feature-18 C-1（探针 5b）：**先**发起 I/O 并判定失败，**再**注册恢复回调。
+    // 原形态「先 registerCallback 再 ReadFile，失败即抛」⇒ 排程已存在却又抛异常
+    // ⇒ 陈旧 resume（错位恢复 / callback 常驻泄漏）。
+    BOOL ok = ReadFile(hFile, buffer, bytesToRead, nullptr, &ov);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) {
+        // 真正的 I/O 错误（如无效 handle）：**此时尚未排程** ⇒ 抛异常安全
+        throw Error(make_string("io_error"), make_string("ReadFile failed"),
+                    nullptr, nullptr, 0, kSiteIoError);
+    }
+    // 已成功提交（或 ERROR_IO_PENDING）⇒ 注册完成回调（此后本函数不再抛）
     IoCompletionPort::instance().registerCallback(&ov,
         [cont](DWORD /*bytes*/) {
             EventLoop::instance().schedule(cont);
         });
-
-    BOOL ok = ReadFile(hFile, buffer, bytesToRead, nullptr, &ov);
-    if (!ok && GetLastError() != ERROR_IO_PENDING) {
-        // 真正的 I/O 错误（如无效 handle），提前抛异常
-        throw Error(make_string("io_error"), make_string("ReadFile failed"));
-    }
-    // ERROR_IO_PENDING 是正常的：异步 I/O 已提交，等待 IOCP 完成
 }
 
 DWORD IoAwaitable::await_resume() {

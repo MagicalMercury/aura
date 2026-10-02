@@ -85,6 +85,10 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
     // feature-14 P2：_tasks 形参不再追加（域归属改由 requireSync() 运行时解析）
     if (!hasIo && bodyRefsIo) out << ", aura_rt::Io& io";
     out << ") -> aura_rt::task<void> {\n";
+    // 🔵 feature-18 P4b-1 B5 ①（change.md 裁定④/⑧、§8.2 B0b）：**协程上下文 lambda 头注入**
+    //   —— 注入点 = lambda 头的 `{` 之后（本行即 `…task<void> {`）⇒ 匿名帧区编号。
+    //   🔴 门控：`emitAnonFrame` 内部随 `metaCollector_` 门控（`NullMetadata` ⇒ 零注入）。
+    emitAnonFrame(out, "spawn", static_cast<uint32_t>(stmt.line), stmt);
     insideSpawn_ = true;
     // #56 §1.8：spawn lambda 体生成期间隔离外层闭包/方法句柄映射（外层闭包内再
     // spawn 引用 self 亦映射自身捕获句柄，不依赖外层 _this_root 可见性）；体后恢复。
@@ -242,6 +246,9 @@ void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt)
     }
     (void)firstParamDone;
     cpp << ") -> aura_rt::task<void> {\n";
+    // 🔵 feature-18 P4b-1 B5 ②（change.md 裁定④/⑧、§8.2 B0b / §6.2 C7）：**调用形态 spawn**
+    //   的协程 lambda 头注入（与块形态①**同款同源**：同一 `emitAnonFrame`）。
+    emitAnonFrame(cpp, "spawn(call)", static_cast<uint32_t>(stmt.line), stmt);
     indentLevel_++;
     insideSpawn_ = true;
     // #56 §1.8：spawn lambda 体生成期间隔离外层闭包/方法句柄映射；体后恢复

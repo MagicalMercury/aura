@@ -9,10 +9,16 @@
 //   - activeCoroutines 计数参与 quiescent 判定
 //   - SpawnTask 的 move 语义（move-only，句柄随移动转移）
 //   - SysContextScope RAII 的异常路径 pop
+//
+// bug-95（2026-10-01）：域栈改为「零初始化 TLS 指针 + syncStack() 惰性创建」
+//   （消除 Windows 多文件编译的 TLS __tls_init 重复定义）⇒ 追加跨线程用例
+//   `SyncContext.TlsStackIsPerThread` 锁住「每线程各一份栈」这一形态前提。
 // ============================================================
 #include "builtin/sync_context.h"
 #include "framework/test_framework.h"
 
+#include <atomic>
+#include <thread>
 #include <utility>
 
 using namespace aura_rt;
@@ -31,7 +37,7 @@ task<void> inc(int* p) {
 // 域栈：无域 → nullptr
 // ------------------------------------------------------------
 TEST(SyncContext, EmptyStackHasNoCurrent) {
-    g_syncStack.clear();
+    syncStack().clear();
     EXPECT_TRUE(currentSync() == nullptr);
 }
 
@@ -39,7 +45,7 @@ TEST(SyncContext, EmptyStackHasNoCurrent) {
 // 域栈：push/pop 与栈顶 = 最近域（嵌套）
 // ------------------------------------------------------------
 TEST(SyncContext, StackTopIsMostRecent) {
-    g_syncStack.clear();
+    syncStack().clear();
     SyncContext outer;
     SyncContext inner;
 
@@ -49,25 +55,25 @@ TEST(SyncContext, StackTopIsMostRecent) {
         {
             SyncContextScope s2(inner);
             EXPECT_TRUE(currentSync() == &inner);   // 最近的域
-            EXPECT_EQ(g_syncStack.size(), (size_t)2);
+            EXPECT_EQ(syncStack().size(), (size_t)2);
         }
         EXPECT_TRUE(currentSync() == &outer);        // 内层出栈后回落
     }
     EXPECT_TRUE(currentSync() == nullptr);
-    EXPECT_EQ(g_syncStack.size(), (size_t)0);
+    EXPECT_EQ(syncStack().size(), (size_t)0);
 }
 
 // ------------------------------------------------------------
 // 域栈：析构顺序不完美时也不泄漏（防御性 pop）
 // ------------------------------------------------------------
 TEST(SyncContext, ScopePopDoesNotLeak) {
-    g_syncStack.clear();
+    syncStack().clear();
     SyncContext a;
     {
         SyncContextScope s(a);
-        EXPECT_EQ(g_syncStack.size(), (size_t)1);
+        EXPECT_EQ(syncStack().size(), (size_t)1);
     }
-    EXPECT_EQ(g_syncStack.size(), (size_t)0);
+    EXPECT_EQ(syncStack().size(), (size_t)0);
 }
 
 // ------------------------------------------------------------
@@ -171,4 +177,79 @@ TEST(SyncContext, AddNestedAppendsInP1) {
     ctx.addNested(std::move(t));
     EXPECT_EQ(ctx.tasks.size(), (size_t)1);
     EXPECT_TRUE(ctx.tasks[0].owner == &ctx);
+}
+
+// ------------------------------------------------------------
+// bug-95：域栈按线程隔离（惰性指针形态的跨线程护栏）
+//
+// 本修法把域栈从「需动态初始化的 TLS vector」换成「零初始化的 TLS 指针 +
+// syncStack() 惰性创建」⇒ 必须证明它仍是**每线程各一份**（而非进程共享），
+// 否则「最近 sync 域」判定会跨线程串味（A 线程 spawn 误判到 B 线程的域）。
+//
+// 判据（三段）：
+//   ① 工作线程起点 = 空栈、无 current（线程隔离的「新线程无域」面）；
+//   ② 两线程**同时**活跃时，各看各的栈顶（真正的并发断言，靠握手保证重叠）；
+//   ③ 各自 pop 后回落、全部退栈后 currentSync() == nullptr。
+//
+// ⚠️ EXPECT_* 只在主线程执行（工作线程只写观测值），避免测试框架计数在
+//    多线程下竞争。
+// ------------------------------------------------------------
+TEST(SyncContext, TlsStackIsPerThread) {
+    syncStack().clear();
+
+    SyncContext mainCtx;    // 主线程的域
+    SyncContext workCtx;    // 工作线程的域
+
+    std::atomic<bool> workerInBlock {false};
+    std::atomic<bool> mainChecked   {false};
+
+    bool         workerStartEmpty    = false;
+    std::size_t  workerStartSize     = 999;
+    SyncContext* workerCurrent       = nullptr;
+    bool         workerSawMainCtx    = true;    // 工作线程**不得**看到主线程的域
+    bool         workerEmptyAfterPop = false;
+    bool         mainSawOwnWhileWorkerActive = false;
+
+    {
+        SyncContextScope mainScope(mainCtx);                 // 主线程栈：[mainCtx]
+
+        std::thread worker([&] {
+            // ① 工作线程起点：本线程从未 push ⇒ 空栈、无 current
+            workerStartEmpty = (currentSync() == nullptr);
+            workerStartSize  = syncStack().size();
+
+            {
+                SyncContextScope workerScope(workCtx);       // 工作线程栈：[workCtx]
+                workerCurrent    = currentSync();
+                workerSawMainCtx = (workerCurrent == &mainCtx);
+
+                workerInBlock.store(true, std::memory_order_release);
+                // ② 等主线程在自己线程上查完 ⇒ 保证两线程栈同时非空
+                while (!mainChecked.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+            }
+            // ③ 本线程 pop 后回落（不影响主线程）
+            workerEmptyAfterPop = (currentSync() == nullptr);
+        });
+
+        while (!workerInBlock.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        // 主线程视角：工作线程活跃期间，本线程 currentSync() 仍是 mainCtx
+        mainSawOwnWhileWorkerActive = (currentSync() == &mainCtx);
+        mainChecked.store(true, std::memory_order_release);
+        worker.join();
+
+        EXPECT_TRUE(currentSync() == &mainCtx);   // 工作线程退出后主线程域仍在
+    }
+
+    EXPECT_TRUE(workerStartEmpty);
+    EXPECT_EQ(workerStartSize, (size_t)0);
+    EXPECT_TRUE(workerCurrent == &workCtx);
+    EXPECT_FALSE(workerSawMainCtx);
+    EXPECT_TRUE(workerEmptyAfterPop);
+    EXPECT_TRUE(mainSawOwnWhileWorkerActive);
+    EXPECT_TRUE(currentSync() == nullptr);        // 全部退栈后无 current
+    EXPECT_EQ(syncStack().size(), (size_t)0);
 }

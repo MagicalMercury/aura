@@ -24,9 +24,12 @@
 // #include "ASTPrinter.h"  // DEPRECATED
 #include "Sema/SemAnalyzer.h"
 #include "CodeGen/CodeGen.h"
+#include "CodeGen/MetaCollect.h"   // feature-18 P3：MetaCollector（**完整定义** —— CgResult 需值语义）/ MetaMerger
+#include "CodeGen/MetaEmit.h"      // feature-18 P3：emitMetaHeader / emitMetaImpl
 #include "Module/ModuleManager.h"
 #include "Diag/DiagnosticEngine.h"
 
+#include <algorithm>  // feature-18 P3：std::sort（flattenLayersDeterministic 的同层字典序）
 #include <cstdlib>
 #include <filesystem>
 #include <future>     // std::async / std::future
@@ -37,6 +40,7 @@
 #include <string>
 #include <string_view>
 #include <thread>     // hardware_concurrency
+#include <unordered_map>  // feature-18 P3：moduleIdxOf
 #include <vector>
 
 // ============================================================
@@ -102,6 +106,25 @@ static int parallelJobs(const CliOptions& opts, size_t taskCount) {
 }
 
 // ============================================================
+// feature-18 P3 §3.6(b)（O19）：拓扑层 → **确定性** 模块路径序
+//
+// 层序（`topologicalLayersOn`）× **同层内按模块路径字典序** —— 后者是红线②
+// （「索引在汇总段统一分配」）的**唯一确定性来源**：同层模块是**真并行**执行的，
+// 到达序不定 ⇒ 必须按路径重排后才能作为 `MetaMerger::addModule` 的序。
+// ⚠️ `O19`：change.md 要求「必须自己实现」（AGENTS.md 硬要求：不留 placeholder）。
+// ============================================================
+static std::vector<std::string> flattenLayersDeterministic(
+        const std::vector<std::vector<std::string>>& layers) {
+    std::vector<std::string> out;
+    for (const auto& layer : layers) {
+        std::vector<std::string> sorted = layer;
+        std::sort(sorted.begin(), sorted.end());
+        out.insert(out.end(), sorted.begin(), sorted.end());
+    }
+    return out;
+}
+
+// ============================================================
 // 单文件编译（原有逻辑，无 import 或仅内置模块）
 // ============================================================
 int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
@@ -162,7 +185,17 @@ int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
         Aura::CodeGenerator cg(diag);
         Aura::CodeGenConfig cfg;
         cfg.setConfig(sema);
-        auto unit = cg.generate(*program, moduleName, cgImports, "", cfg);
+        // ---- feature-18 P3 §3.6(a)：单文件（Inline 模式）----
+        //  ① 🔴 O1：**本地 collector**（线程私有；单文件虽无线程竞争，但与多文件**同一形态** ⇒ 少一套分支）
+        //  ② 🔴 O7：模块身份**构造时传入**（不依赖 `unit.nsName` —— 单文件 `nsName=""` ⇒ 会得到空 stem）
+        //     🔴 O24：`sanitizeId` 是 **`ModuleManager` 的 static 成员**（**不是** `Aura::` 下的自由函数）
+        Aura::MetaCollector metaCollector(opts.inputPath,
+                                          Aura::ModuleManager::sanitizeId(moduleName));
+        cfg.metaMode = Aura::CodeGenConfig::MetaMode::Inline;
+        // feature-18 P2：sourcePath 传真实输入路径（opts.inputPath），供 Error.file 使用
+        auto unit = cg.generate(*program, moduleName, cgImports, "", cfg, {}, {},
+                                opts.inputPath, Aura::MetadataSink::collect(metaCollector));
+        // 🔴 O3：`unit.metaImpl` 由 **generate() 内部**生产（§3.5(e)），此处**只消费**
         if (diag.hasErrors()) {
             std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
             diag.print(std::cerr);
@@ -188,6 +221,9 @@ int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
             fullCpp << "// ============================================================\n";
             fullCpp << "// " << moduleName << ".aura → C++20 translation\n";
             fullCpp << "// ============================================================\n\n";
+            // ---- feature-18 P3 §3.6(a)/O19：metaImpl **插在 impl 之前**（表必须先于使用点；
+            //      ⚠️ O37：`CompileUnit` **没有 banner 字段** ⇒ 用上面 `:189-191` 的实际横幅字面量）----
+            if (!unit.metaImpl.empty()) fullCpp << unit.metaImpl;
             fullCpp << unit.impl;
             if (!unit.footer.empty()) fullCpp << "\n" << unit.footer;
             Aura::writeFile(cppPath, fullCpp.str());
@@ -266,6 +302,17 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
     }
     // 拓扑分层（基于扫描表，path 分组）——供 Sema/CodeGen 按层调度
     auto layers = mgr.topologicalLayersOn();
+
+    // ---- feature-18 P3 §3.6(b)（O19）：确定性模块序 + moduleIdx 表 ----
+    //  ⚠️ 此处**只做**「不依赖任何收集」的准备工作（M1：此刻各模块的 generate() 还没跑）。
+    //  · `orderedModules`：层序 × 同层路径字典序 —— 红线②（索引统一分配）的确定性来源，
+    //    同时是 `MetaMerger::addModule` 的调用序。
+    //  · `moduleIdxOf`：throwSite 的 `moduleIdx`（🔴 O25：此刻即可定，**不依赖收集**；
+    //    取值**不看 merger**，与 merger 的序一致是因为两者用**同一个 orderedModules**）。
+    std::vector<std::string> orderedModules = flattenLayersDeterministic(layers);
+    std::unordered_map<std::string, uint32_t> moduleIdxOf;   // path → orderedModules 下标
+    for (uint32_t i = 0; i < orderedModules.size(); ++i)
+        moduleIdxOf[orderedModules[i]] = i;
 
     // 入口点验证（扫描表 hasMain）
     std::string entryModulePath;
@@ -354,6 +401,13 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
     struct CgResult {
         std::string cppPath;
         std::unique_ptr<Aura::DiagnosticEngine> diag;
+        // ---- feature-18 P3 §3.6(b)：per-module 本地 collector（**线程私有 ⇒ 零共享**）----
+        //  随 CgResult 返回、在**主线程**被 MetaMerger 消费。
+        //  ⚠️ 实测差异（见回报 §6）：change.md 写 `MetaCollector meta;` **值字段** —— 但
+        //     `MetaCollector` **没有默认构造函数**（`MetaCollect.h:72` 的构造须 moduleKey + nsStem）
+        //     ⇒ 值字段会让 `CgResult res;` / `std::map::operator[]` **编不过**。此处用
+        //     `unique_ptr`（仍是「构造在本模块线程、move/交回主线程」的语义，零共享不变）。
+        std::unique_ptr<Aura::MetaCollector> meta;
     };
 
     // 单个模块的 CodeGen 任务（含写 .h/.cpp；路径互异，无写竞争）
@@ -409,10 +463,25 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
             }
         }
 
+        // ---- feature-18 P3 §3.6(b)：per-module 本地 collector（**在本模块线程内构造**）----
+        //  🔴 O1 关键：**零共享** —— 每模块一个实例、随 `CgResult` move 回主线程；
+        //     汇总合并只在主线程（下方 cgResults 回收之后）。判据：`main.cpp` 的既有明文原则
+        //     「任务线程零共享写，无锁」。
+        //  🔴 O24：`sanitizeId` 是 `ModuleManager` 的 static 成员（批 2 已移入 public 段）。
+        Aura::MetaCollector localMeta(mod->sourcePath,
+                                      Aura::ModuleManager::sanitizeId(Aura::stemOf(mod->sourcePath)));
+
         // 代码生成
         Aura::CodeGenerator cg(*modDiag);
+        // feature-18 P3 §3.9：throwSite 的模块序号（`orderedModules` 下标；**不依赖收集** ⇒ 此刻可定）
+        cg.setThrowSiteModuleIdx(moduleIdxOf.count(mod->sourcePath)
+                                     ? moduleIdxOf[mod->sourcePath] : 0u);
+        // feature-18 P3 §3.6(b)/B16：**不能**再用临时默认对象 —— 需显式构造并置 External
+        Aura::CodeGenConfig cfg;
+        cfg.metaMode = Aura::CodeGenConfig::MetaMode::External;
         auto unit = cg.generate(*mod->ast, mod->moduleName, cgImports, mod->nsName,
-                                Aura::CodeGenConfig(), crossDefaults, crossParamSemTypes);
+                                cfg, crossDefaults, crossParamSemTypes,
+                                mod->sourcePath, Aura::MetadataSink::collect(localMeta));   // ← feature-18 P2 追加 / P3 末位 collector
 
         // 写出头文件（feature-13 C4：文件名用源文件 stem——同 module 多文件产物互不覆盖；
         // 无 module 声明时 moduleName==stem，文件名与旧路径逐字一致（存量零变化））
@@ -434,6 +503,8 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
         }
         res.cppPath = cppPath;
         res.diag = std::move(modDiag);
+        // feature-18 P3 §3.6(b)：collector move 回主线程（本模块线程的收集到此结束）
+        res.meta = std::make_unique<Aura::MetaCollector>(std::move(localMeta));
         return res;
     };
 
@@ -477,6 +548,28 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
         return 1;
     }
 
+    // ==== feature-18 P3 §3.6(b)：**主线程单线程**合并 + `aura.meta.h/.cpp` 产出 ====
+    //  ⚠️ M1：合并 + emit **必须在全部 CgResult 回收之后**（此处）—— 原案的 `:269` / `:421-435`
+    //     都是错的（那时各模块的 generate() 还没跑 / 还在并行段内）。
+    //  ⚠️ O1：**合并只在主线程**（无锁）；collector 是各模块线程私有的，此处只**读**。
+    //  ⚠️ O15：`stopAfterCpp` 的早退（下方）**直接 return** ⇒ 该路径不执行 `:513-522` 的清理，
+    //     `aura.meta.h/.cpp` 留盘（与其它中间件行为一致，无害）。
+    {
+        Aura::MetaMerger merger;
+        for (const auto& modPath : orderedModules) {        // 顺序确定 ⇒ 索引确定（红线②）
+            auto it = cgResults.find(modPath);
+            if (it == cgResults.end() || !it->second.meta) continue;   // 内置模块 / 无 collector
+            merger.addModule(*it->second.meta);
+        }
+        merger.finalize();                                  // 一次性写回 index + 建映射（单线程，无锁）
+
+        const std::string metaHdrPath = outDir + "/aura.meta.h";
+        const std::string metaCppPath = outDir + "/aura.meta.cpp";
+        Aura::writeFile(metaHdrPath, Aura::MetaEmit::emitMetaHeader(merger));
+        Aura::writeFile(metaCppPath, Aura::MetaEmit::emitMetaImpl(merger));
+        allCppPaths.push_back(metaCppPath);                 // 元数据 TU 参与链接（🔴 O19：补定义）
+    }
+
     // 入口模块总是在最后一层或接近最后一层
     std::string entryModuleName = Aura::stemOf(entryModulePath);
     // -o 指定 exe，否则用入口模块名
@@ -517,6 +610,9 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
                 std::filesystem::remove(hdr);
             }
         }
+        // feature-18 P3 §3.6(b)（O15）：`aura.meta.h` **不在**上面的模块头清理循环内 ⇒ 单独删，
+        //   与 `aura.meta.cpp`（经 allCppPaths 免费清理）成对。（`stopAfterCpp` 早退路径不执行本段。）
+        std::filesystem::remove(outDir + "/aura.meta.h");
     }
 
     std::cerr << "Output: " << exePath << "\n";

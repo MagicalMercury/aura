@@ -3,6 +3,7 @@
 // aura_rt/aura_rt.h ─ Aura 运行时总头文件
 // ============================================================
 
+#include "logical_stack.h"   // feature-18 P1：逻辑调用栈（轻量、无重量依赖，故置于最前）
 #include "types.h"
 #include "gc.h"
 #include "task.h"

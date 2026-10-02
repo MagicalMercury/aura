@@ -105,7 +105,7 @@ tags:
 
 ### 修复要点
 - `src/CodeGen/ExprGen.cpp` genListExpr 元素保护路径：未绑定泛型元素（`isDeferredGcRoot` 判定）→ `if constexpr (std::is_convertible_v<decltype(_e{idx}_{i}), aura_rt::GcObject*>)` 延迟包装（T=值类型走 else 裸 append 消除 `GcRootHandle<int>` 假根；T=堆仍保护）。
-- 联动 #55：elemType 未绑定泛型回退（泛型名 / 嵌套 `[[T]]` 递归 `listElemCppOf`）——`repro29_list_T_mixed_elem`/`nested_T` 的编译期问题见 bug-55 §8。
+- 联动 \#55：elemType 未绑定泛型回退（泛型名 / 嵌套 `[[T]]` 递归 `listElemCppOf`）——`repro29_list_T_mixed_elem`/`nested_T` 的编译期问题见 bug-55 §8。
 - 公共辅助 `isDeferredGcRoot`/`listContainsUnboundGeneric` 与 #55/#30 共用。
 
 ### 验证统计

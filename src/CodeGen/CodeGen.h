@@ -6,6 +6,7 @@
 #include "../AST/Type.h"
 #include "../ASTWalker.h"
 #include "../Diag/DiagnosticEngine.h"
+#include <cstdint>   // feature-18 P3：throwSiteLocalSeq_ / kSlotsPerModule / throwSiteModuleIdx_
 #include <map>
 #include <memory>
 #include <ostream>
@@ -17,6 +18,9 @@
 namespace Aura {
 
 class SemAnalyzer;
+
+// feature-18 P3：元数据收集器（per-module 本地实例；完整定义见 MetaCollect.h）
+class MetaCollector;
 
 // P4/P3b：SemType 层级前向声明（genUnionDispatch / genMatchStmt 用）
 struct SemType;
@@ -55,6 +59,8 @@ struct CompileUnit {
     std::string nsName;        // C++ 命名空间（如 aura_mod_math_utils，空 = 无命名空间包裹）
     std::string header;        // 头文件内容（类型定义、接口类、函数声明）
     std::string impl;          // 实现文件内容（函数体、_desc 实例）
+    std::string metaImpl;      // feature-18 P3：符号元数据表定义段（**单文件 Inline 模式**下非空）
+                               // 由 main.cpp 拼在 impl **之前**（表必须早于使用点）
     std::string footer;        // 主入口 int main(...)
     bool        hasMain = false;
 };
@@ -64,6 +70,10 @@ struct CompileUnit {
 // ============================================================
 struct CodeGenConfig {
     bool ioSync = false;  // #io.sync = true → 同步模式
+
+    // feature-18 P3：元数据表落地形态
+    enum class MetaMode { Inline, External };
+    MetaMode metaMode = MetaMode::Inline;   // 单文件 = Inline（内嵌 metaImpl）；多文件 = External（aura.meta.h/.cpp）
 
     // 从 SemAnalyzer 中提取所有 #config 配置项（对外唯一入口）
     void setConfig(const SemAnalyzer& sema);
@@ -105,7 +115,44 @@ struct TypeMapEntry {
 };
 
 // ============================================================
-// CodeGenerator — Aura → C++20 翻译器
+// MetadataSink —— `generate()` 的元数据收集目标
+//
+// 🔴 **为什么不用裸 `MetaCollector*`**（2026-10-02，主人裁定 + §11.11 的教训）：
+//    feature-18 P3 把收集器作为**末位裸指针**加入时，调用点写作 `nullptr` 或干脆省略
+//    —— **9 个调用点里 4 个静默漏传**，两种写法**看起来完全一样**：读代码分不出
+//    "我是故意不收集" 还是 "我忘了传" ⇒ 配上当时的硬报错 ⇒ **416 个单测转红**。
+//    ⇒ 改为**具名、强类型**的表达：**不收集就显式写 `NullMetadata`** ⇒
+//      ① **`nullptr` 不再编译**（强制在这一点上表态）；
+//      ② 调用点自解释，评审时一眼可辨。
+// ============================================================
+struct MetadataSink {
+    MetaCollector* collector = nullptr;
+
+    /// 「收集到指定 collector」（**非空**引用）
+    static MetadataSink collect(MetaCollector& c) noexcept { return MetadataSink{&c}; }
+
+    /// 从**可空**指针构造：`nullptr` ⇒ 等价 `NullMetadata`（不收集）。
+    /// ⚠️ 存在的理由（实测教训）：测试里 `collectors[modPath].get()` / `out.meta.get()`
+    ///     **可能是 nullptr**（"本模块没有 collector"是合法状态）。若直接写 `*ptr` 会
+    ///     **在空的 unique_ptr 上解引用** ⇒ `unique_ptr::operator*` 断言崩溃。
+    static MetadataSink of(MetaCollector* c) noexcept { return MetadataSink{c}; }
+
+    /// 语义：本趟**要**收集元数据（发射元数据表）
+    explicit operator bool() const noexcept { return collector != nullptr; }
+    MetaCollector* operator->() const noexcept { return collector; }
+    MetaCollector& operator*()  const noexcept { return *collector; }
+};
+
+/// 🔴 **显式「本趟不收集元数据」哨兵** —— `generate()` 末位参数的合法取值之一。
+///
+/// 语义：**不发射元数据表 ⇒ 不注入帧/行号**（§11.11 的门控），产物等价于 feature-17。
+/// 适用：不关心 `Error.stack` 的调用方（如测试框架 `compileSource`、纯前端分析）。
+///
+/// ⚠️ 传 `nullptr` **不编译** —— 必须写 `NullMetadata`（表态）或 `MetadataSink::collect(c)`。
+inline constexpr MetadataSink NullMetadata{};
+
+// ============================================================
+// CodeGenerator —— Aura → C++20 翻译器
 // ============================================================
 class CodeGenerator {
 public:
@@ -129,13 +176,38 @@ public:
     // crossDefaults: 跨模块函数默认参数表（C5.4，多文件模式由 main.cpp 构造）
     // crossParamSemTypes: 跨模块函数形参 SemType 表（bug-06，main.cpp 与 crossDefaults
     //   同源构造，供 isNs 分支回调包装/默认参数闭包物化）
+    //
+    // 🔴 **`metaCollector` 的门控契约**（2026-10-02 主 Agent 裁定，附实测）：
+    //    背景：feature-18 P3 把它作为**末位带默认值的参数**加入（`= nullptr`），结果
+    //    **9 个调用点里 4 个静默漏传** ⇒ 配上 `emitEntryFrame` 的硬报错 ⇒ **416 个单测转红**
+    //    （完整复盘见 `change.md §11.11`）。
+    //
+    //    **为什么保留默认值**（实测而非臆断）：C++ **不允许**「前面参数有默认值、后面参数没有」
+    //      —— `int f(int a, int b = 1, int c);` 是 ill-formed（g++：`default argument missing
+    //      for parameter 3`）。⇒ 要让本参数必填，就必须**删掉前面 8 个默认值** ⇒ 9 个位置参数
+    //      遍布 9 个调用点，可读性代价不可接受。⇒ **保留默认值，用契约 + 显式化 + 测试兜住。**
+    //
+    //    **取值（`MetadataSink`，见上方定义）**：
+    //      ① **`NullMetadata`** = 「我这一趟**不收集**元数据」—— **合法模式**，不是错误：
+    //         不发射元数据表 ⇒ **不注入帧/行号**（§11.11 的门控），产物与 feature-17 逐字一致。
+    //         ⚠️ **不能写 `nullptr`** —— `MetadataSink` 是强类型，裸 `nullptr` **不编译**
+    //            （主人 2026-10-02 裁定：让"不收集"具名可读，而不是一个像"漏传"的 `nullptr`）。
+    //      ② **`MetadataSink::collect(c)`** = 收集（`main.cpp` 两条产品路径 + 元数据用例）。
+    //      ③ **框架咽喉点显式化**：`test/framework/test_helpers.h` 的 `compileSource` 显式写
+    //         `NullMetadata` —— 411/416 个红的入口就是它。
+    //      ④ **禁止**再给本函数新增带默认值的参数：新增参数若参与**门控**，其默认值就是
+    //         下一个「静默漏传」；应改为参数对象 `GenerateOptions`。
+    //      ⑤ 本门控由**测试**兜底：`CodeGenFrame.NoCollector*` 用例显式断言「`NullMetadata`
+    //         不报错 且 产物零注入」。
     [[nodiscard]] CompileUnit generate(const Program& program,
                                         const std::string& moduleName = "main",
                                         const std::vector<CodeGenImport>& imports = {},
                                         const std::string& nsName = "",
                                         const CodeGenConfig& config = {},
                                         const CrossModuleDefaults& crossDefaults = {},
-                                        const CrossModuleParamSemTypes& crossParamSemTypes = {});
+                                        const CrossModuleParamSemTypes& crossParamSemTypes = {},
+                                        const std::string& sourcePath = "",
+                                        MetadataSink metaCollector = NullMetadata);  // ← feature-18 P3 新增（末位，§3.4(d)）
 
     // -- 协程判定入口 --
     [[nodiscard]] CoroDecision decideCoro(const FunDecl& decl);
@@ -153,6 +225,23 @@ public:
 
     // -- 错误 --
     const std::vector<std::string>& errors() const { return diag_.errorMessages(); }
+
+    // feature-18 P2：把 ExprGen.cpp 原 file-static 的转义函数提升为成员（先例：isHeapSemType）。
+    // 用途：sourceFile_ 是真实文件路径（Windows 含 `\`），必须转义后才能拼进生成的 C++
+    //       字符串字面量，否则 GCC unknown escape sequence 丢弃反斜杠 ⇒ Error.file 失真。
+    // 🔴 feature-18 P3（O40-(a) 裁定，2026-10-01）：本声明由 `private:` 段（本文件原 `:428`）
+    //   **移入 `public:` 段** —— 依据：`MetaEmit` 的 4 个自由函数**无 friend 关系**、也不是
+    //   成员，原本**够不着**它；而 `kSymbolTable[].file` 的渲染必须与 `sourceFile_` 用**同一份**
+    //   转义规则（E1 的血泪教训：转义规则只能有一份）。**只移动声明（含注释），签名与函数体不动。**
+    static std::string escapeStringLiteral(const std::string& s);
+
+    // feature-18 P3 §3.9：throwSite 的**模块序号**（多文件 = `orderedModules` 下标；单文件 = 0）。
+    // ⚠️ 实测差异（见回报 §6）：change.md §3.9 要求 `moduleIdx` 在 `genThrowStmt` 内可用，并说
+    //   「作为 `generate()` 的入参（或随 collector 的构造参数组一起传入）」 —— 但 §3.4(d) 把
+    //   `generate()` 签名锁死为「末尾只追加 `MetaCollector*`」、§3.4(c) 又声明 `moduleIdx_`
+    //   成员**已删**，且简报 T4 把 collector 的构造锁死为**两参** ⇒ **该值没有任何载体**。
+    //   本批取**最小侵入**：新增一个显式 setter（既有签名/collector 构造均不变）。
+    void setThrowSiteModuleIdx(uint32_t idx) { throwSiteModuleIdx_ = idx; }
 
 public:
     // ============================================================
@@ -544,10 +633,6 @@ private:
     void genSyncThreadStmt(std::ostream& cpp, const SyncStmt& stmt);  // sync thread 多线程
     void genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, bool isCoroutine);
 
-    // 原始 try/catch（非协程模式回退，被 genTryCatchStmt 复用）
-    void genTryCatchRaw(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
-    // v1.2：协程模式下无 setupLet 的 try/catch 用 IIFE + variant<monostate, Error>
-    void genTryCatchNoSetupIIFE(std::ostream& cpp, const TryCatchStmt& stmt, bool isCoroutine);
     void genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt, bool isCoroutine);
     void genSpawnAsThread(std::ostream& cpp, const SpawnStmt& stmt);  // sync thread 内的 spawn
     void genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt);   // 调用形态（协程版）：spawn func(args)
@@ -820,6 +905,42 @@ private:
     // 错误记录
     void error(const ASTNode& node, const std::string& msg);
 
+    // ---- 🔴 feature-18 P4a 批 2（A7，change.md §3.2 / §3.1.3）：函数/方法体入口帧注入 ----
+    // 生成（逐字形态，见 change.md §3.1.4 的 N12 改正 + 命名空间订正）：
+    //   `  aura_rt::FrameGuard _lsg_<defLine>(aura_rt::meta::symbolIndexAt(
+    //        <moduleIdx>u, <seq>u), <defLine>u);`
+    // RAII：构造 pushFrame、析构 popFrame（异常路径亦配平 —— runtime/logical_stack.h:78-85）。
+    // ⚠️ `symbolIndexAt` 定义在 **aura_rt::meta**（runtime/meta.h:19/:99）⇒ 命名空间必须写全。
+    // symKey = `MetaSymbolRec::name`（函数 = 裸名；方法 = `ReceiverType.method`）——
+    //   必须与 A 遍收集钩子（CodeGen.cpp:737/:761）写入 `frameSeqOf_` 的键**同源**。
+    // 🔴 R5（简报 §2）：`frameSeqOf_` 查不到键 ⇒ 记诊断错误（编译失败），**禁止静默跳过**。
+    void emitEntryFrame(std::ostream& out, const std::string& symKey,
+                        uint32_t defLine, const ASTNode& node);
+
+    // ---- 🔵 feature-18 P4b-1 B5（change.md 裁定④/⑧、§3.1.2 缺口 C、§8.2 B0b）----
+    //   **协程上下文 lambda 的匿名帧注入**（注入点 = 该可调用体的 `{` 之后）。
+    //
+    //   四处落点（本批实际实施）：
+    //     ① `StmtSpawn.cpp` 块形态   `spawn { … }`
+    //     ② `StmtSpawn.cpp` 调用形态 `spawn(callExpr)`
+    //     ③ `StmtSync.cpp`  sync-for 的 addTask lambda
+    //     ④ `ExprClosure{CallableObj,OldPath}.cpp` 闭包可调用体（`closureIsCoro` 门控）
+    //
+    //   编号（裁定⑧「两级帧区」）：匿名 lambda **不在符号收集面**（无 `seqInModule`）
+    //     ⇒ 走**匿名帧区** `[kSymbolCount, kFrameCount)`：
+    //     `aura_rt::FrameGuard _lsga_<line>_<seq>(aura_rt::meta::anonFrameIndexAt(
+    //          <moduleIdx>u, <seq>u), <line>u);`
+    //   ⚠️ **不是** `symbolIndexAt`（走它 ⇒ 命中平行区的别的符号 ⇒ 静默错 trace）。
+    //   ⚠️ 变量名用 `_lsga_`（**不是** `_lsg_`）—— 与 P4a 的函数帧守卫**不同族**，
+    //      且既有断言族按 `aura_rt::FrameGuard _lsg_` / `_lsg_` 前缀计数，互不干扰。
+    //   🔴 **门控（R7 / change.md §0.2 判据②）**：`metaCollector_` 为空（`NullMetadata`）
+    //      ⇒ **零注入**（既不登记匿名帧、也不发守卫）—— 与 `emitEntryFrame` 同源。
+    //   ⚠️ **命名差异（如实登记，见回报 §6）**：本函数**不自带**「查不到就报错」的硬闸门
+    //      （P4a 的 `emitEntryFrame` 有）—— 匿名帧的编号由本函数**当场分配**
+    //      （`collectAnonFrame` 的返回值），不存在「查不到」的形态 ⇒ 无对应断言。
+    void emitAnonFrame(std::ostream& out, const std::string& kindName,
+                       uint32_t defLine, const ASTNode& node);
+
     // ============================================================
     // 状态
     // ============================================================
@@ -856,6 +977,29 @@ private:
 
     // 当前编译单元中已知的需要协程的函数名
     std::set<std::string> coroutineFunctions_;
+
+    // ============================================================
+    // feature-18 收窄批 A1（2026-10-02）：可抛性索引（名字 → 是否可抛）
+    // ------------------------------------------------------------
+    // 用途：把批 3 的「全调用点注入」收窄为「只对**可抛调用**注入」
+    //   （`StmtGen.cpp` 的 `FirstCallLineScanner` 查本表决定「跳过 but 继续递归」）。
+    // 范式：照 `coroutineFunctions_`（同为「名字 → 属性」索引），键格式**严格同源**
+    //   （否则查不到 ⇒ 白付性能）：
+    //     · 函数 = 裸名（`FunDecl::name`）
+    //     · 方法 = `"ReceiverType.method"`（`MethodDecl::receiverType + "." + name`）
+    //       —— 与 coroutineFunctions_ / frameSeqOf_ 同键；构造器不入（与 genDecl 收集面一致）。
+    // 来源：同模块 AST 上**现成**的 `bool throws`（`src/AST/Stmt.h:344` FunDecl / `:428` MethodDecl）。
+    // 填充点：`CodeGen.cpp` 的 `generate()`（协程判定固定点迭代之后、第三遍生成之前）。
+    //
+    // 🔴 **查询语义（保守原则，简报 §3-A1 / change.md §11.13.3 红线）**：
+    //      **不在表中 ⇒ 视为可抛（注入）**。失效方向必须是「多注入」（白付性能），
+    //      **绝不能**是「漏注入」（traceback 静默少一行）。
+    //      不在表中的典型来源：内建函数（`str` / `int` / `float` / `some` …）、
+    //      函数值调用（Callable 变量）、**跨模块调用**（本批不做跨模块可抛性传递，
+    //      尽管 `ModuleExports::funcs[].throws` 已存在 ⇒ 需新增跨模块表 + setter，
+    //      见收窄批回报 §2「跨模块如何处置」）。
+    // ⚠️ 同名多载：**任一可抛即视为可抛**（填充时取或，见 CodeGen.cpp）—— 保守取并集。
+    std::map<std::string, bool> fnThrows_;
     // feature-12 批次 3 · 5.1b：用户接口 + 内置接口的全集（第二遍协程判定/调用点
     // 反查共用）。原为 genProgram 局部变量，提升为成员供
     // ifaceNameForMethod 使用（含 interfaces.aurai 的 Stringer/Comparable/Iterator）。
@@ -1108,6 +1252,47 @@ private:
     // 嵌套 sync 用唯一后缀防变量遮蔽（change.md §3.5 铁律 3）。
     std::string u5ErrSuffix_;
     int u5ErrCounter_ = 0;
+    // feature-18 P2：当前编译单元的**真实源文件路径**，供 `Error.file` 使用。
+    // 由 generate() 的 sourcePath 参数赋值（**不是** moduleName 派生 —— 见 §0.3-4 / GLM M1）；
+    // genThrowStmt 以 intern_string 落地（同一字面量 intern 命中 ⇒ 零分配；intern 串注册为
+    // 全局根 ⇒ 无需二次根化）。
+    std::string sourceFile_;
+    // ---- feature-18 P3：符号元数据（§3.4c）----
+    // 本模块的元数据收集器（**per-module 本地实例**，由 main 在构造时代入；
+    //   🔴 O1：不再有「共享 collector + setCurrentModule」形态 —— 线程私有，收集期零共享）
+    MetadataSink metaCollector_ = NullMetadata;   // per-module 本地收集目标（线程私有）
+
+    // ---- 🔴 feature-18 P4a 批 1（A3，change.md §3.1.3）：A 遍收集到的「符号名 → 本模块 seqInModule」----
+    // 用途：B 遍注入点（批 2 的 `DeclFun.cpp`）需要**编译期常量** `seqInModule`，而全局 index 在
+    //   `finalize()` 才分配（晚于注入点）⇒ 用本表在 B 遍查回 A 遍分配的本模块序号，注入
+    //   `aura_rt::symbolIndexAt(<throwSiteModuleIdx_>, <seq>)`。
+    // 键 = `rec.name`（函数 = 裸名；方法 = `ReceiverType.method`）—— 与 `MetaSymbolRec::name` 同源。
+    // ⚠️ 收集钩子与 B 遍生成在**同一个 `CodeGenerator` 实例**上 ⇒ 同对象两遍可见，无需跨对象传值。
+    // ⚠️ change.md §9-V13：若 Aura 支持同名重载，本键会冲突（后写覆盖先写）；本批**按现状实现**，
+    //   与 `MetaMerger::symbolIndexOf_`（同样以 `rec.name` 为键）保持一致的语义 —— 见批 1 回报 §5。
+    std::unordered_map<std::string, uint32_t> frameSeqOf_;
+
+    // 🔵 feature-18 P4b-1 B5：**本模块匿名帧序号**（per-CodeGenerator = per-module，线程私有）。
+    //   只增不回退；注入侧每次 `emitAnonFrame` 自增一次，并把**自增前的值**同时送进
+    //   `MetaCollector::collectAnonFrame`（登记）与注入文本（`anonFrameIndexAt` 的实参）
+    //   ⇒ 「登记的匿名帧表序」与「注入的编号」**同源**，不可能错位。
+    uint32_t anonFrameSeq_ = 0;
+
+    // 🔴 O5 修订：`config` 是**逐字段拷贝**的（`CodeGen.cpp:140 ioSync_ = config.ioSync;`），
+    //   CodeGenerator **不保存** CodeGenConfig 整体 ⇒ `config_.metaMode` 这样的写法**编不过**。
+    //   必须像 ioSync_ 一样落成单值成员：
+    CodeGenConfig::MetaMode metaMode_ = CodeGenConfig::MetaMode::Inline;
+    // 🔴 O5 顺带：`nsName_`（B12/V2：nsName 只是 generate() 的入参、不进生成器体内 ⇒ 需缓存一份）
+    std::string nsName_;      // generate() 入口赋值，与 sourceFile_ 同处
+
+    // ---- feature-18 P3 §3.9：throwSite 接线（裁定 ⑤ / 裁定 ⑧）----
+    // 本模块内 throw 点自增序号（每 CG 一份 ⇒ 并行安全；**单调、不 restore**）
+    uint32_t throwSiteLocalSeq_ = 0;
+    // 裁定⑧：每模块 256 个槽位（支持 16 模块 × 256 点）；见 §9-V12
+    static constexpr uint32_t kSlotsPerModule = 256;
+    // 本模块在 `orderedModules` 中的下标（单文件 = 0）；由 main 经 setThrowSiteModuleIdx 注入。
+    // ⚠️ 见 CodeGen.h 的 setThrowSiteModuleIdx 注释：change.md 未给该值的载体，本批补 setter。
+    uint32_t throwSiteModuleIdx_ = 0;
     // 进入本 sync 块前的外层后缀（块尾重抛后恢复，供嵌套块尾驱动正确寻址）。
     std::string savedU5Suffix_;
     // 登记本块声明过的 future（供块尾驱动；与 registerFutureVar 并行调用）。

@@ -187,7 +187,25 @@ void CodeGenerator::genReturnStmt(std::ostream& cpp, const ReturnStmt& stmt,
         writeLine(cpp, prefix + ";");
 }
 
+// ============================================================
+// feature-18 P3 §3.9：throwSite 接线常量
+//   ⚠️ `aura_rt::kMaxThrowSites` / `kThrowSiteUnknown` 定义在 `runtime/logical_stack.h:33-37`
+//      （= 4096 / 0xFFFFFFFFu），而 `src/` **从不 include runtime 头**（全仓 grep 零命中）⇒
+//      此处写**同值字面量**并在注释里注明出处；生成码侧仍发 `aura_rt::kThrowSiteUnknown`
+//      文本（由 runtime 头解析），二者语义一致。
+// ============================================================
+namespace {
+constexpr uint32_t kMaxThrowSitesLocal    = 4096u;          // = aura_rt::kMaxThrowSites
+constexpr uint32_t kThrowSiteUnknownLocal = 0xFFFFFFFFu;    // = aura_rt::kThrowSiteUnknown
+} // namespace
+
 void CodeGenerator::genThrowStmt(std::ostream& cpp, const ThrowStmt& stmt) {
+    // ---- 🔴 feature-18 P4a 批 2（A8，change.md §3.4-1）：抛出点行号注入 ----
+    // 无条件一行，置于 `if (stmt.expr)` **之前**（函数开头）⇒ 一处覆盖全 3 分支 5 形态：
+    //   (a) RecordExpr :204-245 / (b) 普通表达式 :246-271 / (c) 裸 `throw;` :272-274。
+    // ⚠️ 行号取 `stmt.line` —— 与 `Error.line` **同源**（RecordExpr 分支 :240 / 表达式分支 :267
+    //   用的就是它）⇒ R4。语义 = 更新**栈顶帧**的行号（D1：本帧内最近一次抛出点）；无帧时为 no-op。
+    writeLine(cpp, "aura_rt::setFrameLine(" + std::to_string(stmt.line) + ");");
     if (stmt.expr) {
         if (auto* rec = dynamic_cast<const RecordExpr*>(stmt.expr.get())) {
             std::string kind, message;
@@ -201,14 +219,60 @@ void CodeGenerator::genThrowStmt(std::ostream& cpp, const ThrowStmt& stmt) {
             writeLine(cpp, "    aura_rt::GcRootHandle<decltype(_k)> _hk(_k);");
             writeLine(cpp, "    auto _m = (" + message + ");");
             writeLine(cpp, "    aura_rt::GcRootHandle<decltype(_m)> _hm(_m);");
-            writeLine(cpp, "    throw aura_rt::Error(_hk.get(), _hm.get());");
+            // feature-18 P2：填 Error.file / Error.line（唯一自然填装点）。
+            // file 用 intern_string（同字面量 intern 命中 ⇒ 零分配；全局根常驻 ⇒ 无需二次根化）。
+            // 【M-R2 / E3 修正（2026-09-30）】`sourceFile_` 为空（如单测 `compileSource` 只传 5 参）
+            //   ⇒ **不生成填装**（与下方表达式路径同款守卫）：
+            //   ① 否则生成 `intern_string("")` ⇒ 空串非 nullptr + 首次 intern 同样分配，
+            //      破坏「`file == nullptr` 表示无来源」判据；
+            //   ② `file`/`line` 是**坐标整体**（同补同不补）⇒ 空路径下两者同置（nullptr + 0）。
+            //   ⚠️ `_f` 为 intern 产物（全局根常驻）⇒ 无需根化；`_hk`/`_hm` 是真句柄、
+            //      在 `_f` 的 intern 期间保护 kind/message，不得删。
+            // feature-18 P3 §3.9：**先算 id，再替换两处末参字面量**。
+            //   id = moduleIdx * kSlotsPerModule + localSeq；超界 ⇒ clamp 到 kThrowSiteUnknown（安全侧：
+            //   该点恒不降级、只是无收益，**不是**错误行为）。
+            //   ⚠️ `moduleIdx` 由 `setThrowSiteModuleIdx` 注入（change.md 未给该值载体 —— 见回报 §6）；
+            //      单文件不设置 ⇒ 缺省 0 ⇒ `id = localSeq`（自洽，§3.9 判据）。
+            const uint32_t local = throwSiteLocalSeq_++;
+            const uint32_t raw   = throwSiteModuleIdx_ * kSlotsPerModule + local;
+            const uint32_t site  = (local < kSlotsPerModule && raw < kMaxThrowSitesLocal)
+                                   ? raw : kThrowSiteUnknownLocal;
+            const std::string siteExpr = (site == kThrowSiteUnknownLocal)
+                ? std::string("aura_rt::kThrowSiteUnknown")
+                : std::to_string(site);
+            if (!sourceFile_.empty()) {
+                writeLine(cpp, "    auto _f = aura_rt::intern_string(\"" + escapeStringLiteral(sourceFile_) + "\");");
+                writeLine(cpp, "    throw aura_rt::Error(_hk.get(), _hm.get(), nullptr, _f, " +
+                               std::to_string(stmt.line) + ", " + siteExpr + ");");
+            } else {
+                writeLine(cpp, "    throw aura_rt::Error(_hk.get(), _hm.get(), nullptr, nullptr, 0, " +
+                               siteExpr + ");");
+            }
             writeLine(cpp, "}");
         } else {
             std::string eVal = genExpr(*stmt.expr, false);
             writeLine(cpp, "{");
+            // 【M-R1 修正（GLM 盲审，2026-09-30）】**预 intern 前置**：唯一分配点必须在 `_e` 出现**之前**
+            //   原因：`intern_string` 首次（L1 缓存/全局池未命中）会走 `GcString::make` → `alloc`
+            //   （`runtime/builtin/string.cpp:769` 注释自认「make → alloc → **可能触发 safepoint/GC**」）
+            //   ⇒ 若在 `_e` 已存在时调用，窗口内 `_e.message/_e.extra/_e.stack` 三个 GC 指针**无任何根**
+            //   （原 `_he` 是伪句柄、已按 M2 删除）⇒ compact 后 `throw _e` 携悬垂 ⇒ **UAF**。
+            //   ⚠️ 原实现（`throw Error(_he.get())` 纯拷贝 + throw）**零分配** ⇒ P2 的 intern 调用属
+            //      **回归性新增窗口**，必须前置消除。
+            //   ⚠️ `_f` 本身是 intern 产物（全局根常驻）⇒ 无需根化。
+            // 【M-R2 修正】`sourceFile_` 为空（如单测 `compileSource` 只传 5 参）⇒ **不生成填装**：
+            //   ① 与 C1「file/line 坐标整体、同补同不补」自洽；
+            //   ② 保持「`file == nullptr` 表示无来源」判据（否则生成 `intern_string("")` ⇒ 空串非
+            //      nullptr + 首次 intern 同样分配）。
+            if (!sourceFile_.empty()) {
+                writeLine(cpp, "    auto _f = aura_rt::intern_string(\"" + escapeStringLiteral(sourceFile_) + "\");");
+            }
             writeLine(cpp, "    auto _e = (" + eVal + ");");
-            writeLine(cpp, "    aura_rt::GcRootHandle<decltype(_e)> _he(_e);");
-            writeLine(cpp, "    throw aura_rt::Error(_he.get());");
+            if (!sourceFile_.empty()) {
+                writeLine(cpp, "    if (_e.file == nullptr) { _e.file = _f; _e.line = " +
+                               std::to_string(stmt.line) + "; }");
+            }
+            writeLine(cpp, "    throw _e;");
             writeLine(cpp, "}");
         }
     } else {

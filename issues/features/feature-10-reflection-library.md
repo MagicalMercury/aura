@@ -15,6 +15,8 @@ tags:
   - metadata
   - callable
   - stdlib
+related_issues:
+  - "[[feature-18-coroutine-error-semantics-and-diagnostics]]"
 ---
 
 # 【反射元数据表 + reflect 运行时】[ ] **主标题：编译期符号元数据表（收集形态）+ 运行时静态数据与 reflect API（运行时形态）——以 CallableObj 为唯一动态调用载体**
@@ -298,6 +300,85 @@ reflect.call("Player", "heal", [Any.of(p), Any.of(10)])   // -> Any
   - `src/CodeGen/ExprClosureArgs.cpp:278/432` —— 物化生成器（`genCallableObjValueWrap` / `genFnRefCallableObjValue`）
   - `src/Sema/BuiltinRegistry.h` —— 内置模块注册先例
 - **业界对标**：Go reflect（`TypeOf` / `NewValue` / `Value.Field` 的「TypeInfo + Instance」二分——本设计直接对标）；Java 注解 + `RetentionPolicy.RUNTIME`；Python `dataclasses.fields`（字段遍历场景）。
+
+---
+
+## 9. 🔧 增强记录：与 feature-18（协程逻辑栈）对接（2026-09-27，主人裁定）
+
+> **背景**：feature-18 需要「帧描述」来打印逻辑调用栈。主人裁定**两者对接**，并明确本条记为本 feature 的**增强**。
+
+### 9.1 增强 1：`SymbolInfo` 补源位置字段
+
+```cpp
+struct SymbolInfo {
+    const char*      name;         // 限定名（既有）
+    // —— feature-18 对接新增 ——
+    const char*      file;         // 声明所在源文件（编译期字面量）
+    uint32_t         defLine;      // 声明所在行号（0 = 不可用）
+    // ……其余字段不变
+};
+```
+
+- **零额外成本**：与 `name` 同源（都是 codegen 已知的编译期常量，见 §2.3 的列定义）；
+- **收益超出 feature-18**：`reflect` 从此能回答「某函数定义在哪」（此前不能），错误消息/文档生成亦可用。
+
+### 9.2 增强 2：与 feature-18 的「**同源两表**」契约（主人 2026-09-27 裁定）
+
+**编译期同源**（都取自 `feature-13` 两遍扫描产出的全局符号表），**运行期两表分离、各自裁剪**：
+
+| | 表 | 内容 | 裁剪策略 | 理由 |
+|---|---|---|---|---|
+| **栈帧元数据**（feature-18）| `FrameDesc[]`（或符号索引）| `name` / `file` / `line` | ✅ **全量** | 任何函数都可能出现在调用栈里，**编译期无法预知** ⇒ 不可裁剪；但只是几个字面量 + 行号（~20-30B/符号），**无代码膨胀** |
+| **反射元数据**（feature-10，本表）| `SymbolInfo[]` / `TypeInfo[]` | params / returnType / **`materialize` 工厂** / offset 列 | ✅ **按需**（§4 零成本原则**继续有效**）| `materialize` 是**每符号一个生成函数** ⇒ 全量会造成**代码膨胀**，不用反射的程序不该背这份代码 |
+
+**⚠️ 关键结论（主人裁定依据）**：**不能因为 feature-18 需要"全量帧元数据"，就把本 feature 的裁剪规则整体取消** ——
+两者性质不同：帧元数据是**廉价纯静态数据**，反射元数据含**生成代码**（`materialize`）。
+**⇒ 故本笔记 §4「裁剪规则」保持不变；仅新增「帧元数据全量表」作为并列产物。**
+
+### 9.3 对接的数据流
+
+```
+feature-13 两遍扫描 → 全局符号表（编译期唯一真相源）
+        ├──► [全量] FrameDesc[]        （feature-18 帧表：name/file/line）
+        └──► [按需裁剪] SymbolInfo[]   （feature-10 反射表：本笔记 §4 规则）
+```
+
+- **帧表只存符号索引**（非裸指针）⇒ 帧 = `{uint32_t symbolIdx, uint32_t callLine}` = **8B**
+  （对比 feature-18 原设计 `{ptr,ptr,int32}` = 24B ⇒ **缩小 3 倍，栈快照成本降 3-4 倍**）。
+- **调用点行号**由 codegen 在每个调用点注入（编译期常量）；**注意**：栈帧的行号是**动态**的（同一函数在不同调用点进入下一层），故**不能只存 `defLine`**。
+
+---
+*本条为 feature-18 对接增强，2026-09-27 主人裁定*
+
+### 9.4 ⚠️ 开工范围声明（主人 2026-09-27 定）
+
+**本 feature 的 Phase R1（收集形态）+ R2/R3 的初步投影，将由 `feature-18` 的 plan 一并落地（不另立开工）：**
+
+| 项 | 本 plan 是否落地 |
+|---|---|
+| 编译期「收集形态」符号表 | ✅ 落地 |
+| 运行时 `SymbolInfo[]` 静态数据 | ✅ 落地（`aura.meta.h/cpp`）|
+| `materialize` 工厂（CallableObj 联动，§3.2）| ✅ 落地 |
+| `TypeInfo` / `FieldInfo`（类型侧）| ✅ 落地 |
+| **§4 裁剪规则** | ⏸️ **本阶段后置**（无 `reflect` 使用面可分析）⇒ **全量落地，裁剪留待 §3.3 API 落地时接入**；本 plan 只保证表结构**预留裁剪能力** |
+| `reflect` API 四层（§3.3）| ❌ 不在本 plan（Phase R4）|
+
+**⇒ 本 feature 后续开工时，以 `feature-18` 的 plan 为准，不要重复实现这四张表。**
+（对接契约与产物形态见 [[feature-18-coroutine-error-semantics-and-diagnostics]] §7.5 / §7.6；进度见根目录 `feature-18-progress.md`）
+
+## 10. 🔧 补充记录：`materialize` 列的可空契约与当前零消费（2026-10-02）
+
+> **来源**：feature-18 **P4** 规划期的外部评审（GLM，两轮）裁定 —— 原文见 `change.md §3.4` 的「`materialize` 列的处置」小节。
+
+| 项 | 结论 |
+|---|---|
+| **当前状态** | `SymbolInfo::materialize`（`runtime/meta.h:66`）**全仓零调用点** —— 有**生产**（thunk 生成 + 表渲染全链路交付），**零消费** |
+| **性质** | ⚠️ **不是 O3 那类"死代码"** —— O3（`emitTablesInline`）是**产出缺口**（有声明零生产，「承诺了没人交付」）；本列是**消费缺口**，属**为未来功能预留的表结构列** |
+| **契约** | `runtime/meta.h:10-11` 已明写：「列均为可选投影（…`materialize`…**可为 `nullptr`** + 计数 0）」⇒ 契约位已就绪 |
+| **本 feature 的消费计划** | **消费者 = 本 feature（feature-10）的运行时反射**（D3：动态调用恒经 `CallableErased`，表项存**物化配方**）⇒ **本 feature 开工时按契约判空即可** |
+| **不在 P5 使用** | feature-18 的 P5（`formatError` / 诊断打印）**只读** `name/file/defLine/flags` 投影列，**与物化配方无关** |
+| **⚠️ P4 带来的契约扩展** | feature-18 **P4** 的 prune 降级会把**某些记录的 `thunkName` 清空、`materialize` 置 `nullptr`**（`§8.1 A1b`）⇒ **semantics**：`nullptr` = 「该符号不可运行时物化」（原本语义自洽），但 **emit 渲染侧必须适配**（空名 ⇒ 渲染裸 `nullptr` 而非 `&`） |
+| **⇒ 本 feature 开工前的检查项** | ① 表项 `materialize == nullptr` 时必须**判空**（契约已允）；② 若需对「不可物化符号」有区别于「未收集」的语义，须与本 feature 的 D2/D3 对齐 |
 
 ---
 

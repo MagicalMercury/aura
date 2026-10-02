@@ -10,8 +10,9 @@ namespace Aura {
 // ============================================================
 // escapeStringLiteral — 转义字符串字面量内容，使其可安全嵌入生成的 C++ 源码
 // 不转义则源串中的 "、\、\n、\t、\r 会破坏生成的 C++ 字符串字面量或被解释为控制字符
+// feature-18 P2：提升为成员（供 StmtControl 使用）
 // ============================================================
-static std::string escapeStringLiteral(const std::string& s) {
+std::string CodeGenerator::escapeStringLiteral(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
     for (char c : s) {

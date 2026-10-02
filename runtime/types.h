@@ -13,6 +13,8 @@
 #include <type_traits>       // is_pointer_v / void_t / enable_if_t / is_convertible_v
 #include <utility>           // declval（GcViewSlot 视图槽 traits）
 
+#include "logical_stack.h"      // kThrowSiteUnknown / kThrowSiteNoStack（无重量依赖，安全）
+
 namespace aura_rt {
 
 // ============================================================
@@ -256,15 +258,36 @@ struct Error : GcObject {
     GcString* message = nullptr;
     GcObject* extra   = nullptr;  // 自定义附加字段（预留）
 
+    // ── feature-18 新增 ─────────────────────────────────────
+    GcString* file    = nullptr;  // 抛出点源文件（编译期字面量，可为 nullptr）
+    int32_t   line    = 0;        // 抛出点行号（0 = 不可用）
+    Array<uint64_t>* stack = nullptr;  // 逻辑栈快照（**紧凑帧**：(symbolIdx<<32)|line）
+                                       //   nullptr = 无栈（档位 off / 热路径降级 / 空栈）
+    // ────────────────────────────────────────────────────────
+
     static const TypeDescriptor _desc;
 
-    // 便捷构造
-    Error(GcString* k, GcString* m, GcObject* e = nullptr)
-        : kind(k), message(m), extra(e) {}
+    // 便捷构造（**既有 2 参调用零改动**：新增参数全带默认值）
+    //   throwSite：热路径降级标识（kThrowSiteUnknown = 不参与降级；kThrowSiteNoStack = 永不解构）
+    //   ⚠️ 定义在 types.cpp（构造体内会采集逻辑栈）
+    Error(GcString* k, GcString* m, GcObject* e = nullptr,
+          GcString* f = nullptr, int32_t l = 0,
+          uint32_t throwSite = kThrowSiteUnknown);
     Error() = default;
 
     ~Error() = default;
 };
+
+// 布局护栏（紧随 struct 之后，对齐 GcObject 的静态断言做法）
+// ⚠️ Error 继承多态基类 GcObject ⇒ 非标准布局 ⇒ 每条 offsetof 触发 -Winvalid-offsetof；
+//    此处**局部**抑制（仅包裹本 4 条断言），不改断言内容。
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+static_assert(offsetof(Error, kind)  == 16, "Error.kind must stay at offset 16");
+static_assert(offsetof(Error, file)  == 40, "Error.file must stay at offset 40");
+static_assert(offsetof(Error, line)  == 48, "Error.line must stay at offset 48");
+static_assert(offsetof(Error, stack) == 56, "Error.stack must stay at offset 56");
+#pragma GCC diagnostic pop
 
 
 } // namespace aura_rt

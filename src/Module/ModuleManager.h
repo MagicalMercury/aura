@@ -168,6 +168,13 @@ public:
     // 不填充 modules_（modules_ 的填充是 C4 的第二段 loadAllScanned 职责）。
     bool scanAll(const std::string& entryPath);
     const GlobalSymbolTable& globalTable() const { return scanUnits_; }
+
+    // feature-18 P3（批 2）：🔴 `sanitizeId` 由 `private:` 段**移入 `public:` 段** ——
+    //   依据：`main.cpp` 构造 `MetaCollector` 需 `Aura::ModuleManager::sanitizeId(stem)` 生成
+    //   thunk 的 `nsStem`（change.md §3.6a/§3.6b 的写法），而原声明位于 `private:`（本文件 `:215` 起）
+    //   ⇒ 外部**够不着**。这与 O40-(a)（`escapeStringLiteral`）**同族**：**「名字存在 ≠ 你能调」**。
+    //   ⚠️ 只移动声明：签名不变、函数体不变、既有调用点语义不变。
+    static std::string sanitizeId(const std::string& path);
     // 非 const 访问（C4 主流程第二段写入需要）
     std::unordered_map<std::string, ModuleInfo>& modulesInternal() { return modules_; }
     ModuleInfo* moduleAt(const std::string& sourcePath) {
@@ -220,8 +227,7 @@ private:
     // 将模块路径转为 C++ 命名空间
     static std::string pathToNs(const std::string& path);
 
-    // 将路径转为合法的 C++ 标识符
-    static std::string sanitizeId(const std::string& path);
+    // （feature-18 P3：`sanitizeId` 声明已移入 public 段 —— 见彼处注释）
 
     // 解析 import 语句的路径为绝对路径
     std::string resolveImportPath(const std::string& importPath,

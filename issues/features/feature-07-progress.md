@@ -123,7 +123,7 @@ related_issues:
 - **B**（`CodeGen.h`）：`ClosureGenSpec.isCoroutine` 载体 + 新成员 `lastClosureIsCoroTask_` /
   `lastClosureCppBase_` / `lastClosureCppBaseIsCoro_` / `closureTaskVars_`；genFunExprCallableObj 出口回填
 - **C**（7 消费点）：#1 ExprCall needAwait 追加 `closureTaskVars_.count(calleeName)`（P5）；
-  #2/#3/#4 不动；#5 StmtLet 登记 closureTaskVars_；#6/#7 根化类型单源 lastClosureCppBase_（仅协程）
+  \#2/\#3/#4 不动；#5 StmtLet 登记 closureTaskVars_；#6/#7 根化类型单源 lastClosureCppBase_（仅协程）
   + 装饰形态（`decl.type` 提供时也覆盖）
 - **D**：负例 `example/used/leakcheck/_repro/f07_verify/r4.aura`（io 改 gc_force，符合 IoDetector 契约）
 

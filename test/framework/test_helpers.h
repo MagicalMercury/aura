@@ -133,7 +133,17 @@ inline Aura::CompileUnit compileSource(
     (void)sema.analyze(*program);
     if (diag.hasErrors()) return unit;
     Aura::CodeGenerator cg(diag);
-    return cg.generate(*program, moduleName, {}, "", cfg);
+    // 🔴 **显式声明「本框架默认不收集元数据」**（2026-10-02 主 Agent，见 change.md §11.11）：
+    //    原先只写 5 个实参、靠末位默认值 ⇒ `metaCollector == nullptr`。而 feature-18 P4a 的
+    //    `emitEntryFrame` 当时**无条件**查 `frameSeqOf_` 并硬报错 ⇒ **411 个走本函数的用例
+    //    全部转红**（另有 5 个在 test_codegen_concurrency_gc.cpp 直调 `generate` 的 7 参形态）。
+    //    ⇒ 现在把 8 个可选参数**全部显式列出**，其中 `nullptr` = 「本框架这趟不收集元数据」
+    //      —— 这是**合法模式**（不发射元数据表 ⇒ 不注入帧/行号，产物与 feature-17 逐字一致），
+    //      由 `CodeGenFrame.NoCollectorProducesNoInjection` 用例显式断言。
+    //    ⚠️ 若将来需要本框架也收集元数据，改这里的 `nullptr` 为 `&collector` 即可（单点）。
+    return cg.generate(*program, moduleName, /*imports=*/{}, /*nsName=*/"", cfg,
+                       /*crossDefaults=*/{}, /*crossParamSemTypes=*/{},
+                       /*sourcePath=*/"", /*metaCollector=*/Aura::NullMetadata);
 }
 
 // ============================================================

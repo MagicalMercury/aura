@@ -99,6 +99,8 @@ set(AURA_SOURCES
     src/CodeGen/StmtSync.cpp
     src/CodeGen/StmtSpawn.cpp
     src/CodeGen/StmtMatch.cpp
+    src/CodeGen/MetaCollect.cpp
+    src/CodeGen/MetaEmit.cpp
     src/Module/ModuleManager.cpp
     src/Diag/DiagnosticEngine.cpp
 )

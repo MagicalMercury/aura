@@ -1,16 +1,18 @@
 ---
 type: bug_report
 module: runtime/gc
-sub_module: "sync thread 内 gc_force() → STW 停靠死锁 + concat_multi ASAN 越界"
+sub_module: sync thread 内 gc_force() → STW 停靠死锁 + concat_multi ASAN 越界
 status:
   - fixed
 severity:
   - high
 discover_date: 2026-09-19
-discovered_by: "Hermes（feature-14 Phase 0 ASAN 探针，子 Agent 会话 20260919_120910_65d9cc；主 Agent 复核性质判定）"
+discovered_by: Hermes（feature-14 Phase 0 ASAN 探针，子 Agent 会话 20260919_120910_65d9cc；主 Agent 复核性质判定）
 related_issues:
-  - "feature-14（spawn 动态同步域，Phase 0 探针期间撞出，与本特性正交）"
-  - "feature-16（sync 块 M:N 并行，可能相关）"
+  - feature-14（spawn 动态同步域，Phase 0 探针期间撞出，与本特性正交）
+  - feature-16（sync 块 M:N 并行，可能相关）
+  - "[[feature-14-spawn-sync-context-constraint]]"
+  - "[[feature-16-sync-block-mn-parallel]]"
 tags:
   - gc
   - safepoint

@@ -3,7 +3,7 @@ type: todo_feature
 kind: language-semantics
 module: Sema/CodeGen/runtime
 status:
-  - planned
+  - finished
 priority: P1
 estimated_effort: L
 blocked_by: []

@@ -6,191 +6,76 @@
 namespace Aura {
 
 // ============================================================
-// try / catch
+// try / catch（feature-18 P2：IIFE 退役，统一原地路径）
+//
+// 为什么不再用 IIFE（原 `std::variant<Result, Error>` 技法）：
+//   ① bug-87：sync 块生成 `co_await _ctx.wait_all()`，落进**非协程 lambda** ⇒
+//      g++ `unable to find the promise type for this coroutine`；
+//   ② bug-90：try 体内调用协程函数时 initExpr 是 `aura_rt::task<int>`，
+//      与 SemType 推出的 `int` 不匹配 ⇒ `could not convert 'task<int>' to
+//      'std::variant<int, Error>'`。
+//   根因单一：**try 体被塞进非协程 lambda** ⇒ 去掉 IIFE 即可（plan §2.5 翻案结论）。
+//
+// 为什么 catch 只赋值、catchBody 要挪到正常流程：
+//   C++ 标准**禁止 catch handler 内出现 co_await**（GCC 实测
+//   `error: await expressions are not permitted in handlers`）⇒ trick：
+//   handler 内只做值拷贝 + 置标志，catchBody 在 `if (_tk_err) { ... }`
+//   分支里生成 —— 那里已是正常流程，`co_await` 合法。
+//
+// 为什么 try 体可以直接原地生成（含 co_await）：
+//   值化后「同步 throw」与「协程 await_resume 抛」走**同一条 C++ 异常路径**
+//   ⇒ 就地捕获即可，不需要「逐语句显式检查」（plan §4.5 末条）。
 // ============================================================
 
 void CodeGenerator::genTryCatchStmt(std::ostream& cpp,
                                      const TryCatchStmt& stmt,
                                      bool isCoroutine) {
-    if (!isCoroutine || !stmt.tryBody || stmt.tryBody->stmts.empty()) {
-        genTryCatchRaw(cpp, stmt, isCoroutine);
-        return;
-    }
-
-    // === 协程安全模式 ===
-    // C++20 协程 + GCC 上 try/catch 有 bug（非 std::exception 异常类型匹配失败）
-    // 改用：把 try 体中的"setup"语句包装为普通函数 IIFE，用 variant 传回错误
-    //
-    // 策略：分析 try 体，找到第一个 LetDecl（含 initializer）作为"抛出版本"，
-    // 将其初始值表达式提取到非协程 IIFE 中，其余语句作为 continuation 分支。
-
-    auto& stmts = stmt.tryBody->stmts;
-
-    // 1. 找到 try 体中的第一个 LetDecl（含 initializer）
-    const LetDecl* setupLet = nullptr;
-    size_t letIdx = 0;
-    for (size_t i = 0; i < stmts.size(); ++i) {
-        if (auto* let = dynamic_cast<const LetDecl*>(stmts[i].get())) {
-            if (let->initializer) { setupLet = let; letIdx = i; break; }
-        }
-    }
-
-    if (!setupLet) {
-        // v1.2 修复：协程模式下无 setupLet 时也用 IIFE + variant 模式
-        // 原因：genTryCatchRaw 会在 catch handler 中生成 co_await，违反 C++ 标准
-        // （catch handler 内禁止 co_await）
-        // 策略：IIFE 执行 try 体所有语句（同步版本），返回 variant<monostate, Error>
-        //       成功分支执行后续语句（无 setupLet 时通常无后续）
-        //       错误分支执行 catchBody（在协程正常流程中，可含 co_await）
-        if (!isCoroutine) {
-            genTryCatchRaw(cpp, stmt, isCoroutine);
-            return;
-        }
-        genTryCatchNoSetupIIFE(cpp, stmt, isCoroutine);
-        return;
-    }
-
-    // 2. 推断结果类型
-    // 优先用 SemType 推导（避免 decltype(initExpr) 中嵌套 lambda 在未求值上下文无法捕获变量）
-    std::string initExpr = genExpr(*setupLet->initializer, false);
-    std::string resultType;
-    if (setupLet->type) {
-        resultType = mapType(*setupLet->type);
-    } else if (setupLet->initializer && setupLet->initializer->inferredType) {
-        resultType = mapSemType(*setupLet->initializer->inferredType);
-    }
-    if (resultType.empty() || resultType == "auto") {
-        // 退化：无法从 SemType 推导，用 decltype（仅在 initExpr 不含 lambda 时安全）
-        resultType = "decltype(" + initExpr + ")";
-    }
-    std::string varName = safeName(setupLet->name);
+    // P2：isCoroutine 只用于透传给 try 体/ catchBody（co_await 由下游判定）
     std::string cv = safeName(stmt.catchVar);
 
     cpp << indentStr() << "{\n";
     indentLevel_++;
 
-    // 3. 安全 IIFE：在普通函数中 try/catch，返回 variant<Result, Error>
-    writeLine(cpp, "auto _try = [&]() -> std::variant<" + resultType + ", aura_rt::Error> {");
-    indentLevel_++;
+    // ① 承装槽 + 5 个 Ref 模式根化句柄
+    //    Ref 模式绑定 `_tk_hold` 的**成员地址**：compact 时 GC 原位改写这些字段，
+    //    保证 catchBody（可能含 co_await ⇒ 触发 GC）中读取的 kind/message/file/stack 有效。
+    //    `_tk_hold` 是非 optional 的值对象 ⇒ 成员地址始终有效 ⇒ 可安全用 Ref 模式。
+    //    ⚠️ kind/file 通常为 intern_string（全局根常驻），此处一并根化 = 防将来来源变化
+    //       （与既有 StmtTry/CodeGen 的注释同理由）。
+    writeLine(cpp, "bool _tk_err = false;");
+    writeLine(cpp, "aura_rt::Error _tk_hold{};");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_tk_hold.kind)> _tk_kind_h(_tk_hold.kind);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_tk_hold.message)> _tk_msg_h(_tk_hold.message);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_tk_hold.extra)> _tk_extra_h(_tk_hold.extra);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_tk_hold.file)> _tk_file_h(_tk_hold.file);");
+    writeLine(cpp, "aura_rt::GcRootHandle<decltype(_tk_hold.stack)> _tk_stack_h(_tk_hold.stack);");
+
+    // ② try 体：**原地**生成（isCoroutine 原样透传 ⇒ try 内 co_await / sync 块合法）
     writeLine(cpp, "try {");
     indentLevel_++;
-    writeLine(cpp, "return " + initExpr + ";");
-    indentLevel_--;
-    writeLine(cpp, "} catch (const aura_rt::Error& _e) {");
-    indentLevel_++;
-    writeLine(cpp, "return _e;");
-    indentLevel_--;
-    writeLine(cpp, "}");
-    indentLevel_--;
-    writeLine(cpp, "}();");
-
-    // 4. 错误分支
-    cpp << indentStr() << "if (std::holds_alternative<aura_rt::Error>(_try)) {\n";
-    indentLevel_++;
-    writeLine(cpp, "auto& " + cv + " = std::get<aura_rt::Error>(_try);");
-    // GC 安全：variant 中的 Error 是值嵌入的，GC 不知道其内部结构，
-    // 不会自动更新 kind/message/extra 指针。用 GcRootHandle 保护，
-    // catchBody 中若有 co_await 触发 GC compact，指针会被自动更新。
-    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".kind)> _eh_kind(" + cv + ".kind);");
-    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".message)> _eh_msg(" + cv + ".message);");
-    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".extra)> _eh_extra(" + cv + ".extra);");
-    valueTypeVarNames_.insert(cv);
-    // feature-14 U5：catch 体在 `} else {` 之后，有自己的 `{}` → opensScope=true。
-    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine, /*opensScope=*/true);
-    valueTypeVarNames_.erase(cv);
-    indentLevel_--;
-    cpp << indentStr() << "} else {\n";
-    indentLevel_++;
-
-    // 5. 成功分支
-    writeLine(cpp, "auto " + varName + " = std::get<" + resultType + ">(_try);");
-    // GC 安全：resultType 为 GC 指针时用 GcRootHandle 保护（对齐错误分支 kind/message/extra 保护），
-    // 后续 stmts 中若触发 GC（co_await compact），varName 指向的堆对象不会被回收/悬垂。
-    if (isGcPointerType(resultType)) {
-        writeLine(cpp, "aura_rt::GcRootHandle<" + resultType + "> _" + varName + "_root(" + varName + ");");
-    }
-    for (size_t i = letIdx + 1; i < stmts.size(); ++i) {
-        if (stmts[i]) genStmt(cpp, *stmts[i], isCoroutine);
-    }
-
-    indentLevel_--;
-    cpp << indentStr() << "}\n";
-    indentLevel_--;
-    cpp << indentStr() << "}\n";
-}
-
-// v1.2 修复：协程模式下无 setupLet 的 try/catch 用 IIFE + variant<monostate, Error>
-// 避免 catch handler 内生成 co_await（C++ 标准禁止）
-// IIFE 内执行 try 体所有语句（同步版本，isCoroutine=false），
-// 成功返回 monostate，失败返回 Error；后续在协程正常流程中处理错误分支
-void CodeGenerator::genTryCatchNoSetupIIFE(std::ostream& cpp,
-                                            const TryCatchStmt& stmt,
-                                            bool isCoroutine) {
-    std::string cv = safeName(stmt.catchVar);
-
-    cpp << indentStr() << "{\n";
-    indentLevel_++;
-
-    // IIFE：普通函数，执行 try 体所有语句（同步版本），返回 variant<monostate, Error>
-    // feature-05：生成面联合已弃用 std::variant，此处为 try 内部 monostate|Error 机制保留
-    writeLine(cpp, "auto _try = [&]() -> std::variant<std::monostate, aura_rt::Error> {");
-    indentLevel_++;
-    writeLine(cpp, "try {");
-    indentLevel_++;
-    // try 体语句：同步版本（isCoroutine=false，避免生成 co_await）
-    if (stmt.tryBody) {
-        for (auto& s : stmt.tryBody->stmts) {
-            if (s) genStmt(cpp, *s, false);
-        }
-    }
-    writeLine(cpp, "return std::monostate{};");
-    indentLevel_--;
-    writeLine(cpp, "} catch (const aura_rt::Error& _e) {");
-    indentLevel_++;
-    writeLine(cpp, "return _e;");
-    indentLevel_--;
-    writeLine(cpp, "}");
-    indentLevel_--;
-    writeLine(cpp, "}();");
-
-    // 错误分支：在协程正常流程中执行 catchBody（可含 co_await）
-    cpp << indentStr() << "if (std::holds_alternative<aura_rt::Error>(_try)) {\n";
-    indentLevel_++;
-    writeLine(cpp, "auto& " + cv + " = std::get<aura_rt::Error>(_try);");
-    // GC 安全：variant 中的 Error 是值嵌入的，需 GcRootHandle 保护内部指针
-    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".kind)> _eh_kind(" + cv + ".kind);");
-    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".message)> _eh_msg(" + cv + ".message);");
-    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".extra)> _eh_extra(" + cv + ".extra);");
-    valueTypeVarNames_.insert(cv);
-    // feature-14 U5：catch 体在 `if (holds_alternative<Error>) {` 之内 → opensScope=true。
-    if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine, /*opensScope=*/true);
-    valueTypeVarNames_.erase(cv);
-    indentLevel_--;
-    cpp << indentStr() << "}\n";
-
-    indentLevel_--;
-    cpp << indentStr() << "}\n";
-}
-
-void CodeGenerator::genTryCatchRaw(std::ostream& cpp,
-                                    const TryCatchStmt& stmt,
-                                    bool isCoroutine) {
-    cpp << indentStr() << "try {\n";
     // feature-14 U5：try 体在 `try {` 之内 → opensScope=true。
     if (stmt.tryBody) genBlock(cpp, *stmt.tryBody, isCoroutine, /*opensScope=*/true);
-    std::string cv = safeName(stmt.catchVar);
-    cpp << indentStr() << "} catch (aura_rt::Error& " << cv << ") {\n";
+    indentLevel_--;
+
+    // ③ catch handler：只做值拷贝 + 置标志（**禁止**在此生成 co_await）
+    writeLine(cpp, "} catch (const aura_rt::Error& _e) {");
     indentLevel_++;
-    // GC 安全：Error 在 C++ 异常存储区中（非 GC 堆），GC compact 不会自动更新
-    // 其内部的 GcString* 指针（kind/message/extra）。用 GcRootHandle 持有这些指针的地址，
-    // GC compact 时会通过 roots_ 更新它们，防止 catchBody 中访问悬垂指针。
-    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".kind)> _eh_kind(" + cv + ".kind);");
-    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".message)> _eh_msg(" + cv + ".message);");
-    writeLine(cpp, "aura_rt::GcRootHandle<decltype(" + cv + ".extra)> _eh_extra(" + cv + ".extra);");
+    writeLine(cpp, "_tk_hold.kind = _e.kind; _tk_hold.message = _e.message; _tk_hold.extra = _e.extra;");
+    writeLine(cpp, "_tk_hold.file = _e.file; _tk_hold.line = _e.line; _tk_hold.stack = _e.stack;");
+    writeLine(cpp, "_tk_err = true;");
+    indentLevel_--;
+    writeLine(cpp, "}");
+
+    // ④ catchBody：在正常流程分支中生成（可含 co_await）
+    cpp << indentStr() << "if (_tk_err) {\n";
+    indentLevel_++;
+    writeLine(cpp, "auto& " + cv + " = _tk_hold;");
     valueTypeVarNames_.insert(cv);
-    // feature-14 U5：catch 体在 `} catch (...) {` 之内 → opensScope=true。
     if (stmt.catchBody) genBlock(cpp, *stmt.catchBody, isCoroutine, /*opensScope=*/true);
     valueTypeVarNames_.erase(cv);
+    indentLevel_--;
+    cpp << indentStr() << "}\n";
+
     indentLevel_--;
     cpp << indentStr() << "}\n";
 }

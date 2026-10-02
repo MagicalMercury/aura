@@ -11,15 +11,20 @@
 // run_event_loop ─ 驱动主协程直至完成
 //
 // 依赖：types.h (GcString, Error 等)
-//       gc.h 仅 task.cpp 需要（run_event_loop 实现中注册 GC 栈根）
+//       gc.h — feature-18 G-1：promise 的 error_ 字段需要 GcRootHandle 根包（含 handles.h）
 // ============================================================
 
 #include <coroutine>
 #include <cstddef>
 #include <cstdio>
 #include <exception>
+#include <optional>            // feature-18 G-1：optional<GcRootHandle<…>> 懒激活根包
 #include <utility>
 #include <vector>
+
+#include "builtin/error.h"     // feature-18 §3.4：Error 值化 + kThrowSiteNoStack（intern_string/make_string）
+#include "gc.h"                // feature-18 G-1：GcRootHandle（Ref 模式根包；gc.h 末尾含 handles.h）
+#include "coro_snapshot.h"     // feature-18 P4b-1 B0/B4：创建点快照 + ~task_promise_base 清理钩子
 
 namespace aura_rt {
 
@@ -51,27 +56,97 @@ inline thread_local int g_chainDepth = 0;   // 只增不降，超限归零
 
 // promise_type 基类（共享逻辑）
 struct task_promise_base {
-    std::exception_ptr exception_;
+    // feature-18：异常以 **Error 值** 承载（红线：绝不保留 std::exception_ptr 路径）
+    aura_rt::Error error_{};
+    bool           has_error_ = false;
+
+    // ── G-1（GLM 审查 2026-09-28）：error_ 的 GC 指针根包（懒激活 · **Ref 模式**）──
+    //  为什么必须根化：协程帧在 C++ 堆、**不在 GC 扫描面**（registerStackRoots 全仓唯一调用
+    //    者 = task.cpp:61，仅 main 帧）；而「错误协程」可能经 `g_chainDepth >= 512`
+    //    → `scheduleOnEventLoop(continuation)`（task.h:59-71）延迟恢复 ⇒ continuation 进 ready_ 队列，
+    //    而 processReady（task.cpp:114-124）是 **swap 整队** ⇒ 本批换出后新入队的要等下一轮；
+    //    期间其他就绪协程恢复并分配 → 可能 GC/compact ⇒ 搬走 error_.kind/message/file/stack 指向的对象。
+    //  为什么必须 **Ref** 而非 Value：Value 模式 compact 只更新句柄内部副本，`error_.kind` 本体不动
+    //    ⇒ await_resume 抛出的仍是**旧地址**；Ref 模式把 `ptr_ref_` 绑到 promise 字段地址
+    //    ⇒ compact **原位改写 `error_.kind` 等字段** ✓
+    //  懒激活：无错误的协程零成本（optional 未 engaged ⇒ 未注册任何根）。
+    std::optional<aura_rt::GcRootHandle<GcString*>>        kindH_;
+    std::optional<aura_rt::GcRootHandle<GcString*>>        msgH_;
+    std::optional<aura_rt::GcRootHandle<GcObject*>>        extraH_;
+    std::optional<aura_rt::GcRootHandle<GcString*>>        fileH_;
+    std::optional<aura_rt::GcRootHandle<Array<uint64_t>*>> stackH_;
+    //  ⚠️ 声明顺序：这 5 个必须在 `error_` **之后** —— 逆序析构 ⇒ 先注销句柄、再销毁 error_。
+    //  ⚠️ 跨线程前提：Ref 注册到**当前线程**根链，本设计假定「unhandled_exception 执行线程
+    //     == promise 销毁线程」（协作式事件循环下成立：帧由 task 持有，resume 与析构同线程；
+    //     ThreadPool worker 上 spawn 的任务亦然）。若将来出现跨线程传递 task 的形态 ⇒
+    //     改为 Value+Global 并在 `await_resume` 前用 `take()` 同步回写（见 §6.3 回退）。
+    //  ⚠️ bug-79 检查：槽位 = promise 成员，unhandled_exception 只写一次、帧销毁前不复用 ⇒ 满足。
+
     std::coroutine_handle<> continuation_; // 等待者链
+
+    // ============================================================
+    // 🔴 feature-18 P4b-1（B4，change.md §3.3.2 / §9-N5）：side table 清理钩子
+    //   · 键 = `coroutine_handle::address()`（与 B0 创建点快照写入的键**同源**）
+    //   · ⚠️ **析构函数体在成员析构「之前」执行**（C++ `[class.dtor]`）—— 本轮已订正
+    //     （上一轮曾写反）。函数体只碰 side table，与 5 个 `optional<GcRootHandle>`
+    //     的注销**无数据交互** ⇒ 顺序安全，且「先清 entry」更利于 fail-fast。
+    //   · ⚠️ **detach 路径不覆盖**（`run_to_completion` 的 `(void)new task<T>(...)` 故意泄漏帧）：
+    //     该 promise **永不析构** ⇒ entry 永不 erase ⇒ 与既有泄漏**同生命周期**，一致性无害
+    //     （change.md §3.3.2 R3-🟢-6-1 / §9-V16）。
+    //   · 基类内**可以**用 `coroutine_handle<task_promise_base>::from_promise(*this)` 取帧地址：
+    //     实测（本机 UCRT64 g++ 13 / libstdc++）与派生 `coroutine_handle<promise_type>` 的
+    //     `address()` **逐位相同**（探针 scripts/_f18_p4b1_tmp/probe_fromp.cpp，三值一致）。
+    //     理由：promise 子对象在帧内的偏移为 0（`&promise` 与帧地址差一个已知常量，
+    //     由 `__builtin_coro_promise` 反算）⇒ 静态类型换成基类不改变结果。
+    ~task_promise_base() noexcept {
+        eraseSnapshotFor(
+            std::coroutine_handle<task_promise_base>::from_promise(*this).address());
+    }
 
     auto initial_suspend() noexcept { return std::suspend_always{}; }
 
     struct final_awaiter : std::suspend_always {
         std::coroutine_handle<> continuation;
         final_awaiter(std::coroutine_handle<> h) : continuation(h) {}
+        // ⚠️ feature-18 C-2（探针 5b）：本函数**不得**抛（noexcept ⇒ 抛即 terminate）
+        //    P4 若要在此插入 restoreStack(...)，其实现必须 nothrow
         void await_suspend(std::coroutine_handle<>) noexcept {
             if (!continuation) return;
             if (++g_chainDepth >= kMaxChainDepth) {
-                g_chainDepth = 0;                    // 栈将清空，重新计数
-                scheduleOnEventLoop(continuation);   // 转调度器，不直接 resume
+                g_chainDepth = 0;
+                scheduleOnEventLoop(continuation);
             } else {
-                continuation.resume();               // 短链同步直连（零开销）
+                continuation.resume();
             }
         }
     };
 
     void unhandled_exception() noexcept {
-        exception_ = std::current_exception();
+        try {
+            throw;
+        } catch (const aura_rt::Error& e) {
+            error_ = e;                      // 值化（浅拷贝：file/stack 指针共享）
+            has_error_ = true;
+        } catch (...) {
+            // ── G-8（GLM 复核 2026-09-28）：**不得**用 make_runtime_error（它会采栈 ⇒ 双分配窗口）──
+            //  窗口：make_string("unknown…") 产出的 message（分配①）→ 临时 Error 的成员已就位但
+            //        对象本体还不是任何 GC 根 → captureLogicalStack 的 Array 分配（分配②）触发 GC
+            //        → compact 搬走 message → 本对象留旧地址 → 赋给 error_ 后被 G-1 句柄「根化的是悬垂值」。
+            //  P1 阶段栈恒空 ⇒ 分配② 不发生 ⇒ 碰巧安全；**P4 帧注入后必开窗**。
+            //  修法用 kThrowSiteNoStack：①「unknown C++ exception」本属 C++ 异常、逻辑栈意义有限；
+            //  ②消灭窗口（只剩分配①，其时源为字面量 ⇒ 无 GC 指针 ⇒ 安全）。
+            error_ = aura_rt::Error{aura_rt::intern_string("RuntimeError"),
+                                    aura_rt::make_string("unknown C++ exception"),
+                                    nullptr, nullptr, 0, aura_rt::kThrowSiteNoStack};
+            has_error_ = true;
+        }
+        // ── G-1：立即根化 5 个指针字段（全部零分配：Ref 模式只是根链表 push，noexcept 安全）──
+        //    ⚠️ 必须在 error_ 赋值之后（句柄绑定字段地址）；此后再不重绑 ⇒ 满足 bug-79 的一次性约束
+        kindH_.emplace(error_.kind);
+        msgH_.emplace(error_.message);
+        extraH_.emplace(error_.extra);
+        fileH_.emplace(error_.file);
+        stackH_.emplace(error_.stack);
     }
 };
 
@@ -95,7 +170,15 @@ struct task<void> {
         }
 
         task<void> get_return_object() {
-            return task<void>{std::coroutine_handle<promise_type>::from_promise(*this)};
+            auto h = std::coroutine_handle<promise_type>::from_promise(*this);
+            // 🔵 feature-18 P4b-1（B0，change.md §8.2 B0a + §3.3.4 / 🟡-1）：**创建点快照**。
+            //   · 创建点在 **caller 线程** ⇒ 此刻 TLS 链 = **caller 的整链**
+            //     （含 baseDepth 之下的外层 caller 帧）⇒ 跨线程 spawn 的 `I3` 全靠它。
+            //   · `baseDepth = 当前 depth`（B0a 原文；新链此刻尚无自有帧）。
+            //   · 快照点**早于** `initial_suspend` ⇒ 新协程自己的帧还没 push（无污染）。
+            //   · nothrow（R4/C-2）：实现是纯 memcpy + 表写入（失败即放弃，绝不抛）。
+            aura_rt::snapshotStackAtCreation(h.address());
+            return task<void>{h};
         }
         auto final_suspend() noexcept {
             return detail::task_promise_base::final_awaiter{continuation_};
@@ -122,13 +205,15 @@ struct task<void> {
         struct awaiter {
             handle_type handle;
             bool await_ready() noexcept { return !handle || handle.done(); }
+            // ⚠️ feature-18 C-2：本函数为 noexcept ⇒ **不得抛出**（抛 ⇒ std::terminate，探针 5b 实测）。
+            //    若将来需要在此抛错，必须先去掉 noexcept 并满足 C-1（已排程后不得抛）。
             auto await_suspend(std::coroutine_handle<> continuation) noexcept {
                 handle.promise().continuation_ = continuation;
                 return handle;
             }
             void await_resume() {
-                if (handle.promise().exception_)
-                    std::rethrow_exception(handle.promise().exception_);
+                auto& p = handle.promise();
+                if (p.has_error_) throw p.error_;       // 意见 2：抛 Error 值
             }
         };
         return awaiter{handle_};
@@ -156,7 +241,11 @@ struct task {
         }
 
         task<T> get_return_object() {
-            return task<T>{std::coroutine_handle<promise_type>::from_promise(*this)};
+            auto h = std::coroutine_handle<promise_type>::from_promise(*this);
+            // 🔵 feature-18 P4b-1（B0，change.md §8.2 B0a + §3.3.4 / 🟡-1）：**创建点快照**。
+            //   与 `task<void>`（上方同名函数）**完全同源**：caller 线程的整链 + baseDepth = 当前 depth。
+            aura_rt::snapshotStackAtCreation(h.address());
+            return task<T>{h};
         }
         auto final_suspend() noexcept {
             return detail::task_promise_base::final_awaiter{continuation_};
@@ -182,14 +271,16 @@ struct task {
         struct awaiter {
             handle_type handle;
             bool await_ready() noexcept { return !handle || handle.done(); }
+            // ⚠️ feature-18 C-2：本函数为 noexcept ⇒ **不得抛出**（抛 ⇒ std::terminate，探针 5b 实测）。
+            //    若将来需要在此抛错，必须先去掉 noexcept 并满足 C-1（已排程后不得抛）。
             auto await_suspend(std::coroutine_handle<> continuation) noexcept {
                 handle.promise().continuation_ = continuation;
                 return handle;
             }
             T await_resume() {
-                if (handle.promise().exception_)
-                    std::rethrow_exception(handle.promise().exception_);
-                return std::move(handle.promise().value_);
+                auto& p = handle.promise();
+                if (p.has_error_) throw p.error_;       // 意见 2：抛 Error 值
+                return std::move(p.value_);
             }
         };
         return awaiter{handle_};
@@ -231,7 +322,7 @@ inline task<void> when_all(std::vector<task<void>>& tasks) {
 // 语义：
 //   - resume 一次：协程体同步执行到底（co_await 同步链如 io.println 的
 //     await_ready / 对称转移在同一 C++ 栈内跑完）
-//   - 完成后：promise.exception_ 在此重抛（ThreadPool::workerLoop 捕获后记入
+//   - 完成后：promise.error_ 在此重抛（ThreadPool::workerLoop 捕获后记入
 //     group 异常列表，waitGroup 再抛给 sync thread 块的调用方）
 //   - 若在真正异步点挂起（IOCP 完成包 / FutureAwaiter 等需要事件循环推进的
 //     await）：worker 线程没有事件循环，无法继续驱动。此时不能二次 resume（会在
@@ -252,8 +343,8 @@ void run_to_completion(task<T> t) {
             "cannot be driven to completion (frame detached).\n");
         return;
     }
-    if (h.promise().exception_)
-        std::rethrow_exception(h.promise().exception_);
+    if (h.promise().has_error_)
+        throw h.promise().error_;                        // 值化路径（原 rethrow_exception）
 }
 
 // ============================================================

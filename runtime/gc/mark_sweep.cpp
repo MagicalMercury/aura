@@ -154,8 +154,10 @@ void GcHeap::scanRootsOnly(bool youngOnly) {
     }
 
     // 5. 始终标记 OOM 错误缓存字符串（确保可随时抛出）
-    if (oomError_.kind) markRootEnqueue(oomError_.kind);
+    if (oomError_.kind)    markRootEnqueue(oomError_.kind);
     if (oomError_.message) markRootEnqueue(oomError_.message);
+    if (oomError_.file)    markRootEnqueue(oomError_.file);    // feature-18（防御）
+    if (oomError_.stack)   markRootEnqueue(reinterpret_cast<GcObject*>(oomError_.stack));  // 防御
 }
 
 // P0-B：单个栈候选指针的保守扫描（从 scanRootsOnly 提取）。

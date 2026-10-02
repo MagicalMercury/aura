@@ -75,10 +75,14 @@ task<GcString*> Io::readln() {
                    == std::future_status::ready;
         }
         void await_suspend(std::coroutine_handle<> cont) {
-            std::thread([this, cont]() mutable {
+            // feature-18 C-1：std::thread 构造可能抛（资源不足）⇒ 必须**先**建线程成功，
+            // 再让线程内部 schedule；构造失败时本函数直接抛出（尚未排程 ⇒ 安全）。
+            std::thread th([this, cont]() mutable {
                 try { future.wait(); } catch (...) {}
                 EventLoop::instance().schedule(cont);
-            }).detach();
+            });
+            // 到此处线程已建成并会负责 schedule ⇒ 之后的 detach 不抛
+            th.detach();
         }
         GcString* await_resume() { return future.get(); }
     };

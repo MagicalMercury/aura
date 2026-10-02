@@ -29,14 +29,14 @@ struct Channel {
             auto s = std::move(senders_.front()); senders_.pop_front();
             auto r = receivers_.front(); receivers_.pop_front();
             buffer_.push_back(std::move(s.value));
-            s.handle.resume();
-            r.resume();
+            if (s.handle && !s.handle.done()) s.handle.resume();   // feature-18：陈旧守卫
+            if (r && !r.done())               r.resume();          // feature-18：陈旧守卫
         }
         // 关闭时唤醒所有接收方
         if (closed_ && senders_.empty() && buffer_.empty()) {
             while (!receivers_.empty()) {
                 auto r = receivers_.front(); receivers_.pop_front();
-                r.resume();
+                if (r && !r.done()) r.resume();                    // feature-18：陈旧守卫
             }
         }
     }
