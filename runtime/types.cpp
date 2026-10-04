@@ -4,6 +4,8 @@
 
 #include "types.h"
 #include "builtin/array.h"      // Array<uint64_t>::make（captureLogicalStack 用）
+#include "builtin/string.h"     // GcString::data()（feature-18 P5 诊断输出）
+#include "meta.h"               // FrameDesc / frameByIndex（feature-18 P5 逻辑栈打印）
 #include <cstdio>
 #include <cstring>
 
@@ -63,9 +65,19 @@ Error::Error(GcString* k, GcString* m, GcObject* e,
 }
 
 // 采集当前逻辑栈为紧凑帧数组（E1）；调用方：Error 构造（构造时解构 = 主人开放问题 2 裁定）
+//   截断语义 = **保最内 n 帧**（与 plan §4.3 规则 4「保留最内 32 帧」及 P4b-1 快照截断
+//   `[max(0, depth−64), depth)` 同向）：
+//     栈下标 0 = 最外帧、depth−1 = 最内帧（栈顶）—— 见 logical_stack.h 的
+//     pushFrame（写 g_lsFrames[depth] 后 ++depth）与 setFrameLine（只改 depth−1）。
+//     深栈（depth > n）取 [depth−n, depth)、浅栈（depth ≤ n）取 [0, depth)
+//     ⇒ 抛错现场（最内帧）永远落在窗口末位，绝不被丢弃。
+//   ⚠️ 旧实现误取 [0, n)（最外 n 帧）⇒ 丢弃抛错现场，已按主人 2026-10-03 裁定（方案 A）修正，
+//      见 issues/bugs/bug-101-logical-stack-capture-truncates-outermost-frames.md。
 Array<uint64_t>* captureLogicalStack() noexcept {
     const uint32_t n = (g_lsDepth < kMaxStackFrames) ? g_lsDepth : kMaxStackFrames;
     if (n == 0) return nullptr;                 // 空栈 ⇒ 不分配
+    // 截断窗口起点：depth ≤ n ⇒ 0（全栈）；depth > n ⇒ depth−n（丢最外 depth−n 帧、保最内 n 帧）
+    const uint32_t from = (g_lsDepth > n) ? (g_lsDepth - n) : 0;
     Array<uint64_t>* arr = nullptr;
     try {
         arr = Array<uint64_t>::make(static_cast<int32_t>(n));
@@ -90,8 +102,8 @@ Array<uint64_t>* captureLogicalStack() noexcept {
             c->used = c->capacity;
         for (uint32_t i = 0; i < n; ++i) {
             (*arr)[static_cast<int32_t>(i)] =
-                (static_cast<uint64_t>(g_lsFrames[i].symbolIdx) << 32)
-                | static_cast<uint64_t>(g_lsFrames[i].line);
+                (static_cast<uint64_t>(g_lsFrames[from + i].symbolIdx) << 32)
+                | static_cast<uint64_t>(g_lsFrames[from + i].line);
         }
     } catch (...) {
         return nullptr;                         // 分配失败（含 OOM）⇒ 退化为无栈，绝不抛出
@@ -148,5 +160,102 @@ GcString* float_to_string(double val) { ... }
 GcString* bool_to_string(bool val) { ... }
 GcString* concat(...) { ... }
 */
+
+// ============================================================
+// feature-18 P5：诊断输出（formatError / formatErrorStack）
+//
+// 形态权威：plan §4.6（首行 + `  at <name> (<file>:<line>)`）；
+//          折叠 / 深度上限见 plan §4.3 规则 3/4。
+// ⚠️ **nothrow 友好**：全部实现在此路径上不得抛（容量 / 空指针一律退化）。
+// ============================================================
+namespace meta {
+// ── 弱默认查表（feature-18 P5 新增）─────────────────────────────
+//   生成码提供**强定义**（Inline 模式 = 生成的 TU 的 metaImpl；External 模式 =
+//   aura.meta.cpp，`MetaEmit.cpp:224` 渲染 `frameByIndex`）覆盖本默认。
+//   目的：让「collector OFF / 未产表」的生成程序**仍能链接** libaura_rt.a ——
+//   否则本 TU 的 formatError 会把 `meta::frameByIndex` 变成**无条件**未定义引用
+//   （P5 之前 runtime 侧无任何 meta 引用，故 collector OFF 程序链接正常；
+//    `test_codegen_spawn_call.cpp` 明验 collector ON/OFF 双路径真链接）。
+//   实测（MinGW UCRT64 GCC 16.2）：强定义覆盖弱定义、无强定义时落本默认（返回 nullptr）。
+//   返回 nullptr ⇒ formatError 退化为 `  at <unknown:idx>`，绝不读越界。
+__attribute__((weak)) const FrameDesc* frameByIndex(uint32_t) { return nullptr; }
+} // namespace meta
+
+namespace {
+// 写一行逻辑栈帧。count 为折叠计数（>1 时追加 `(xN)`，plan §4.3 规则 3）。
+inline void writeFrameLine(std::FILE* out, uint32_t symbolIdx, uint32_t line,
+                           uint32_t count) {
+    // 解紧凑帧后查表；越界 / 表空 / 占位帧（非帧符号 name==nullptr）⇒ 退化，绝不读越界
+    const meta::FrameDesc* d = meta::frameByIndex(symbolIdx);
+    if (!d || !d->name) {
+        std::fprintf(out, "  at <unknown:%u>", symbolIdx);
+    } else if (d->file) {
+        std::fprintf(out, "  at %s (%s:%u)", d->name, d->file, line);
+    } else {
+        std::fprintf(out, "  at %s:%u", d->name, line);       // file=null ⇒ 退化形态
+    }
+    if (count > 1) std::fprintf(out, "(x%u)", count);         // 折叠计数（规则 3）
+    std::fputc('\n', out);
+}
+} // namespace
+
+// 只打逻辑栈帧（不打首行）—— 供 `Unhandled` 与 `additional sync error` 两处复用。
+// 输出序 = **最内 → 最外**（与 plan §4.6 样例一致：抛出点在最上）。
+//   e.stack 数组序 = **最外 → 最内**（captureLogicalStack 自窗口起点递增写；
+//   深栈时窗口 = 最内 kMaxStackFrames 帧，见其定义处注释）
+//   ⇒ 打印时自 len-1 递减。
+// 深度 > kMaxStackFrames(32)：保留**最内 32 帧**（数组末 32 个），
+//   并在末尾追加 `省略最外 N 帧`（被略去的是最外 N 帧，故落在输出末尾）。
+//   ⚠️ 上限用 kMaxStackFrames(32)（解构/显示上限），**不是** kMaxSnapshotFrames(64)（快照容量）。
+void formatErrorStack(const Error& e, std::FILE* out) noexcept {
+    if (!out) out = stderr;
+    try {
+        // 档位 off ⇒ 无栈（向后兼容：只打首行）；stack=null / 空栈同理
+        if (!errStackConfig().capture) return;
+        Array<uint64_t>* s = e.stack;
+        if (!s || s->length <= 0) return;
+
+        const int32_t len     = s->length;
+        const int32_t cap     = static_cast<int32_t>(kMaxStackFrames);   // 32，非 64
+        const int32_t omitted = (len > cap) ? (len - cap) : 0;
+        const int32_t start   = omitted;      // 保留最内 cap 帧 = 数组的 [start, len)
+
+        int32_t i = len - 1;
+        while (i >= start) {
+            const uint64_t f    = (*s)[i];
+            const uint32_t sym  = static_cast<uint32_t>(f >> 32);
+            const uint32_t line = static_cast<uint32_t>(f & 0xFFFFFFFFu);
+            // 折叠：连续相同 (symbolIdx,line) ⇒ 计数（规则 3）
+            uint32_t n = 1;
+            while (i - 1 >= start) {
+                const uint64_t g = (*s)[i - 1];
+                if (static_cast<uint32_t>(g >> 32) != sym ||
+                    static_cast<uint32_t>(g & 0xFFFFFFFFu) != line) break;
+                ++n; --i;
+            }
+            writeFrameLine(out, sym, line, n);
+            --i;
+        }
+
+        if (omitted > 0)
+            std::fprintf(out, "  ... 省略最外 %d 帧\n", omitted);      // 规则 4
+    } catch (...) {
+        // 诊断路径绝不抛出：退化（已写出的部分保留）
+    }
+}
+
+// 完整诊断：首行（形态与 P5 之前**逐字符一致**，向后兼容）+ 逻辑栈帧。
+void formatError(const Error& e, std::FILE* out) noexcept {
+    if (!out) out = stderr;
+    const char* kind = "unknown";
+    const char* msg  = "";
+    try {
+        // ⚠️ GcString::data() 对 Rope 可能物化（可能分配）⇒ 兜底 catch（本函数 nothrow 契约）
+        if (e.kind)    { const char* k = e.kind->data();    if (k) kind = k; }
+        if (e.message) { const char* m = e.message->data(); if (m) msg  = m; }
+    } catch (...) { /* 退化：沿用默认 kind/msg */ }
+    std::fprintf(out, "Unhandled error: [%s] %s\n", kind, msg);
+    formatErrorStack(e, out);
+}
 
 } // namespace aura_rt

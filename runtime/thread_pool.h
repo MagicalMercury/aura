@@ -152,9 +152,16 @@ public:
     // 信号量限流：并发数达上限时阻塞，task 完成时 release
     void submit(std::function<void()> task);
 
+    // ---- bug-103(B,2026-10-04)：非析构入口 ----
+    // 等待本 group 全部任务完成；若有 Error ⇒ 重抛到**调用者**（**非 noexcept 函数**，
+    // 故 Aura 层 `try { sync thread { … } } catch (e) { … }` 可捕获）。
+    // 幂等：仅首次真正 waitGroup（group 已被 erase ⇒ 二次调用为空操作，但用 waited_ 显式闸门）。
+    void waitAndRethrow();
+
 private:
     uint64_t groupId_;
     std::counting_semaphore<> sem_;  // 并发上限信号量（初始计数 = maxConcurrency）
+    bool     waited_ = false;        // bug-103(B)：waitGroup 只执行一次
 };
 
 } // namespace aura_rt

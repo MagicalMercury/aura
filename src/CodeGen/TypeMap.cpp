@@ -477,6 +477,13 @@ std::string CodeGenerator::mapValueType(const TypeExpr& type) {
 std::string CodeGenerator::mapParamType(const TypeExpr& type) {
     // P1：接口参数按值传视图（视图 { 方法Fn, self } 是值类型，可拷贝；
     //     self 指向的堆适配器由保守栈扫描保护，无需 const& 引用形态）
+    //
+    // 🔴 反向红线（bug-102(A)，2026-10-04）：本函数**从不生成 `const&` 形参**（恒按值 /
+    //    值视图）——这是 bug-102 方案 A「把惰性协程调用的 deferred 实参物化提升到 IIFE
+    //    外」的安全前提 P2。**若将来为「大对象 const& 优化」引入按引用传参**，则
+    //    ExprClosure.cpp 的 `deferred` 分支提升覆盖条件（`!awaitPrefix.empty() ||
+    //    argIsAwait`）须先同步修复：否则新引入的 `const&` 形参在惰性协程
+    //    （initial_suspend=suspend_always）下会即刻复现实参悬垂（bug-102 形态）。
     return mapType(type);
 }
 

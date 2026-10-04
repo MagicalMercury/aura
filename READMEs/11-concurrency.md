@@ -22,6 +22,8 @@ sync {
 
 `sync` 内**未被消费**的 future 若抛异常，编译器会驱动完全部 future、记录**首个**异常、并在块尾重新抛出它；其余异常仅记录到 stderr。由 `spawn` 启动的任务则是**首个异常即中断**（见 §3.5 的 (乙1) 语义）。
 
+未捕获错误在终止进程前会打印**逻辑调用栈**（`Unhandled error: [<kind>] <message>` 首行 + 逐帧 `  at <name> (<file>:<line>)`）；`sync` 块内「其余异常」的 stderr 记录形如 `[aura_rt] additional sync error` 后接该错误的栈帧。档位由环境变量 `AURA_ERR_STACK` 控制（`on` / `off` / `on:threshold=N`，默认 `on`），详见 `10-error-handling.md` 的「未捕获错误的诊断输出」。
+
 ### 11.1.1 有界并发控制 `sync(max=N)`
 
 ```aura
@@ -141,6 +143,8 @@ fun worker(io: Io) throws {
 fun main(io: Io) throws {
     sync { worker(io) }        // ✅ 合法：worker 被 sync 可达调用
 }
+
+⚠️ 若 `worker` 本身是**协程函数**（体内含 I/O / 挂起点），则 `sync { worker(io) }` 这种**不绑定返回值**的裸调用语句当前存在已知缺陷：返回的 lazy `task` 被丢弃 ⇒ **被调协程不会启动**（`issues/bugs/bug-99-sync-block-bare-coroutine-call-statement-dropped.md`）。该形态的语义裁定与修复方向由 **feature-19** 承接。
 ```
 
 调用链可以跨多层（`sync { f(io) }` → `f` → `g`），`sync thread` / `sync for` 同样是合法根。
@@ -272,6 +276,8 @@ sync {
 
 → **并行收益**：两个请求同时发起，而非串行。
 
+> ⚠️ **实测现状（2026-10-03）**：当前实现是 **lazy `task`**（`runtime/task.h:106` `initial_suspend = suspend_always`）⇒ 协程体**直到消费点才首次 `resume`**，并非上句的「先全部启动」。探针 `scripts/_bug99/par1.aura`（形态与本段示例逐字一致）实测输出 `start 1 / end 1 / A: 1 / start 2 / end 2 / B: 2` —— **完全串行、零交错**（证据：`scripts/bug99_fix_report.md` §⑤ 探针 1）。故「并行收益」是**目标语义**，当前实现尚未达成；io 的提交/等待语义与并行化由 **feature-19** 承接（`plan/feature-19-io-offload-decoupling-draft.md`）。
+
 **未被消费的 future 也会被驱动完成**：块内声明但从未使用的 future，编译器会在**其所在块的末尾**自动驱动（`co_await`），保证协程真正跑完，而不是被直接销毁。若 future 声明在嵌套块（`if` / `for` / `while`）内，驱动点在该嵌套块的末尾。
 
 ```aura
@@ -315,6 +321,8 @@ must itself be called from a sync domain).
 ```
 
 这是**最后防线**：正常代码应在上面的编译期检查中被拦下。
+
+该 `Error` 若未被捕获，会经未捕获路径打印 `Unhandled error: [<kind>] <message>` 与逻辑栈（见 `10-error-handling.md` 的「未捕获错误的诊断输出」）。
 
 ## 11.5 `sync thread` — 真线程并发
 

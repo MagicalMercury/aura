@@ -6,6 +6,7 @@
 #include "array.h"
 #include "../gc.h"
 #include "string.h"
+#include "../coro_snapshot.h"   // feature-18 P4b-2（B4）：FutureAwaiter 挂起点快照
 
 #include <fstream>
 #include <iostream>
@@ -83,6 +84,14 @@ task<GcString*> Io::readln() {
             });
             // 到此处线程已建成并会负责 schedule ⇒ 之后的 detach 不抛
             th.detach();
+            // 🔴 feature-18 P4b-2（B4 / §3.3.3 挂起面）：本协程即将挂起 ⇒ 快照。
+            //   · 位置在「可能抛出」之后（C-1）：抛出路径从未挂起 ⇒ 不留陈旧 entry。
+            //   · 键 = 挂起方句柄地址（恢复走 `schedule` → `processReady` 的
+            //     `resumeWithRestore(h)`，同键）。
+            //   · 本 awaiter 不在 change.md §3.3.3 的**枚举清单**内，但属该条
+            //     「各内建 awaiter」的**语义**范围 ⇒ 按语义补插（见报告 §8 偏差 1）。
+            //   · C-2/R4：nothrow（纯 memcpy + 表写入，失败即放弃）。
+            snapshotStack(cont.address());
         }
         GcString* await_resume() { return future.get(); }
     };
@@ -103,7 +112,7 @@ GcString* Io::readln_sync() {
 // 文件 I/O
 // ============================================================
 
-task<GcString*> Io::read_file(const Path& path) {
+task<GcString*> Io::read_file(Path path) {
 #ifdef _WIN32
     // ── IOCP 真异步路径 ──
     HANDLE hFile = CreateFileW(path.native().c_str(),
@@ -169,7 +178,7 @@ GcString* Io::read_file_sync(const Path& path) {
     return make_string(oss.str());
 }
 
-task<void> Io::write_file(const Path& path, GcString* content) {
+task<void> Io::write_file(Path path, GcString* content) {
     std::ofstream file(path.native(), std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
         throw Error(make_string("io_error"),
@@ -207,7 +216,7 @@ bool Io::file_exists(const Path& path) const {
 // 目录操作
 // ============================================================
 
-task<void> Io::mkdir(const Path& path) {
+task<void> Io::mkdir(Path path) {
     std::error_code ec;
     std::filesystem::create_directories(path.native(), ec);
     if (ec) {
@@ -226,7 +235,7 @@ void Io::mkdir_sync(const Path& path) {
     }
 }
 
-task<void> Io::remove(const Path& path) {
+task<void> Io::remove(Path path) {
     std::error_code ec;
     if (std::filesystem::is_directory(path.native())) {
         std::filesystem::remove(path.native(), ec);
@@ -253,7 +262,7 @@ void Io::remove_sync(const Path& path) {
     }
 }
 
-task<Array<Path>*> Io::list_dir(const Path& path) {
+task<Array<Path>*> Io::list_dir(Path path) {
     std::error_code ec;
     std::vector<Path> entries;
     for (auto& entry : std::filesystem::directory_iterator(path.native(), ec)) {

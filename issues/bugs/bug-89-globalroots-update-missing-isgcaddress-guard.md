@@ -3,7 +3,7 @@ type: bug_report
 module: runtime/gc
 sub_module: updateAllReferences 步骤 3（更新 globalRoots_）遍历时直接解引用 *rootPtr，缺 isGCAddress 防御——与步骤 1（bug-79 已加固）不对称
 status:
-  - pending_fix
+  - blocked
 severity:
   - medium
 discover_date: 2026-09-27
@@ -22,6 +22,8 @@ tags:
 ---
 
 # 【`updateAllReferences` 步骤 3 更新 `globalRoots_` 时缺 `isGCAddress` 防御（与步骤 1 不对称）】
+
+> **阻塞（2026-10-03）**：作为 `[[feature-19-io-offload-decoupling]]` 的**前置依赖**，与其同批处理（跨线程 GC 根需要该守卫）。
 
 **状态**：`[ ] 未修复`（**加固项** —— 非当前可复现缺陷，属防御性收口）
 **严重度**：**medium**

@@ -88,6 +88,10 @@ struct CodeGenImport {
     std::string modName;    // 模块名（用作命名空间别名键，如 "math_utils"）
     bool        isBuiltin;  // 内置模块
     std::string nsName;     // 目标命名空间
+    // ---- bug-94：依赖模块的【产物身份键】----
+    //   多文件撞车工程下 = 相对路径 slug；空串 ⇒ 回落裸 stem
+    //   （单文件 / 测试路径 / 非撞车工程 ⇒ 行为逐字节不变）
+    std::string artifactKey;
 };
 
 // ============================================================

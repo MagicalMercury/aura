@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>            // std::FILE / stderr（feature-18 P5：formatError 的 out 参数）
 #include <type_traits>       // is_pointer_v / void_t / enable_if_t / is_convertible_v
 #include <utility>           // declval（GcViewSlot 视图槽 traits）
 
@@ -288,6 +289,28 @@ static_assert(offsetof(Error, file)  == 40, "Error.file must stay at offset 40")
 static_assert(offsetof(Error, line)  == 48, "Error.line must stay at offset 48");
 static_assert(offsetof(Error, stack) == 56, "Error.stack must stay at offset 56");
 #pragma GCC diagnostic pop
+
+// ============================================================
+// feature-18 P5：诊断输出（Unhandled error 首行 + 逻辑栈帧）
+//
+//   formatError(e, out)      = 首行 `Unhandled error: [kind] msg` + 逐帧逻辑栈
+//   formatErrorStack(e, out) = **只打逻辑栈帧**（供 sync 的 `additional sync error` 补栈复用）
+//
+// 形态权威：plan §4.6（首行逐字符向后兼容现输出）；折叠 / 深度上限见 plan §4.3 规则 3/4：
+//   · 每帧 `  at <name> (<file>:<line>)`；`file == nullptr` ⇒ `  at <name>:<line>`
+//   · 连续同 `(symbolIdx,line)` 折叠但保留计数 ⇒ 帧尾追加 `(xN)`
+//   · 深度 > `kMaxStackFrames`(32) ⇒ 只保留**最内 32 帧** + `省略最外 N 帧`（⚠️ 不是 64）
+//   · `stack == nullptr` / 档位 off / 空栈 ⇒ **只打首行**（向后兼容现输出）
+//   · `symbolIdx` 越界 / 表空 / 占位帧（name==nullptr）⇒ 退化为 `  at <unknown:idx>`，绝不读越界
+//
+// ⚠️ 二者均 **nothrow 友好**：它们位于 `std::exit(1)` 前的**未捕获路径**上，诊断自身
+//    绝不允许抛出（容量 / 空指针 / 查表失败一律退化，且**禁用 abort** —— 项目既有裁定）。
+// ⚠️ 故采用**直接写 `FILE*`**（而非返回 `GcString*`）：致命路径上 EventLoop 已停、
+//    GC 不得被请求分配；直写零 GC 交互、零根化需求。理由与替代方案见
+//    `scripts/f18_p5_impl_report.md` §2。
+// ============================================================
+void formatError(const Error& e, std::FILE* out = stderr) noexcept;
+void formatErrorStack(const Error& e, std::FILE* out = stderr) noexcept;
 
 
 } // namespace aura_rt

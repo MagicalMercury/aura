@@ -113,10 +113,15 @@ struct task_promise_base {
         void await_suspend(std::coroutine_handle<>) noexcept {
             if (!continuation) return;
             if (++g_chainDepth >= kMaxChainDepth) {
+                // 🔴 P4b-2 红线：**超限分支不得触碰**——`g_chainDepth` 是既有防爆栈机制；
+                //   本分支经 `scheduleOnEventLoop` → `processReady`（真调度边界）**天然收敛覆盖**。
                 g_chainDepth = 0;
                 scheduleOnEventLoop(continuation);
             } else {
-                continuation.resume();
+                // 🔴 feature-18 P4b-2（B5 / §3.3.3 恢复面）：final 短链 —— **真恢复点**。
+                //   用**普通** `resumeWithRestore`（不是 Scoped）：此处**幂等** ——
+                //   此刻 TLS == 挂起方挂起时的栈（覆盖 = 同数据），见 §3.3.1b 分派表第 2 行。
+                resumeWithRestore(continuation);
             }
         }
     };
@@ -209,7 +214,17 @@ struct task<void> {
             //    若将来需要在此抛错，必须先去掉 noexcept 并满足 C-1（已排程后不得抛）。
             auto await_suspend(std::coroutine_handle<> continuation) noexcept {
                 handle.promise().continuation_ = continuation;
-                return handle;
+                // 🔴 feature-18 P4b-2（B4 / change.md §3.3.1c）：**挂起 = 移出（快照）**。
+                //   · 本协程在此放弃线程 ⇒ TLS 链随后随时可能被别的协程**整体覆盖**
+                //     （§3.3.1 子问 1）⇒ 必须把「含外层 caller 的整链」存档。
+                //   · 键 = **挂起方**句柄地址（与恢复面 `resumeWithRestore(continuation)` 同键 ——
+                //     对称转移后由被等待协程的 final_awaiter 用同一 continuation 恢复）。
+                //   · 顺序（§3.3.1c）：`continuation_ = continuation;` → 快照 → `return handle;`。
+                //   · C-2 / R4：`snapshotStack` 是 noexcept（纯 memcpy + 表写入，失败即放弃）。
+                aura_rt::snapshotStack(continuation.address());
+                return handle;   // 对称转移：编译器**直接恢复被等待协程**（隐式 resume）
+                                 // ⇒ 该路径**无需 restore 且恰好无害**（TLS 链天然连续）——
+                                 // B6 豁免清单第 1 条，理由见 change.md §3.3.1c。
             }
             void await_resume() {
                 auto& p = handle.promise();
@@ -275,7 +290,13 @@ struct task {
             //    若将来需要在此抛错，必须先去掉 noexcept 并满足 C-1（已排程后不得抛）。
             auto await_suspend(std::coroutine_handle<> continuation) noexcept {
                 handle.promise().continuation_ = continuation;
-                return handle;
+                // 🔴 feature-18 P4b-2（B4 / change.md §3.3.1c）：**挂起 = 移出（快照）**。
+                //   与 `task<void>`（上方同名函数）**完全同源**：键 = 挂起方句柄地址，
+                //   值 = 含外层 caller 的整链；顺序 = continuation_ → 快照 → return handle。
+                //   C-2 / R4：`snapshotStack` noexcept（纯 memcpy + 表写入，失败即放弃）。
+                aura_rt::snapshotStack(continuation.address());
+                return handle;   // 对称转移（隐式 resume）⇒ **无需 restore 且恰好无害**；
+                                 // B6 豁免清单第 2 条，理由见 change.md §3.3.1c。
             }
             T await_resume() {
                 auto& p = handle.promise();
@@ -334,7 +355,16 @@ template <typename T>
 void run_to_completion(task<T> t) {
     if (!t) return;                       // 空 task（callee 返回空句柄）→ 无操作
     auto h = t.handle();
-    h.resume();                           // lazy：必须显式启动
+    // 🔴 feature-18 P4b-2（B5 / §3.3.3 分派表）：worker 首启 —— **不是「不适用」**！
+    //   本线程（ThreadPool worker）TLS 为空 ⇒ 必须把 **创建点 entry** 恢复进来 ——
+    //   `I3` **跨线程逻辑栈**全靠这一步。
+    //   路径（本批采用）：**已有的 side table entry** —— P4b-1 的 B0a 已在
+    //   `get_return_object()` 于 **caller 线程**写入创建点快照（`snapshotStackAtCreation`，
+    //   含 caller 整链 + baseDepth）；`resumeWithRestore(h)` → `restoreStack(h.address())`
+    //   取出该 entry → **覆盖** worker 的 TLS（并 erase entry）→ 再 resume。
+    //   （未改用 `snapshotStackAtCreation`：那是**写**入口，此处需要的是**读**；
+    //     且创建点快照已在正确线程写好 —— 重复写会把 worker 的空链盖掉。）
+    resumeWithRestore(h);                 // lazy：必须显式启动（B5：恢复创建点 entry）
     if (!h.done()) {
         (void)new task<T>(std::move(t));  // detach：保帧存活（防外部等待者 UAF）
         std::fprintf(stderr,

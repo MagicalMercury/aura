@@ -142,6 +142,10 @@ inline void resetThrowCounters() noexcept {
 
 // 采集紧凑帧（E1）：返回 Array<uint64_t>*，每条 = (symbolIdx << 32) | line
 //   上限 kMaxStackFrames；无帧 / 分配失败 ⇒ nullptr。**实现在 types.cpp**（需要 Array<T> 完整定义）
+//   ⚠️ 截断契约 —— **保最内**：帧数 > kMaxStackFrames 时取窗口 [max(0, depth − n), depth)
+//     （n = min(depth, kMaxStackFrames)），即**保留最内**（栈顶侧 = 抛错现场）的 n 帧、**丢弃最外**
+//     （main 侧）帧；与 pushFrame 的下标约定（`g_lsFrames[0]` = 最外、`[depth−1]` = 最内）配套。
+//     ⚠️ 曾经反向实现（取 [0, n) = 保最外、丢抛错现场）⇒ 见 issues/bugs/bug-101-….md。
 Array<uint64_t>* captureLogicalStack() noexcept;
 
 } // namespace aura_rt

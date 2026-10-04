@@ -3,8 +3,7 @@ type: feature_request
 module: runtime + src/CodeGen + src/Sema
 sub_module: 协程异常语义（task 异常值化）+ Error 诊断增强（协程栈解构）
 status:
-  - draft
-  - pending_review
+  - finished
 severity:
   - high
 discover_date: 2026-09-27

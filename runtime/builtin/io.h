@@ -44,13 +44,15 @@ public:
     // ========== 文件 I/O (参数为 Path) ==========
 
     // read_file(path: Path) throws -> string — 读取文件内容
-    task<GcString*> read_file(const Path& path);
+    //   bug-102(B)：按值 —— 惰性协程帧须自带一份 Path 副本（帧存引用会悬垂）。
+    task<GcString*> read_file(Path path);
 
-    // read_file_sync(path: Path) throws -> string — 同步版本
+    // read_file_sync(path: Path) throws -> string — 同步版本（无惰性，保持 const&）
     GcString* read_file_sync(const Path& path);
 
     // write_file(path: Path, content: string) throws — 写入文件（覆盖）
-    task<void> write_file(const Path& path, GcString* content);
+    //   bug-102(B)：按值（同族 API 一并按值化）。
+    task<void> write_file(Path path, GcString* content);
 
     // write_file_sync(path: Path, content: string) throws — 同步版本
     void write_file_sync(const Path& path, GcString* content);
@@ -59,19 +61,22 @@ public:
     bool file_exists(const Path& path) const;
 
     // mkdir(path: Path) throws — 创建目录
-    task<void> mkdir(const Path& path);
+    //   bug-102(B)：按值（同族惰性协程）。
+    task<void> mkdir(Path path);
 
     // mkdir_sync(path: Path) throws — 同步版本
     void mkdir_sync(const Path& path);
 
     // remove(path: Path) throws — 删除文件或空目录
-    task<void> remove(const Path& path);
+    //   bug-102(B)：按值（同族惰性协程）。
+    task<void> remove(Path path);
 
     // remove_sync(path: Path) throws — 同步版本
     void remove_sync(const Path& path);
 
     // list_dir(path: Path) throws -> [Path] — 列出目录内容
-    task<Array<Path>*> list_dir(const Path& path);
+    //   bug-102(B)：按值（同族惰性协程）。
+    task<Array<Path>*> list_dir(Path path);
 
     // list_dir_sync(path: Path) throws -> [Path] — 同步版本
     Array<Path>* list_dir_sync(const Path& path);

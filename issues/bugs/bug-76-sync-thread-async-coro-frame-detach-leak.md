@@ -22,6 +22,8 @@ tags:
 
 # 【sync thread 内 spawn 真异步挂起型协程】worker 无线程事件循环 → 无法驱动完成 → 帧 detach（**泄漏 1 个协程帧**）+ stderr 诊断（bug-73 修复的降级路径，架构性限制）
 
+> **出口（2026-10-03）**：`[[feature-19-io-offload-decoupling]]` 的 **U2 探针**（io 线程作 IOCP 唯一消费者去驱动 worker 上挂起的帧）是可能的解出路径（R7 裁定项），**须实测，不作断言**。
+
 [ ] **主标题：`sync thread` 内 `spawn f(args)` 当 `f` 是「真异步挂起型协程」（体含 IOCP 完成包 / `FutureAwaiter` 等待）时，`run_to_completion` 单次 `resume` 无法推进到完成——线程池 worker 没有事件循环；为避免 UB/UAF 只能 detach 帧（泄漏）并输出诊断**
 
 > **一句话摘要**：bug-73 修复让「同栈跑完的协程」正常了，但**真异步挂起型协程**在线程池 worker 上无法被驱动完成——降级为 detach 帧（泄漏 1 帧）+ stderr 诊断（原为静默丢弃）。

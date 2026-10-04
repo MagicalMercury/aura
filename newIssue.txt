@@ -2,33 +2,59 @@
 1、enum
 2、运行时Error输出规范化以及调用栈
 3、"#"配置器 + 反射机制
-    主要作用：用于配置某些东西，既想把它当宏（用一个标准库实现）用，又想把它当Java的注解用，也想把它当python的装饰器用
-    #type SubscribeEvent = {
-        event: event,
-        #side: Thread // sync thread 中 spawn 要额外添加配置器注明线程名，thread内置库支持线程命名
-    }
+    '#'现在主要的作用是加载元数据，可用的元数据是：
+        #type ：type内的所有字段就是元数据的内容，可以用类似json的方法解析。对于type的函数解析，可以用于校验、代码生成等等，但怎么调用还没想过。
+        #interface ：既可以集成给#type，也可以独立当成元数据加载。
+    另外的想法是#fun编译期函数（但是它这个逻辑怎么和加载元数据结合起来暂时想不通）
 
-    使用：
-    #SubscribeEvent{event = ...}
-    fun (self Player) link(url: str, db: DataBase){
-        #[side = Server]{
-            ...
-        }
-        #[side = Client]{
-            ...
-        }
-    }
+    关于反射机制：就是一个reflect库（编译期调用就是#reflect）
+    内置类型：
+            reflect.Any 一种带限制的Any类型，必须能在运行时调用前被推断出具体类型
+            reflect.Type aura支持的类型的一个Enumerate(编译期动态生成：收集所有的内置基础类型、具名的record、interface，
+                                                                    后面的两个生成的是reflect.RecordEntry和reflect.MethodEntry)
+            reflect.metadata json类的一个格式
+            reflect.Entry 是以下几种Entry的集合 （interface需不需要独立的一个？）
+            reflect.FunEntry 函数元数据
+                name: string 函数名
+                params: [Union<string, reflect.Type, reflect.Any>] 参数名和参数列表
+                return: [reflect.Type]
+                metadata: [reflect.metadata]
+            reflect.RecordEntry Record元数据
+                name: string
+                fields: [Union<string, reflect.Type, reflect.Any>]
+                method: [reflect.MethodEntry]
+                metadata: [reflect.metadata]
+            reflect.MethodEntry 方法元数据
+                name: string 函数名
+                params: [Union<string, reflect.Type, reflect.Any（万一有默认参数）>] 参数名和参数列表
+                return: [reflect.Type]
+                owner: [reflect.RecordEntry]
+                metadata: [reflect.metadata]
+            reflect.CallableEntry
+            reflect.InterfaceEntry
 
-    sync thread(max = 7){
-        #Thread("Server")
-        spawn ...
-    }
+            reflect.Entry需要一种通过string搜索的创建方式。就是说匹配了，这个变量就直接指向了那个函数/方法/record/interface
 
-    type EventFuncCollector = {}
+    内置函数：
+            reflect.collect(metadata: string) -> [reflect.Entry] 收集带有某个元数据的东西
+
+            reflect.typeof(x) -> reflect.Type
+            #reflect.typeof(x) -> reflect.Type
+            这两个用于运行时和编译期生成某个变量的类型
+
+            reflect.typeEqual(a, b) -> bool
+            #reflect.typeEqual(a, b) -> bool
+            运行时和编译期判断两者类型是否相同
+
+            reflect.callable(x) -> bool
+            #reflect.callable(x) -> bool
+            判断是否能够被调用
+
+            reflect.invoke(callable: reflect.CallableEntry, params: [Union<string, reflect.Type, reflect.Any])
 
 5、typeof函数内置
 6、VarInt
 7、编译期Channel死锁检查
 8、sync的runtime优化
 9、编译期函数：
-    
+    大体样式#fun...(后面跟正常的fun同一个逻辑)

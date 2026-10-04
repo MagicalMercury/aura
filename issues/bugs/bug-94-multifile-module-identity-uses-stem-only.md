@@ -3,7 +3,7 @@ type: bug_report
 module: src/main.cpp / src/CodeGen — 多文件模块身份键用 `stem`（文件名主干）⇒ 不同目录同名模块冲突
 sub_module: compileMultiFile 的 nsName/产物命名 —— `sanitizeId(stemOf(path))` 丢掉了目录信息 ⇒ 同名 stem 的模块撞 `nsName`（thunk 重名 `multiple definition`）与产物路径（`<stem>.aura.h/.cpp` 互相覆盖）
 status:
-  - pending_fix
+  - fixed
 severity:
   - medium
 discover_date: 2026-10-01
@@ -21,9 +21,9 @@ tags:
   - multiple-definition
 ---
 
-# [ ] bug-94 多文件模式下模块身份键只用 `stem` ⇒ 不同目录同名模块（`a/util.aura` 与 `b/util.aura`）冲突（thunk 重名 + 产物互相覆盖）
+# [x] bug-94 多文件模式下模块身份键只用 `stem` ⇒ 不同目录同名模块（`a/util.aura` 与 `b/util.aura`）冲突（thunk 重名 + 产物互相覆盖）
 
-**状态**：`[ ] 待修复`（2026-10-01 登记）
+**状态**：`[x] 已修复`（2026-10-03）—— 身份键改造（产物名 + thunk 前缀 + 依赖 `#include` 名统一走 `computeModuleKeys`/`identityKeyOf`），**默认键 = 裸 stem（向后兼容）**，仅撞车组改「相对入口目录 slug」。
 **严重度**：**medium** —— 需要「项目里存在两个不同目录、但文件名主干相同的模块」才触发；一旦触发，表现是 `multiple definition of ...`（链接期）或**产物被静默覆盖**（后者更危险：不报错但结果错）。属「合法项目结构 ⇒ 坏结果」类。
 
 ---
@@ -124,4 +124,34 @@ tmp/
 
 ## 8. 修复记录
 
-（待修复批登记）
+**状态**：`[x] 已修复`（2026-10-03 实施批）。
+
+### 8.1 实现（身份键改造，跨 5 文件）
+
+| 文件 | 改动 |
+| :--- | :--- |
+| `src/Module/ModuleManager.h`（public 段） | 新增 `computeModuleKeys(entryPath)` + `identityKeyOf(baseDir, sourcePath)` 声明 |
+| `src/Module/ModuleManager.cpp` | 新增两函数实现：按 stem 分桶 → **默认键 = 裸 stem** → 仅撞车组（同 stem ≥ 2 文件）改「相对入口目录、去扩展名」slug（`sanitizeId` 归一）；slug 仍撞车时按路径字典序追加 `_<n>`（确定性） |
+| `src/CodeGen/CodeGen.h` | `CodeGenImport` 增字段 `std::string artifactKey`（空串 ⇒ 回落裸 stem） |
+| `src/CodeGen/CodeGen.cpp`（依赖 `#include`） | `depStem = imp.artifactKey.empty() ? path(imp.path).stem() : imp.artifactKey` |
+| `src/main.cpp`（5 处） | ① `moduleKeyOf` 建表 + `moduleKeyOfPath` lambda；② import 构建填 `ci.artifactKey`；③ collector 身份 `sanitizeId(moduleKeyOfPath(...))`（thunk 前缀）；④ 产物命名 `modStem = moduleKeyOfPath(...)`；⑤ 中间件清理同键（与 ④ 成对） |
+
+**明确不改**（守 feature-13 C0 契约）：`nsName` 生成（`:141-150`）、`pathToNs`（`:90-94`）、`checkModuleConflicts`、入口 exe 名、`MetaCollect.cpp:26` 拼接式。
+
+### 8.2 对笔记 §1 的两处实测更正（回写）
+
+1. **「隐式回落 stem 同名 ⇒ 冲突」不成立**：隐式同名被 `checkModuleConflicts` **明确报错**（实测 `error: module name conflict: 'util' resolves to multiple files without an explicit 'module' declaration:`）。真实触发面 = 两文件**均带显式同名 `module` 声明**（D12 判为「全显式同名 = 合法共享命名空间」⇒ 放行）。
+2. **「静默覆盖（错结果、不报错）」部分不成立**：实测覆盖后**必报错**（链接 `multiple definition` / 编译 `'fa' is not a member of 'ua'`）。但确有两处**真静默**：thunk 重名（`aura.meta.cpp` 两符号同指同一 thunk）与两别名同指（`namespace ua = aura_mod_util; namespace ub = aura_mod_util;`）—— 本次身份键改造清除了前者。
+
+### 8.3 实证（2026-10-03 实施批实跑）
+
+- **产物命名**（`-S`，`scripts/_b939497/b94/`，两文件均 `module util`）：产物为 **`a_util.aura.h/.cpp` + `b_util.aura.h/.cpp`**（修复前只有一份 `util.aura.*` 互相覆盖）；`main.aura.h` 含 `#include "a_util.aura.h"` 与 `#include "b_util.aura.h"` 两行。
+- **thunk 唯一**：`aura.meta.cpp` 中 `_aura_mat_a_util_0` 与 `_aura_mat_b_util_0` **不重名**（修复前两者同为 `_aura_mat_util_0`）。
+- **CLI 端到端（场景 A：同名 module + 不同函数名 fa/fb）**：`aurac scripts/_b939497/b94_scenA/main.aura --cpp <out> -o <exe>` ⇒ **`rc=0`**，运行输出 `a=1` / `b=2`，`run rc=0`（修复前：`'fa' is not a member of 'ua'; did you mean 'fb'?` 编译错）。**这是本缺陷的决定性端到端改善**。
+- **非撞车回归（逐字节兼容）**：`example/used/test_import.aura` ⇒ 产物名 = **裸 stem**（`math_utils.aura.*` / `test_import.aura.*`，无 slug）。
+- **确定性**：同工程连编两次，6/6 产物 **md5 逐字节一致**。
+- **单测**：`ModuleScan.Bug94StemCollisionKeysAreUnique` / `Bug94NonCollidingKeepsRawStem`（`test/module/test_module_scan.cpp`）+ `CodeGenArtifactKey.DependencyIncludeUsesArtifactKey` / `ThunkPrefixFollowsIdentityKey`（`test/codegen/test_codegen_artifact_key.cpp`）全绿；**反向实验**（退回「全部 = 裸 stem」+ 单注释 `artifactKey` 分支）⇒ 前 3 例转红，恢复 ⇒ 全绿。
+
+### 8.4 偏差（如实记录，未硬凑）
+
+`change.md §2.6` 的判据「`b94/main.aura`（两文件**同名函数** `helper()`）`-o` ⇒ `rc=0`、输出 `= 1` 与 `= 2`」**未达成且不可达成**：两文件按 D12 契约**共享 `aura_mod_util` 命名空间**，各自定义同名的 `aura_mod_util::helper()` ⇒ 链接期 `multiple definition of 'aura_mod_util::helper()'`（`rc=1`）。**修复的是「每源文件的产物/thunk 键」，不是「共享命名空间」**（后者是 feature-13 C0 的有意特性，`change.md §2.2/§2.3.6` 明文不改）。⇒ 「同符号名 + 同 module」是**用户侧的语义冲突**，非本缺陷；本缺陷的正确端到端判据是 **场景 A（不同函数名）**，实测 `rc=0` + `a=1`/`b=2`。详见实施报告 §9 偏差 ①。

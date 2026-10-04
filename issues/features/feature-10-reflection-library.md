@@ -79,7 +79,7 @@ related_issues:
 ```
 SymbolEntry {
     name          : string          // "heal" / "Player.heal"（限定名）
-    kind          : enum            // fn | method | ctor | builtin
+    kind          : enum            // fun | method | ctor | builtin
     owner         : TypeEntry*      // 方法/receiver 所属 record（函数为 null）
     params        : [ParamInfo]     // { name?, type: TypeEntry*, is_gc: bool }
     return_type   : TypeEntry*

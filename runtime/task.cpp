@@ -65,7 +65,7 @@ void EventLoop::run(task<void>& mainTask) {
                           static_cast<char*>(framePtr) + (pageEnd - frameAddr));
 
     running_ = true;
-    handle.resume();  // initial_suspend → 进入 main 函数体
+    handle.resume();  // initial_suspend → 进入 main 函数体（P4b-2 B5 分派表：链根、无 caller 链 ⇒ **故意保持裸 resume**，见报告 §4 保留项 1）
 
     // ── 事件循环 ──
     while (running_) {
@@ -97,10 +97,9 @@ void EventLoop::run(task<void>& mainTask) {
     if (handle.promise().has_error_) {
         const aura_rt::Error& e = handle.promise().error_;
         // Error 是 GcObject 子类，不继承 std::exception；EventLoop 已停止，GC 不会移动对象
-        const char* kind = (e.kind && e.kind->data()) ? e.kind->data() : "unknown";
-        const char* msg  = (e.message && e.message->data()) ? e.message->data() : "";
-        std::fprintf(stderr, "Unhandled error: [%s] %s\n", kind, msg);
-        // ⚠️ P5 接：此处按 e.stack（紧凑帧）+ FrameDesc[] 打印逻辑栈；本阶段仅判空不做输出
+        // feature-18 P5：首行（`Unhandled error: [kind] msg`，形态向后兼容）+ 逻辑栈一并输出。
+        //   此处 EventLoop 已停止、GC 不移动 ⇒ 直接按 e.stack（紧凑帧）+ FrameDesc[] 打印安全。
+        aura_rt::formatError(e, stderr);
         std::exit(1);
     }
 }
@@ -113,7 +112,7 @@ void EventLoop::processReady() {
     }
     while (!batch.empty()) {
         auto h = batch.front(); batch.pop();
-        if (h && !h.done()) h.resume();
+        if (h && !h.done()) resumeWithRestore(h);   // feature-18 P4b-2 B5：**真调度边界**（普通恢复）
     }
 }
 

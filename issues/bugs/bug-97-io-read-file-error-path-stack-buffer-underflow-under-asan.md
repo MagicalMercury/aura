@@ -4,7 +4,7 @@ module:
   - ASAN(CLANG64/libc++)工具链的文件路径处理：（表现点在'runtime/builtin/io.cpp'的'Io::read_file'）
 sub_module: CLANG64/libc++ 下 `std::filesystem`/`Path` 路径失真 ⇒ 写出**乱码名文件** ⇒ `read_file` 打不开 ⇒ 走 `th...[truncated]
 status:
-  - pending_fix
+  - fixed
 severity:
   - medium
 discover_date: 2026-10-02
@@ -19,12 +19,11 @@ tags:
   - io
 ---
 
-# [ ] bug-97 —— ASAN(CLANG64) 的**文件路径失真**被误报为 `Io::read_file` 越界（**已重新定性**）
+# [x] bug-97 —— ASAN(CLANG64) 的**文件路径失真**被误报为 `Io::read_file` 越界（**已重新定性**）
 
-> **🔴 状态说明**：**不是产品缺陷，是 ASAN 模式（CLANG64/libc++）的覆盖限制**。
-> 标题保留原名以便检索；实况见 §3/§5。**仍有两项待办**（§6）：① 登记 ASAN 限制到 AGENTS.md；
-> ② 在**常规模式**下单测 `io.cpp:113-116` 错误分支，确认它**自身**无独立真越界。
-> ⇒ 未打 `[x]`：重新定性 ≠ 处置完毕。
+> **🔴 状态说明**：**不是产品缺陷，是 ASAN 模式（CLANG64/libc++）的覆盖限制** —— 且本缺陷实为**误报**（真因指向 `[[bug-102]]`）。
+> 标题保留原名以便检索；实况见 §3/§5。**2026-10-03 关单**（实施批）：① 常规模式单测 `read_file` 错误分支（`test/rt/test_io.cpp`，**非 ASAN 判据**）已落地并全绿，确认 `io.cpp` throw 分支**自身无独立真越界**；② 「CLANG64/libc++ 工具链路径失真」**降级为未证实假设**（`probe_E` 两工具链逐项一致）。
+> ⚠️ **唯一悬留项**：`AGENTS.md §七` 的 ASAN 覆盖限制条目**未落盘**（`AGENTS.md` 为受保护文件）—— 完整提议文本已贴进实施报告（`scripts/fix_b939497_impl_report.md` §4），待主人本人落地。
 
 ## 1. 现象
 
@@ -117,3 +116,25 @@ fun main(io: Io) throws {
 - `scripts/_f18_p4a_b5_tmp/v5_run.log`（第 68-82 行 = `CASE c8_io` 段）
 - `scripts/_f18_p4a_b5_tmp/v5_evidence/asan_c8_io.console.log`（完整 stderr）
 - `scripts/_f18_p4a_b5_tmp/io_probe.aura`（复现件）
+
+---
+
+## 8. 重大更正（2026-10-03，实施批）
+
+**本缺陷为误报**；原「CLANG64/libc++ 工具链路径失真」定性**降级为未证实假设**；ASAN 报点的真因指向 **`[[bug-102]]`**（`const Path&` 实参在惰性协程中悬垂的 use-after-free）。
+
+### 8.1 三条更正
+
+1. **`io.cpp` 的 `read_file` throw 分支不是真缺陷**（实测裁定）：常规模式（UCRT64 g++/libstdc++）下 `probe_B` 负例（**活引用**、61 字符路径）⇒ `caught aura_rt::Error kind=[io_error] msg=[cannot open file: <完整路径>]`、`rc=0`，**无越界、无路径失真**。⇒ 原 §3「待查 1」的答案 = **否**；原 §3 行号 `io.cpp:113-116` **漂移 +7**，实际 = `runtime/builtin/io.cpp:122-126`。
+2. **「libc++ 路径失真」未被独立证实**：`probe_E`（裸 `std::filesystem::path` 窄→宽转换 + 落盘 + 目录扫描）在 **UCRT64/libstdc++ 与 CLANG64/libc++** 下**逐项一致且正确**（`native_size=16 ssize=16 str=[b97enc_probe.dat] exists=1`，无乱码名）。⇒ 「仓库根出现乱码名文件」更可能来自 **UAF 后的垃圾路径**（bug-102），而非 libc++ 的路径转换。
+3. **ASAN 报点 `io.cpp:115` 的最可能真因 = bug-102**：证据链 —— ① bug-102 已实测长路径常规模式 100% 失败；② 本批 `probe_A`（Aura 生成码按引用传临时）失败 vs `probe_B`（C++ 层活引用）成功，**唯一变量 = 实参生存期**；③ ASAN 的 `stack-buffer-underflow` 读的正是 `std::wstring` 的长度/容量头（`basic_string<wchar_t>::size()/__is_long()`），与「已析构的 `Path::path_`」吻合；④ `path.native().string()` 抛转换异常（`fs_path.h:785`）正是 bug-102 §2.2 记录的链条；⑤ 「unknown C++ exception」的产地 = `runtime/task.h:143-145` 的 `catch(...)` 值化。
+
+### 8.2 处置（不改 `io.cpp` 逻辑）
+
+- **新增 `test/rt/test_io.cpp`**（2 例，**非 ASAN 可判定**的 throw 分支回归护栏）：`RtIo.ReadFileSyncMissingFileThrowsIoErrorWithPath`（断言 `kind == "io_error"` + 消息含 `cannot open file` + 文件名 **未失真**）+ `RtIo.ReadFileSyncExistingFileReadsContent`（正例不误伤）。走 **`read_file_sync`** 以规避 bug-102 的惰性协程实参悬垂。**反向实验**：把 `io.cpp` 的 `read_file_sync` throw 改为 `return make_string("")` ⇒ 第 1 例转红；恢复 ⇒ 全绿。
+- **`AGENTS.md §七` 的 ASAN 覆盖限制条目**：`AGENTS.md` 为受保护文件 ⇒ **提议文本已贴进实施报告 §4，未落盘，待主人本人落地**。
+- **交叉引用**：`[[bug-102]]` 笔记已加一行交叉引用（本缺陷的 ASAN 误报真因指向它）；**不改 bug-102 的 status**。
+
+### 8.3 与 bug-102 的联动关单
+
+本缺陷（误报）与 bug-102（真 UAF）**联动**：bug-102 修复后，Aura 层长路径 `read_file` 应得干净 `io_error`（详见实施报告 §9 未闭合项）。

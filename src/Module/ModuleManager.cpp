@@ -94,6 +94,68 @@ std::string ModuleManager::pathToNs(const std::string& path) {
 }
 
 // ============================================================
+// bug-94：多文件模块身份键（产物命名 / thunk 前缀 / 依赖 include 名）
+//
+// 背景：`stem` 丢失目录信息 ⇒ `a/util.aura` 与 `b/util.aura` 撞同一对产物
+//   （`util.aura.h/.cpp`）与同一 thunk 前缀（`_aura_mat_util_<seq>`）。
+// 策略：默认键 = 裸 stem（向后兼容红线）；仅撞车组改「相对入口目录 slug」。
+// ============================================================
+std::string ModuleManager::identityKeyOf(const std::string& baseDir,
+                                         const std::string& sourcePath) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path absSrc = fs::absolute(sourcePath, ec);
+    if (ec) absSrc = fs::path(sourcePath);
+    fs::path absBase = fs::absolute(baseDir, ec);
+    if (ec) absBase = fs::path(baseDir);
+
+    fs::path rel = fs::relative(absSrc, absBase, ec);
+    const std::string relStr = rel.generic_string();            // 统一 '/'
+    if (ec || rel.empty() || relStr.rfind("..", 0) == 0)        // 越界/失败 ⇒ 退路
+        rel = absSrc.filename();
+
+    std::string noExt = rel.replace_extension().generic_string();  // 去扩展名
+    return sanitizeId(noExt);   // '/'→'_'；非 [A-Za-z0-9_] → '_'；折叠连续 '_'
+}
+
+std::unordered_map<std::string, std::string>
+ModuleManager::computeModuleKeys(const std::string& entryPath) const {
+    namespace fs = std::filesystem;
+    const std::string baseDir = fs::absolute(entryPath).parent_path().string();
+
+    // ① 收集参与 CodeGen 的非内置模块（有 sourcePath），按 stem 分桶
+    std::vector<std::string> paths;
+    std::unordered_map<std::string, std::vector<std::string>> byStem;
+    for (const auto& [key, info] : modules_) {
+        (void)key;
+        if (info.isBuiltin || info.sourcePath.empty()) continue;
+        paths.push_back(info.sourcePath);
+        byStem[stemOf(info.sourcePath)].push_back(info.sourcePath);
+    }
+    std::sort(paths.begin(), paths.end());                      // 确定性（与调度序无关）
+    for (auto& [stem, group] : byStem) std::sort(group.begin(), group.end());
+
+    // ② 默认键 = 裸 stem（非撞车工程产物名逐字节不变）
+    std::unordered_map<std::string, std::string> result;
+    for (const auto& p : paths) result[p] = stemOf(p);
+
+    // ③ 仅撞车组（同 stem ≥ 2 文件）改派生 slug
+    for (const auto& [stem, group] : byStem) {
+        if (group.size() < 2) continue;
+        std::unordered_map<std::string, std::vector<std::string>> bySlug;
+        for (const auto& p : group) bySlug[identityKeyOf(baseDir, p)].push_back(p);
+        for (auto& [slug, dups] : bySlug) {
+            if (dups.size() == 1) { result[dups[0]] = slug; continue; }
+            // ④ 派生 slug 仍撞车（如 `a-b/x.aura` 与 `a/b/x.aura` 均归一成 `a_b_x`）
+            //    ⇒ 按路径字典序追加 `_<n>`（确定性；对排序后下标）
+            for (size_t i = 0; i < dups.size(); ++i)
+                result[dups[i]] = slug + "_" + std::to_string(i);
+        }
+    }
+    return result;
+}
+
+// ============================================================
 // 内置模块白名单
 // ============================================================
 bool ModuleManager::isKnownBuiltin(const std::string& name) const {

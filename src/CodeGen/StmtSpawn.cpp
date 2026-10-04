@@ -90,6 +90,19 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
     //   🔴 门控：`emitAnonFrame` 内部随 `metaCollector_` 门控（`NullMetadata` ⇒ 零注入）。
     emitAnonFrame(out, "spawn", static_cast<uint32_t>(stmt.line), stmt);
     insideSpawn_ = true;
+    // ============================================================
+    // 🔴 bug-98（A″，2026-10-02）：块形态 spawn lambda 体**同样不继承**外层 sync
+    //    块的「延迟协程调用」语义（与调用形态同一条契约，CodeGen.h:1205）。
+    //    lambda 本身是 `-> aura_rt::task<void>` 协程 ⇒ 体内协程调用应立即 co_await，
+    //    而不是登记为 future 等「本块块尾驱动」—— 该 lambda 体并**不** push
+    //    futureBlockStack_ 帧（genSpawnStmt 逐条 genStmt，不走 genBlock）⇒ 延迟登记
+    //    会挂到**外层** frame 上，块尾生成引用越界变量 `co_await r;` 的坏 C++
+    //    （实测：`sync { spawn (io) { let r = worker2(13, io) … } }` ⇒
+    //      `error: 'r' was not declared in this scope`，见 scripts/_bug98/m6d_*）。
+    //    置 false 后该形态生成 `auto r = co_await worker2(13, io);`（正确）。
+    // ============================================================
+    bool savedInsideSyncBlockSpawnBlock = insideSyncBlock_;
+    insideSyncBlock_ = false;
     // #56 §1.8：spawn lambda 体生成期间隔离外层闭包/方法句柄映射（外层闭包内再
     // spawn 引用 self 亦映射自身捕获句柄，不依赖外层 _this_root 可见性）；体后恢复。
     // 缺口 1：协程 lambda init-capture 的 GcRootHandle 存在 g++ 暂存窗口（globalRoots_
@@ -139,6 +152,7 @@ void CodeGenerator::genSpawnStmt(std::ostream& cpp, const SpawnStmt& stmt,
     ioInScope_ = savedIoInScope;
 
     insideSpawn_ = false;
+    insideSyncBlock_ = savedInsideSyncBlockSpawnBlock;   // 🔴 bug-98（A″）：恢复外层 sync 块语义
     currentClosureThisHandle_ = savedClosureHandle;
     currentMethodThisHandle_ = savedMethodHandle;
     out << indentStr() << "    co_return;\n";
@@ -251,6 +265,22 @@ void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt)
     emitAnonFrame(cpp, "spawn(call)", static_cast<uint32_t>(stmt.line), stmt);
     indentLevel_++;
     insideSpawn_ = true;
+    // ============================================================
+    // 🔴 bug-98（A″，2026-10-02）：spawn lambda 体**不继承**外层 sync 块的
+    //    「延迟协程调用」语义 —— CodeGen.h:1205 早已把该不变量写成契约，但此前
+    //    从未实现（`grep -n insideSyncBlock_ src/CodeGen/StmtSpawn.cpp` 曾命中 0）。
+    //
+    //    该 lambda 自身就是 `-> aura_rt::task<void>` 协程、由 sync 域驱动 ⇒ 体内
+    //    协程调用必须在**调用点立即 co_await**。若继承 insideSyncBlock_ == true，
+    //    ExprCall/ExprMethodCall 走 `needAwait = isCoroCall && !isDeferredCoroutineCall()`
+    //    的「延迟」支（feature-14 P2）⇒ 不生成 co_await，且本形态体内**没有 let 绑定**
+    //    ⇒ 不登记 futureVars_ ⇒ 无人驱动 ⇒ 返回的 lazy task 被当表达式语句丢弃
+    //    ⇒ 被 spawn 的协程体**永不启动**（静默无效）。
+    //    置 false 后 genExpr 自行按 isCoroCall 决定（协程目标 ⇒ co_await；非协程
+    //    目标 ⇒ 普通调用），无需任何字符串拼接（避免双源漂移）。
+    // ============================================================
+    bool savedInsideSyncBlockSpawnCall = insideSyncBlock_;
+    insideSyncBlock_ = false;
     // #56 §1.8：spawn lambda 体生成期间隔离外层闭包/方法句柄映射；体后恢复
     std::string savedClosureHandle = currentClosureThisHandle_;
     std::string savedMethodHandle = currentMethodThisHandle_;
@@ -275,6 +305,7 @@ void CodeGenerator::genSpawnCallAsCoro(std::ostream& cpp, const SpawnStmt& stmt)
     // isCoroutine=true：若 callee 为协程函数，genExpr 自动加 co_await；返回值丢弃
     writeLine(cpp, genExpr(*stmt.callExpr, true) + ";");
     insideSpawn_ = false;
+    insideSyncBlock_ = savedInsideSyncBlockSpawnCall;   // 🔴 bug-98（A″）：恢复外层 sync 块语义
     callableObjVars_ = savedSpawnCallableVarsC;   // bug-75: 恢复外层集合
     currentClosureThisHandle_ = savedClosureHandle;
     currentMethodThisHandle_ = savedMethodHandle;

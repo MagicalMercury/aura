@@ -125,6 +125,10 @@ set(AURA_TEST_SOURCES
     rt/test_logical_stack.cpp      # feature-18 P1
     rt/test_logical_stack_p4a.cpp  # feature-18 P4a 批 4（T1–T3：FrameGuard 配平 / 真递归 300 帧不变量 / setFrameLine 只改栈顶）
     rt/test_coro_snapshot_p4b1.cpp # feature-18 P4b-1 批（T4–T8 / T13–T15：快照往返、64 截断、空栈、baseDepth 随快照（含跨线程）、覆盖非 push、无 entry、entry 生命周期 + B0/B1 联动）
+    rt/test_coro_snapshot_wiring_p4b2.cpp # feature-18 P4b-2 批（B4/B5 **接线实证**：channel send/recv + task_awaiter 挂起快照；close/try_flush 的 scoped 分派、final 短链、run_to_completion 创建点恢复。只编译不跑）
+    rt/test_error_format.cpp       # feature-18 P5（诊断输出：formatError 首行 + 逻辑栈解码/查表/折叠/深度上限/退化；只编译不跑）
+    rt/test_io.cpp                 # bug-97（read_file 错误分支：非 ASAN 判据；走 read_file_sync 规避 bug-102）
+    rt/test_thread_pool_error.cpp  # bug-103（sync_thread_context waitAndRethrow 传播 + 幂等）
 
     # ---- 词法分析 ----
     lexer/test_toktype.cpp
@@ -172,6 +176,11 @@ set(AURA_TEST_SOURCES
     codegen/test_codegen_meta.cpp            # feature-18 P3（符号元数据表 + aura.meta；⑩ 为 long-running：真调 g++）
     codegen/test_codegen_frames_p4a.cpp      # feature-18 P4a 批 4（T9–T12 编号 + C1–C11/C-新/C-新2 生成码形态）
     codegen/test_codegen_frames_p4b1.cpp     # feature-18 P4b-1（C6–C8 匿名帧四处注入 + 匿名帧区形态 + 门控 OFF 零注入）
+    codegen/test_codegen_spawn_call.cpp      # bug-98（spawn <call> 调用形态真运行：真编译+真链接+真执行，collector ON/OFF 双路径）
+    codegen/test_codegen_spawn_let_coro.cpp  # bug-93（spawn 体内 let 绑定协程调用：co_await 落 lambda 内；真编译+真链接+真运行，collector ON/OFF）
+    codegen/test_codegen_path_arg_lifetime.cpp  # bug-102（惰性协程按引用值类型实参：A 物化提升形态断言 + B 长路径按值真运行；collector ON/OFF）
+    codegen/test_codegen_sync_thread.cpp        # bug-103（sync thread 块尾 waitAndRethrow：生成码断言 + 提前退出+异常真运行）
+    codegen/test_codegen_artifact_key.cpp    # bug-94（依赖 #include 名 + thunk 前缀用身份键：artifactKey 传递链路）
 
     # ---- 诊断引擎 ----
     diag/test_diag.cpp

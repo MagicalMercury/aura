@@ -111,7 +111,17 @@ std::string CodeGenerator::genGcRootedArgs(
         } else if (deferred[i]) {
             // 未绑定泛型实参：仅绑定值（协程参数因 co_await 语法限制放 IIFE 外），
             // GcRootHandle 包装由下方 if constexpr 延迟判定（值类型不包装 / 堆类型保护）
-            if (argIsAwait) {
+            //
+            // 🔴 bug-102(A,2026-10-04)：**惰性协程调用**时（awaitPrefix 非空）本实参无论
+            //   是否自身含 co_await，都必须提升到 IIFE 外 —— 否则 IIFE 返回即析构，
+            //   而惰性协程帧（initial_suspend=suspend_always）存的是引用 ⇒ 悬垂 UAF。
+            //   本例：`io.read_file(<Path 值>)`（Path 命中 deferred 判定，见 ExprGen.cpp
+            //   isDeferredGcRoot）。非协程调用（awaitPrefix 空且非 argIsAwait）保持 IIFE 内
+            //   （IIFE 立即调用 ⇒ 生存期自洽，形态逐字节不变）。
+            //   ⚠️ 安全前提 P1/P2：惰性协程的 `const&` 形参目前仅 io 5 个（已按值化，
+            //   bug-102 B）；用户函数恒按值收参（TypeMap.cpp mapParamType 从不生成 const&）。
+            //   若引入 const& 形参传递，须先修本覆盖条件（反向红线见 mapParamType）。
+            if (!awaitPrefix.empty() || argIsAwait) {
                 outer << "auto " << vi << " = (" << argExpr << ");\n";
             } else {
                 inner << "    auto " << vi << " = (" << argExpr << ");\n";

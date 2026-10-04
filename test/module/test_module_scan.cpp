@@ -613,3 +613,49 @@ TEST(ModuleScan, C3LoadAllScannedSecondPass) {
 
 // ⚠️ 补充：既有 hasCycle/topologicalLayers/validateEntry（读 modules_）不受影响——
 //     C3 只新增 On 版本，不触碰既有三方法（由既有 test_module.cpp 回归守护）。
+
+// ============================================================
+// bug-94：多文件同名 stem 的模块身份键必须唯一
+// ============================================================
+TEST(ModuleScan, Bug94StemCollisionKeysAreUnique) {
+    auto dir = c2TempDir();
+    c2Write(dir, "main.aura",
+        "import \"a/util.aura\" as ua\n"
+        "import \"b/util.aura\" as ub\n"
+        "fun main(io: Io) { }\n");
+    fs::create_directories(fs::path(dir) / "a");
+    fs::create_directories(fs::path(dir) / "b");
+    c2Write(dir, "a/util.aura", "module util\npub fun fa() -> int { return 1 }\n");
+    c2Write(dir, "b/util.aura", "module util\npub fun fb() -> int { return 2 }\n");
+
+    const std::string entry = (fs::path(dir) / "main.aura").string();
+    DiagnosticEngine diag;
+    ModuleManager mgr(diag);
+    ASSERT_TRUE(mgr.scanAll(entry));
+    EXPECT_FALSE(mgr.checkModuleConflicts());      // 全显式同名 ⇒ D12 放行（缺陷入口）
+    ASSERT_TRUE(mgr.loadAllScanned());
+
+    auto keys = mgr.computeModuleKeys(entry);
+    const std::string aPath = (fs::absolute(fs::path(dir) / "a/util.aura")).string();
+    const std::string bPath = (fs::absolute(fs::path(dir) / "b/util.aura")).string();
+    ASSERT_EQ(keys.count(aPath), 1u);
+    ASSERT_EQ(keys.count(bPath), 1u);
+    EXPECT_TRUE(keys[aPath] != keys[bPath]);       // 🔴 核心：键必须不同
+    EXPECT_EQ(keys[aPath], "a_util");
+    EXPECT_EQ(keys[bPath], "b_util");
+    fs::remove_all(dir);
+}
+
+TEST(ModuleScan, Bug94NonCollidingKeepsRawStem) {
+    auto dir = c2TempDir();
+    c2Write(dir, "main.aura", "import \"lib.aura\" as lib\nfun main(io: Io) { }\n");
+    c2Write(dir, "lib.aura", "pub fun f() -> int { return 1 }\n");
+    const std::string entry = (fs::path(dir) / "main.aura").string();
+    DiagnosticEngine diag;
+    ModuleManager mgr(diag);
+    ASSERT_TRUE(mgr.scanAll(entry));
+    ASSERT_TRUE(mgr.loadAllScanned());
+    auto keys = mgr.computeModuleKeys(entry);
+    EXPECT_EQ(keys[(fs::absolute(fs::path(dir) / "lib.aura")).string()], "lib");  // 逐字节向后兼容
+    fs::remove_all(dir);
+}

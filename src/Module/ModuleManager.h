@@ -175,6 +175,17 @@ public:
     //   ⇒ 外部**够不着**。这与 O40-(a)（`escapeStringLiteral`）**同族**：**「名字存在 ≠ 你能调」**。
     //   ⚠️ 只移动声明：签名不变、函数体不变、既有调用点语义不变。
     static std::string sanitizeId(const std::string& path);
+    // ---- bug-94：多文件模块身份键（产物命名 + thunk 前缀 + 依赖 #include 名）----
+    //   默认 = 裸 stem（产物名逐字节向后兼容）；仅当工程内出现 stem 撞车时，
+    //   撞车组改用「相对入口文件目录、去扩展名」的稳定 slug（sanitizeId 归一）。
+    //   返回：sourcePath（绝对）→ 身份键。确定性：与模块调度序无关。
+    std::unordered_map<std::string, std::string>
+    computeModuleKeys(const std::string& entryPath) const;
+
+    // 路径 → 稳定标识符 slug（相对 baseDir 去扩展名 → sanitizeId）。
+    //   不在 baseDir 之下 / 路径解析失败 ⇒ 回落文件名。
+    static std::string identityKeyOf(const std::string& baseDir,
+                                     const std::string& sourcePath);
     // 非 const 访问（C4 主流程第二段写入需要）
     std::unordered_map<std::string, ModuleInfo>& modulesInternal() { return modules_; }
     ModuleInfo* moduleAt(const std::string& sourcePath) {

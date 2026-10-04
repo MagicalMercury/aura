@@ -3,12 +3,13 @@ type: todo_feature
 kind: refactor
 module: Parser/Sema/CodeGen/Module
 status:
-  - in_progress
+  - finished
 priority: P2
 estimated_effort: XL
 blocked_by: []
 related:
   - "[[feature-10-reflection-library]]"
+  - "[[feature-15-codegen-state-machine-refactor]]"
 discover_date: 2026-09-12
 tags:
   - compile-unit

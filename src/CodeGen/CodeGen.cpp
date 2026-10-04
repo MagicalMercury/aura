@@ -94,7 +94,7 @@ void CodeGenerator::genFutureDrive(std::ostream& cpp,
         indentLevel_++;
         writeLine(cpp, "if (!_u5has" + sfx + ") { _u5has" + sfx + " = true; _u5err" + sfx +
                        " = _u5e" + sfx + "; }");
-        writeLine(cpp, "else std::fprintf(stderr, \"[aura_rt] additional sync error\\n\");");
+        writeLine(cpp, "else { std::fprintf(stderr, \"[aura_rt] additional sync error\\n\"); aura_rt::formatErrorStack(_u5e" + sfx + "); }");
         indentLevel_--;
         writeLine(cpp, "}");
     } else {
@@ -107,7 +107,7 @@ void CodeGenerator::genFutureDrive(std::ostream& cpp,
             indentLevel_++;
             writeLine(cpp, "if (!_u5has" + sfx + ") { _u5has" + sfx + " = true; _u5err" + sfx +
                            " = _u5e" + sfx + "; }");
-            writeLine(cpp, "else std::fprintf(stderr, \"[aura_rt] additional sync error\\n\");");
+            writeLine(cpp, "else { std::fprintf(stderr, \"[aura_rt] additional sync error\\n\"); aura_rt::formatErrorStack(_u5e" + sfx + "); }");
             indentLevel_--;
             writeLine(cpp, "}");
         } else {
@@ -194,7 +194,11 @@ CompileUnit CodeGenerator::generate(const Program& program,
              header << "// using builtin: " << imp.path << "\n";
          } else {
             // 用户模块：相对路径 #include
-            std::string depStem = std::filesystem::path(imp.path).stem().string();
+            // bug-94：依赖产物的 #include 名须与该依赖的产物身份键一致
+            //   （撞车工程 = 相对路径 slug；空串回落裸 stem ⇒ 既有产物逐字节不变）
+            std::string depStem = imp.artifactKey.empty()
+                ? std::filesystem::path(imp.path).stem().string()
+                : imp.artifactKey;
             header << "#include \"" << depStem << ".aura.h\"\n";
         }
     }

@@ -5,6 +5,7 @@
 // ============================================================
 #include "logical_stack.h"
 #include "framework/test_framework.h"
+#include "builtin/array.h"          // bug-101 回归：读取 captureLogicalStack() 返回的 Array<uint64_t>
 #include <memory>                   // 偏差补：std::unique_ptr / std::make_unique（GuardOverflowKeepsDepthBalanced）
 
 using namespace aura_rt;
@@ -87,5 +88,38 @@ TEST(LogicalStack, GuardPopsOnExceptionPath) {
 
 TEST(LogicalStack, CaptureReturnsNullOnEmptyStack) {
     g_lsDepth = 0;
+    EXPECT_TRUE(captureLogicalStack() == nullptr);
+}
+
+// ── bug-101 回归：深栈采集必须**保最内**（旧实现取 [0, n) ⇒ 保留最外、丢弃抛错现场）──
+//   40 帧（每帧可区分：symbolIdx = line = 帧号 i，0 = 最外 … 39 = 最内/栈顶）
+//   ⇒ n = min(40, kMaxStackFrames=32) = 32，from = 40 − 32 = 8
+//   ⇒ arr[0] 对应第 8 帧、arr[31] 对应第 39 帧（最内）；丢的是最外 0..7 帧。
+TEST(LogicalStack, CaptureDeepStackKeepsInnermostFrames) {
+    g_lsDepth = 0;
+    for (uint32_t i = 0; i < 40; ++i) pushFrame(i, i);
+    EXPECT_EQ(g_lsDepth, 40u);
+
+    Array<uint64_t>* arr = captureLogicalStack();
+
+    // 不变量：空栈才返 nullptr；此处非空
+    ASSERT_TRUE(arr != nullptr);
+    // 解构上限 = kMaxStackFrames(32)
+    EXPECT_EQ(arr->length, 32);
+
+    // arr[0] 对应对第 (40−32)=8 帧
+    EXPECT_EQ(static_cast<uint32_t>((*arr)[0] >> 32), 8u);
+    EXPECT_EQ(static_cast<uint32_t>((*arr)[0] & 0xFFFFFFFFu), 8u);
+    // arr[31] 对应对第 39 帧（最内 / 栈顶）
+    EXPECT_EQ(static_cast<uint32_t>((*arr)[31] >> 32), 39u);
+    EXPECT_EQ(static_cast<uint32_t>((*arr)[31] & 0xFFFFFFFFu), 39u);
+
+    // 递增序「最外 → 最内」：arr[i] 恰为第 (8+i) 帧；最外 0..7 帧不得出现
+    for (uint32_t i = 0; i < 32; ++i)
+        EXPECT_EQ(static_cast<uint32_t>((*arr)[i] >> 32), 8u + i);
+
+    // popFrame 归零后 ⇒ 仍返 nullptr（n == 0 不变量）
+    for (uint32_t i = 0; i < 40; ++i) popFrame();
+    EXPECT_EQ(g_lsDepth, 0u);
     EXPECT_TRUE(captureLogicalStack() == nullptr);
 }

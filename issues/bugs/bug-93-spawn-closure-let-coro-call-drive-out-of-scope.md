@@ -3,15 +3,18 @@ type: bug_report
 module: src/CodeGen
 sub_module: StmtSync/CodeGen — `spawn` 闭包体内 `let r = <协程调用>` ⇒ sync 收集器的驱动 `try { co_await r; }` 被生成到 lambda **之外** ⇒ 跨作用域引用 ⇒ 坏 C++
 status:
-  - pending_fix
+  - fixed
 severity:
   - high
 discover_date: 2026-09-30
-discovered_by: "Hermes（feature-18 P2 批 D 的 ASAN 验证中，用对照探针发现；本鲸 2026-09-30 独立复现并定性）"
+discovered_by: Hermes（feature-18 P2 批 D 的 ASAN 验证中，用对照探针发现；本鲸 2026-09-30 独立复现并定性）
 related_issues:
-  - "bug-88（同类族：naked throw body 降级隐式 future）"
-  - "bug-90（同族：try 块内协程调用的生成形态）"
-  - "bug-87（feature-18 P2 已修复；本缺陷与 P2 **无因果关系**，见 §5.3）"
+  - bug-88（同类族：naked throw body 降级隐式 future）
+  - bug-90（同族：try 块内协程调用的生成形态）
+  - bug-87（feature-18 P2 已修复；本缺陷与 P2 **无因果关系**，见 §5.3）
+  - "[[bug-88-naked-throw-body-degrades-implicit-future]]"
+  - "[[bug-90-try-block-coroutine-call-type-mismatch]]"
+  - "[[bug-87-try-block-sync-await-noncoro-iife]]"
 tags:
   - codegen
   - spawn
@@ -22,9 +25,9 @@ tags:
   - bad-cpp
 ---
 
-# [ ] bug-93 `spawn` 闭包体内 `let` 绑定协程调用 ⇒ sync 收集器把 `co_await <var>` 生成到 lambda 外（跨作用域 ⇒ 坏 C++）
+# [x] bug-93 `spawn` 闭包体内 `let` 绑定协程调用 ⇒ sync 收集器把 `co_await <var>` 生成到 lambda 外（跨作用域 ⇒ 坏 C++）
 
-**状态**：`[ ] 待修复`（2026-09-30 登记）
+**状态**：`[x] 已关闭`（2026-10-03）—— **由 bug-98 顺带覆盖**（非本缺陷独立修复）；关单与 **bug-98 的 `src/CodeGen/StmtSpawn.cpp` 修复提交绑定**。
 **严重度**：**high** —— **合法 Aura 代码**触发，用户看到的是 `g++` 的 `'r' was not declared in this scope`（**不是干净的 Aura 报错**）；属「生成坏 C++」类，与 bug-87/bug-90 同族。
 
 ---
@@ -188,3 +191,28 @@ grep -n co_await "$LOCALAPPDATA/Temp/base_cg.cpp"
 - 让 `genFutureDrive` 感知变量所在作用域（若变量被闭包捕获/未跨出闭包，则不在外层写 `co_await`），或
 - 在 `let` 绑定协程调用时**把该 future 提升到与驱动同层**（改变生成形态，需评估对既有 943 处生成码断言的影响）。
 - ⚠️ 本缺陷**未修**（发现于验证批，按「验证批只测量不修复」纪律保留最小复现）。
+
+---
+
+## 8. 修复记录
+
+**结论**：本缺陷**不由本缺陷自身修复**，而是**被 bug-98 顺带覆盖**（2026-10-03 关单）。
+
+### 8.1 覆盖机理（与 bug-98 同一处改动）
+
+bug-98 的修复在 `src/CodeGen/StmtSpawn.cpp` 两处 spawn lambda 体入口 save / 置 `false` / restore `insideSyncBlock_`（块形态 `:105`、调用形态 `:283`）：
+
+- 本缺陷的**触发条件** = `insideSyncBlock_ == true` 泄漏进 spawn lambda 体（`src/CodeGen/CodeGen.h:1316` `isDeferredCoroutineCall()` 为真）⇒ 协程调用走「延迟支」：只登记 `futureVars_`、**不生成 `co_await`**；而 `r` 声明在 lambda **内**、块尾驱动却由外层 `genFutureDrive`（`src/CodeGen/CodeGen.cpp:69`）写出 ⇒ 跨作用域 `co_await r;`（坏 C++）。
+- `insideSyncBlock_ = false` 使协程调用**在调用点立即 `co_await`**（`int32_t r = co_await [&]() -> auto { ... }(...)`）⇒ 不再有跨作用域的块尾驱动。**同一根因链** ⇒ bug-98 的修复顺带消除了 bug-93。
+
+### 8.2 实证（2026-10-03，实施批实跑）
+
+- **四探针两步编译**：`_p1`/`_p4`（反例）与 `_p2`/`_p3`（对照）均 `aurac rc=0` **且** `g++ -std=gnu++20 -fsyntax-only rc=0`；`_p1` 生成码 `co_await r;` 计数 = **0**，实际形态 `int32_t r = co_await [&]() -> auto {`（`co_await` 落在 lambda 内）。
+- **回归用例已入 `test/codegen/test_codegen_spawn_let_coro.cpp`**（5 例：`_p1`/`_p4` 反例 collector OFF、`_p1` collector ON、`_p2`/`_p3` 对照；真编译 + 真链接 + 真运行）。
+- **反向实验**：临时注释掉 `StmtSpawn.cpp:105` 与 `:283` 的 `insideSyncBlock_ = false;` ⇒ 本 3 例转红（`co_await r;` 计数 > 0 且 `buildRc != 0`）；恢复 ⇒ 全绿（md5 核对一致）。
+
+### 8.3 关单绑定与边界
+
+- **关单判据**：bug-98 的 `src/CodeGen/StmtSpawn.cpp` 修复**落地提交**（当前为工作树未提交）⇒ **bug-93 与 bug-98 绑定关单**；若 bug-98 回退，本缺陷**同时复活**（已由反向实验证明）。
+- **边界（不含线程块形态）**：`spawn` 共四个形态，bug-98 只覆盖**协程块形态 / 协程调用形态**；**线程块形态**（`sync thread(max = N) { spawn (io) { let r = <协程调用> } }`）**未做同款处理**（`src/CodeGen/StmtSpawn.cpp:706-728`，`:726 genStmt(cpp, *s, false) // 非协程！`，区间内 `insideSyncBlock_` 命中 = 0）⇒ 实施批实测**转红**：`g++` 报 `cannot convert 'aura_rt::task<int>' to 'int32_t'`（生成码 `int32_t r = [&]() -> auto { ... }()` —— 非协程 lambda 内绑定协程调用）。**该形态不在本关单判定内**，语义归属 `[[bug-99]]` 族（sync 块内调用点语义），**已单独立项，未顺手修**。
+- 笔记 `[ ]` → `[x]`（2026-10-03）。

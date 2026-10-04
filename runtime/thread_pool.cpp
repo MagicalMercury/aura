@@ -7,6 +7,8 @@
 #include "gc/gc_interrupt.h"  // gc_interruptible_sleep（P2 可中断 sleep）
 #include "builtin/string.h"   // feature-18 G-8：intern_string / make_string（值化构造）
 #include <chrono>
+#include <cstdio>    // bug-103(A)：stderr（formatError 的 out 参数）
+#include <cstdlib>   // bug-103(A)：std::exit
 
 namespace aura_rt {
 
@@ -230,8 +232,27 @@ sync_thread_context::sync_thread_context(int maxConcurrency)
       sem_(maxConcurrency > 0 ? maxConcurrency
                                 : static_cast<ptrdiff_t>(ThreadPool::defaultMaxTasks())) {}
 
+void sync_thread_context::waitAndRethrow() {
+    // bug-103(B)：真正修好传播语义 —— 在**有 try 上下文处**（CodeGen 在 sync thread 块尾
+    //   显式调用）重抛 Error。本函数**非** noexcept ⇒ 抛出合法，可被 Aura try/catch 捕获。
+    if (waited_) return;
+    waited_ = true;
+    ThreadPool::instance().waitGroup(groupId_);   // 有异常则在此抛出（Error 值）
+}
+
 sync_thread_context::~sync_thread_context() {
-    ThreadPool::instance().waitGroup(groupId_);
+    // bug-103(A+B)：析构隐式 noexcept ⇒ 不得让 Error 逃出。
+    //   · 若 CodeGen 已在块尾调用 waitAndRethrow()（B）⇒ waited_ 已 true ⇒ 本处只兜底清理。
+    //   · 若块经 return/break/异常提前退出（未走到块尾 waitAndRethrow）⇒ 本处兜底等待，
+    //     并把错误就地转成可读诊断 + 退出（A；绝不 terminate）。
+    if (waited_) return;
+    waited_ = true;
+    try {
+        ThreadPool::instance().waitGroup(groupId_);
+    } catch (const aura_rt::Error& e) {
+        aura_rt::formatError(e, stderr);
+        std::exit(1);
+    }
 }
 
 void sync_thread_context::submit(std::function<void()> task) {

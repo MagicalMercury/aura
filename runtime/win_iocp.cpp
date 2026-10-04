@@ -5,6 +5,7 @@
 #include "win_iocp.h"
 #include "event_loop.h"
 #include "builtin/string.h"
+#include "coro_snapshot.h"   // feature-18 P4b-2（B4）：IoAwaitable 挂起点快照
 #include <cstdio>
 
 namespace aura_rt {
@@ -86,6 +87,12 @@ void IoAwaitable::await_suspend(std::coroutine_handle<> cont) {
         throw Error(make_string("io_error"), make_string("ReadFile failed"),
                     nullptr, nullptr, 0, kSiteIoError);
     }
+    // 🔴 feature-18 P4b-2（B4 / §3.3.3 挂起面）：提交成功、即将挂起 ⇒ 快照。
+    //   · 插在**错误抛出之后**：抛出路径从未挂起 ⇒ 不留陈旧 entry（与 C-1 同向）。
+    //   · 键 = 挂起方句柄地址（恢复走 IOCP 回调 → `EventLoop::schedule` → `processReady`
+    //     的 `resumeWithRestore(h)`，同键 ⇒ 恢复时取回本快照）。
+    //   · C-2/R4：nothrow（纯 memcpy + 表写入，失败即放弃）。
+    snapshotStack(cont.address());
     // 已成功提交（或 ERROR_IO_PENDING）⇒ 注册完成回调（此后本函数不再抛）
     IoCompletionPort::instance().registerCallback(&ov,
         [cont](DWORD /*bytes*/) {

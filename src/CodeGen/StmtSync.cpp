@@ -191,7 +191,10 @@ void CodeGenerator::genSyncThreadStmt(std::ostream& cpp, const SyncStmt& stmt) {
 
     // 块结束前触发 safepoint（可能执行延迟的 GC）
     writeLine(cpp, "aura_rt::gc_safepoint();");
-    // sync_thread_context 析构会调用 waitGroup，阻塞至所有任务完成
+    // bug-103(B,2026-10-04)：在**非析构**入口显式等待 + 重抛 —— 本语句位于用户 try 上下文内，
+    //   Error 可被 Aura try/catch 捕获（析构仅兜底，见 thread_pool.cpp ~sync_thread_context）。
+    writeLine(cpp, "_stx.waitAndRethrow();");
+    // sync_thread_context 析构兜底清理（正常路径 waited_ 已 true ⇒ 空操作）
     indentLevel_--;
     cpp << indentStr() << "}\n";
 }
@@ -311,7 +314,9 @@ void CodeGenerator::genSyncForStmt(std::ostream& cpp, const SyncForStmt& stmt, b
         writeLine(cpp, "aura_rt::gc_safepoint();");
         indentLevel_--;
         cpp << indentStr() << "}\n";   // close for
-        // _stx 析构自动 waitGroup
+        // bug-103(B)：块尾显式等待 + 重抛（同 genSyncThreadStmt）
+        writeLine(cpp, "_stx.waitAndRethrow();");
+        // _stx 析构兜底清理
         indentLevel_--;
         cpp << indentStr() << "}\n";   // close block
         return;

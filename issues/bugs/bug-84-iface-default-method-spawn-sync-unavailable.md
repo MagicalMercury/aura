@@ -1,15 +1,16 @@
 ---
 type: bug_report
 module: CodeGen
-sub_module: "接口默认方法体内 spawn/sync 整体不可用（ioInScope_ 从未设置 / sync 静默产出坏 C++）"
+sub_module: 接口默认方法体内 spawn/sync 整体不可用（ioInScope_ 从未设置 / sync 静默产出坏 C++）
 status:
-  - pending_fix
+  - blocked
 severity:
   - medium
 discover_date: 2026-09-16
 related_issues:
   - "[[feature-12-callable-reserved-domains-migration]]"
   - "[[bug-83-old-path-f0-forwarding-param-residue]]"
+  - "[[feature-19-io-offload-decoupling]]"
 tags:
   - feature-12
   - codegen

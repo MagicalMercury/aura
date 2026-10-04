@@ -314,6 +314,15 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
     for (uint32_t i = 0; i < orderedModules.size(); ++i)
         moduleIdxOf[orderedModules[i]] = i;
 
+    // ---- bug-94：per-source-file 身份键（产物名 + thunk 前缀 + 依赖 include 名）----
+    //  默认 = 裸 stem；仅 stem 撞车组改「相对入口目录 slug」⇒ 非撞车工程零变化。
+    std::unordered_map<std::string, std::string> moduleKeyOf =
+        mgr.computeModuleKeys(opts.inputPath);
+    auto moduleKeyOfPath = [&](const std::string& p) -> std::string {
+        auto it = moduleKeyOf.find(p);
+        return it != moduleKeyOf.end() ? it->second : Aura::stemOf(p);
+    };
+
     // 入口点验证（扫描表 hasMain）
     std::string entryModulePath;
     if (!mgr.validateEntryOn(entryModulePath)) {
@@ -429,6 +438,7 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
                 if (it != mgr.modules().end()) {
                     ci.nsName   = it->second.nsName;
                     ci.modName  = it->second.moduleName;
+                    ci.artifactKey = moduleKeyOfPath(it->second.sourcePath);   // bug-94
                 }
             } else {
                 ci.modName = imp.path; // 内置模块名即命名空间键
@@ -468,8 +478,9 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
         //     汇总合并只在主线程（下方 cgResults 回收之后）。判据：`main.cpp` 的既有明文原则
         //     「任务线程零共享写，无锁」。
         //  🔴 O24：`sanitizeId` 是 `ModuleManager` 的 static 成员（批 2 已移入 public 段）。
+        // bug-94：thunk 前缀 = 本源文件的身份键（撞车工程下为相对路径 slug ⇒ 不重名）
         Aura::MetaCollector localMeta(mod->sourcePath,
-                                      Aura::ModuleManager::sanitizeId(Aura::stemOf(mod->sourcePath)));
+                                      Aura::ModuleManager::sanitizeId(moduleKeyOfPath(mod->sourcePath)));
 
         // 代码生成
         Aura::CodeGenerator cg(*modDiag);
@@ -485,7 +496,7 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
 
         // 写出头文件（feature-13 C4：文件名用源文件 stem——同 module 多文件产物互不覆盖；
         // 无 module 声明时 moduleName==stem，文件名与旧路径逐字一致（存量零变化））
-        std::string modStem = Aura::stemOf(mod->sourcePath);
+        std::string modStem = moduleKeyOfPath(mod->sourcePath);   // bug-94：身份键（默认 = stem）
         std::string hdrPath = outDir + "/" + modStem + ".aura.h";
         {
             std::ostringstream hdr;
@@ -606,7 +617,8 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
             std::filesystem::remove(cpp);
         for (auto& [path, info] : mgr.modules()) {
             if (!info.isBuiltin) {
-                std::string hdr = outDir + "/" + Aura::stemOf(info.sourcePath) + ".aura.h";
+                // bug-94：与 :489 的产物命名同键（否则撞车工程清错/残留）
+                std::string hdr = outDir + "/" + moduleKeyOfPath(info.sourcePath) + ".aura.h";
                 std::filesystem::remove(hdr);
             }
         }
