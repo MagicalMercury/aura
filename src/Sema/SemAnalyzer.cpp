@@ -58,6 +58,13 @@ void qualifyRecordTypes(std::unique_ptr<SemType>& t, const std::string& alias) {
         }
         for (auto& f : rec->fields)
             if (f.type) qualifyRecordTypes(f.type, alias);
+    } else if (auto* en = dynamic_cast<EnumSemType*>(t.get())) {
+        // enum（F-1）：限定名只落 declModule，**不动 canonicalName**
+        //（canonicalName 是 CodeGen 的 C++ 类型名与方法表键，加前缀会污染生成名）
+        if (en->declModule.empty()) en->declModule = alias;
+        // 关联值类型（形态 2）里若含 record，仍需按既有规则递归限定
+        for (auto& v : en->variants)
+            if (v.valueType) qualifyRecordTypes(v.valueType, alias);
     } else if (auto* l = dynamic_cast<ListSemType*>(t.get())) {
         qualifyRecordTypes(l->elementType, alias);
     } else if (auto* u = dynamic_cast<UnionSemType*>(t.get())) {
@@ -325,14 +332,22 @@ ModuleExports SemAnalyzer::extractExports() const {
     // 取出方法签名（key 用本地未限定 canonicalName；导入侧 importExports 再限定）。
     // 注意须先 cloneMethodSig 深拷贝——typeMethods_ 与导出表生命周期不同。
     for (auto& [name, type] : e.types) {
-        auto* rec = dynamic_cast<const RecordSemType*>(type.get());
-        if (!rec || rec->canonicalName.empty()) continue;
-        auto it = typeMethods_.find(rec->canonicalName);
+        std::string key;
+        if (auto* rec = dynamic_cast<const RecordSemType*>(type.get())) {
+            if (rec->canonicalName.empty()) continue;
+            key = rec->canonicalName;
+        } else if (auto* en = dynamic_cast<const EnumSemType*>(type.get())) {
+            if (en->canonicalName.empty()) continue;
+            key = en->canonicalName;
+        } else {
+            continue;   // 联合/函数/list 等无名类型
+        }
+        auto it = typeMethods_.find(key);
         if (it == typeMethods_.end()) continue;
         std::vector<InterfaceSemType::MethodSig> sigs;
         sigs.reserve(it->second.size());
         for (auto& s : it->second) sigs.push_back(cloneMethodSig(s));
-        e.methods[rec->canonicalName] = std::move(sigs);
+        e.methods[key] = std::move(sigs);
     }
     return e;
 }

@@ -224,6 +224,68 @@ void SemAnalyzer::checkMatchStmt(const MatchStmt& stmt) {
     std::set<std::string> seenConstants;
     std::vector<const ASTNode*> caseLiterals;  // 与 stmt.cases 并行；无常量 case → nullptr
 
+    // enum 专用（§4.4-⑧）：enum scrutinee 时
+    //   (a) 裸名 TypePattern 若命中 variant 表 ⇒ 视为【变体模式】（裁定 C：裸名与限定名等价）
+    //   (b) 裸名既不是类型、也不是该 enum 的变体 ⇒ 【明确报错】（裁定 A 配套：「无法定向必须报错」）
+    //   (c) 变体模式参与重复检测（键 = "enum:" + 枚举名 + "." + 变体名）
+    // 注意：不改 literalSemType / literalKey（那两个是文件内 static，无分析器状态，
+    //       无法解析限定名与变体表）——enum 的判定全部在本函数内完成
+    const EnumSemType* matchedEnum = matchedType
+        ? dynamic_cast<const EnumSemType*>(matchedType.get()) : nullptr;
+    if (matchedEnum) {
+        auto coverName = [&](const Pattern* pat) -> std::string {
+            if (!pat) return "";
+            if (auto* cp = dynamic_cast<const ConstantPattern*>(pat))
+                return enumVariantNameOfAccess(cp->value.get(), *matchedEnum);   // Color.Red
+            if (auto* tp = dynamic_cast<const TypePattern*>(pat)) {
+                // bug-107（三处同源之①）：判定顺序 = resolveBareEnumPattern（SemType.h 唯一真源）。
+                //   🔴 纯裸名**先查变体表** —— 同名变体（`enum type Foo = { Foo, Bar }` 的 `Foo`）
+                //   必须解为【变体常量模式】并参与重复检测，**不得**被
+                //   「typeName == 枚举名 ⇒ <all>」抢先吞成恒真兜底（否则 `Bar` 臂死代码 + 穷尽性静默）。
+                //   `Color v`（varName 非空）与裸枚举名仍返回 `<all>`（既有语义）。
+                switch (resolveBareEnumPattern(*matchedEnum, tp->typeName, !tp->varName.empty())) {
+                case BareEnumPatternKind::Variant: return tp->typeName;  // 变体常量模式（键 = 变体名）
+                case BareEnumPatternKind::TypeAll: return "<all>";
+                case BareEnumPatternKind::Other:   return tp->typeName;  // 交下方 (b) 判定报错/放行
+                }
+                return tp->typeName;
+            }
+            return "";
+        };
+        for (size_t ci = 0; ci < stmt.cases.size(); ++ci) {
+            auto& c = stmt.cases[ci];
+            // 注：模式基类 Pattern 不是 ASTNode，容器元素类型必须是 const Pattern*
+            //     （实施批 2 最小修正，见报告 §报红 B2-3）
+            std::vector<const Pattern*> pats;
+            pats.push_back(c.pattern.get());
+            if (auto* gp = dynamic_cast<const GroupPattern*>(c.pattern.get()))
+                for (auto& a : gp->alts) pats.push_back(a.get());
+
+            for (auto* pat : pats) {
+                std::string vn = coverName(pat);
+                if (vn.empty()) continue;
+
+                // (b) 裸名：是类型就保持类型语义；两者都不是 ⇒ 报错（不静默）
+                if (auto* tp = dynamic_cast<const TypePattern*>(pat)) {
+                    if (tp->typeName != matchedEnum->name &&
+                        !isEnumVariant(*matchedEnum, tp->typeName) && tp->varName.empty()) {
+                        if (isDeclaredTypeName(tp->typeName)) continue;   // 真类型模式（如 `string s`）
+                        error(stmt, "match pattern '" + tp->typeName +
+                              "' cannot be resolved: it is neither a type nor a variant of enum '" +
+                              matchedEnum->name + "'");
+                        continue;
+                    }
+                }
+                // (c) 重复变体检测
+                if (vn == "<all>") continue;      // `Color c` 兜底不算具体变体
+                std::string key = "enum:" + matchedEnum->name + "." + vn;
+                if (!seenConstants.insert(key).second) {
+                    error(stmt, "duplicate match variant; each variant may appear only once");
+                }
+            }
+        }
+    }
+
     for (size_t ci = 0; ci < stmt.cases.size(); ++ci) {
         auto& c = stmt.cases[ci];
 

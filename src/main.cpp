@@ -208,7 +208,7 @@ int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
         std::string cppPath = opts.cppOutput;
         if (cppPath.empty()) {
             std::string dir = opts.outputDir.empty()
-                ? std::filesystem::path(opts.inputPath).parent_path().string()
+                ? Aura::pathString(Aura::fsPath(opts.inputPath).parent_path())
                 : opts.outputDir;
             cppPath = dir.empty() ? (moduleName + ".gen.cpp")
                                   : (dir + "/" + moduleName + ".gen.cpp");
@@ -232,7 +232,7 @@ int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
         if (opts.stopAfterCpp) return 0;
 
         // 编译
-        std::string exePath = std::filesystem::path(cppPath).replace_extension(".exe").string();
+        std::string exePath = Aura::pathString(Aura::fsPath(cppPath).replace_extension(".exe"));
         std::ostringstream compileCmd;
         compileCmd << "g++ -std=gnu++20 -fcoroutines " << gccFlags(opts)
                    << " -w -I runtime"
@@ -248,7 +248,7 @@ int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
         }
 
         if (opts.cppOutput.empty())
-            std::filesystem::remove(cppPath);
+            std::filesystem::remove(Aura::fsPath(cppPath));
 
         return 0;
     }
@@ -398,10 +398,10 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
     // 6. 确定输出目录
     std::string outDir = opts.outputDir;
     if (outDir.empty()) {
-        outDir = std::filesystem::absolute(opts.inputPath).parent_path().string();
+        outDir = Aura::pathString(std::filesystem::absolute(Aura::fsPath(opts.inputPath)).parent_path());
     }
     // 确保目录存在
-    std::filesystem::create_directories(outDir);
+    std::filesystem::create_directories(Aura::fsPath(outDir));
 
     // 7. 收集所有生成的 .cpp 文件路径
     std::vector<std::string> allCppPaths;
@@ -614,17 +614,17 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
     // 清理中间文件（feature-13 C4：与落盘一致——按源文件 stem）
     if (!keepIntermediate) {
         for (auto& cpp : allCppPaths)
-            std::filesystem::remove(cpp);
+            std::filesystem::remove(Aura::fsPath(cpp));
         for (auto& [path, info] : mgr.modules()) {
             if (!info.isBuiltin) {
                 // bug-94：与 :489 的产物命名同键（否则撞车工程清错/残留）
                 std::string hdr = outDir + "/" + moduleKeyOfPath(info.sourcePath) + ".aura.h";
-                std::filesystem::remove(hdr);
+                std::filesystem::remove(Aura::fsPath(hdr));
             }
         }
         // feature-18 P3 §3.6(b)（O15）：`aura.meta.h` **不在**上面的模块头清理循环内 ⇒ 单独删，
         //   与 `aura.meta.cpp`（经 allCppPaths 免费清理）成对。（`stopAfterCpp` 早退路径不执行本段。）
-        std::filesystem::remove(outDir + "/aura.meta.h");
+        std::filesystem::remove(Aura::fsPath(outDir + "/aura.meta.h"));
     }
 
     std::cerr << "Output: " << exePath << "\n";
@@ -634,7 +634,10 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
 // ============================================================
 // 主函数
 // ============================================================
-int main(int argc, char* argv[]) {
+// bug-109：实际逻辑在 runMain；main 只做**兜底 catch** —— 任何残留的
+//   std::filesystem::filesystem_error（畸形/不可表示路径）都转成干净诊断，
+//   杜绝 "terminate called after throwing an instance of ..."（rc=127）。
+static int runMain(int argc, char* argv[]) {
     // 1. 解析命令行
     std::vector<std::string_view> args;
     for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
@@ -691,4 +694,19 @@ int main(int argc, char* argv[]) {
     // 3. 无用户模块 import → 单文件模式
     diag.reset();  // 清除快速检查产生的错误
     return compileSingleFile(opts, diag);
+}
+
+// ============================================================
+// bug-109 兜底：未捕获的 filesystem_error ⇒ 干净诊断（不 terminate）
+// ============================================================
+int main(int argc, char* argv[]) {
+    try {
+        return runMain(argc, argv);
+    } catch (const std::filesystem::filesystem_error& e) {
+        std::cerr << "Error: filesystem operation failed: " << e.what() << "\n";
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
 }

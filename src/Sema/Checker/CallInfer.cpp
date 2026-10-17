@@ -665,6 +665,59 @@ std::unique_ptr<SemType> SemAnalyzer::inferMethodCall(const MethodCallExpr& e) {
         return ErrorSemType::make();
     }
 
+    // enum 接收者方法调用（Color.to_hex() / ErrorCode.code_of()）：键通路与 record 相同
+    // （键由 recordTypeKey 提供，见 §4.4-④ 改动 5）。enum 无字段 ⇒ 无需字段回退。
+    // ⚠️ 本分支【独立复制】call 校验逻辑，不改动下面 record 分支（后者耦合字段回退 + E013 文案）
+    if (auto* en = dynamic_cast<const EnumSemType*>(objType.get())) {
+        auto findMethods = [&](const std::string& key)
+            -> const std::vector<InterfaceSemType::MethodSig>* {
+            auto it = typeMethods_.find(key);
+            if (it != typeMethods_.end()) return &it->second;
+            auto it2 = importedMethods_.find(key);
+            if (it2 != importedMethods_.end()) return &it2->second;
+            return nullptr;
+        };
+        // 🔴 批 6（B2）跨模块（导入）enum 的方法表键 = **模块限定名 + canonicalName**
+        //   （change.md §4.9.4-L18）。实读依据：
+        //     · 建键侧 `importExports`：`qkey = alias + "::" + key`（SemAnalyzer.cpp:267-277）
+        //       ⇒ 导入模块的方法表键是 `a::Color`；
+        //     · F-1 有意让 enum 的 `canonicalName` **不带**模块前缀（`qualifyRecordTypes`
+        //       只写 `declModule`，SemAnalyzer.cpp:61-67）⇒ 只查 `canonicalName`（= `Color`）
+        //       对导入 enum **恒不命中** ⇒ 误报 E013「enum type 'Color' has no method 'hex'」。
+        //   限定名真源 = `declModule`（F-1 的类型身份字段），与 record 侧靠
+        //   `canonicalName` 自带前缀（`qualifyRecordTypes` 写 record 的 canonicalName）
+        //   **等价**；本单元声明的 enum `declModule` 为空 ⇒ 走原路径，行为逐字不变。
+        const auto* methods = findMethods(en->canonicalName);
+        if (!methods && !en->declModule.empty())
+            methods = findMethods(en->declModule + "::" + en->canonicalName);
+        if (methods) {
+            for (auto& m : *methods) {
+                if (m.name != e.method) continue;
+                checkThrowsContext(e, e.method, m.throws);
+                std::vector<const SemType*> formalTypes;
+                for (auto& pt : m.paramTypes) formalTypes.push_back(pt.get());
+                std::map<std::string, std::unique_ptr<SemType>> genericMap;
+                checkCallArgs(e, e.method, "method", formalTypes, e.args, genericMap, m.defaultCount);
+                auto result = m.returnType ? m.returnType->clone() : NoneSemType::make();
+                return applyGenericMap(std::move(result), genericMap);
+            }
+        }
+        std::string hint;
+        if (methods && !methods->empty()) {
+            hint = "valid methods: ";
+            for (size_t i = 0; i < methods->size(); ++i) {
+                if (i > 0) hint += ", ";
+                hint += (*methods)[i].name;
+            }
+            hint += "; or declare 'fun (self " + en->name + ") " + e.method + "(...)'";
+        } else {
+            hint = "declare 'fun (self " + en->name + ") " + e.method + "(...)'";
+        }
+        error(e, DiagCode::E013_MethodNotFound,
+              "enum type '" + en->name + "' has no method '" + e.method + "'", hint);
+        return ErrorSemType::make();
+    }
+
     // record 接收者方法调用（如 p.offset(3) / p.offset(3,4)）：
     // 在 typeMethods_（buildTypeMethods 构建，key=canonicalName）中按方法名匹配，
     // 返回声明返回类型；参数用 checkCallArgs 校验（含尾部默认参数计数）。

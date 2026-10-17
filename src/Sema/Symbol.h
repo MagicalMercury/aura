@@ -34,6 +34,9 @@ struct Symbol {
     std::string name;
     std::unique_ptr<SemType> type; // 符号的类型
     bool isConst = false;  // const 绑定不可重新赋值
+    // enum 深只读（change.md §4.4-⑥）：绑定来源是 enum 变体值 ⇒ 其【可达对象图】不可写。
+    // ⚠️ 与 isConst 是【两套规则】：本标记只拦「写进值图」，不拦重新绑定（let 语义不变）
+    bool readOnly = false;
 
     // ——— 仅函数/方法 ———
     std::vector<SymParam> params;

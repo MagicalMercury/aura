@@ -28,6 +28,8 @@ struct UnionSemType;
 struct OptionalSemType;
 struct InterfaceSemType;
 struct ListSemType;
+// feature-20（enum）批 3：enum 类型真源类型（成员表 enumTypes_ / enumTypeOf）
+struct EnumSemType;
 
 // ============================================================
 // PendingMethod — 暂存方法签名，供 genRecordStruct 嵌入 struct
@@ -35,6 +37,11 @@ struct ListSemType;
 struct PendingMethod {
     std::string receiverType;
     std::string methodName;
+    // 批 5（T3）：方法声明源位置（`fun` 关键字处，Parser::parseMethodDecl 的 setNodePos）
+    //   —— 供生成期诊断（壳保留名冲突）打出行列，替代此前的 `--> …:0:0`。
+    //   0 = 未知（保守：调用方回退到宿主 TypeDecl 的行列）。
+    int declLine = 0;
+    int declCol  = 0;
     std::string returnTypeStr;
     std::vector<std::string> paramTypes;
     std::vector<std::string> paramNames;
@@ -469,6 +476,28 @@ private:
     // 判断 SemType 是否对应 GC 堆对象指针（用于 GcRootHandle 包装决策）
     [[nodiscard]] bool isHeapSemType(const SemType* type) const;
 
+    // ============================================================
+    // feature-20 批 8（bug-108）：SemType 是否为 **enum（值语义壳）**。
+    //
+    // 🔴 判据同源（**不得**在别处另造第三套判据——本 feature 已因判据分叉吃过两次亏：
+    //    方法物化 thunk（批 3 报红 B3-2）、类型映射面（TypeMap 的 enum 防御分支））：
+    //      · 与批 3 落地的值语义链同一 hop —— `enumTypes_` 装填的对象就是本函数认的
+    //        `EnumSemType*`（CodeGen.cpp 第一遍 `enumTypes_[t->name] = enumTypeOf(*t)`）；
+    //      · 语义结论与 `isHeapSemType`（ExprGen.cpp）的 **显式 enum 分支**（`EnumSemType ⇒
+    //        return false`，即"非堆/值类型"）逐字一致；
+    //      · 词法与既有 8 处 `dynamic_cast<const EnumSemType*>` **完全同款**（enumTypeOf /
+    //        enumReceiverOf / StmtMatch / StmtLet / CoroDecide / DeclTParams /
+    //        registerImportedEnumAnnotation / mapSemType 防御分支）—— 本函数只是给这条
+    //        既有判据起一个名字，**零新增语义**。
+    //
+    // ⚠️ 窄守卫（**只认 enum**）：与 DeclFun.cpp（值接收者）/ DeclGen.cpp / CodeGen.cpp
+    //    （方法物化 thunk 跳过）三处的既有纪律一致 ——「**不得**放宽成 `isValueType`」
+    //    （`isValueType` 对函数名/其它非堆登记项也返回 true，是歧义判据）。
+    //    `isHeapSemType` **不能**直接拿来当本判据：它对 Iterator 值视图返回 false（值视图
+    //    非堆）——若据此把 Iterator 也归入"值语义标量"，erased 边界会产出坏 C++。
+    // ============================================================
+    [[nodiscard]] static bool isEnumValueSemType(const SemType* type);
+
     // P1：视图类型判定（值视图 { 函数指针, self }，非 GC 堆对象）
     //   - 内置 Iterator<T>（GenericSemType "Iterator"）
     //   - 接口视图（InterfaceSemType：Stringer/Comparable/用户接口）
@@ -537,6 +566,55 @@ private:
     void genRecordStruct(std::ostream& h, std::ostream& cpp,
                          const std::string& name, const RecordType& body,
                          const std::vector<std::string>& templateParams = {});
+
+    // --- enum 声明（change.md §4.4-⑨⑩；实现于 DeclEnum.cpp）---
+    //  形态 1（int 支撑）与形态 2（绑定类型）共用同一生成器 = 「enum class 外套壳」：
+    //    struct X { enum class _Tag : uintN { … }; _Tag _tag; static const X <Variant>;
+    //               [形态 2：static const <T> _val_<Variant>();] bool operator==/!=; … };
+    void genEnumDecl(std::ostream& h, std::ostream& cpp,
+                     const TypeDecl& decl, const EnumTypeExpr& body);
+    [[nodiscard]] std::string enumUnderlyingType(const EnumSemType& en) const;   // uint8_t/…/uint64_t
+    // 批 5（T1）：变体单例的 **C++ 成员名** —— Aura 侧 `enum type Foo = { Foo }` 合法
+    //（§4.6.1 裁定 A），但 C++ 禁止静态数据成员与所在类同名（成员名与注入类名冲突）
+    //   ⇒ 撞名时固定追加后缀 `_v`。**唯一改名真源**：三处（壳内声明 / 类外定义 /
+    //   变体访问产点）必须同源调用本函数，漏一处 = 坏 C++。Aura 侧写法 `Foo.Foo` 不变。
+    //   先例：DeclFun.cpp:669–673（方法名撞字段名追加 `_fun`）。
+    [[nodiscard]] std::string enumVariantCppName(const std::string& enumRawName,
+                                                 const std::string& variantName) const;
+    // 形态 2 批 A（§4.4-⑩）：标量/字符串关联值访问器 —— 形式 A = **每次直调 intern_string**，
+    //   不留静态裸缓存（B-1/C-1/G-1：compact 后裸副本悬垂 + magic-static guard 阻塞分配）。
+    void emitBoundValueAccessors(std::ostream& h, std::ostream& cpp,
+                                 const TypeDecl& decl, const EnumSemType& en);
+    // 壳保留成员名冲突检查（改动 5-④；R-2 的 6 类清单）⇒ 生成期 error（不产坏 C++）
+    void checkShellMemberNameConflicts(const TypeDecl& decl, const EnumSemType& en);
+    // 壳内 / record 内的方法声明内嵌（从 DeclGen.cpp 原样抽出，两处共用 ⇒ 不分叉）
+    //  🔴 唯一新增 = enum 壳接收者（`enumTypes_` 命中）类内声明末尾追加 ` const`（硬约束 (d)）。
+    void emitPendingMethodDecls(std::ostream& h, const std::string& recvName,
+                                const std::set<std::string>& fieldNames);
+    // receiver 是否为 enum（形态 1/2 均是值对象）⇒ 硬约束 (c) 的 access 窄守卫判据。
+    //  真源 = Sema 推断的 `e.object->inferredType`（EnumSemType），**不是名字集合**（E-1）。
+    [[nodiscard]] const EnumSemType* enumReceiverOf(const MethodCallExpr& e) const;
+    // TypeDecl 的 enum SemType 真源（§4.4-⑨「SemType 获取约定」）——非 enum 声明返回 nullptr
+    [[nodiscard]] const EnumSemType* enumTypeOf(const TypeDecl& decl) const;
+
+    // ------------------------------------------------------------
+    // 🔴 批 6（B2）：跨模块（导入）enum 的装填（change.md §4.9.4-L18）
+    //   `enumTypes_` / `declaredEnumNames_` 的既有来源是**本单元 AST 的 TypeDecl**
+    //   （CodeGen.cpp 第一遍）——而导入 enum 的 TypeDecl **不在**本单元的 `program.decls` 里
+    //   （`importExports` 只注入符号：SemAnalyzer.cpp:249-257）⇒ 本单元对它一无所知 ⇒
+    //   ① 类型标注按「未知类型 = 堆类型」映射（TypeMap.cpp:144-146 补 `*`）⇒ 值类型被当指针；
+    //   ② 形参标注被 `collectTParams` 当**泛型形参**（DeclTParams.cpp:57）⇒ 虚假 `template<typename X>`。
+    //   装填真源 = Sema 回填在**类型标注节点**上的 `EnumSemType`
+    //   （TypeResolver.cpp `resolveType` 的 enum 回填，与 `TypeDecl::inferredType` 同款一跳）。
+    //   键 = **源码限定名**（`namespacePrefix` 以 `.` 连接 + 名，如 `a.Color`）——即本单元
+    //   C++ 里写作 `a::Color` 的那个 Aura 侧写法的逐字形态（本地 enum 无前缀 ⇒ 不进本集）。
+    std::set<std::string> importedEnumNames_;
+    // 单个标注 → 装填（幂等；不覆盖既有键）
+    void registerImportedEnumAnnotation(const NamedType& n, const EnumSemType& en);
+    // 递归（NamedType/ListType/RecordType/Tuple/Union/FunctionType）扫一个类型标注
+    void registerImportedEnumAnnotations(const TypeExpr* t);
+    // 标注是不是「已知的跨模块 enum 值类型」（键 = 源码限定名）
+    [[nodiscard]] bool isImportedEnumTypeName(const NamedType& n) const;
 
     // --- TypeDescriptor 生成 (§4.2, §4.10) ---
     void genTypeDescriptor(std::ostream& cpp,
@@ -958,6 +1036,32 @@ private:
     // 已注册的类型名 → 是否为堆对象
     std::unordered_map<std::string, bool> registeredTypes_;
 
+    // ============================================================
+    // feature-20（enum）批 3（change.md §4.4-⑨⑩⑪）
+    // ============================================================
+    // enum 类型的 SemType 真源（name → EnumSemType）：由第一遍从 **Sema 结果** 装填，
+    //   必须在 `genMethodDecl` / `emitPendingMethodDecls` / `genEnumDecl` 之前装满
+    //   （§4.8 Step 0 准入 gate）。用途：
+    //     (a) `genEnumDecl` 取 variant 表 / 底层宽度（形态 1 的 intValue、形态 2 的关联值）；
+    //     (b) **值接收者判定**：`DeclFun::genMethodDecl` 与 `emitPendingMethodDecls`
+    //         用它认出「该方法的接收者是 enum 壳」⇒ 跳过 `_this` GC 句柄 +
+    //         `self` 入口按值拷贝 + 追加 ` const`（§4.4-⑪ 改动 4 的三项落点）。
+    //   🔴 这是 **SemType 真源**，不是纯名字集合：它不能用来判定 `EnumName.VariantName`
+    //      访问（那由 AST 标记 `enumVariantAccess` 承担，E-1），且其键来自 Sema，
+    //      与「用户变量/影子变量」不会混淆。
+    //   🔴 值接收者判定**不得**放宽成 `isValueType(decl.receiverType)`：那个 API 对
+    //      「接口默认方法 receiver（值视图，靠 `_self_root` 句柄）」等值视图接收者也返回 true
+    //      ⇒ 会连带改掉既有语义。窄守卫 = **enum 专用**（本映射）。
+    //   ⚠️ 批 3 实施口径：`TypeDecl::inferredType` 由 **Sema 回填**（declareEnumDecl）⇒
+    //      本映射装填的真源 = 同一 `EnumSemType` 对象（等价于 `Symbol::type`）；
+    //      CodeGen 侧无 `SemAnalyzer` / `symtab` 通路（`generate()` 形参被 feature-18 锁定）。
+    std::map<std::string, const EnumSemType*> enumTypes_;
+    // 🔴 R-1：**已声明的 enum 名**（AST 侧真源；第一遍扫 `TypeDecl` 的 `EnumTypeExpr` 收集）。
+    //   **唯一用途** = `genMethodDecl` 的生成期硬失败判据（「已声明的 enum 却查不到 `enumTypes_`」
+    //   ⇒ 装填时序错 ⇒ error）。它**不参与任何生成决策**，与 E-1 删除的 `enumTypeNames_`
+    //   （表达式级变体访问判定）用途正交：本条只看**声明级类型名**。
+    std::set<std::string> declaredEnumNames_;
+
     // 当前作用域内值类型变量名（用于决定 . vs -> 访问）
     std::set<std::string> valueTypeVarNames_;
 
@@ -1154,11 +1258,19 @@ private:
     // 取不到（非具体形态/含裸泛型）时返回空串。
     [[nodiscard]] std::string iteratorElemCppOf(const SemType* iteratorType);
     // erased/union 调用（c(1)）：calleeText 为 Erased 值表达式（句柄内保护）、
-    // args 为 (实参文本, 实参 C++ 类型) 对（Ptr 参数额外句柄栈保护）、retTy 为
-    // Sema 推断的返回类型（拆箱期望；None→void）。产出 IIFE 表达式。
+    // args 为实参载荷（文本 + C++ 类型 + Sema 推断 SemType；Ptr 参数额外句柄栈保护）、
+    // retTy 为 Sema 推断的返回类型（拆箱期望；None→void）。产出 IIFE 表达式。
+    // 🔴 feature-20 批 8（bug-108）：载荷携带 `sem`（可空）——装/拆箱的「值 / 指针」判据
+    //    必须走 `isEnumValueSemType(sem)`（与批 3 enum 值语义同源），不得只看 C++ 名
+    //    （enum 壳名无 `*`，旧字符串判据把它当堆指针 ⇒ `static_cast<GcObject*>(Color::Red)`）。
+    struct ErasedCallArg {
+        std::string text;               // 实参 C++ 表达式
+        std::string cppType;            // 实参 C++ 类型（mapSemType 产物；空 = 不可得）
+        const SemType* sem = nullptr;   // Sema 推断的实参类型（判据同源输入；可空）
+    };
     [[nodiscard]] std::string genErasedInvoke(
         const std::string& calleeText,
-        const std::vector<std::pair<std::string, std::string>>& args,
+        const std::vector<ErasedCallArg>& args,
         const SemType* retTy);
     // 判断 callee Identifier 是否为 CallableErased 值变量（根化类型表查 C++ 类型）
     [[nodiscard]] bool calleeVarIsErased(const std::string& calleeName) const;

@@ -16,6 +16,15 @@ std::unique_ptr<Decl> Parser::parseDecl() {
     if (peekSoftKeyword("module")) {
         decl = parseModuleDecl();
     }
+    // enum 软关键字（A4，2026-10-14）：判定沿用既有 peekSoftKeyword（Identifier + 文本比对），
+    // 再加【两 token 前瞻】——必须看到紧随的硬关键字 `type` 才算 enum 声明。
+    // 先例：`lock` 的两 token 前瞻（src/Parser/StmtParser.cpp:35–36）。
+    // 🔴 与 check(TokType::Type) 分支**不存在**争抢：软关键字的首 token 类型是 Identifier，
+    //    而 `type` 分支判的是 TokType::Type ⇒ 两者互斥
+    //    （只有硬关键字方案才需要「必须排在 Type 之前」）。
+    else if (peekSoftKeyword("enum") && peekNext().type == TokType::Type) {
+        decl = parseEnumDecl();
+    }
     else if (check(TokType::Hash))       decl = parseConfigDecl();
     else if (check(TokType::Fun)) {
         if (peekNext().type == TokType::LParen) {
@@ -30,6 +39,14 @@ std::unique_ptr<Decl> Parser::parseDecl() {
     else if (check(TokType::Interface)) decl = parseInterfaceDecl();
     else if (check(TokType::Import))   { seenImport_ = true; decl = parseImportDecl(); }
     else {
+        // enum 定向诊断（软关键字的代价面）：`enum` 后不是 `type` 时给可操作文案。
+        // 声明位置的裸 Identifier 本就非法（本分支**不改变任何合法源码**的语义）；
+        // 但 `enum Color = { Red }`（漏写 `type`）是最可能的笔误 ⇒ 单独提示。
+        if (check(TokType::Identifier) && peek().lexeme == "enum") {
+            error("expected 'type' after 'enum'; Aura enums are declared as "
+                  "`enum type Name = { Variant, ... }`");
+            return nullptr;
+        }
         error("expected declaration");
         return nullptr;
     }
@@ -160,6 +177,60 @@ std::unique_ptr<TypeDecl> Parser::parseTypeDecl() {
 
     consume(TokType::Assign, "expected '=' in type declaration");
     decl->type = parseType();
+    match(TokType::Semicolon);
+    return decl;
+}
+
+std::unique_ptr<TypeDecl> Parser::parseEnumDecl() {
+    // 入口前提（由 parseDecl 的软关键字分支保证）：当前 token = Identifier("enum")，
+    // 下一个 token = TokType::Type。下方 advance() 吃掉的是【标识符 enum】（不是关键字 token）。
+    auto tok = advance(); // enum（Identifier；软关键字，A4）
+    consume(TokType::Type, "expected 'type' after 'enum'");   // 防御性复查（正常恒成立）
+
+    auto decl = std::make_unique<TypeDecl>();
+    setNodePos(decl.get(), tok);
+
+    auto& nameTok = consume(TokType::Identifier, "expected enum type name");
+    decl->name = nameTok.lexeme;
+
+    auto body = std::make_unique<EnumTypeExpr>();
+    setNodePos(body.get(), nameTok);
+
+    // [<绑定类型>]：统一用 parseType()（形态 2 的具体类型与形态 3 的 <T> 语法同形，语义留给 Sema）
+    // ⚠️ 不填 decl->typeParams（enum 不参与泛型注册，见 §4.4-④）
+    if (match(TokType::Less)) {
+        do {
+            body->bindingTypes.push_back(parseType());
+        } while (match(TokType::Comma));
+        consume(TokType::Greater, "expected '>' after enum type binding");
+    }
+
+    // .aurai（noBody_）/ 声明级扫描（scanOnly_）：允许 `enum type X` 前向声明（无 '='），
+    // 与 parseTypeDecl 的既有放宽（src/Parser/DeclParser.cpp:152–159）同口径
+    if ((noBody_ || scanOnly_) && !check(TokType::Assign)) {
+        decl->type = std::move(body);
+        match(TokType::Semicolon);
+        return decl;
+    }
+
+    consume(TokType::Assign, "expected '=' in enum declaration");
+    consume(TokType::LBrace, "expected '{' after '=' in enum declaration");
+
+    // ⚠️ 不要照抄 TypeParser.cpp:57–66 的 do{...}while(match(Comma))——那里尾随逗号会报错；
+    //    本处：',' 必需、尾随逗号允许、缺逗号 ⇒ break 后由 consume(RBrace) 报干净错误
+    while (!check(TokType::RBrace) && !atEnd()) {
+        EnumVariantDecl v;
+        auto& vTok = consume(TokType::Identifier, "expected variant name in enum");
+        v.name = vTok.lexeme;
+        v.line = vTok.line;
+        v.col  = vTok.col;
+        if (match(TokType::Assign)) v.value = parseExpr();   // 值可以是任意表达式，语义由 Sema 拦截
+        body->variants.push_back(std::move(v));
+        if (!match(TokType::Comma)) break;
+    }
+
+    consume(TokType::RBrace, "expected '}' after enum body");
+    decl->type = std::move(body);
     match(TokType::Semicolon);
     return decl;
 }

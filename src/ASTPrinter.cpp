@@ -101,6 +101,29 @@ void GenericTypeRef::print(std::ostream& os, int indent) const {
     os << "GenericTypeRef: <" << name << ">\n";
 }
 
+void EnumVariantDecl::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << name;
+    if (value) {
+        os << " =\n";
+        value->print(os, indent + 1);
+    } else {
+        os << '\n';
+    }
+}
+
+void EnumTypeExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "EnumTypeExpr";
+    for (auto& b : bindingTypes) {
+        os << " <";
+        if (b) b->print(os, indent + 1);
+        os << ">";
+    }
+    os << '\n';
+    for (auto& v : variants) v.print(os, indent + 1);
+}
+
 // ---- Expr 实现 ----
 
 void IntLiteral::print(std::ostream& os, int indent) const {

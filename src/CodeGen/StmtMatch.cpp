@@ -24,7 +24,31 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
     bool elemIsHeap = false;                 // Optional 元素是否为堆类型（步骤 5 用）
     std::vector<std::string> gcTmpVars;      // 本分支临时注册的 GC 根变量名（步骤 4/5 注册、步骤 6 清理）
     std::vector<std::string> variantCppTypes;  // 各变体 C++ 类型（索引对应；ValueVariant 与 Variant 路径共用）
-    if (auto* u = dynamic_cast<const UnionSemType*>(mt)) {
+    // enum scrutinee（§4.4-⑧⑪）：**A-1 撤销后形态 1/2 表示统一**（壳 struct + `_Tag` + `_tag`）
+    //   ⇒ 变体模式一律生成 **tag 比较**：`_match_val._tag == <Enum>::_Tag::<Variant>`；
+    //   类型模式（`Color c`）生成恒真兜底 + 绑定（与下方普通类型分支同款）。
+    //   注意 enum 是**值类型**（isHeap=false）⇒ 不走 isVariantPtr / isOptional 两分支，
+    //   `_match_val` 由 `auto&& _match_val = <expr>;` 绑定（值/引用，不是指针）。
+    bool isEnum = false;
+    std::string enumRawName;                 // 枚举【原始名】（Aura 侧）——**只用于模式判据**（R-4）
+    std::string enumCppName;                 // safeName(枚举【原始名】)，**只用于 C++ 产出侧**（R-4）
+    const EnumSemType* enumSemType = nullptr;  // bug-107：变体表（裸名定向解析的唯一真源输入）
+    if (auto* en = dynamic_cast<const EnumSemType*>(mt)) {
+        isEnum = true;
+        enumSemType = en;                    // bug-107：留指针供下方 resolveBareEnumPattern
+        enumRawName = en->name;              // R-4：判据用**原始名**（Aura 侧）
+        // 🔴 批 6（B2）：导入 enum 的 C++ 壳名必须带**模块别名前缀**（`a::Color`）——
+        //   与 `mapSemType` 的 enum 分支同源判据（`declModule` 非空 = 跨模块导入副本；
+        //   F-1 让模块限定名只落 `declModule`、不进 `canonicalName`）。漏掉 ⇒ 产物写裸
+        //   `Color::_Tag::Red`（本命名空间内不可见 ⇒ 坏 C++，只有 `g++` 能抓：实测
+        //   导入 enum 的 match 产物 `error: 'Color' has not been declared`）。
+        //   R-4 不受影响：**判据**仍用原始名 `enumRawName` / `tp->typeName`，前缀只加在
+        //   C++ 产出侧；本单元声明的 enum `declModule` 为空 ⇒ 产出串逐字不变。
+        const std::string enumShell =
+            safeName(en->canonicalName.empty() ? en->name : en->canonicalName);
+        enumCppName = en->declModule.empty() ? enumShell : (en->declModule + "::" + enumShell);
+    } else if (auto* u = dynamic_cast<const UnionSemType*>(mt)) {
+
         for (auto& v : u->variants) {
             if (v && isUnionHeapVariant(v.get())) isVariantPtr = true;
             variantCppTypes.push_back(v ? mapSemType(*v) : "void");
@@ -129,6 +153,23 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
             return prefix + cmp + " == " + litExpr;
         }
         // 非联合：直接比较
+        // 🔴 enum（§4.4-⑪，定死唯一写法）：限定名变体模式（`Color.Red`）一律生成【tag 比较】
+        //    `_match_val._tag == Color::_Tag::Red` —— **不**写成 `_match_val == Color::Red`：
+        //    ①不必依赖访问侧产出的静态单例（跨编译单元定义可见性/链接期面更小）；
+        //    ②与形态 1/2 的 `_Tag` 表示逐字一致；③与类型模式分支同源，避免两套 enum 判定写法。
+        //    注：`litExpr` 仍会算出（`genExpr` 有副作用面），但 enum 分支不使用它。
+        if (isEnum) {
+            std::string vn;
+            if (auto* ma = dynamic_cast<const MemberAccessExpr*>(lit)) {
+                if (auto* id = dynamic_cast<const Identifier*>(ma->object.get())) {
+                    // 🔴 R-4：`object` 的名字来自 Parser ⇒ **原始名 vs 原始名**（`enumRawName`）；
+                    //   C++ 名（`enumCppName`）只出现在下面的产出串里。
+                    if (id->name == enumRawName) vn = ma->member;    // `Color.Red`
+                }
+            }
+            if (vn.empty()) return "_match_val == " + litExpr;        // 兜底（Sema 已拦「不可定向」形态）
+            return "_match_val._tag == " + enumCppName + "::_Tag::" + safeName(vn);
+        }
         if (dynamic_cast<const StringLiteral*>(lit))
             return "aura_rt::string_eq(_match_val, " + litExpr + ")";
         return "_match_val == " + litExpr;
@@ -246,6 +287,28 @@ void CodeGenerator::genMatchStmt(std::ostream& cpp, const MatchStmt& stmt,
                                   " = _match_val.get<" + std::to_string(idx) + ">();";
                 } else {
                     cond = "false";  // 类型模式与任何变体不匹配（Sema 应已拦截）
+                }
+            } else if (isEnum) {
+                // enum（§4.4-⑪，定死唯一写法）：`Color c` ⇒ 恒真兜底 + 绑定；`Red`（裸名变体）
+                //   ⇒ **tag 比较** `_match_val._tag == Color::_Tag::Red`（不依赖生成的 operator==，
+                //   也不依赖变体单例的定义可见性；两形态表示一致）。
+                // 🔴 R-4：判据是**原始名 vs 原始名**（`tp->typeName` 来自 Parser，是 Aura 原始名）
+                //   ⇒ 必须比 `enumRawName`；`enumCppName`（= safeName(名)）只用于 C++ 产出侧。
+                // 🔴 bug-107（三处同源之③）：判定顺序 = resolveBareEnumPattern（SemType.h 唯一真源），
+                //   与 StmtFlow.cpp / ExprInferMisc.cpp **逐字一致**——纯裸名**先查变体表**：
+                //   同名变体（`enum type Foo = { Foo, Bar }` 的裸名臂 `Foo`）必须走 tag 比较，
+                //   **不得**因 `tp->typeName == enumRawName` 落成 `if (true)`（⇒ `Bar` 臂死代码）。
+                //   `Color v`（varName 非空）与裸枚举名 → TypeAll ⇒ 恒真兜底（既有语义不变）。
+                const BareEnumPatternKind kind = enumSemType
+                    ? resolveBareEnumPattern(*enumSemType, tp->typeName, !tp->varName.empty())
+                    : BareEnumPatternKind::Other;
+                if (kind == BareEnumPatternKind::TypeAll) {
+                    cond = "true";
+                    if (!tp->varName.empty())
+                        binding = "auto&& " + safeName(tp->varName) + " = _match_val;";
+                } else {
+                    // Variant（含同名变体）与 Other（Sema 已拦形态的兜底）均按 tag 比较
+                    cond = "_match_val._tag == " + enumCppName + "::_Tag::" + safeName(tp->typeName);
                 }
             } else {
                 // 普通类型：类型静态已知，条件恒真，直接绑定

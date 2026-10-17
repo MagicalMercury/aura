@@ -395,6 +395,13 @@ public:
     Tlab* ensureTlab();     // registerThread 时调用：分配 TLAB 结构
     void  releaseTlab();    // unregisterThread 时调用：flush + 释放 TLAB 结构
 
+    // bug-111：compact() 入口不变量自检（实现见 gc/compact.cpp）。
+    // 返回 true ⇔ **存在**未 flush 的 TLAB（任一 Tlab 的 curPage != nullptr
+    // 或 localYoung 非空）。必须遍历 tlabList_（含**其它线程**的 TLAB）——
+    // 只查 tlab_ 会漏掉别的线程，那正是本缺陷的真实情形。
+    // 注：非 const（tlabList_m_ 非 mutable，遵守「gc.h 只加声明、不改既有成员」的约束）。
+    bool  hasDirtyTlabs();
+
     // 每线程独立 TLAB 指针（thread_local 保证线程隔离）
     // 注：用裸指针，由 registerThread/unregisterThread 显式管理生命周期
     //     避免 thread_local 析构顺序与 GcHeap 单例冲突

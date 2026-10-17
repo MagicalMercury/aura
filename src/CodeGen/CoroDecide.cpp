@@ -205,6 +205,16 @@ private:
                 // 方法名查 coroFns_（键 = "ReceiverType.methodName"）。与函数侧 CallExpr
                 // 传播对称：调用协程方法的方法也被标为协程（否则方法内 co_await 落普通
                 // 方法 → 坏 C++）。ioSync_ 不豁免（与 CallExpr 分支一致）。
+                // 🔴 feature-20 批 3（报红 B3-5）：**enum 接收者同款传播** —— enum 方法是挂在
+                //   壳 struct 上的普通成员函数（§4.4-⑪），声明侧键 = `Color.slow_is_red`（`coroutineFunctions_`
+                //   的 `receiverType.methodName`）。漏掉这条 ⇒ 调用 enum 协程方法的函数/方法**不被标协程**
+                //   ⇒ 调用点无 co_await、产物 `bool b = <task<bool>>` ⇒ 坏 C++（只有 `g++` 能抓；§4.7.5 验收对象 ⑦）。
+                if (mc->object->inferredType) {
+                    if (auto* en = dynamic_cast<const EnumSemType*>(mc->object->inferredType)) {
+                        if (!en->name.empty() && coroFns_.count(en->name + "." + mc->method))
+                            return true;
+                    }
+                }
                 if (mc->object->inferredType) {
                     if (auto* r = dynamic_cast<const RecordSemType*>(mc->object->inferredType)) {
                         std::string recvKey = r->canonicalName;

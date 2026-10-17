@@ -39,12 +39,17 @@ TEST(TokType, KeywordLookupAllKeywords) {
     EXPECT_EQ(lookupKeyword("and"), TokType::And);
     EXPECT_EQ(lookupKeyword("or"), TokType::Or);
     EXPECT_EQ(lookupKeyword("not"), TokType::Not);
+    // A4 反向断言（change.md §4.7.1）：`enum` **未**登记为关键字 ——
+    // 它是软关键字（词法上仍是 Identifier，由 Parser 按 `enum` + `type` 两 token 判定）。
+    // 若有人误把 "enum" 加进 lookupKeyword 正向表，本断言即变红（守护有效）。
+    EXPECT_EQ(lookupKeyword("enum"), TokType::Identifier);
 }
 
 TEST(TokType, KeywordLookupNonKeywords) {
     // 非关键字 → Identifier
     EXPECT_EQ(lookupKeyword("funx"), TokType::Identifier);
     EXPECT_EQ(lookupKeyword("Fun"), TokType::Identifier);   // 大小写敏感
+    EXPECT_EQ(lookupKeyword("Enum"), TokType::Identifier);  // 大小写敏感（enum 是软关键字）
     EXPECT_EQ(lookupKeyword("let_"), TokType::Identifier);
     EXPECT_EQ(lookupKeyword("_let"), TokType::Identifier);
     EXPECT_EQ(lookupKeyword("spawner"), TokType::Identifier);

@@ -15,6 +15,14 @@ void CodeGenerator::genTypeDecl(std::ostream& h, std::ostream& cpp,
                                  const TypeDecl& decl) {
     if (!decl.type) return;
 
+    // enum（方案 B：TypeDecl + EnumTypeExpr）→ 专用生成（change.md §4.4-⑨⑩）
+    // ⚠️ 必须放在 record 判断之前，否则会落到 :36–40 的「其他类型」分支，
+    //    生成 `using Color = <mapType(EnumTypeExpr)>` ⇒ 坏 C++
+    if (auto* en = dynamic_cast<const EnumTypeExpr*>(decl.type.get())) {
+        genEnumDecl(h, cpp, decl, *en);
+        return;
+    }
+
     // 记录类型 → 生成 struct
     if (auto* rec = dynamic_cast<const RecordType*>(decl.type.get())) {
         // 优先使用 TypeDecl 显式声明的泛型参数，否则从字段中扫描 GenericTypeRef
@@ -113,38 +121,53 @@ void CodeGenerator::genRecordStruct(std::ostream& h, std::ostream& cpp,
 
     structFieldNames_[name] = fieldNames;
 
-    // 收集此类型的所有方法声明并嵌入 struct 内部
-    for (auto& md : pendingMethods_) {
-        if (md.receiverType == name) {
-            // 检测方法名与字段名冲突（C++ 不允许同名成员函数与成员变量）
-            std::string cppMethodName = safeName(md.methodName);
-            if (fieldNames.count(cppMethodName))
-                cppMethodName += "_fun";
-            // bug-07：方法自身裸泛型（非 receiver 泛型，如 apply(f: fun(U)->U) 的 U）
-            // → 类内函数模板声明 template<...> 前缀（与定义侧 genMethodDecl 对齐）；
-            // receiver 泛型（Box<T> 的 T）已在 struct 模板作用域内，无需重复声明。
-            if (!md.templateParams.empty()) {
-                h << "  template<";
-                for (size_t tp = 0; tp < md.templateParams.size(); ++tp) {
-                    if (tp > 0) h << ", ";
-                    h << "typename " << md.templateParams[tp];
-                }
-                h << ">\n";
-            }
-            h << "  " << md.returnTypeStr << " " << cppMethodName << "(";
-            for (size_t i = 0; i < md.paramTypes.size(); ++i) {
-                if (i > 0) h << ", ";
-                h << md.paramTypes[i] << " " << safeName(md.paramNames[i]);
-            }
-            h << ");\n";
-        }
-    }
+    emitPendingMethodDecls(h, name, fieldNames);   // 行为逐字等价（helper = 上面整段原样搬出）
 
     h << "\n  static const aura_rt::TypeDescriptor _desc;\n";
     h << "};\n\n";
 
     // 模板类型的 _desc 必须在头文件中实例化（跨模块链接需要）
     genTypeDescriptor(tparams.empty() ? cpp : h, name, tparams, ptrFields, deferredPtrFields);
+}
+
+// ============================================================
+// 方法声明内嵌（record struct 与 enum 壳共用；change.md §4.4-⑪ 改动 5）
+//   - 搬出源 = genRecordStruct 内原「收集此类型的所有方法声明并嵌入 struct 内部」整段
+//     （语义零变化，仅把 `if (md.receiverType == name)` 体改成 `continue` 守卫）；
+//   - 🔴 唯一新增（硬约束 (d)）：enum 壳接收者是**值语义** ⇒ 类内声明末尾追加 ` const`
+//     （否则在 `static const Color Red;` 上调方法生成 `Color::Red.hex()` ⇒
+//      "passing 'const Color' as 'this' argument discards qualifiers" ⇒ 坏 C++）。
+//     判据 = `enumTypes_`（窄守卫，仅 enum；**不得**用 isValueType，见 CodeGen.h 成员注释）。
+//   - `_fun` 改名对 enum 壳**不适用**（壳保留名冲突走生成期报错，见 DeclEnum.cpp 的
+//     checkShellMemberNameConflicts）——此处的 `fieldNames` 对壳恒为空集。
+// ============================================================
+void CodeGenerator::emitPendingMethodDecls(std::ostream& h, const std::string& recvName,
+                                           const std::set<std::string>& fieldNames) {
+    const bool isEnumRecv = enumTypes_.count(recvName) != 0;
+    for (auto& md : pendingMethods_) {
+        if (md.receiverType != recvName) continue;
+        // 检测方法名与字段名冲突（C++ 不允许同名成员函数与成员变量）
+        std::string cppMethodName = safeName(md.methodName);
+        if (fieldNames.count(cppMethodName))
+            cppMethodName += "_fun";
+        // bug-07：方法自身裸泛型（非 receiver 泛型，如 apply(f: fun(U)->U) 的 U）
+        // → 类内函数模板声明 template<...> 前缀（与定义侧 genMethodDecl 对齐）；
+        // receiver 泛型（Box<T> 的 T）已在 struct 模板作用域内，无需重复声明。
+        if (!md.templateParams.empty()) {
+            h << "  template<";
+            for (size_t tp = 0; tp < md.templateParams.size(); ++tp) {
+                if (tp > 0) h << ", ";
+                h << "typename " << md.templateParams[tp];
+            }
+            h << ">\n";
+        }
+        h << "  " << md.returnTypeStr << " " << cppMethodName << "(";
+        for (size_t i = 0; i < md.paramTypes.size(); ++i) {
+            if (i > 0) h << ", ";
+            h << md.paramTypes[i] << " " << safeName(md.paramNames[i]);
+        }
+        h << (isEnumRecv ? ") const;\n" : ");\n");     // ★ 唯一新增（硬约束 (d)）
+    }
 }
 
 // ============================================================

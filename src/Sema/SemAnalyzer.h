@@ -211,6 +211,16 @@ private:
     // ============ 声明注册（第 1 遍） ============
     void declareTopLevel(const Program& program);
     void declareDecl(const Decl& decl);
+    // enum 声明的注册与校验（§4.4-④ 改动 4）：形态 1/2 走独立路径；形态 3（`<T>` 绑定）
+    // 在此明确报错（v1 不支持，不留半实现）
+    void declareEnumDecl(const TypeDecl& t);
+    // enum variant 约束校验（§4.4-⑤）：重名 / 壳保留名（`_Tag`/`_tag`）/ 显式值合法性与
+    // 唯一性 / 形态 2 漏值与绑定类型匹配 / 编译期常量判定
+    void checkEnumVariants(const TypeDecl& t, const EnumTypeExpr& et, EnumSemType& es);
+    // 「编译期常量」白名单判定（§4.4-⑤）：v1 全仓无常量求值器 ⇒ 只认字面量 / enum 变体 /
+    // record·元组字面量；false 时 why 写入可读原因
+    [[nodiscard]] bool isCompileTimeConstant(const ASTNode& e, const EnumSemType& curEnum,
+                                             std::string& why) const;
     // 接口符号注册（用户接口与内置 .aurai 接口共用）
     void declareInterface(const InterfaceDecl& i);
     // 解析接口方法签名并填充到已注册的接口符号（allowForward=true 为声明时；
@@ -347,6 +357,10 @@ private:
     [[nodiscard]] std::unique_ptr<SemType> inferMemberAccess(const MemberAccessExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferIndexExpr(const IndexExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferAssign(const AssignExpr& e);
+    // enum 深只读（§4.4-⑥）：target / 初始值表达式的【根 Identifier】（沿
+    // MemberAccessExpr / IndexExpr 链回溯）+ 该根来源是否为 enum 变体值（含 readOnly 别名传播）
+    [[nodiscard]] const Identifier* rootIdentifierOf(const ASTNode& e) const;
+    [[nodiscard]] bool enumValueRootOf(const ASTNode* e) const;
     [[nodiscard]] std::unique_ptr<SemType> inferErrorPropagation(const ErrorPropagationExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferPipe(const PipeExpr& e);
     [[nodiscard]] std::unique_ptr<SemType> inferConditional(const ConditionalExpr& e,
@@ -359,6 +373,15 @@ private:
     // ============ match 穷尽性检查 ============
     bool isMatchExhaustive(const SemType& matchedType,
                            const std::vector<MatchCase>& cases);
+    // enum match 定向解析辅助（§4.4-⑧）：
+    //   ① `Color.Red`（ConstantPattern{MemberAccessExpr}）→ 变体名（不匹配当前 enum ⇒ ""）
+    //   ② 名是否是当前 enum 的变体
+    //   ③ 名是否是已声明的类型名（符号表命中 TypeAlias/Interface/Builtin）——用于「裸名是
+    //      变体还是类型模式」的定向判定（不调用 resolveNamedType，避免 clone 与自引用占位）
+    [[nodiscard]] std::string enumVariantNameOfAccess(const ASTNode* e,
+                                                      const EnumSemType& en) const;
+    [[nodiscard]] bool isEnumVariant(const EnumSemType& en, const std::string& name) const;
+    [[nodiscard]] bool isDeclaredTypeName(const std::string& name) const;
 
     // ============ 当前上下文 ============
     // 当前正在检查的函数的返回类型（用于 return 检查）

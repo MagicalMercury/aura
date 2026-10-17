@@ -9,24 +9,33 @@ namespace Aura {
 namespace {
 
 // 参数/返回值 C++ 类型 → CallArg 形态判定与装拆箱转换（erased 边界专用）
+//
+// 🔴 feature-20 批 8（bug-108）：与 `ExprClosureArgs.cpp` 的同一组助手**逐字同步**
+//   （两处曾各持一份旧判据 ⇒ 同族的「判据分叉」风险）。本 TU 当前**未调用**这些助手
+//   （死代码，仅保持两份不漂移；如需清理请单独批处理），但一旦被启用，`isEnum` 必须由
+//   调用点用 `isEnumValueSemType(sem)`（CodeGen.h / ExprGen.cpp 的判据同源入口）算出。
+//   值语义枚举经 **I64 槽** 承载 `_tag`（零 runtime 改动；`CallArg` 无值类型槽）。
 bool erasedIsPtrCpp(const std::string& t) {
     if (t == "int32_t" || t == "double" || t == "bool") return false;
     if (t == "void" || t == "aura_rt::NoneType") return false;
     return true;   // 其余一律 GC 指针（T*/Optional*/Variant*/CallableObj*/auto 保守为指针）
 }
-std::string erasedKindName(const std::string& t) {
+std::string erasedKindName(const std::string& t, bool isEnum) {
+    if (isEnum) return "aura_rt::CallArg::Kind::I64";
     if (t == "double") return "aura_rt::CallArg::Kind::F64";
     if (!erasedIsPtrCpp(t)) return "aura_rt::CallArg::Kind::I64";
     return "aura_rt::CallArg::Kind::Ptr";
 }
-// 实参表达式 → CallArg::of 参数（值提升 / GC 指针上转 GcObject*）
-std::string erasedArgToCallArg(const std::string& cppTy, const std::string& expr) {
+// 实参表达式 → CallArg::of 参数（值提升 / GC 指针上转 GcObject* / enum 取 _tag）
+std::string erasedArgToCallArg(const std::string& cppTy, const std::string& expr, bool isEnum) {
+    if (isEnum) return "(int64_t)((" + expr + ")._tag)";
     if (!erasedIsPtrCpp(cppTy))
         return cppTy == "double" ? "(double)(" + expr + ")" : "(int64_t)(" + expr + ")";
     return "static_cast<aura_rt::GcObject*>(" + expr + ")";
 }
 // 适配函数内：CallArg 槽值 → 目标形参 C++ 值
-std::string erasedSlotToParam(const std::string& cppTy, const std::string& slot) {
+std::string erasedSlotToParam(const std::string& cppTy, const std::string& slot, bool isEnum) {
+    if (isEnum) return cppTy + "{static_cast<" + cppTy + "::_Tag>(" + slot + ".v.i)}";
     if (!erasedIsPtrCpp(cppTy)) {
         if (cppTy == "double") return "(" + slot + ".v.f)";
         std::string castTy = cppTy == "bool" ? "bool" : "int32_t";
@@ -35,9 +44,10 @@ std::string erasedSlotToParam(const std::string& cppTy, const std::string& slot)
     return "static_cast<" + cppTy + ">(" + slot + ".v.p)";
 }
 // 适配函数内：invoke 返回值 → CallArg（void/None 先执行调用后返回 none）
-std::string erasedRetToCallArg(const std::string& retCpp, const std::string& call) {
+std::string erasedRetToCallArg(const std::string& retCpp, const std::string& call, bool isEnum) {
     if (retCpp == "void" || retCpp == "aura_rt::NoneType")
         return call + ";\n" + std::string(10, ' ') + "return aura_rt::CallArg::none();";
+    if (isEnum) return "return aura_rt::CallArg::of((int64_t)((" + call + ")._tag));";
     std::string cast = !erasedIsPtrCpp(retCpp)
         ? (retCpp == "double" ? "(double)(" + call + ")"
                               : "(int64_t)(" + call + ")")
@@ -45,7 +55,8 @@ std::string erasedRetToCallArg(const std::string& retCpp, const std::string& cal
     return "return aura_rt::CallArg::of(" + cast + ");";
 }
 // 调用端：invokeErased 返回 CallArg → 期望 C++ 返回类型
-std::string erasedResultUnpack(const std::string& retCpp, const std::string& var) {
+std::string erasedResultUnpack(const std::string& retCpp, const std::string& var, bool isEnum) {
+    if (isEnum) return retCpp + "{static_cast<" + retCpp + "::_Tag>(" + var + ".v.i)}";
     if (retCpp == "int32_t") return "(int32_t)(" + var + ".v.i)";
     if (retCpp == "bool")    return "(bool)(" + var + ".v.i)";
     if (retCpp == "double")  return "(" + var + ".v.f)";
@@ -211,8 +222,14 @@ std::string CodeGenerator::genFunExprCallableObj(const ClosureGenSpec& spec)
             // 普通变量（值捕获）：类型 decltype（[&] IIFE 内可见，捕获时点拷贝）
             // bug-71：init / 类型同源走作用域表达式——嵌套捕获时为 __c->cap_x，
             // decltype(成员访问) 即外层槽类型（合法且同型）
+            // bug-113：源变量若 cv 限定（enum 值接收者的 `const Color self`、`const n = 5`
+            // 等），`decltype(src)` 即 const 限定 ⇒ 槽成员是只读的，而下方填槽生成
+            // `槽 = 变量` ⇒ g++ "assignment of read-only member" / "passing 'const T' as
+            // 'this'"（aurac 抛的是生 C++ 错误）。值捕获是**拷贝**语义，源的只读限定
+            // 不必带到槽上 ⇒ remove_const_t 去限定（不用 decay_t：数组/函数退化会改动
+            // 槽类型，可能影响 GcViewSlot/desc 的判定）。
             const std::string src = nestedSrc.empty() ? sn : nestedSrc;
-            addSlot(sn, "cap_" + sn, "decltype(" + src + ")", src);
+            addSlot(sn, "cap_" + sn, "std::remove_const_t<decltype(" + src + ")>", src);
         }
     }
 

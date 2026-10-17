@@ -127,7 +127,12 @@ void GcHeap::scanRootsOnly(bool youngOnly) {
     {
         std::lock_guard<std::mutex> lk(globalRoots_m_);
         for (auto* rootPtr : globalRoots_) {
-            if (rootPtr && *rootPtr) {
+            // [FIX-BUG110] 全局根槽值可能是脏值/悬垂值（上游缺陷的下游表现：
+            //   bug-111 的未 flush compact 会把槽值留在已 VirtualFree 的页上）。
+            //   markRootEnqueue() 第一件事是 obj->forwarded()（读 obj+13）⇒ 脏值即 UB。
+            //   isGCAddress 只做页区间比较 + los_.contains、**不解引用** ⇒ 对任意值安全。
+            //   与步骤 1（:93，bug-79 L2）及 compact 侧（compact.cpp:359，bug-89）对称。
+            if (rootPtr && *rootPtr && isGCAddress(*rootPtr)) {
                 markRootEnqueue(*rootPtr);
             }
         }
@@ -154,10 +159,18 @@ void GcHeap::scanRootsOnly(bool youngOnly) {
     }
 
     // 5. 始终标记 OOM 错误缓存字符串（确保可随时抛出）
-    if (oomError_.kind)    markRootEnqueue(oomError_.kind);
-    if (oomError_.message) markRootEnqueue(oomError_.message);
-    if (oomError_.file)    markRootEnqueue(oomError_.file);    // feature-18（防御）
-    if (oomError_.stack)   markRootEnqueue(reinterpret_cast<GcObject*>(oomError_.stack));  // 防御
+    // [FIX-BUG110] 同族缺口：这四个指针来自 runtime 缓存（`Error oomError_`，gc.h:621），
+    //   上游一旦留下悬垂值（bug-111 实测：compact 后 message = 0x180000，页已释放），
+    //   markRootEnqueue() 直接读 obj+13 ⇒ UB。isGCAddress 只做区间比较、不解引用。
+    // 关于 `stack`：本仓**不存在** `struct OomError`；类型是 `Error`（types.h:257），
+    //   `stack` 的静态类型是 `Array<uint64_t>*`（types.h:265），而 `template Array : GcObject`
+    //   （builtin/array.h:97）⇒ 它**就是**真正的 GC 对象指针（逻辑栈快照），
+    //   由 captureLogicalStack() 经 GC 分配。故与 kind/message/file 同等对待：
+    //   加守卫不改变标记语义（合法值恒落在 GC 页区间内），只把「脏值 ⇒ 任意地址读」降级为安全跳过。
+    if (oomError_.kind    && isGCAddress(oomError_.kind))    markRootEnqueue(oomError_.kind);
+    if (oomError_.message && isGCAddress(oomError_.message)) markRootEnqueue(oomError_.message);
+    if (oomError_.file    && isGCAddress(oomError_.file))    markRootEnqueue(oomError_.file);    // feature-18（防御）
+    if (oomError_.stack   && isGCAddress(oomError_.stack))   markRootEnqueue(reinterpret_cast<GcObject*>(oomError_.stack));  // 防御
 }
 
 // P0-B：单个栈候选指针的保守扫描（从 scanRootsOnly 提取）。

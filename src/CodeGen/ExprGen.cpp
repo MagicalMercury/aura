@@ -57,12 +57,38 @@ bool CodeGenerator::isHeapSemType(const SemType* type) const {
     // 误判为 heap 会在 record 字段赋值/传参处生成 GcRootHandle<Iterator<T>> → 编译失败
     if (auto* g = dynamic_cast<const GenericSemType*>(type))
         if (g->name == "Iterator") return false;
+    // enum（§4.9.5-16 的相邻项）：enum 壳是**值类型**（非 GcObject、零 GC 面、零分配）
+    //   ⇒ 必须**显式**返回 false。不能靠默认——本函数末行是 `return true;`（未知类型
+    //   一律判堆）⇒ 漏掉这条会把 enum 值当 GC 指针包 `GcRootHandle<Color>`（假根 /
+    //   编译失败），且与 CodeGen 第一遍的 `isHeap=false` 口径分叉。
+    if (dynamic_cast<const EnumSemType*>(type)) return false;
     if (auto* u = dynamic_cast<const UnionSemType*>(type)) {
         for (auto& v : u->variants)
             if (isHeapSemType(v.get())) return true;
         return false;
     }
     return true;
+}
+
+// ============================================================
+// feature-20 批 8（bug-108）isEnumValueSemType — enum（值语义壳）判定
+// ------------------------------------------------------------
+// 判据同源（**唯一**入口；调用点不得另造判据）：
+//   · 认的就是 `enumTypes_` 装填的那个对象类型 `EnumSemType`（CodeGen.cpp 第一遍
+//     `enumTypes_[t->name] = enumTypeOf(*t)`；批 6 的导入 enum 同款装填）⇒ 与批 3
+//     落地的值语义链**同一 hop**，非新判据；
+//   · 结论与 `isHeapSemType`（上方 L64）的**显式 enum 分支**（`EnumSemType ⇒ false`
+//     = 非堆 = 值类型）逐字一致；
+//   · 词法与仓内既有 8 处 `dynamic_cast<const EnumSemType*>` 同款（enumTypeOf /
+//     enumReceiverOf / StmtMatch / StmtLet / CoroDecide / DeclTParams /
+//     registerImportedEnumAnnotation / mapSemType 的 enum 防御分支）。
+// ⚠️ **窄守卫**（只认 enum）：与 DeclFun.cpp:635（值接收者）/ DeclGen.cpp:146 /
+//   CodeGen.cpp:620（方法物化 thunk 跳过）的既有纪律一致 —— 不得放宽成
+//   `isValueType`（对函数名等非堆登记项亦 true，歧义）；也不得用
+//   `!isHeapSemType`（对 Iterator 值视图亦 false ⇒ 会把值视图误判为标量值类型）。
+// ============================================================
+bool CodeGenerator::isEnumValueSemType(const SemType* type) {
+    return type && dynamic_cast<const EnumSemType*>(type) != nullptr;
 }
 
 // 未绑定泛型判定：GenericSemType 且 resolvedName 空（未实例化的模板参数，如泛型

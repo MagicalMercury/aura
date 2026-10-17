@@ -681,11 +681,19 @@ namespace {
     // ============================================================
     // intern_string L1 线程局部缓存（64 槽 LRU）
     //
-    // 热点字符串字面量无锁命中，消除 1000 万次循环的锁竞争
-    // key 指向 Aura 源码字符串字面量（编译期常量，永久存活），不会失效
+    // 热点字面量无锁命中，消除 1000 万次循环的锁竞争
+    // [FIX-B112] key 是本缓存**自持的字节副本**（内联 char[]），
+    //   不依赖调用方指针存活。原实现存的是调用方指针 s，调用方复用同一缓冲区
+    //   装入等长不同内容时，memcmp 会「自己和自己比」⇒ 命中旧条目 ⇒ 静默返回旧字符串。
+    //   长度 > kInternL1MaxKey 的字符串**不进 L1**（直接走 L2 g_internPool，仍然正确）。
     // 线程间缓存不一致不影响正确性：L1 未命中走全局锁 double-check
     // ============================================================
-    struct InternCacheEntry { const char* key; size_t keyLen; GcString* val; };
+    static constexpr size_t kInternL1MaxKey = 32;   // 超过则不缓存（直接走 L2 全局池）
+    struct InternCacheEntry {
+        char      key[kInternL1MaxKey];   // 内容字节副本（零堆分配），不持有调用方指针
+        uint32_t  keyLen;
+        GcString* val;
+    };
     // [FIX-B86-2] GC compaction 代次：任何线程完成 compact 后自增。
     //   线程局部 L1 缓存里的 val 是【裸指针】，compact 搬运 intern 对象后必须作废；
     //   原实现只在 GC initiator 自己的线程调用 clear_intern_cache()，
@@ -700,6 +708,8 @@ namespace {
 
     // L1 缓存插入（LRU 淘汰：新条目放头部，满则淘汰末尾）
     static void internCacheInsert(const char* s, size_t len, GcString* val) {
+        // [FIX-B112] key 容量固定：超长字符串不进 L1（L2 全局池已经保证正确去重）
+        if (len > kInternL1MaxKey) return;
         auto& cache = tl_internCache;
         // 先查重：若已存在则提前到头部（提升命中率）
         for (size_t i = 0; i < cache.count; ++i) {
@@ -714,19 +724,24 @@ namespace {
                 return;
             }
         }
+        // [FIX-B112] 新条目持有**字节副本**，不再存调用方指针 s
+        InternCacheEntry fresh{};
+        if (len > 0) std::memcpy(fresh.key, s, len);
+        fresh.keyLen = static_cast<uint32_t>(len);
+        fresh.val    = val;
         // 不存在：插入头部
         if (cache.count < 64) {
             if (cache.count > 0) {
                 std::memmove(&cache.entries[1], &cache.entries[0],
                              cache.count * sizeof(InternCacheEntry));
             }
-            cache.entries[0] = {s, len, val};
+            cache.entries[0] = fresh;
             ++cache.count;
         } else {
             // 满：淘汰末尾，新条目放头部
             std::memmove(&cache.entries[1], &cache.entries[0],
                          63 * sizeof(InternCacheEntry));
-            cache.entries[0] = {s, len, val};
+            cache.entries[0] = fresh;
         }
     }
 }
@@ -743,6 +758,7 @@ GcString* intern_string(const char* s, size_t len) {
         }
         for (size_t i = 0; i < cache.count; ++i) {
             auto& e = cache.entries[i];
+            // [FIX-B112] 两侧都是稳定字节：e.key 是自持副本，s 只在本次调用内读取
             if (e.keyLen == len && std::memcmp(e.key, s, len) == 0) {
                 return e.val;  // 命中
             }

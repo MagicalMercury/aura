@@ -195,11 +195,19 @@ struct MethodCallExpr : ASTNode {
 struct MemberAccessExpr : ASTNode {
     std::unique_ptr<ASTNode> object;
     std::string member;
+    // enum 变体访问标记（change.md §4.4-④ 改动 8）：**由 Sema 置位**——当且仅当
+    // `object` 解析为**类型名**（`SymKind::TypeAlias` + `EnumSemType`）且 `member` 命中
+    // 该 enum 的 variant 表时为 true。CodeGen 依此生成 `Enum::Variant`（§4.4-⑪）。
+    // ⚠️ 换掉「名字在 enumTypeNames_ 里」的纯名字判据（E-1）：影子变量
+    //    `let Color = {...}` 之后 `Color.x` 在 Sema 侧解析为**变量** ⇒ 标记保持 false
+    //    ⇒ 按值语义生成，不再静默错生成 `Color::x`。
+    bool enumVariantAccess = false;
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<MemberAccessExpr>();
         n->object = object ? object->clone() : nullptr;
         n->member = member;
+        n->enumVariantAccess = enumVariantAccess;   // 必须一并拷贝
         n->line = line; n->col = col;
         return n;
     }

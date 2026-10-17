@@ -79,6 +79,7 @@ set(AURA_SOURCES
     src/CodeGen/TypeMap.cpp
     src/CodeGen/DeclGen.cpp
     src/CodeGen/DeclFun.cpp
+    src/CodeGen/DeclEnum.cpp
     src/CodeGen/DeclTParams.cpp
     src/CodeGen/StmtGen.cpp
     src/CodeGen/ExprGen.cpp

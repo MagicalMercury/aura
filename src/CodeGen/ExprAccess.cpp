@@ -6,6 +6,22 @@
 namespace Aura {
 
 std::string CodeGenerator::genMemberAccess(const MemberAccessExpr& e) {
+    // enum 变体访问（Color.Red / ErrorCode.not_found）→ **壳的静态变体单例** `Enum::Variant`
+    // 🔴 定死（§4.4-⑨ 改动 4）：形态 1/2 都产出静态单例 ⇒ 一条分支通吃两形态，
+    //    且与形态 1 的 `_Tag _tag;` 表示一致（单例值 = tag）。
+    // 🔴 E-1：判据是【Sema 写进 AST 的标记】`e.enumVariantAccess`，不是「名字在某个 enum
+    //    名字集合里」——纯名字判据在影子变量（内层 `let Color = ...`）下会误判 ⇒ 静默生成
+    //    `Color::x`。标记由 SemAnalyzer::inferMemberAccess 在【符号表解析为类型】时置位
+    //    （§4.4-④ 改动 8），CodeGen 只读。
+    if (e.enumVariantAccess && e.object) {
+        if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+            // 批 5（T1）第 ③ 处：单例名走 `enumVariantCppName`（与 DeclEnum.cpp 的壳内声明 /
+            //   类外定义**同源**）。Aura 侧写法 `Foo.Foo` 不变；`enum type Foo = { Foo }` ⇒
+            //   C++ 名 `Foo::Foo_v`（C++ 禁止静态成员与类同名）。
+            return safeName(id->name) + "::" + enumVariantCppName(id->name, e.member);
+        }
+    }
+
     // feature-06（阶段 C）：方法值（p.next——record 方法在取值位置）→ __mv_N 包装
     //（CallableObj 值，cap_recv 槽承载 receiver）。判定：member 非字段而是方法
     //（recordMethods_ 命中）且 Sema 推断为 FuncSemType（方法值）。字段访问（含闭包

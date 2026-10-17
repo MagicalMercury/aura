@@ -15,7 +15,17 @@
 
 标识符以字母或下划线开头，后可跟字母、数字、下划线，区分大小写。
 
-关键字：`fun, let, const, throws, throw, try, catch, match, if, else, for, while, loop, break, continue, spawn, sync, return, import, type, interface, true, false, None, impl, as`
+关键字：`fun, let, const, throws, throw, try, catch, match, if, else, for, while, loop, break, continue, spawn, sync, return, import, type, interface, true, false, None, impl`
+
+软关键字（上下文关键字）：`module, as, lock, thread, enum`。它们**不是**关键字——词法上仍是普通标识符，
+仅在特定位置由 Parser 按上下文识别（`module <name>` 只能在文件首；`enum` 只有在后随硬关键字 `type`
+时才构成 `enum type Name = { Variant, ... }` 声明；由于 Aura **换行不参与语法**（无 `Newline` token），
+该组合**分处两行**亦同样成立）。因此它们**可以**继续用作变量名、参数名、字段名与方法名：
+`let enum = 1`、`fun f(enum: int)`、`x.enum` 均合法。
+
+例如 `enum` 与 `type Color = { Red, Green }` **分开写在两行**时，其 token 序列与写成同一行
+`enum type Color = { Red, Green }` 完全相同 ⇒ 解析为**同一个**声明（**不必**挤在同一行）；
+反之 `enum` 后面不是 `type` 时（如 `let enum = 1`、`x.enum`）**不**构成 enum 声明，`enum` 仍是普通标识符。
 
 ```aura
 // --- 合法标识符 ---

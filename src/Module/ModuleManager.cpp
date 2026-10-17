@@ -16,7 +16,94 @@
 #include <sstream>
 #include <unordered_set>
 
+#ifdef _WIN32
+// bug-109：窄字节 ↔ 宽字符路径转换需 Win32 API（MultiByteToWideChar / WideCharToMultiByte）。
+// NOMINMAX / WIN32_LEAN_AND_MEAN 防止 <windows.h> 的 min/max 宏与 <algorithm> 打架。
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
+
 namespace Aura {
+
+// ============================================================
+// bug-109：非 ASCII 路径的安全桥
+//
+// 现象：`aurac "<中文目录>/输入.aura"` ⇒ 未捕获
+//   `std::filesystem::filesystem_error: Cannot convert character sequence: Illegal byte sequence`
+//   ⇒ terminate（rc=127）；仅 `--cpp` 输出路径含中文则正常。
+//
+// 根因（本机实测，见 scripts/enum_impl_b9_report.md §侦查）：
+//   · 主机原生子进程的 `argv` 是**本地 ANSI 代码页**（中文 Windows = CP936/GBK）字节；
+//     `std::ifstream`/`std::ofstream` 亦按该页解释窄文件名 ⇒ 二者自洽、可正常读写；
+//   · 但 libstdc++(MinGW) 的 `std::filesystem::path(const std::string&)` 与 `.string()`
+//     走的是 **C locale 的 codecvt**（UCRT64 下无法 `std::locale("")`），凡字节 ≥ 0x80
+//     即 EILSEQ ⇒ 抛 `filesystem_error`（"Illegal byte sequence"）。该异常无 catch ⇒ terminate。
+//   · 崩/不崩的差异由此而定：单文件模式下 `stemOf(inputPath)`（`fs::path(...).stem()`）
+//     在**读入侧**最先触发；而 case B 走 `-S` 在触碰 `fs::path(cppPath)` 之前就 `return`，
+//     故仅输出路径含中文不崩（见报告 §侦查⑤）。
+//
+// 修法：把「窄 ↔ path」的转换显式钉死在**进程 ANSI 代码页**（与 argv / ifstream / ofstream /
+//   std::system 同口径），不再借用 C locale codecvt。等价于入口侧的「宽字符路径」思路——
+//   每个路径都先物化成 `std::wstring` 再进 `std::filesystem::path`，杜绝窄字符串的隐式转换。
+//   ※ 未改 main 形态 / CMake：argv 实测即 CP_ACP，故在 ACP 口径上落地是**精确**解，
+//     无需 `wmain`/`-municode`（详见报告 §红线段）。
+// ============================================================
+std::filesystem::path fsPath(const std::string& s) {
+#ifdef _WIN32
+    if (s.empty()) return std::filesystem::path();
+    const int n = MultiByteToWideChar(CP_ACP, 0, s.data(), (int)s.size(), nullptr, 0);
+    if (n <= 0) {
+        // 非法字节序列（理论上不会出现，argv/文件系统交互本就用同一页）：
+        // 退回原生构造，让上层 main 的兜底 catch 转成干净诊断，绝不 terminate。
+        return std::filesystem::path(s);
+    }
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_ACP, 0, s.data(), (int)s.size(), w.data(), n);
+    return std::filesystem::path(w);
+#else
+    return std::filesystem::path(s);
+#endif
+}
+
+// bug-109 case ④：import 名常来自 **UTF-8 源码内容**（本仓 .aura 均为 UTF-8），
+//   与 argv 的 CP_ACP 不同 ⇒ 提供一个 UTF-8 口径的构造器，供 resolveImportPath
+//   对同一 import 名分别按 ACP / UTF-8 试解析。非法 UTF-8 ⇒ 返回空 path（调用方跳过）。
+std::filesystem::path fsPathUtf8(const std::string& s) {
+#ifdef _WIN32
+    if (s.empty()) return std::filesystem::path();
+    const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                      s.data(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return std::filesystem::path();
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int)s.size(), w.data(), n);
+    return std::filesystem::path(w);
+#else
+    return std::filesystem::path(s);
+#endif
+}
+
+std::string pathString(const std::filesystem::path& p) {
+#ifdef _WIN32
+    // 注意：libstdc++ 在 Windows 上 `.string()` 产出的是 **UTF-8**（与 argv 的 CP_ACP 不一致）
+    // ⇒ 一旦混用会出现「读取路径写对了却打不开」。此处统一取 `.native()`（宽）再转 CP_ACP。
+    const std::wstring& w = p.native();
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_ACP, 0, w.data(), (int)w.size(),
+                                      nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_ACP, 0, w.data(), (int)w.size(), s.data(), n,
+                        nullptr, nullptr);
+    return s;
+#else
+    return p.string();
+#endif
+}
 
 // ============================================================
 // ModuleManager 构造
@@ -45,7 +132,7 @@ void writeFile(const std::string& path, const std::string& content) {
 
 std::string stemOf(const std::string& path) {
     namespace fs = std::filesystem;
-    return fs::path(path).stem().string();
+    return pathString(fsPath(path).stem());   // bug-109：不经 C locale codecvt
 }
 
 // ============================================================
@@ -89,7 +176,7 @@ std::string ModuleManager::sanitizeId(const std::string& path) {
 //     追加哈希（或按 §2.1 报错引导用户补显式 module 声明）。
 std::string ModuleManager::pathToNs(const std::string& path) {
     namespace fs = std::filesystem;
-    std::string stem = fs::path(path).stem().string();
+    std::string stem = pathString(fsPath(path).stem());
     return "aura_mod_" + sanitizeId(stem);
 }
 
@@ -104,10 +191,10 @@ std::string ModuleManager::identityKeyOf(const std::string& baseDir,
                                          const std::string& sourcePath) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    fs::path absSrc = fs::absolute(sourcePath, ec);
-    if (ec) absSrc = fs::path(sourcePath);
-    fs::path absBase = fs::absolute(baseDir, ec);
-    if (ec) absBase = fs::path(baseDir);
+    fs::path absSrc = fs::absolute(fsPath(sourcePath), ec);
+    if (ec) absSrc = fsPath(sourcePath);
+    fs::path absBase = fs::absolute(fsPath(baseDir), ec);
+    if (ec) absBase = fsPath(baseDir);
 
     fs::path rel = fs::relative(absSrc, absBase, ec);
     const std::string relStr = rel.generic_string();            // 统一 '/'
@@ -121,7 +208,7 @@ std::string ModuleManager::identityKeyOf(const std::string& baseDir,
 std::unordered_map<std::string, std::string>
 ModuleManager::computeModuleKeys(const std::string& entryPath) const {
     namespace fs = std::filesystem;
-    const std::string baseDir = fs::absolute(entryPath).parent_path().string();
+    const std::string baseDir = pathString(fs::absolute(fsPath(entryPath)).parent_path());
 
     // ① 收集参与 CodeGen 的非内置模块（有 sourcePath），按 stem 分桶
     std::vector<std::string> paths;
@@ -173,7 +260,7 @@ bool ModuleManager::isKnownBuiltin(const std::string& name) const {
 // ============================================================
 ModuleInfo ModuleManager::parseModule(const std::string& sourcePath) {
     ModuleInfo info;
-    info.sourcePath = std::filesystem::absolute(sourcePath).string();
+    info.sourcePath = pathString(std::filesystem::absolute(fsPath(sourcePath)));
     // 先按「隐式回落 stem」派生（向后兼容：无 module 声明时即为最终值）
     info.moduleName = stemOf(sourcePath);
     info.nsName      = pathToNs(sourcePath);
@@ -234,7 +321,7 @@ ModuleInfo ModuleManager::parseModule(const std::string& sourcePath) {
                 info.imports.push_back(ii);
             } else {
                 // 用户模块：解析路径并记录依赖
-                std::string importerDir = std::filesystem::path(sourcePath).parent_path().string();
+                std::string importerDir = pathString(fsPath(sourcePath).parent_path());
                 std::string resolved = resolveImportPath(ii.path, importerDir);
                 if (resolved.empty()) {
                     diag_.error(0, 0, sourcePath + ": cannot resolve import '" + ii.path + "'");
@@ -305,6 +392,19 @@ static std::string typeStringOf(const TypeExpr* t) {
     if (auto* l = dynamic_cast<const ListType*>(t)) {
         return "[" + typeStringOf(l->elementType.get()) + "]";
     }
+    // enum（方案 B）：骨架比对用稳定串；variant 名进串 ⇒ 增删变体会被 C3 骨架比对捕获
+    if (auto* en = dynamic_cast<const EnumTypeExpr*>(t)) {
+        std::string s = "enum";
+        if (!en->bindingTypes.empty())
+            s += "<" + typeStringOf(en->bindingTypes[0].get()) + ">";
+        s += " {";
+        for (size_t i = 0; i < en->variants.size(); ++i) {
+            if (i > 0) s += ", ";
+            s += en->variants[i].name;
+            if (en->variants[i].value) s += " = ?";   // 值不参与骨架串（表达式形态不稳定）
+        }
+        return s + "}";
+    }
     if (auto* r = dynamic_cast<const RecordType*>(t)) {
         std::string s = "{";
         for (size_t i = 0; i < r->fields.size(); ++i) {
@@ -348,7 +448,7 @@ static std::vector<std::string> typeStringsOf(const std::vector<Param>& params) 
 
 DeclUnit ModuleManager::scanDeclarations(const std::string& sourcePath) {
     DeclUnit unit;
-    unit.sourcePath = std::filesystem::absolute(sourcePath).string();
+    unit.sourcePath = pathString(std::filesystem::absolute(fsPath(sourcePath)));
     // 先按「隐式回落 stem」派生（与 parseModule 同款，C0 逻辑）
     unit.moduleName = stemOf(sourcePath);
 
@@ -401,7 +501,7 @@ DeclUnit ModuleManager::scanDeclarations(const std::string& sourcePath) {
                 unit.imports.push_back(ii);
             } else {
                 std::string importerDir =
-                    std::filesystem::path(sourcePath).parent_path().string();
+                    pathString(fsPath(sourcePath).parent_path());
                 std::string resolved = resolveImportPath(ii.path, importerDir);
                 if (resolved.empty()) {
                     diag_.error(0, 0, sourcePath + ": cannot resolve import '" + ii.path + "'");
@@ -489,7 +589,7 @@ bool ModuleManager::scanAll(const std::string& entryPath) {
     std::vector<std::string> pending;
     std::unordered_set<std::string> visited;
 
-    std::string absEntry = std::filesystem::absolute(entryPath).string();
+    std::string absEntry = pathString(std::filesystem::absolute(fsPath(entryPath)));
     pending.push_back(absEntry);
 
     while (!pending.empty()) {
@@ -650,19 +750,25 @@ std::string ModuleManager::resolveImportPath(const std::string& importPath,
                                               const std::string& importerDir) const {
     namespace fs = std::filesystem;
 
-    // 先尝试相对路径
-    fs::path rel = fs::path(importerDir) / importPath;
-    if (fs::exists(rel)) return fs::absolute(rel).string();
+    // bug-109：目录来自 argv（CP_ACP）；import 名可能含非 ASCII 且来自 **UTF-8 源码内容**
+    //   ⇒ 对同一名字分别按 ACP / UTF-8 各试一轮（ASCII 下两者恒等 ⇒ 零回归）。
+    const fs::path impCandidates[2] = { fsPath(importPath), fsPathUtf8(importPath) };
+    const fs::path dir = fsPath(importerDir);
+    for (const fs::path& imp : impCandidates) {
+        if (imp.empty()) continue;
 
-    // 自动补 .aura 扩展名
-    rel += ".aura";
-    if (fs::exists(rel)) return fs::absolute(rel).string();
+        // ① 相对导入者目录
+        fs::path rel = dir / imp;
+        if (fs::exists(rel)) return pathString(fs::absolute(rel));
+        rel += ".aura";                       // 自动补扩展名
+        if (fs::exists(rel)) return pathString(fs::absolute(rel));
 
-    // 再尝试作为绝对路径
-    fs::path abs = importPath;
-    if (fs::exists(abs)) return fs::absolute(abs).string();
-    abs += ".aura";
-    if (fs::exists(abs)) return fs::absolute(abs).string();
+        // ② 作为绝对路径
+        fs::path abs = imp;
+        if (fs::exists(abs)) return pathString(fs::absolute(abs));
+        abs += ".aura";
+        if (fs::exists(abs)) return pathString(fs::absolute(abs));
+    }
 
     return {};
 }
@@ -674,9 +780,11 @@ std::string ModuleManager::resolveImportPath(const std::string& importPath,
 // ============================================================
 void ModuleManager::loadAuraiFile(const std::string& baseName) {
     namespace fs = std::filesystem;
-    fs::path auraiPath = fs::current_path() / "builtins" / baseName;
+    // bug-109：cwd 可能含非 ASCII；`.string()` 在 Windows 返回 UTF-8（≠ argv 的 CP_ACP）
+    // ⇒ 用 pathString 保持与 readFile(ifstream) 同口径。
+    fs::path auraiPath = fs::current_path() / "builtins" / fsPath(baseName);
     if (!fs::exists(auraiPath)) return;
-    std::string src = readFile(auraiPath.string());
+    std::string src = readFile(pathString(auraiPath));
     if (src.empty()) return;
 
     Lexer lexer(src);
@@ -707,7 +815,7 @@ bool ModuleManager::loadAll(const std::string& entryPath) {
     std::unordered_set<std::string> visited;
 
     // 解析入口文件为绝对路径
-    std::string absEntry = std::filesystem::absolute(entryPath).string();
+    std::string absEntry = pathString(std::filesystem::absolute(fsPath(entryPath)));
     pending.push_back(absEntry);
 
     while (!pending.empty()) {

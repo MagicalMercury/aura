@@ -30,6 +30,7 @@ enum class TypeKindBits : uint32_t {
     Iterator    = 1u << 6,
     GenericInst = 1u << 7,
     Interface   = 1u << 8,
+    Enum        = 1u << 9,   // enum v1.1（L-2）：enum 壳的元数据身份位（bit9，原空闲）
 };
 
 // ---- SymbolInfo.flags 位定义（change.md §3.1 注：本档新增，写入 meta.h）----

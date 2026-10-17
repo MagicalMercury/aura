@@ -173,6 +173,11 @@ std::string SemAnalyzer::recordTypeKey(const std::string& receiverType) const {
     if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
         if (auto* rec = dynamic_cast<const RecordSemType*>(sym->type.get()))
             return rec->canonicalName;   // 空 = 匿名 record（无法实现接口）
+        // enum（§4.4-④）：键 = 类型名。
+        // 🔴 不改此处 ⇒ buildTypeMethods（:187 if (key.empty()) continue;）继续跳过、
+        //    findRecordMethod 查不到 ⇒ enum 方法 / impl / 跨模块方法导出【全线静默失效】
+        if (auto* en = dynamic_cast<const EnumSemType*>(sym->type.get()))
+            return en->canonicalName;
     }
     return "";   // 非 record 接收者（v1 接口仅支持 record 实现）
 }
@@ -323,6 +328,11 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         hasAnyPub_ = true;
     }
     if (auto* t = dynamic_cast<const TypeDecl*>(&decl)) {
+        // enum（方案 B：TypeDecl + EnumTypeExpr）走独立注册/校验路径（§4.4-④⑤）
+        if (dynamic_cast<const EnumTypeExpr*>(t->type.get())) {
+            declareEnumDecl(*t);
+            return;
+        }
         // 注册类型泛型参数（如 type Stack<T> 中的 T）
         for (auto& tp : t->typeParams) {
             Symbol tpSym;
@@ -456,6 +466,181 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         symtab_.defineGlobal(std::move(sym));
         return;
     }
+}
+
+// ============================================================
+// enum 声明的注册与校验（change.md §4.4-④ 改动 4 / §4.4-⑤）
+// ============================================================
+
+// enum 声明的注册与校验（形态 1 / 形态 2；形态 3 明确报错）
+// 两段式与 TypeDecl 同款：先前向占位（解决自引用），解析后回填 existing->type
+void SemAnalyzer::declareEnumDecl(const TypeDecl& t) {
+    const auto* et = dynamic_cast<const EnumTypeExpr*>(t.type.get());
+    if (!et) return;
+
+    // ---- (0) 形态 3（泛型绑定）拦截：v1 不做，不留半实现 ----
+    if (et->bindingTypes.size() > 1) {
+        error(t, "enum type supports at most one type binding; "
+                 "generic enum type binding (spectrum 3) is not supported in v1");
+        return;
+    }
+    std::unique_ptr<SemType> binding;
+    if (et->bindingTypes.size() == 1) {
+        binding = resolveType(*et->bindingTypes[0]);
+        if (dynamic_cast<const ErrorSemType*>(binding.get())) {
+            // `<T>`：resolveType 已报 undefined type 'T'；此处补一条可操作的说明
+            error(*et->bindingTypes[0],
+                  "generic enum type binding (spectrum 3) is not supported in v1; "
+                  "bind a concrete type instead (e.g. enum type Code<string>)");
+            return;
+        }
+    }
+
+    // ---- (1) 前向占位（与 TypeDecl 分支同款）----
+    Symbol fwd;
+    fwd.kind = SymKind::TypeAlias;
+    fwd.name = t.name;
+    fwd.isPublic = t.isPublic;
+    fwd.type = ErrorSemType::make();
+    symtab_.defineGlobal(std::move(fwd));
+
+    auto es = std::make_unique<EnumSemType>();
+    es->name = t.name;
+    es->canonicalName = t.name;
+    es->declModule = "";     // F-1：本模块声明 ⇒ 限定名留空；跨模块导入副本由
+                             //      qualifyRecordTypes（SemAnalyzer.cpp:52–75）填成别名
+    es->plainInt = !binding;
+    es->bindingType = binding ? binding->clone() : nullptr;
+
+    checkEnumVariants(t, *et, *es);     // ← §4.4-⑤（约束与常量求值）
+
+    // ---- (2) 回填 ----
+    auto* existing = symtab_.lookupGlobal(t.name);
+    if (existing) existing->type = std::move(es);
+    // 🔴 feature-20 批 3（报红 B3-1）：把 `EnumSemType` 真源**回填到 AST**。
+    //   CodeGen 侧**没有** SemAnalyzer / symtab 通路（`CodeGenerator::generate()` 的形参被
+    //   feature-18 锁定、不含 SemAnalyzer；`symtab_` 是 SemAnalyzer 的 private 成员），
+    //   因此「CodeGen 从 `Symbol::type` 自行装填 `enumTypes_`」只能经此一跳落地：
+    //   回填的指针**就是** `Symbol::type` 的同一对象 ⇒ CodeGen 第一遍据此装填
+    //   `enumTypes_`（§4.4-⑨「SemType 获取约定」(a) 的主路径 / §4.8 Step 0 准入 gate）。
+    //   仓内既有写法用 `const_cast` 写回语义标注（先例：ExprInferMisc.cpp 的
+    //   `const_cast<MemberAccessExpr&>(e).enumVariantAccess = true`）。
+    if (existing && existing->type)
+        const_cast<TypeDecl&>(t).inferredType = existing->type.get();
+}
+
+// 「编译期常量」白名单判定（v1 最小实现；无常量求值器，故只认这几类 AST 形态）
+// 返回 true = 编译期常量；false 时 why 写入可读原因（逐条给出反例提示）
+bool SemAnalyzer::isCompileTimeConstant(const ASTNode& e, const EnumSemType& curEnum,
+                                       std::string& why) const {
+    if (dynamic_cast<const IntLiteral*>(&e) ||
+        dynamic_cast<const FloatLiteral*>(&e) ||
+        dynamic_cast<const BoolLiteral*>(&e) ||
+        dynamic_cast<const StringLiteral*>(&e) ||
+        dynamic_cast<const NoneLiteral*>(&e)) {
+        return true;
+    }
+    // 另一 enum 的变体（EnumName.Variant）——跨声明引用；恒量（variant 身份）
+    if (auto* ma = dynamic_cast<const MemberAccessExpr*>(&e)) {
+        if (auto* id = dynamic_cast<const Identifier*>(ma->object.get())) {
+            auto* sym = symtab_.lookup(id->name);
+            if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
+                if (auto* en2 = dynamic_cast<const EnumSemType*>(sym->type.get())) {
+                    for (auto& v : en2->variants) if (v.name == ma->member) return true;
+                    why = "enum type '" + en2->name + "' has no variant '" + ma->member + "'";
+                    return false;
+                }
+            }
+        }
+        (void)curEnum;
+    }
+    // record / 元组构造（Player{...}）：Sema 只做类型检查，不产生值（S3 §5 推论 4）
+    // ⇒ v1 允许其作为关联值，实际构造交给 CodeGen（§4.4-⑩ 批 B）
+    // 注：仓内该节点统一为 RecordExpr（`e.typeName` 非空即具名字面量；不存在独立的
+    //     NamedRecordExpr 类型 —— 实施批 2 最小修正，见报告 §报红 B2-2）
+    if (dynamic_cast<const RecordExpr*>(&e)) {
+        return true;
+    }
+    why = "expression is not a compile-time constant (v1 allows literals, "
+          "enum variants and record/tuple literals)";
+    return false;
+}
+
+// variant 约束校验（形态 1 / 形态 2）
+void SemAnalyzer::checkEnumVariants(const TypeDecl& t, const EnumTypeExpr& et, EnumSemType& es) {
+    std::set<std::string> seenNames;
+    std::set<int64_t>     seenInts;     // 裁定 B：显式值必须互不相同
+    int64_t nextAuto = 0;               // 未写值 ⇒ 自增（首个从 0 起）
+
+    for (const auto& v : et.variants) {
+        // (a) variant 名唯一
+        if (!seenNames.insert(v.name).second) {
+            error(v.line, v.col, "duplicate enum variant '" + v.name + "' in enum '" + t.name + "'");
+            continue;
+        }
+        // (a2) 壳保留名（§4.4-⑨ 改动 4）：生成的壳自带 `_Tag`（嵌套 `enum class`）与
+        //      `_tag`（身份字段）⇒ 变体名撞这两个名字会让 `Color::_Tag` 一词两义
+        //      （既是嵌套类型名、又要做静态单例名）⇒ 直接报错，不留坏 C++、不做半实现。
+        if (v.name == "_Tag" || v.name == "_tag") {
+            error(v.line, v.col, "'" + v.name + "' is reserved for the generated enum shell "
+                  "(the shell has a nested 'enum class _Tag' and a '_tag' identity field); "
+                  "rename this variant");
+            continue;
+        }
+        EnumVariantSem sv;
+        sv.name = v.name;
+
+        if (es.plainInt) {
+            // ---- 形态 1 ----
+            if (v.value) {
+                auto* i = dynamic_cast<const IntLiteral*>(v.value.get());
+                if (!i) {
+                    error(v.line, v.col, "explicit enum variant value must be an integer constant "
+                          "(spectrum 1); got a non-integer expression");
+                    continue;
+                }
+                if (i->value < 0) {
+                    error(v.line, v.col, "explicit enum variant value must be non-negative "
+                          "(int-backed enum, spectrum 1)");
+                    continue;
+                }
+                if (!seenInts.insert(i->value).second) {
+                    error(v.line, v.col, "duplicate explicit enum value " + std::to_string(i->value)
+                          + "; each explicit value may appear only once (it would break "
+                            "identity-based equality)");
+                    continue;
+                }
+                sv.hasExplicitValue = true;
+                sv.intValue = i->value;
+                nextAuto = i->value + 1;      // 后续未写值继续自增
+            } else {
+                sv.intValue = nextAuto++;
+            }
+        } else {
+            // ---- 形态 2 ----
+            if (!v.value) {
+                error(v.line, v.col, "enum variant of a type-bound enum must have an explicit value "
+                      "(e.g. " + v.name + " = <constant>)");
+                continue;
+            }
+            std::string why;
+            if (!isCompileTimeConstant(*v.value, es, why)) {
+                error(v.line, v.col, "enum variant value must be a compile-time constant: " + why);
+                continue;
+            }
+            auto vt = inferExpr(*v.value);       // 复用既有推断（含 record 字面量类型检查）
+            if (es.bindingType && !isAssignable(*es.bindingType, *vt)) {
+                error(v.line, v.col, "enum variant value type '" + vt->toString()
+                      + "' does not match enum binding type '" + es.bindingType->toString() + "'");
+                continue;
+            }
+            sv.valueType = std::move(vt);
+            sv.valueExpr = v.value.get();
+        }
+        es.variants.push_back(std::move(sv));
+    }
+    // (b) 底层类型选择所需信息（CodeGen 用；此处仅记录最大值/数量，见 §4.4-⑨）
+    //     空 enum（0 variant）合法：不选底层宽度以外的任何值语义
 }
 
 } // namespace Aura

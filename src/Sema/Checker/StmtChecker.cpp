@@ -202,6 +202,10 @@ void SemAnalyzer::checkLetDecl(const LetDecl& decl) {
         // 标注初始值表达式类型，传播 canonicalName 到嵌套记录
         if (decl.initializer) {
             propagateCanonicalName(*decl.initializer, sym->type.get());
+            // enum 深只读传播（§4.4-⑥）：初始值来源是 enum 变体值（含 `p.inventory` 这类
+            // 从 enum 值出发的取字段）⇒ 该绑定标记 readOnly。别名逃逸（let q = p.inventory）
+            // 通过在【根 Identifier】上判定而自动覆盖
+            if (enumValueRootOf(decl.initializer.get())) sym->readOnly = true;
         }
     }
 }    
@@ -300,6 +304,7 @@ void SemAnalyzer::checkConstDecl(const ConstDecl& decl) {
     sym.isConst = true;
     sym.name = decl.name;
     sym.type = inferredType->clone();
+    if (decl.initializer && enumValueRootOf(decl.initializer.get())) sym.readOnly = true;
     symtab_.define(std::move(sym));
     auto* stored = symtab_.lookup(decl.name);
     if (stored) {

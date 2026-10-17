@@ -73,6 +73,8 @@ private:
     std::unique_ptr<LetDecl> parseLetDecl();
     std::unique_ptr<ConstDecl> parseConstDecl();
     std::unique_ptr<TypeDecl> parseTypeDecl();
+    // 方案 B：enum 复用 TypeDecl，type = EnumTypeExpr（见 change.md §4.4-②）
+    std::unique_ptr<TypeDecl> parseEnumDecl();
     std::unique_ptr<InterfaceDecl> parseInterfaceDecl();
     std::unique_ptr<MethodDecl> parseMethodDecl();
     std::unique_ptr<ImportDecl> parseImportDecl();

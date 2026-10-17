@@ -1,5 +1,6 @@
 #include "CodeGen.h"
 #include "../Sema/BuiltinRegistry.h"
+#include "../Sema/SemType.h"   // feature-20 批 3：mapSemType 的 EnumSemType 防御分支（完整类型）
 
 namespace Aura {
 
@@ -116,6 +117,14 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
             }
         }
 
+        // 🔴 批 6（B2）：导入 enum 标注的**惰性装填**（change.md §4.9.4-L18）。
+        //   本函数是「Aura 标注 → C++ 类型名」的唯一出口，也是下列 `*` 判定的消费点；
+        //   函数体内的 `let x: a.Color = …` 标注不在 `generate()` 第一遍的可达范围内
+        //   （体在生成期才遍历）⇒ 就地装填（幂等、窄守卫：仅带命名空间前缀的 enum 标注生效）。
+        //   本地 enum 走 `registeredTypes_`（第一遍 `TypeDecl`，非堆）⇒ 行为逐字不变。
+        if (auto* en = dynamic_cast<const EnumSemType*>(n->inferredType))
+            registerImportedEnumAnnotation(*n, *en);
+
         std::string base = mapNamedType(n->name);
         if (!n->typeArgs.empty()) {
             bool hadStar = base.size() > 1 && base.back() == '*';
@@ -141,7 +150,12 @@ std::string CodeGenerator::mapType(const TypeExpr& type) {
                 for (auto& ns : n->namespacePrefix)
                     prefix += ns + "::";
                 // 跨模块类型都是堆指针，若 base 不是以 * 结尾则追加
-                if (!base.empty() && base.back() != '*')
+                // 🔴 批 6（B2）**例外**：跨模块（导入）**enum** 是**值类型**（§4.4-⑪：
+                //   壳 struct 非 GcObject、零分配）⇒ 与本地 enum 同路径：**不补 `*`**。
+                //   判据 = `importedEnumNames_`（源码限定名，如 `a.Color`；由 Sema 回填在
+                //   本标注节点上的 `EnumSemType` 装填）。放行补 `*` 的后果实测 = 值被当指针：
+                //   `a::Color* c_raw = a::get_red();`（`g++` 报 cannot convert 'Color' to 'Color*'）。
+                if (!base.empty() && base.back() != '*' && !isImportedEnumTypeName(*n))
                     base += "*";
                 if (base.find("aura_rt::") == 0) {
                     base.insert(std::string("aura_rt::").size(), prefix);
@@ -632,6 +646,34 @@ std::string CodeGenerator::mapSemType(const SemType& semType) {
         if (auto* ti = BuiltinRegistry::get().findType(gs->name))
             return ti->cppType;
         return "auto";
+    }
+    // ============================================================
+    // enum（§4.9.5-16 / RS12 的防御分支，feature-20 批 3 补）
+    // ============================================================
+    // 为什么要有它：enum 的 C++ 名走【AST 侧】`mapType` → `mapNamedType`（非堆 ⇒ 裸名），
+    //   正常路径**不经过** `mapSemType`；但 `mapSemType` 是会收到 SemType 的公共出口
+    //   （List / Optional / Union / Func 的元素都是递归 `mapSemType`）⇒ 一旦某条路径把
+    //   `EnumSemType` 直接喂进来，旧代码会落到末行 `return "/* unknown_semtype */";`
+    //   ⇒ 产出**注释形态的坏 C++**（如 `aura_rt::Array</* unknown_semtype */>*`），
+    //   且这类错**只有 `g++ -fsyntax-only` 能抓**（两步铁律兜底）。
+    // 口径（与 `mapNamedType` 的非堆口径一致）：enum 壳是**值类型**（isHeap=false、非 GcObject、
+    //   零分配）⇒ 返回【裸壳名】（无 `*`）；名字加工 = `safeName`（与壳生成 / 变体访问 /
+    //   `emitPendingMethodDecls` 三处同源，防 C++ 保留字）。
+    // 空名兜底（按 `mapNamedType` 的「保守返回」口径）：enum 侧 `canonicalName` 恒 = `name`，
+    //   跨模块限定名只落 `declModule`、**不进** C++ 名（F-1）⇒ 两字段都空时给出可读占位
+    //   （不静默产空名）。
+    if (auto* en = dynamic_cast<const EnumSemType*>(&semType)) {
+        const std::string& shellName = en->canonicalName.empty() ? en->name : en->canonicalName;
+        if (shellName.empty()) return std::string("/* unknown_enum */");
+        // 🔴 批 6（B2）跨模块（导入）enum：C++ 名必须带**模块别名前缀**（`a::Color`）。
+        //   F-1 让 `declModule` 承载模块限定名、**不进** `canonicalName`（SemAnalyzer.cpp:61-67
+        //   的理由是「canonicalName 参与 C++ 名映射」）⇒ 本模块里**唯一**知道「这个 enum
+        //   来自哪个模块」的地方就是 `declModule`。漏掉 ⇒ 产物写裸 `Color`
+        //   （本命名空间内不可见 ⇒ 坏 C++，只有 `g++` 能抓：实测元数据 thunk 的
+        //    `aura_rt::CallableObj<int32_t, Color>` / `static_cast<Color>(…)`）。
+        //   本单元声明的 enum `declModule` 为空 ⇒ 行为逐字不变（F-1 口径不破）。
+        if (!en->declModule.empty()) return en->declModule + "::" + safeName(shellName);
+        return safeName(shellName);
     }
     return "/* unknown_semtype */";
 }

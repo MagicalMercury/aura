@@ -213,7 +213,24 @@ std::unique_ptr<Pattern> Parser::parseSinglePattern() {
         return pat;
     }
 
+    // enum 变体【限定名】模式（Color.Red）：与 ExprParser.cpp:261–285 的成员访问同形，
+    // 复用 parseCall() 建 MemberAccessExpr；是否真的是变体由 Sema 按 scrutinee
+    // 类型定向判定（本处只解决「当前是硬语法错误」的问题，见 S2 §8-R2）
+    // ⚠️ 报红（见 scripts/enum_impl_b1_report.md §「报红」R-3）：change.md §4.4-③ 原文写
+    //    `pat->value = parsePrimary();`（注释称「直接复用 parsePrimary() 建 MemberAccessExpr」），
+    //    但成员访问**不在** `parsePrimary()`（ExprParser.cpp:325–444）里，而在
+    //    `parseCall()`（:184–323，成员访问构造点 :261–285）⇒ 照原文落地只消费 `Color`、
+    //    把 `.` 留给 `consume('=>')`，恰好复现本改动要修掉的那条
+    //    `expected '=>' in match case`。故此处改为 `parseCall()`（最小语义修正）。
+    if (check(TokType::Identifier) && peekNext().type == TokType::Dot) {
+        auto pat = std::make_unique<ConstantPattern>();
+        pat->value = parseCall();
+        return pat;
+    }
+
     // 类型模式: TypeName [variableName]
+    // ⚠️ 裸名 variant（Red）与类型模式（int n / User）语法同形 ⇒ 保持 TypePattern，
+    //    由 Sema 按 scrutinee 类型的 variant 表定向解析（裁定 C；Sema 侧见 §4.4-⑧）
     if (check(TokType::Identifier)) {
         auto pat = std::make_unique<TypePattern>();
         pat->typeName = advance().lexeme;

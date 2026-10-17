@@ -453,6 +453,15 @@ void CodeGenerator::genLetStmt(std::ostream& cpp, const LetDecl& decl) {
                                mc->object->inferredType)) {
                     recvKey = is->name;
                 }
+                // 🔴 feature-20 批 3（报红 B3-5 第三处）：enum 接收者同款 —— 键 = enum 类型名
+                //   （与声明侧 `coroutineFunctions_` 的 `receiverType.methodName` 同源）。
+                //   漏掉 ⇒ sync 块内 `let b = c.slow_is_red(io)` **不登记为 lazy future**
+                //   ⇒ 承载类型不换成 `task<T>`、块尾不驱动 ⇒ 产物 `bool b = <task<bool>>`
+                //   （坏 C++，只有 `g++` 能抓；§4.7.5 验收对象 ⑦）。
+                else if (auto* en = dynamic_cast<const EnumSemType*>(
+                             mc->object->inferredType)) {
+                    recvKey = en->name;
+                }
                 if (!recvKey.empty()
                     && coroutineFunctions_.count(recvKey + "." + mc->method))
                     initIsCoroCall = true;

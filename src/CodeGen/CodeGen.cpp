@@ -236,8 +236,29 @@ CompileUnit CodeGenerator::generate(const Program& program,
     // 第一遍：注册所有类型名和接口名
     for (auto& d : program.decls) {
         if (!d) continue;
-        if (auto* t = dynamic_cast<const TypeDecl*>(d.get()))
-            registerTypeName(t->name, true);
+        if (auto* t = dynamic_cast<const TypeDecl*>(d.get())) {
+            // enum 是【值类型】：形态 1/2 都生成同一个「壳 struct」（`enum class _Tag` +
+            // `_tag` 身份字段 + 静态变体单例 + operator==/!=；形态 1 无关联值）——§4.4-⑨ 改动 4
+            // ⇒ isHeap 必须为 false（否则 mapNamedType 产出 "Color*"、isValueType 判错）
+            const bool isEnum = dynamic_cast<const EnumTypeExpr*>(t->type.get()) != nullptr;
+            registerTypeName(t->name, !isEnum);
+            // 🔴 R-1：**已声明的 enum** 的 AST 侧真源（本遍顺带收集）。用途**仅一个**：
+            //   `genMethodDecl` 的生成期硬失败——「该接收者是已声明的 enum 却查不到
+            //   `enumTypes_`」⇒ 装填时序错，直接 error。它**不参与任何生成决策**，
+            //   只看**声明级类型名**（`decl.receiverType` 恒是类型名，不是值名）⇒ 无静默错生成面。
+            // 🔴 E-1：这里**不登记**任何「enum 名字集合」用于表达式级变体访问判定——
+            //   `EnumName.VariantName` 的生成判定由 Sema 置位的 AST 标记承担
+            //   （MemberAccessExpr::enumVariantAccess，§4.4-② 改动 3 / §4.4-⑪ 改动 1）。
+            // 🔴 Step 0（gate）：enum 的 SemType 真源装填（§4.4-⑨「SemType 获取约定」）。
+            //   批 3 实施口径（报红 B3-1）：CodeGen 侧无 SemAnalyzer/symtab 通路（`generate()`
+            //   形参被 feature-18 锁定）⇒ Sema 已把同一个 `EnumSemType` 回填到
+            //   `TypeDecl::inferredType`，第一遍据此装填（对象身份 = `Symbol::type`）。
+            //   **必须在第一遍结束前装满**（下方准入 gate 断言兜底）。
+            if (isEnum) {
+                declaredEnumNames_.insert(t->name);
+                if (auto* en = enumTypeOf(*t)) enumTypes_[t->name] = en;
+            }
+        }
         if (auto* i = dynamic_cast<const InterfaceDecl*>(d.get()))
             interfaceNames_.insert(i->name);
         if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
@@ -262,6 +283,52 @@ CompileUnit CodeGenerator::generate(const Program& program,
                 interfaceImplementations_[m->receiverType][m->implInterface] = std::move(argCpp);
             }
         }
+    }
+
+    // ============================================================
+    // 🔴 批 6（B2）：**跨模块（导入）enum** 的第一遍装填（change.md §4.9.4-L18）
+    // ------------------------------------------------------------
+    // 上面那遍只看**本单元 AST 的 `TypeDecl`** ⇒ 导入 enum 不在其中（依赖模块的
+    //   `TypeDecl` 归它自己的编译单元，`importExports` 只注入符号）。
+    // 真源 = Sema 回填在**类型标注节点**上的 `EnumSemType`（TypeResolver.cpp 的 enum 回填，
+    //   与 `TypeDecl::inferredType` 同款一跳）⇒ 本遍扫各 decl 的类型标注装填
+    //   `enumTypes_` / `declaredEnumNames_` / `importedEnumNames_`（键 = 源码限定名 `a.Color`）。
+    // 必须在本遍内完成：`mapType`（类型名映射）与 `collectTParams`（泛型形参收集）在生成期
+    //   读 `importedEnumNames_`，晚一步 ⇒ 导入 enum 仍被当**堆类型**（补 `*`）与**泛型形参**。
+    // ⚠️ 函数体内的 `let x: a.Color = …` 标注不在本遍可达范围内（体在生成期才遍历）⇒
+    //   那条路径由 `mapType` 的**惰性装填**兜底（同一函数，幂等）。
+    // ============================================================
+    for (auto& d : program.decls) {
+        if (!d) continue;
+        if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
+            for (auto& p : f->params) registerImportedEnumAnnotations(p.type.get());
+            registerImportedEnumAnnotations(f->returnType.get());
+        } else if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
+            for (auto& p : m->params) registerImportedEnumAnnotations(p.type.get());
+            registerImportedEnumAnnotations(m->returnType.get());
+        } else if (auto* t = dynamic_cast<const TypeDecl*>(d.get())) {
+            registerImportedEnumAnnotations(t->type.get());
+        }
+    }
+
+    // ============================================================
+    // 🔴 Step 0（准入 gate；change.md §4.8 Step 0 / R-1）：`enumTypes_` 装填时序最小验证
+    // ------------------------------------------------------------
+    // 判据：遍历 `program.decls`，凡 `TypeDecl` 且 `dynamic_cast<const EnumTypeExpr*>`
+    //   非空者，断言 `enumTypes_.count(t->name) == 1`。缺失 ⇒ **装填晚于第一遍** ⇒
+    //   四项依赖同时失效（①值接收者窄守卫 a/b/d ②`emitPendingMethodDecls` 的 isEnumRecv
+    //   const ③`genEnumDecl` 取 variant 表 ④`enumUnderlyingType` 底层宽度）。
+    //   ⇒ 硬报错（不静默、不产坏 C++）；生成期硬失败兜底另见 `DeclFun::genMethodDecl`（R-1）。
+    // ============================================================
+    for (auto& d : program.decls) {
+        if (!d) continue;
+        auto* t = dynamic_cast<const TypeDecl*>(d.get());
+        if (!t || !t->type) continue;
+        if (!dynamic_cast<const EnumTypeExpr*>(t->type.get())) continue;
+        if (enumTypes_.count(t->name) == 0)
+            error(*t, "enum '" + t->name + "' SemType is missing at the end of the first pass "
+                  "(enumTypes_ not filled before generation; internal ordering bug - "
+                  "see change.md §4.8 Step 0)");
     }
 
     // 适配器生成需遍历的接口集合 = 用户接口 + 内置接口（interfaces.aurai：Stringer/Comparable/Iterator）
@@ -394,6 +461,10 @@ CompileUnit CodeGenerator::generate(const Program& program,
                 PendingMethod pm;
                 pm.receiverType  = m->receiverType;
                 pm.methodName    = m->name;
+                // 批 5（T3）：方法声明位置（`fun` 处）—— 生成期诊断（壳保留名冲突）用；
+                //   为 0 时消费方回退到宿主 TypeDecl 的行列（见 DeclEnum.cpp）。
+                pm.declLine      = m->line;
+                pm.declCol       = m->col;
                 pm.returnTypeStr = m->returnType ? mapType(*m->returnType) : "void";
                 // M1/M5：返回泛型函数类型别名（Mapper<A,U>）或直接写泛型函数类型
                 // （fun(U,T)->U，含"未在方法模板参数中的闭包自身泛型"）→ struct 内声明
@@ -538,6 +609,15 @@ CompileUnit CodeGenerator::generate(const Program& program,
             }
             if (!fd && !md) continue;
             if (md && !md->receiverTypeArgs.empty()) continue;   // 泛型接收者的 C++ 类型含裸 T ⇒ 跳过
+            // 🔴 feature-20 批 3（报红 B3-2）：**enum 接收者是值类型**（壳 struct 值，非 GcObject*）
+            //   ⇒ 不可走「方法物化 thunk」模板——该模板逐字假定接收者是指针：
+            //     `static_cast<Color>(static_cast<aura_rt::GcObject*>(recv->v.p))`（值转指针）、
+            //     `auto* __rv_0 = (__mat_recv)`（值取指针）、`cap_recv->member()`（值用 `->`）
+            //     ⇒ 三处对 enum 全是坏 C++（实测见报告 §报红 B3-2）。
+            //   语言侧 v1 本就不支持 enum 的方法值一等化（§4.9.4-L7）⇒ **跳过**（不发 thunk）：
+            //   表项随后被 `pruneUnmaterialized` 降级（`thunkName` 清空 ⇒ 渲染 `nullptr`、
+            //   且不发 thunk 前置声明），与 `main` 同款 ⇒ 无悬空、无坏 C++。
+            if (md && enumTypes_.count(md->receiverType) != 0) continue;
 
             // ---- 构造签名（两个生成器共用的 `spec.sig`）----
             auto sig = std::make_unique<FuncSemType>();
@@ -692,13 +772,17 @@ CompileUnit CodeGenerator::generate(const Program& program,
             if (fnNames.count(name)) continue;   // 函数名不是类型（见上方注释）
             MetaTypeRec trec;
             trec.name = name;
-            // ⚠️ 实测差异（见回报 §6）：change.md §3.5(c)/O8 的补块写 `kTypeRecord` / `kTypeHeap`
-            //   两个**未定义**的标识符（§3.1 的枚举是 `TypeKindBits::Record = 1u<<0` 等，且
-            //   **没有任何 "Heap" 位**）⇒ 照抄**编不过**。本批按 §3.1 的枚举取值：一律置 Record 位。
-            //   ⚠️ `registeredTypes_` 的 value 语义 ≈「是否堆类型」（`DeclFun.cpp:35`/`:143-144` 消费），
-            //     但 `meta::TypeKindBits` **无对应位** ⇒ 本阶段无处落（不臆造位；记录为待审取舍）。
-            (void)isHeap;
-            trec.kind   = (1u << 0);   // TypeKindBits::Record
+            // 历史说明（保留可读性）：`kTypeRecord` / `kTypeHeap` 在本仓**不存在**（§3.1 的枚举是
+            //   `TypeKindBits::Record = 1u << 0` 这类位值，且**没有 "Heap" 位**）⇒ 不得照抄。
+            //   本循环的 kind 取值 =「enum 身份 ? Enum 位 : Record 位」（见下方分支）。
+            //   `registeredTypes_` 的 value 语义 ≈「是否堆类型」（`DeclFun.cpp:35`/`:143-144` 消费），
+            //   但 `meta::TypeKindBits` **无 Heap 位** ⇒ 本阶段无处落（不臆造位），故下方显式丢弃。
+            (void)isHeap;   // isHeap 仍不参与 kind 判定：本循环只回填「用户声明类型」
+            // enum 身份判据容器 = enumTypes_（第一遍 :257-260 装填；缺失由 Step 0 gate
+            //   :323-332 与 DeclFun::genMethodDecl 的硬失败兜底，见 v1 change.md:2311）。
+            //   ⚠️ 不得用 isHeap 判：它在上一行被显式丢弃，且 enum 与 record 的 isHeap 语义不同源。
+            trec.kind = enumTypes_.count(name) ? (1u << 9)    // TypeKindBits::Enum（meta.h:33）
+                                              : (1u << 0);   // TypeKindBits::Record
             trec.nsName = nsName_;
             trec.descSymbol = "";      // 🔴 O11：基础投影阶段 desc 恒为空串（不解析 `_desc` 列）
             // ⚠️ 范围说明：`kTypeTable` 本阶段只含**用户声明类型**（内建/容器类型不收集 ——

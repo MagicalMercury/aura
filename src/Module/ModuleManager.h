@@ -15,6 +15,7 @@
 #include "../Sema/Symbol.h"
 
 #include <memory>
+#include <filesystem>   // bug-109：fsPath / pathString 桥（非 ASCII 路径）
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -259,5 +260,19 @@ private:
 std::string readFile(const std::string& path);
 void writeFile(const std::string& path, const std::string& content);
 std::string stemOf(const std::string& path);
+
+// ============================================================
+// bug-109：非 ASCII 路径的安全桥（详见 ModuleManager.cpp 顶部注释）
+//
+//   fsPath(s)      ：窄字节（进程本地 ANSI 代码页，Windows = CP_ACP）→ std::filesystem::path
+//   pathString(p)  ：std::filesystem::path → 同口径窄字节
+//
+// 用途：凡「窄字符串 ↔ path」的边界一律走此二函数，**禁止**再用
+//   `std::filesystem::path(narrow)` / `.string()` 的隐式转换（libstdc++ 在
+//   Windows 上按 C locale 做该转换 ⇒ 非 ASCII 字节抛 filesystem_error）。
+// ============================================================
+std::filesystem::path fsPath(const std::string& s);
+std::filesystem::path fsPathUtf8(const std::string& s);   // 供 UTF-8 源码内容里的文件名（bug-109 case ④）
+std::string pathString(const std::filesystem::path& p);
 
 } // namespace Aura

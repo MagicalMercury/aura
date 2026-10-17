@@ -69,13 +69,39 @@ bool CodeGenerator::isSyncChannelType(const SemType* inferredType,
         && it->second.find("ThreadChannel") != std::string::npos;
 }
 
+// receiver 是否为 enum（形态 1/2 均返回非空；调用方据此把 access 钉成 '.'）
+// 🔴 判据真源 = **Sema 推断**的 `e.object->inferredType`（`EnumSemType`），不是名字集合（E-1）。
+//   覆盖面：局部变量（`c.hex()`）、表达式、以及**变体单例**（`Color.Red.hex()` 的 object 是
+//   MemberAccessExpr，其 inferredType 就是 enum 类型，由 Sema §4.4-④ 改动 8 的
+//   `return sym->type->clone();` 给出）⇒ 同一分支覆盖。
+//   尚未推断出的裸类型名（如 `Color.METHOD(...)` 形态）不属本 plan 语法 ⇒ 返回 nullptr。
+const EnumSemType* CodeGenerator::enumReceiverOf(const MethodCallExpr& e) const {
+    if (!e.object) return nullptr;
+    if (auto* en = dynamic_cast<const EnumSemType*>(e.object->inferredType))
+        return en;
+    return nullptr;
+}
+
 std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCoroutine) {
+
+    // 🔴 硬约束 (c)（A-1 撤销后两形态统一）：enum 接收者恒为【值语义】⇒ 成员访问运算符必须 `.`。
+    //   形态 1（壳的静态单例 `Color::Red`）与形态 2（`static const ErrorCode not_found;`）
+    //   在 C++ 侧都是**值**对象 ⇒ `->` 一律坏 C++。本标志供下方 access 判定消费。
+    bool enumValueReceiver = false;
 
     // P4：联合接收者动态分派——receiver 是 UnionSemType 时生成运行时类型判定分派
     if (e.object && e.object->inferredType) {
         if (auto* u = dynamic_cast<const UnionSemType*>(e.object->inferredType))
             return genUnionDispatch(e, *u, isCoroutine);
     }
+    // enum 接收者（§4.4-⑪）：**不做任何调用改写**（A-1 已撤销——方法挂在壳 struct 上，走
+    // 既有成员函数通路），只把 access 钉成 `.`。
+    // 判据 = `enumReceiverOf(e)`（从 receiver 的 inferredType 取 `EnumSemType*`），
+    // **不是名字集合** ⇒ 与 E-1 的取向一致（影子变量/普通变量不会被误判）。
+    // 注：方法体内 `self.m()` 这一路的 `.` 由**既有**值类型登记自动覆盖
+    //     （DeclFun.cpp 的 valueTypeVarNames_），本标志只补「object 不是裸 Identifier」的缺口。
+    if (enumReceiverOf(e)) enumValueReceiver = true;
+
     // sync.Mutex() / sync.RWMutex() / sync.Once() / sync.Channel<T>(cap) 构造特殊处理
     // 解析为 MethodCallExpr(object=Identifier("sync"), method="Mutex"/.../"Channel")
     // Aura 暴露 sync.Channel<T>，C++ Runtime 仍叫 ThreadChannel<T>（与协程 Channel<T> 区分）
@@ -383,6 +409,12 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
             else if (auto* is = dynamic_cast<const InterfaceSemType*>(e.object->inferredType)) {
                 recvKey = is->name;
             }
+            // 🔴 feature-20 批 3（报红 B3-5）：enum 接收者 —— 键 = enum 类型名，与声明侧
+            //   `coroutineFunctions_`（`receiverType.methodName`）同源。漏掉 ⇒ enum 协程方法的
+            //   调用点不 co_await ⇒ `bool b = <task<bool>>` 坏 C++（§4.7.5 验收对象 ⑦）。
+            else if (auto* en = dynamic_cast<const EnumSemType*>(e.object->inferredType)) {
+                recvKey = en->name;
+            }
         }
         if (!recvKey.empty() && coroutineFunctions_.count(recvKey + "." + e.method))
             needAwait = true;
@@ -445,7 +477,14 @@ std::string CodeGenerator::genMethodCall(const MethodCallExpr& e, bool isCorouti
         oss << "(";
     } else {
         // 判断对象是值类型（用 . ）还是指针类型（用 -> ）还是命名空间（用 ::）
-        if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+        // 🔴 硬约束 (c)：enum 接收者（两形态都是值对象）恒用 `.`。
+        //   原判定只认「裸 `Identifier` 且命中 `valueTypeVarNames_`」⇒ ① `ErrorCode.not_found.describe()`
+        //   的 object 是 `MemberAccessExpr` ⇒ 落到兜底 `access = "->"`；② `Color.Red.hex()` 同理
+        //   ⇒ 生成 `…->describe()` / `Color::Red->hex()` ⇒ 坏 C++。
+        //   窄守卫 = `enumValueReceiver`（由 `enumReceiverOf` 置位，**仅 enum**；不放宽到所有 object）。
+        if (enumValueReceiver) {
+            access = ".";
+        } else if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
             if (importNsNames_.count(id->name)) {
                 access = "::";
             } else if (valueTypeVarNames_.count(id->name)) {

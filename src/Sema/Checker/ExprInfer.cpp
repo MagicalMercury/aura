@@ -529,6 +529,23 @@ std::unique_ptr<SemType> SemAnalyzer::inferBinaryExpr(const BinaryExpr& e) {
         }
         return lt->clone();   // 非数值基元（如 string 参与 -/* 等）：保持现有行为
     }
+    // enum 身份判等（§4.4-⑦）：自动生成 `==` / `!=`，判据 = 同一 variant 的单例身份
+    // ⇒ Sema 层只需保证「同 enum 类型才允许比较」；`<`/`>` 等有序比较 v1 不支持
+    if (auto* ltE = dynamic_cast<const EnumSemType*>(lt.get())) {
+        auto* rtE = dynamic_cast<const EnumSemType*>(rt.get());
+        // F-1：判等必须走 EnumSemType::equals（**模块限定名 + 名字**）而非比 canonicalName，
+        //      否则 `Color.Red == math.Color.Red`（同名不同模块的两个 enum）静默通过。
+        if (!rtE || !ltE->equals(*rt)) {
+            error(e, "cannot compare enum value of type '" + ltE->toString() + "' with '"
+                  + rt->toString() + "'; enum values compare only with the same enum type");
+            return boolType();
+        }
+        if (op != "==" && op != "!=") {
+            error(e, "enum values support only '==' and '!=' in v1");
+            return boolType();
+        }
+        return boolType();     // CodeGen 落裸运算符（形态 1: C++ enum class；形态 2: tag 比较）
+    }
     // C5b: 比较符号 → Comparable 校验（左右均为 record 时）
     // 同类型 record：要求显式 impl Comparable（recordImplIfaces_ 判定）
     // 不同类型 record：显式报错（避免 C++ 指针比较静默通过）

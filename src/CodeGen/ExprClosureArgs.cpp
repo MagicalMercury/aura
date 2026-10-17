@@ -9,24 +9,46 @@ namespace Aura {
 namespace {
 
 // 参数/返回值 C++ 类型 → CallArg 形态判定与装拆箱转换（erased 边界专用）
+//
+// 🔴 feature-20 批 8（bug-108）：下列每个装/拆箱函数都多了一个 `isEnum` 形参 —— 它**必须**
+//   由调用点用 `isEnumValueSemType(sem)`（CodeGen.h / ExprGen.cpp 的判据同源入口）算出，
+//   调用点**不得**另造判据（本 feature 已因判据分叉吃过两次亏）。
+//
+//   为什么不能只看 C++ 名：enum 壳（`struct Color { enum class _Tag…; _Tag _tag; … }`）是
+//   **值类型**、C++ 名**无 `*`**，而下面 `erasedIsPtrCpp` 的末行是「其余一律 GC 指针」
+//   ⇒ 旧判据把 `Color` 当 `GcObject*`，产出 `static_cast<Color>(__v[0].v.p)` /
+//   `static_cast<aura_rt::GcObject*>(Color::Red)` —— 坏 C++，且 `aurac` 零诊断（bug-108）。
+//
+//   值语义表示（**零 runtime 改动**：`CallArg` 只有 I64/F64/Ptr/Nonev 四槽 ⇒ enum 值经
+//   **I64 槽** 承载 `_tag`，与 int/bool 同槽）：
+//     · 装箱 `(int64_t)((EXPR)._tag)`   ← `_tag` = 壳的身份字段（DeclEnum.cpp:329）
+//     · 拆箱 `<Shell>{static_cast<Shell::_Tag>(slot.v.i)}`
+//       聚合初始化写法与 `DeclEnum.cpp:362` 的单例定义
+//       `const Color Color::Red{Color::_Tag::Red};` **逐字同款**（壳 = 单非静态成员
+//       `_tag` 的聚合 ⇒ `Shell{_Tag}` 合法，两形态（形态 1/2）同款 —— 形态 2 的关联值
+//       走静态访问器，不进壳实例字段）。
 bool erasedIsPtrCpp(const std::string& t) {
     if (t == "int32_t" || t == "double" || t == "bool") return false;
     if (t == "void" || t == "aura_rt::NoneType") return false;
     return true;   // 其余一律 GC 指针（T*/Optional*/Variant*/CallableObj*/auto 保守为指针）
 }
-std::string erasedKindName(const std::string& t) {
+std::string erasedKindName(const std::string& t, bool isEnum) {
+    // enum 值经 I64 槽承载（与 int/bool 同槽）——必须与下面装/拆箱表达式**同源**
+    if (isEnum) return "aura_rt::CallArg::Kind::I64";
     if (t == "double") return "aura_rt::CallArg::Kind::F64";
     if (!erasedIsPtrCpp(t)) return "aura_rt::CallArg::Kind::I64";
     return "aura_rt::CallArg::Kind::Ptr";
 }
-// 实参表达式 → CallArg::of 参数（值提升 / GC 指针上转 GcObject*）
-std::string erasedArgToCallArg(const std::string& cppTy, const std::string& expr) {
+// 实参表达式 → CallArg::of 参数（值提升 / GC 指针上转 GcObject* / enum 取 _tag）
+std::string erasedArgToCallArg(const std::string& cppTy, const std::string& expr, bool isEnum) {
+    if (isEnum) return "(int64_t)((" + expr + ")._tag)";
     if (!erasedIsPtrCpp(cppTy))
         return cppTy == "double" ? "(double)(" + expr + ")" : "(int64_t)(" + expr + ")";
     return "static_cast<aura_rt::GcObject*>(" + expr + ")";
 }
 // 适配函数内：CallArg 槽值 → 目标形参 C++ 值
-std::string erasedSlotToParam(const std::string& cppTy, const std::string& slot) {
+std::string erasedSlotToParam(const std::string& cppTy, const std::string& slot, bool isEnum) {
+    if (isEnum) return cppTy + "{static_cast<" + cppTy + "::_Tag>(" + slot + ".v.i)}";
     if (!erasedIsPtrCpp(cppTy)) {
         if (cppTy == "double") return "(" + slot + ".v.f)";
         std::string castTy = cppTy == "bool" ? "bool" : "int32_t";
@@ -35,9 +57,10 @@ std::string erasedSlotToParam(const std::string& cppTy, const std::string& slot)
     return "static_cast<" + cppTy + ">(" + slot + ".v.p)";
 }
 // 适配函数内：invoke 返回值 → CallArg（void/None 先执行调用后返回 none）
-std::string erasedRetToCallArg(const std::string& retCpp, const std::string& call) {
+std::string erasedRetToCallArg(const std::string& retCpp, const std::string& call, bool isEnum) {
     if (retCpp == "void" || retCpp == "aura_rt::NoneType")
         return call + ";\n" + std::string(10, ' ') + "return aura_rt::CallArg::none();";
+    if (isEnum) return "return aura_rt::CallArg::of((int64_t)((" + call + ")._tag));";
     std::string cast = !erasedIsPtrCpp(retCpp)
         ? (retCpp == "double" ? "(double)(" + call + ")"
                               : "(int64_t)(" + call + ")")
@@ -45,7 +68,8 @@ std::string erasedRetToCallArg(const std::string& retCpp, const std::string& cal
     return "return aura_rt::CallArg::of(" + cast + ");";
 }
 // 调用端：invokeErased 返回 CallArg → 期望 C++ 返回类型
-std::string erasedResultUnpack(const std::string& retCpp, const std::string& var) {
+std::string erasedResultUnpack(const std::string& retCpp, const std::string& var, bool isEnum) {
+    if (isEnum) return retCpp + "{static_cast<" + retCpp + "::_Tag>(" + var + ".v.i)}";
     if (retCpp == "int32_t") return "(int32_t)(" + var + ".v.i)";
     if (retCpp == "bool")    return "(bool)(" + var + ".v.i)";
     if (retCpp == "double")  return "(" + var + ".v.f)";
@@ -106,6 +130,14 @@ std::string CodeGenerator::genErasedWrap(const ErasedWrapSpec& spec) {
     std::vector<std::string> paramCpp;
     for (auto& p : sig.paramTypes)
         paramCpp.push_back(p ? mapSemType(*p) : "auto");
+    // 🔴 feature-20 批 8（bug-108）：逐参/返回的 **enum 值语义** 标记 —— 判据同源
+    //   （`isEnumValueSemType(sig.paramTypes[i])` / `(sig.returnType)`），输入就是**生成
+    //   `paramCpp` / `retCpp` 用的同一个 SemType** ⇒ 判据与 C++ 类型串**不可能漂移**。
+    //   ⚠️ 不得用「C++ 名是否以 `*` 结尾」替代：enum 壳名无 `*` 却是值类型（见文件头注释）。
+    std::vector<bool> paramIsEnum;
+    paramIsEnum.reserve(sig.paramTypes.size());
+    for (auto& p : sig.paramTypes) paramIsEnum.push_back(isEnumValueSemType(p.get()));
+    const bool retIsEnum = isEnumValueSemType(sig.returnType.get());
     std::string base = "aura_rt::CallableObj<" + retCpp
         + (paramCpp.empty() ? "" : ", " + erasedJoin(paramCpp, ", ")) + ">";
     std::string basePtr = base + "*";   // CallableObj 值 = GC 堆指针
@@ -228,7 +260,7 @@ std::string CodeGenerator::genErasedWrap(const ErasedWrapSpec& spec) {
     // 校验：argc + 逐参 kind
     oss << indentStr() << "if (__n != " << paramCpp.size();
     for (size_t i = 0; i < paramCpp.size(); ++i)
-        oss << " || __v[" << i << "].kind != " << erasedKindName(paramCpp[i]);
+        oss << " || __v[" << i << "].kind != " << erasedKindName(paramCpp[i], paramIsEnum[i]);
     std::string sigText = "(";
     for (size_t i = 0; i < paramCpp.size(); ++i) {
         if (i > 0) sigText += ", ";
@@ -251,10 +283,10 @@ std::string CodeGenerator::genErasedWrap(const ErasedWrapSpec& spec) {
         : "__t->invoke(__t";
     for (size_t i = 0; i < paramCpp.size(); ++i) {
         if (spec.kind != 4 || i > 0) call += ", ";
-        call += erasedSlotToParam(paramCpp[i], "__v[" + std::to_string(i) + "]");
+        call += erasedSlotToParam(paramCpp[i], "__v[" + std::to_string(i) + "]", paramIsEnum[i]);
     }
     call += ")";
-    oss << indentStr() << erasedRetToCallArg(retCpp, call) << "\n";
+    oss << indentStr() << erasedRetToCallArg(retCpp, call, retIsEnum) << "\n";
     indentLevel_--;
     oss << indentStr() << "}\n";
     indentLevel_--;
@@ -435,10 +467,11 @@ std::string CodeGenerator::iteratorElemCppOf(const SemType* iteratorType) {
 }
 
 // genErasedInvoke — erased/union 调用点（c(1)）：callee 句柄化 + 参数 CallArg 打包 +
-// invokeErased + 按期望类型拆箱。args 元素 = (实参 C++ 文本, 实参 C++ 类型)。
+// invokeErased + 按期望类型拆箱。args 元素 = ErasedCallArg{实参 C++ 文本, 实参 C++ 类型,
+// 实参 SemType}（批 8：SemType 供判据同源的装/拆箱分流，见 CodeGen.h 的 ErasedCallArg）。
 std::string CodeGenerator::genErasedInvoke(
     const std::string& calleeText,
-    const std::vector<std::pair<std::string, std::string>>& args,
+    const std::vector<ErasedCallArg>& args,
     const SemType* retTy) {
     std::string retCpp;
     if (retTy && !dynamic_cast<const NoneSemType*>(retTy))
@@ -454,18 +487,22 @@ std::string CodeGenerator::genErasedInvoke(
     oss << indentStr() << "aura_rt::GcRootHandle<aura_rt::CallableErased*> __ce_"
         << n << "(" << calleeText << ");\n";
     // Ptr 实参 → 句柄栈保护（调用窗口内 GC 安全）
+    // 🔴 feature-20 批 8（bug-108）：enum 实参先按**值语义**分流（判据同源 =
+    //   `isEnumValueSemType(args[i].sem)`）—— enum 是值类型，**不**进 Ptr 分支
+    //   （`GcRootHandle<Color>` 会产坏 C++，且 `static_cast<GcObject*>(Color::Red)` 编不过）。
     std::vector<std::string> packs;
     for (size_t i = 0; i < args.size(); ++i) {
-        const std::string& cppTy = args[i].second;
-        if (erasedIsPtrCpp(cppTy) && !cppTy.empty() && cppTy != "auto") {
+        const std::string& cppTy = args[i].cppType;
+        const bool isEnum = isEnumValueSemType(args[i].sem);
+        if (!isEnum && erasedIsPtrCpp(cppTy) && !cppTy.empty() && cppTy != "auto") {
             std::string hn = "__ca_" + std::to_string(n) + "_" + std::to_string(i);
             oss << indentStr() << "aura_rt::GcRootHandle<" << cppTy
-                << "> " << hn << "(" << args[i].first << ");\n";
+                << "> " << hn << "(" << args[i].text << ");\n";
             packs.push_back("aura_rt::CallArg::of(static_cast<aura_rt::GcObject*>("
                             + hn + ".get()))");
         } else {
             packs.push_back("aura_rt::CallArg::of("
-                            + erasedArgToCallArg(cppTy, args[i].first) + ")");
+                            + erasedArgToCallArg(cppTy, args[i].text, isEnum) + ")");
         }
     }
     oss << indentStr() << "aura_rt::CallArg __av_" << n << "[] = { ";
@@ -478,7 +515,9 @@ std::string CodeGenerator::genErasedInvoke(
         << ".get()->invokeErased(__ce_" << n << ".get(), __av_" << n
         << ", " << args.size() << ");\n";
     if (retCpp != "void")
-        oss << indentStr() << "return " << erasedResultUnpack(retCpp, "__r_" + std::to_string(n)) << ";\n";
+        oss << indentStr() << "return "
+            << erasedResultUnpack(retCpp, "__r_" + std::to_string(n),
+                                  isEnumValueSemType(retTy)) << ";\n";
     else
         oss << indentStr() << "(void)__r_" << n << ";\n";
     indentLevel_--;

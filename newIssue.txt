@@ -1,6 +1,12 @@
 目前有几个想法：
-1、enum
-2、运行时Error输出规范化以及调用栈
+1、enum：
+    语法：enum type Enum = { // 这边可以用泛型绑定一个record： enum type Enum<...>，也可以绑定其它类型： enum type Enum<string>
+      a, // a{如果绑定了record就要初始化}/a(...)如果有构造函数就用构造函数
+      b, // 如果绑定了其它类型，如string：b = 'B'必须写
+      c
+    }
+    底层：
+
 3、"#"配置器 + 反射机制
     '#'现在主要的作用是加载元数据，可用的元数据是：
         #type ：type内的所有字段就是元数据的内容，可以用类似json的方法解析。对于type的函数解析，可以用于校验、代码生成等等，但怎么调用还没想过。
@@ -9,7 +15,7 @@
 
     关于反射机制：就是一个reflect库（编译期调用就是#reflect）
     内置类型：
-            reflect.Any 一种带限制的Any类型，必须能在运行时调用前被推断出具体类型
+            reflect.Any 一种带限制的Any类型，必须能在运行时调用前（包括编译期）被推断出具体类型
             reflect.Type aura支持的类型的一个Enumerate(编译期动态生成：收集所有的内置基础类型、具名的record、interface，
                                                                     后面的两个生成的是reflect.RecordEntry和reflect.MethodEntry)
             reflect.metadata json类的一个格式
@@ -56,5 +62,3 @@
 6、VarInt
 7、编译期Channel死锁检查
 8、sync的runtime优化
-9、编译期函数：
-    大体样式#fun...(后面跟正常的fun同一个逻辑)

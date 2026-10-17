@@ -117,6 +117,42 @@ std::unique_ptr<SemType> UnionSemType::clone() const {
 }
 
 // ============================================================
+// EnumSemType
+// ============================================================
+// ⚠️ 与 Record/Union 的【结构等价】不同：enum 按【类型名身份】判等。
+//    理由：裁定 B 要求「同 enum 内显式值互不相同」+ 裁定 7 要求「按 variant 身份相等」，
+//    若 A、B 两个 enum 因变体表结构相同而被判为同一类型，则 `A.X == B.X` 会静默通过。
+// 🔴 F-1：L5 允许跨模块**类型标注** ⇒ 两个模块各自声明 `enum type Color` 后，别名导入的一方
+//    若只比裸名会被判为同一类型 ⇒ `Color.Red == math.Color.Red` 静默通过。故判据 = 限定名 + 名字。
+bool EnumSemType::equals(const SemType& other) const {
+    auto* o = dynamic_cast<const EnumSemType*>(&other);
+    if (!o) return false;
+    // 模块限定名 + 名字（结构由声明期校验保证；declModule 空串 = 本模块）
+    return declModule == o->declModule && name == o->name;
+}
+std::string EnumSemType::toString() const {
+    return "enum " + name;
+}
+std::unique_ptr<SemType> EnumSemType::clone() const {
+    auto n = std::make_unique<EnumSemType>();
+    n->name = name;
+    n->canonicalName = canonicalName;
+    n->declModule = declModule;                        // F-1：限定名随 clone 走（跨模块导入靠它）
+    n->plainInt = plainInt;
+    if (bindingType) n->bindingType = bindingType->clone();
+    for (auto& v : variants) {
+        EnumVariantSem nv;
+        nv.name = v.name;
+        nv.hasExplicitValue = v.hasExplicitValue;
+        nv.intValue = v.intValue;
+        nv.valueExpr = v.valueExpr;                       // AST 指针，生命周期由 Program 保证
+        if (v.valueType) nv.valueType = v.valueType->clone();
+        n->variants.push_back(std::move(nv));
+    }
+    return n;
+}
+
+// ============================================================
 // ListSemType
 // ============================================================
 bool ListSemType::equals(const SemType& other) const {

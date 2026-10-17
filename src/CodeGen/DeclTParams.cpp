@@ -15,6 +15,13 @@ void CodeGenerator::collectTParams(const TypeExpr& type, std::set<std::string>& 
         return;
     }
     if (auto* n = dynamic_cast<const NamedType*>(&type)) {
+        // 🔴 批 6（B2）：该标注已被 Sema 回填 `EnumSemType` ⇒ **已知 enum 值类型**，与
+        //   本地 enum 同路径（本地 enum 由下方 L57 的 `registeredTypes_.count(n->name)`
+        //   排除；导入 enum 不在 `registeredTypes_` 里，故必须在此显式排除）。
+        //   漏掉 ⇒ 标注被当**泛型形参**，产出虚假模板头
+        //   （实测 `template<typename Color> … use(a::Color* c_raw);`）。
+        //   v1 enum 无泛型实参 ⇒ 直接返回（不递归 typeArgs）。
+        if (dynamic_cast<const EnumSemType*>(n->inferredType)) return;
         // 先递归收集 typeArgs 中的泛型变量（这些变量会原样出现在 C++ 形参类型中，
         // 需作为函数/方法模板参数；如 Transform<T> 的 T、Pair<A,B> 的 A/B）。先收集
         // 到独立集合 argGen 供下方「typeArgs 是否含泛型」判定复用（含嵌套，如

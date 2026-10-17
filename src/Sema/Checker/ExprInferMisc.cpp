@@ -8,6 +8,31 @@ std::unique_ptr<SemType> SemAnalyzer::inferMemberAccess(const MemberAccessExpr& 
         error(e, "expected expression before member access");
         return ErrorSemType::make();
     }
+    // enum 变体访问（EnumName.VariantName）：object 是【类型名】，先于 inferExpr(object) 拦截。
+    // 🔴 顺序不可倒：inferIdentifier 对 TypeAlias 会先报 "cannot use type 'X' as a value"
+    //    （src/Sema/Checker/ExprInfer.cpp:88–101）⇒ 不倒序则【任何】enum 变体访问都产生误导错误
+    // 🔴 E-1（不许纯名字判据）：判定必须走**符号表的 kind**（作用域敏感），
+    //    而非「名字在某个 enum 名字集合里」。影子变量 `let Color = {...}` 之后，
+    //    symtab_.lookup("Color") 命中【变量】符号 ⇒ 本分支不进入 ⇒ 按值语义继续（不误生成 `Color::x`）。
+    if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
+        auto* sym = symtab_.lookup(id->name);
+        if (sym && sym->kind == SymKind::TypeAlias && sym->type) {
+            if (auto* en = dynamic_cast<const EnumSemType*>(sym->type.get())) {
+                for (auto& v : en->variants) {
+                    if (v.name != e.member) continue;
+                    // ★ Sema 定夺的结论写进 AST：CodeGen 只读标记（§4.4-⑪ 改动 1）。
+                    //   本函数签名是 const&，仓内既有写法用 const_cast 写回语义标注
+                    //   （先例：src/Sema/Checker/StmtChecker.cpp:306 一带 const_cast<ConstDecl&>）。
+                    const_cast<MemberAccessExpr&>(e).enumVariantAccess = true;
+                    // 形态 1/2 的值本身都是「该 enum 类型的单例」⇒ 返回 enum 类型
+                    // （裁定 D：v1 无关联值读取语法；备选取 v.valueType，见 §4.9-未定-4）
+                    return sym->type->clone();
+                }
+                error(e, "enum type '" + en->name + "' has no variant '" + e.member + "'");
+                return ErrorSemType::make();
+            }
+        }
+    }
     auto objType = inferExpr(*e.object);
     if (auto* rec = dynamic_cast<const RecordSemType*>(objType.get())) {
         for (auto& f : rec->fields) {
@@ -94,6 +119,17 @@ std::unique_ptr<SemType> SemAnalyzer::inferMemberAccess(const MemberAccessExpr& 
         if (ures->variants.size() == 1) return ures->variants[0]->clone();
         return ures;
     }
+    // enum v1.1（L-4 / T5-C2）：enum 值的成员访问没有合法面（enum 方法走 MethodCallExpr /
+    //   inferMethodCall，不经本函数）⇒ 显式报错，取代此前的静默 ErrorSemType。
+    //   静默吞错会让下游 `let` 的 containsErrorElement 级联（StmtChecker.cpp:168 一带）
+    //   抢在真正的错误之前 ⇒ 首条错误指向无关语句。此处置为报错后，级联的
+    //   `!diag_.hasErrors()` 守卫自动不再触发（§6 Step 8 / §8 T5）。
+    if (auto* en = dynamic_cast<const EnumSemType*>(objType.get())) {
+        error(e, "enum value of type '" +
+                 (en->canonicalName.empty() ? en->name : en->canonicalName) +
+                 "' has no member '" + e.member + "'");
+        return ErrorSemType::make();
+    }
     // 接口类型或其他：允许成员访问（编译时无法确定）
     return ErrorSemType::make();
 }
@@ -143,6 +179,29 @@ std::unique_ptr<SemType> SemAnalyzer::inferIndexExpr(const IndexExpr& e) {
     return ErrorSemType::make();
 }
 
+// target / 初始值表达式的【根 Identifier】：沿 MemberAccessExpr / IndexExpr 链回溯
+const Identifier* SemAnalyzer::rootIdentifierOf(const ASTNode& e) const {
+    const ASTNode* cur = &e;
+    while (cur) {
+        if (auto* id = dynamic_cast<const Identifier*>(cur)) return id;
+        if (auto* ma = dynamic_cast<const MemberAccessExpr*>(cur)) { cur = ma->object.get(); continue; }
+        if (auto* ix = dynamic_cast<const IndexExpr*>(cur))        { cur = ix->object.get(); continue; }
+        return nullptr;   // 调用/字面量/构造 ⇒ 无根（返回值逃逸见 §4.9-已知限制-3）
+    }
+    return nullptr;
+}
+
+// 表达式是否「根来源是 enum 变体值」（用于 readOnly 传播与写检查）
+bool SemAnalyzer::enumValueRootOf(const ASTNode* e) const {
+    if (!e) return false;
+    auto* root = rootIdentifierOf(*e);
+    if (!root) return false;
+    auto* sym = symtab_.lookup(root->name);
+    if (!sym) return false;
+    if (sym->readOnly) return true;                       // 别名传播
+    return sym->type && dynamic_cast<const EnumSemType*>(sym->type.get()) != nullptr;
+}
+
 std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
     // const 绑定不可重新赋值
     if (e.target) {
@@ -153,6 +212,17 @@ std::unique_ptr<SemType> SemAnalyzer::inferAssign(const AssignExpr& e) {
                           "cannot reassign to const binding '" + id->name + "'",
                           "use 'let' instead of 'const' if you need to reassign");
                 }
+            }
+        }
+        // enum 深只读（§4.4-⑥）：写【值图】一律编译期错误。
+        // 规则：target 不是裸 Identifier（即 MemberAccessExpr / IndexExpr 形态）且其根来源
+        //       是 enum 变体值 ⇒ 报错；裸 Identifier 的重绑定按既有 isConst 规则（let 语义不变）。
+        //       目标自身直接是 enum 值表达式（如 `Color.Red.x = 1`）同样拦截。
+        if (!dynamic_cast<const Identifier*>(e.target.get())) {
+            if (enumValueRootOf(e.target.get())) {
+                error(e, "cannot modify a read-only value derived from an enum variant "
+                         "(enum variant values are deeply read-only, including nested "
+                         "records and arrays)");
             }
         }
     }
@@ -361,6 +431,38 @@ std::unique_ptr<SemType> SemAnalyzer::inferFunExpr(const FunExpr& e,
 // match 穷尽性检查
 // ============================================================
 
+// `Color.Red`（ConstantPattern{MemberAccessExpr}）→ 变体名；不匹配当前 enum ⇒ ""
+std::string SemAnalyzer::enumVariantNameOfAccess(const ASTNode* e, const EnumSemType& en) const {
+    if (!e) return "";
+    auto* ma = dynamic_cast<const MemberAccessExpr*>(e);
+    if (!ma) return "";
+    auto* id = dynamic_cast<const Identifier*>(ma->object.get());
+    if (!id) return "";
+    if (id->name != en.name && id->name != en.canonicalName) return "";
+    for (auto& v : en.variants) if (v.name == ma->member) return v.name;
+    return "";
+}
+
+// 名是否是当前 enum 的变体（判据唯一真源 = enumHasVariant，SemType.h）
+bool SemAnalyzer::isEnumVariant(const EnumSemType& en, const std::string& name) const {
+    return enumHasVariant(en, name);
+}
+
+// 名是否是【已声明】的类型名（内置类型名 / None / 符号表命中 TypeAlias / Interface / GenericParam）。
+// 判据刻意【不调用 resolveNamedType】（它会 clone 类型并可能触发自引用占位逻辑）——
+// 只回答「这个名字是否已被声明为类型」，供 §4.4-⑧ 的裸名定向解析使用。
+bool SemAnalyzer::isDeclaredTypeName(const std::string& name) const {
+    if (name == "None") return true;
+    // 内置类型名（int / string / Io / Path / Iterator …）：与 resolveNamedType 前两步同口径
+    auto builtin = semTypeFromAuraName(name);
+    if (!dynamic_cast<const ErrorSemType*>(builtin.get())) return true;
+    auto* sym = symtab_.lookup(name);
+    if (sym && (sym->kind == SymKind::TypeAlias || sym->kind == SymKind::Interface ||
+                sym->kind == SymKind::GenericParam))
+        return true;
+    return false;
+}
+
 bool SemAnalyzer::isMatchExhaustive(const SemType& matchedType,
                                      const std::vector<MatchCase>& cases) {
     // 联合类型：每个 variant 必须在 cases 中被覆盖
@@ -402,6 +504,57 @@ bool SemAnalyzer::isMatchExhaustive(const SemType& matchedType,
                 if (dynamic_cast<const WildcardPattern*>(c.pattern.get())) {
                     covered = true;
                     break;
+                }
+            }
+            if (!covered) return false;
+        }
+        return true;
+    }
+    // enum：每个 variant 必须被覆盖（§4.4-⑧）；不改动下方「非联合类型：默认穷尽」契约
+    if (auto* en = dynamic_cast<const EnumSemType*>(&matchedType)) {
+        for (auto& v : en->variants) {
+            bool covered = false;
+            for (auto& c : cases) {
+                // `_` 兜底
+                if (dynamic_cast<const WildcardPattern*>(c.pattern.get())) { covered = true; break; }
+                // 裸名（Parser 侧为 TypePattern；定向解析见 checkMatchStmt）
+                if (auto* tp = dynamic_cast<const TypePattern*>(c.pattern.get())) {
+                    // 🔴 bug-107（三处同源之②）：**先查变体表**（resolveBareEnumPattern，SemType.h 唯一真源）。
+                    //   同名变体（`enum type Foo = { Foo, Bar }` 的裸名臂 `Foo`）旧代码先命中
+                    //   「typeName == 枚举名 ⇒ covered」⇒ 判全覆盖 ⇒ 漏臂也不报（静默的另一半）。
+                    //   ① `Color v`（varName 非空）⇒ 整型兜底（吞掉全部变体）
+                    //   ② 纯裸名命中变体表        ⇒ 只覆盖同名变体
+                    //   ③ 裸枚举名 / 其他        ⇒ 裸枚举名 = 整型兜底；其他不覆盖（既有行为）
+                    const BareEnumPatternKind kind =
+                        resolveBareEnumPattern(*en, tp->typeName, !tp->varName.empty());
+                    if (kind == BareEnumPatternKind::TypeAll) { covered = true; break; }
+                    if (kind == BareEnumPatternKind::Variant && tp->typeName == v.name) {
+                        covered = true; break;
+                    }
+                }
+                // 限定名 `Color.Red`（ConstantPattern{MemberAccessExpr}）
+                if (auto* cp = dynamic_cast<const ConstantPattern*>(c.pattern.get())) {
+                    if (enumVariantNameOfAccess(cp->value.get(), *en) == v.name) { covered = true; break; }
+                }
+                // `|` 分组（Parser 只允许常量模式分组；限定名与裸名都可能出现）
+                if (auto* gp = dynamic_cast<const GroupPattern*>(c.pattern.get())) {
+                    for (auto& alt : gp->alts) {
+                        if (auto* acp = dynamic_cast<const ConstantPattern*>(alt.get())) {
+                            if (enumVariantNameOfAccess(acp->value.get(), *en) == v.name) {
+                                covered = true; break;
+                            }
+                        }
+                        if (auto* atp = dynamic_cast<const TypePattern*>(alt.get())) {
+                            // bug-107 同源：分组内的裸名/类型模式按同一判定顺序（resolveBareEnumPattern）
+                            const BareEnumPatternKind gkind =
+                                resolveBareEnumPattern(*en, atp->typeName, !atp->varName.empty());
+                            if (gkind == BareEnumPatternKind::TypeAll ||
+                                (gkind == BareEnumPatternKind::Variant && atp->typeName == v.name)) {
+                                covered = true; break;
+                            }
+                        }
+                    }
+                    if (covered) break;
                 }
             }
             if (!covered) return false;

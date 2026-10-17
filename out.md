@@ -1,125 +1,165 @@
-# GLM 深度审查报告：change.md（bug-102 / bug-103 修复实施方案）
+# GLM 审查报告：change.md（enum v1.1 **实施文档**，989 行 · 细化后）
 
 > **来自**：GLM（外部审查）
-> **对象**：`change.md`（2026-10-04，实测 **1037 行 / 56,389 B / md5 `528642dd7cdedc20a78912d1520c7d5b`**）
-> **日期**：2026-10-04
-> **审查框架**（按主人要求的三层）：**① 治标 vs 治本判定；② 修复是否引入新 bug；③ 修复可能暴露的新 bug**。行号核对为辅助（不逐字复述，只报偏差）。
-> **实证口径**：全部结论本轮直读源码（runtime/{io.h, io.cpp, task.h, task.cpp, thread_pool.cpp, gc/{mark_sweep, compact, alloc}.cpp, builtin/path.h}、src/CodeGen/{ExprClosure.cpp, StmtSync.cpp, TypeMap.cpp, DeclFun.cpp}、test/）+ git（HEAD `c164018`，工作树 47 项 M/??，与档自述一致）。探针目录（`scripts/_b102103/`、`scripts/_f18_p5_verify/w3/`）与依赖测试文件存在性已核。
+> **对象**：`change.md` 现行版（2026-10-17，实测 **989 行 / 88,396 B / md5 `dbd6ba64d1c43ec15994d73f681b5dd1`**）
+> **性质**：**覆盖重写后的细化实施方案**（旧 4468 行 v1 版本已归档至 `backups/change-md/change.md.20261017_115801.pre-enum-v1.1.md`，md5 `d86f242f3af13fc4f17910973220e583`）
+> **上一轮**：GLM 审 `plan/enum-v1.1-plan.md`（432 行 / `5fce38a7…`）报出 C1–C5；本档 §0.3 已逐条裁决（C1/C2/C3/C5①/C5③ 采纳，C4 改为引用既有机制，**C5② 驳回**）
+> **本轮性质**：**实施文档首审 + 载荷性实证抽验 + 边缘情况挖掘**
+> **实证口径**：本轮直读源码 —— `src/CodeGen/{MetaEmit.cpp, CodeGen.cpp, DeclFun.cpp, TypeMap.cpp, CodeGen.h, DeclEnum.cpp, ExprGen.cpp, ExprClosureCaptures.cpp}`、`runtime/meta.h`（含 PowerShell 物理行号复核）、`runtime/gc/compact.cpp`、`src/Sema/Checker/{DeclChecker.cpp, StmtChecker.cpp, ExprInferMisc.cpp}`、`src/Diag/DiagnosticEngine.cpp`、`test/{sema/test_sema_enum.cpp, rt/test_enum_gc.cpp}` + `awk`/`ReadAllLines` 行号交叉核验
 
 ---
 
-## 〇、总裁决（先行）
+## 〇、裁决
 
-- [ ] 通过
-- [x] **需修改（轻量）**——两个修复方案本身（B 按值 + `waitAndRethrow`）**治本取向正确、设计质量高**，可实施；但：
-  1. 🔴 **一个本档未盘点的同族缺陷（GC 变体）被本修复「解锁」**——`write_file(path, content)` 的 `content`（`GcString*`）实参，见 §三-1，建议登记新 bug；
-  2. 🟡 A 方案单独采用的**两个安全前提未写入档内**（见 §一-1），未来会被静默打破；
-  3. 🟡 若干小项（行号微偏群、`sync thread`「提前退出 + 异常」路径无测试、防复发规范缺位）。
+**结论：可实施（高质量）；但有 1 🔴 + 6 🟡 需先修。另：GLM 撤回自己上一轮的 C5②（判定其为自己误报）。**
 
 ---
 
-## 一、治标 vs 治本判定
+## 一、先撤回：**C5② 是 GLM 错了，本档的驳回正确**
 
-### 1. bug-102（Path 实参悬垂）
+本档 §0.3 列了 GLM 上轮主张「`runtime/meta.h` 的 `Interface` 实在 `:31`、区间实在 `:22-32`」并**驳回**，且注明「不得再被订正」。GLM 用**第三方独立方法**（PowerShell `[System.IO.File]::ReadAllLines` 物理行号，独立于本档的 `awk` 与 GLM 的 Read 工具）复核：
 
-| 修法 | 判定 | 论证 |
-|---|---|---|
-| **B（io.h/io.cpp 5 方法 `const Path&`→`Path`）** | **io 面治本** | 签名级修复，与调用形态无关（co_await / sync 延迟 / future / 嵌套）**全覆盖**；帧内自有副本，任何时序下安全。25/25 实测转绿。**局限**：只治 io 的 5 个方法，不是「惰性协程 + const& + 自带堆类型」这一**类**缺陷的通道级修复 |
-| **A（ExprClosure.cpp deferred 分支提升）** | **通道级修复，但依赖两个未写明的前提** | 把「协程调用的 deferred 实参」提升出 IIFE，修的是**实参物化通道**（比 B 更接近根因）。但 A 的覆盖完整性依赖：**(P1)** 惰性协程的 `const&` 形参只有 io 5 个（§1.1 ⑤ grep 已覆盖 runtime 面 ✅）；**(P2)** 用户函数恒按值收参（[TypeMap.cpp:477-481](file:///d:/you/Aura/src/CodeGen/TypeMap.cpp#L477-L481) 实证 `mapParamType` = `mapType` 转发、**从不生成 `const&`**）——若(P2)成立，sync 块内延迟调用（`awaitPrefix` 空、实参留 IIFE 内）也安全（被调按值 ⇒ 帧存副本）。**这两个前提都没写进档内** ⇒ 未来若 mapParamType 引入「大对象 const& 优化」会静默打开 A 修不掉的新洞 |
+```
+23: enum class TypeKindBits : uint32_t {
+32:     Interface   = 1u << 8,
+33: };
+```
 
-**组合判定**：B 先落 + A 补（档内建议路线）= 当前已知面闭环 ✅。**「A/B 可单独采用」的分支里，A 单独的完备性论证缺 (P2) 一环**——建议补写。
+⇒ **本档正确（`:23` / `:32` / `:33`），GLM 偏 −1，撤回 C5②。** 本档「不得再订正」的措辞**成立**。
 
-### 2. bug-103（sync thread 内 spawn 抛错 ⇒ terminate）
-
-| 修法 | 判定 | 论证 |
-|---|---|---|
-| **A（析构 catch + formatError + exit(1)）** | **止血**（档内自认，定性诚实） | terminate → 「诊断 + exit(1)」。与 [task.cpp:102-103](file:///d:/you/Aura/runtime/task.cpp#L102-L103)（实测 `aura_rt::formatError(e, stderr); std::exit(1);`）**同款** ✅；`std::exit` flush stdio ⇒ stdout 不丢（thr2 实测背书）。局限：错误仍不可被用户 catch |
-| **B（`waitAndRethrow()` + 块尾显式调用）** | **语义级治本** | 重抛点移到非析构、用户 try 上下文内 ⇒ Aura 层可 catch。**设计亮点（本轮专项推演确认）**：`waited_ = true` 置于 `waitGroup` **之前**（[档内 §2.3(b)]）⇒ `waitAndRethrow` 抛出 → 栈展开触发 `_stx` 自身析构 → `if (waited_) return;` no-op——**成员函数内 throw 析构自身的路径上闸门设计正确**，不会二次 waitGroup / 不会 exit |
-
-**B 的已知边界（档内已诚实标注但无测试）**：块内 `return`/`break`/`throw` **提前退出**时不走块尾 `waitAndRethrow` ⇒ 析构兜底 ⇒ 错误走 exit(1) 而非传播（用户 catch 不到）。例：`sync thread { spawn 抛错; if x { return } }`。这是 B 的语义缝隙——**建议补一个「提前退出 + 异常」用例把该行为锁死**（哪怕结论是「该路径走 exit 是设计裁定」，也要有测试防漂移）。
-
-### 3. 「只治标」总结论
-
-**都不是只治标**：B(bug-102) 在 io 面是签名级根治；A 是通道级；B(bug-103) 是语义级根治。唯一「治标」成分是 bug-103 的 A（自认止血、定位正确）。**但整批修复对「缺陷类」的防护是局部的**——见 §三。
+**方法教训（比该条本身更重要）**：这是本会话**第二次** GLM 的行号读数相对物理行号偏 −1（上一次是 `src/TokType.h` 的 N-1 误报，同被文档驳回）。⇒ **GLM 此后凡仅凭 Read 输出得出的行号，必须经 `grep` / PowerShell 物理行号交叉验证后才主张**（本轮起已执行：凡未交叉验证者一律不作判决依据）。
 
 ---
 
-## 二、修复是否引入新 bug（逐项推演）
+## 二、载荷性抽验（本轮直读源码，逐条命中）
 
-1. **GC 交互（重点排查项）——排除**。A/B 都让 `Path` 跨挂起存活（协程帧内的 wstring 堆缓冲），担心「GC compact 搬走 wstring 缓冲 ⇒ 新 UAF」。实证排除：Aura GC 是**页式分配器**（只管自己的 GcObject 页），`std::wstring` 的 C++ 堆缓冲不在 GC 管辖内；保守扫描的 [scanStackCandidate 四路校验](file:///d:/you/Aura/runtime/gc/mark_sweep.cpp#L163)（页边界 + descriptor）会把页外指针丢弃 ⇒ 二者无交集。**A/B 不引入 GC 面 UAF** ✅。
-2. **B 按值的副作用**：每次调用多一次 `Path` 拷贝（含 wstring 堆分配）——io 冷路径，成本可忽略；协程按值参数是 C++ 标准行为（initial_suspend 前拷入帧）✅；调用点 ABI 无感 ✅。
-3. **A 提升的副作用**：`_a1_0` 生命周期延长至所在块尾（跨 co_await）——`argHandleCounter_` 编号机制成熟（`argIsAwait` 分支早就在提升，非新机制），无变量名冲突；微小内存滞留无害。非协程路径形态不变（档内 ⑤ 用例防护 + 实测条件正确）✅。
-4. **bug-103 B 的生成码变化**：块尾多一行 `_stx.waitAndRethrow();`——**我替档内做了它没做的转红预判**：grep 全 test/，既有 7 处 `_stx` 断言（test_codegen_concurrency_gc.cpp :736/:774/:819/:841/:1152/:1179/:1209）全部是 `_stx.submit(...)` 捕获形态的子串匹配，**无一处断言块尾形态** ⇒ 加行不撞任何既有断言 ✅（但档内应补一句这个预判，按本仓 §4.2 惯例）。
-5. **`std::exit(1)` 在析构内**：跳过后续局部对象析构——与 task.cpp:102 未捕获路径同款、错误路径可接受；Aura `io.println` 走 C stdio（thr2 实测 stdout 保留）⇒ 当前无 iostream 缓冲风险（🟢 未来若有 iostream 输出面需重审）。
-6. **`waited_` 线程安全**：仅主线程（waitAndRethrow 与析构同线程）读写 ⇒ 无竞争 ✅。
+| 本档断言 | 核验结果 |
+| :--- | :--- |
+| `MetaEmit.cpp` 的 `typeKindExpr` 位表 = 9 项，末项 `1u << 8, "TypeKindBits::Interface"`；**fallback 返回 `"0"`** | ✅ **逐字精确**（`kB[]` 九项齐全；`return out.empty() ? std::string("0") : out;` 实读命中）⇒ 本档「漏改位 ⇒ 静默渲染 `static_cast<uint32_t>(0)`」的机制描述**成立** |
+| Step 0 准入 gate：第一遍末遍历 `program.decls`，`EnumTypeExpr` 而 `enumTypes_.count(t->name) == 0` ⇒ `error(*t, "enum '…' SemType is missing at the end of the first pass … change.md §4.8 Step 0")` | ✅ **逐字精确**；其上方注释已列「四项依赖同时失效（值接收者窄守卫 / `isEnumRecv` 的 const / `genEnumDecl` 取 variant 表 / `enumUnderlyingType`）」 |
+| 生成期硬失败：`genMethodDecl` 内 `declaredEnumNames_.count(recv) && enumTypes_.count(recv)==0` ⇒ `error(decl, …)` + **立即 `return`**（注释标注 **R-1（GLM 终审）**） | ✅ **逐字精确** ⇒ GLM 在 v1 终审提出的 R-1 已被实施 |
+| `TypeMap.cpp` 的 enum 分支：裸壳名（过 `safeName`）+ 跨模块 `declModule + "::" + …` 前缀 + 空名 `/* unknown_enum */` | ✅ 精确 |
+| 编译期常量白名单 = `IntLiteral`/`FloatLiteral`/`BoolLiteral`/`StringLiteral`/`NoneLiteral` + `Enum.Variant` + `RecordExpr` | ✅ 精确；**并暴露 E3**（见 §三） |
+| `CodeGen.h`：`std::map<std::string, const EnumSemType*> enumTypes_;`（`:1058`）与 `std::set<std::string> declaredEnumNames_;`（`:1063`） | ✅ 精确（类型与文档描述**完全一致**） |
+| `compact.cpp`「步骤 3 缺 `isGCAddress`、步骤 1 已加固」的不对称 | ✅ 主张为真（步骤 1 守卫 `if (fieldPtr && *fieldPtr && isGCAddress(*fieldPtr))` vs 步骤 3 `if (obj && obj->forwarded())`；注释逐字「脏值（0x1 等）即未定义行为」） |
+| `DeclEnum.cpp` `emitBoundValueAccessors` 签名含 `cpp`、`:196` `"_val_" + safeName`、兜底注释逐字点名「record / 数组 / 另一 enum 变体 / NoneLiteral ⇒ 批 B…本批不产」 | ✅ 逐字精确 |
+| `ExprClosureCaptures.cpp` 门控 `!currentReceiverName_.empty() && name == currentReceiverName_`；`DeclFun.cpp` 值接收者分支 `const <Recv> self = *this;` 且**不设** `currentReceiverName_` | ✅ 逐字精确 ⇒ L-3② 的「**可能不可达**」推断**成立**（本档已正确地把它降为「先探针」） |
 
-**结论：两修复均不引入新 bug**（在现有推演与实测证据下）。
-
----
-
-## 三、修复可能暴露的新 bug（本轮核心产出）
-
-### 🔴 1. 同族缺陷的 **GC 变体**被 B 修复「解锁」：`write_file` 的 `content`（`GcString*`）实参
-
-**证据链（全部本轮实证）**：
-
-1. [io.h:52](file:///d:/you/Aura/runtime/builtin/io.h#L52)：`task<void> write_file(const Path& path, GcString* content);`——`content` 是**指针值**（B 修复不改它，也不该改——指针值拷贝本身合法）；[io.h:32](file:///d:/you/Aura/runtime/builtin/io.h#L32) `task<void> println(GcString* value)` 同族。
-2. 调用点实参物化（bug-102 同一条通道）：`content` 是堆类型（非 deferred）⇒ [ExprClosure.cpp:103-108](file:///d:/you/Aura/src/CodeGen/ExprClosure.cpp#L103-L108) 的 **IIFE 内** `auto _a1_1 = (content); GcRootHandle<...> _h1_1(_a1_1);` ⇒ `io.write_file(_a1_0, _h1_1.get())`。
-3. IIFE 返回（task 建帧、帧存 content 裸指针值）⇒ **`_h1_1` 立即析构注销根** ⇒ co_await 挂起期间，`write_file` 协程帧内的 `content` 指针**无任何精确根**。
-4. [compact.cpp:346-347](file:///d:/you/Aura/runtime/gc/compact.cpp#L346-L347)（原文）：`// 2. 跳过 stackRoots_ 保守扫描 —— 协程帧内的 GC 指针已通过 GcRootHandle 注册到 roots_（步骤 1 已更新）`——**compact 明确跳过栈/帧保守槽的重写**，其设计前提是「帧内 GC 指针都有 GcRootHandle」。而本场景中**句柄已析构** ⇒ 设计前提被「IIFE 内句柄 + 惰性协程」组合**违反**。
-5. 后果：挂起窗口内 GC（如并发任务触发 minor compact）搬走该 `GcString` ⇒ mark 阶段保守扫描会**保活**它（帧内指针是合法候选）但 compact **不重写帧内槽** ⇒ 恢复后 `write_file` 帧内的 `content` 悬垂 ⇒ UAF。
-
-**为什么此前没爆**：bug-102 让长路径 `write_file` 在**进到挂起之前**就 UAF/抛错（path 先悬垂）⇒ content 的 GC 窗口被「更早的崩溃」掩盖。**B 修复后 path 安全 ⇒ `write_file` 真正能跑到挂起 ⇒ content 的 GC 悬垂面从「不可达」变为「真实可达」——这正是「修复暴露新 bug」的定义**。`println(str)`（io.h:32，惰性 + GcString* 值传）理论同族（需确认其挂起窗口长度与实参通道）。
-
-**处置建议**：登记新 bug（本仓规则：发现即登记），与 bug-102 交叉引用；专项调研两件事——① `println`/`write_file` 的实参通道实测（read_file 已实证走 IIFE+deferred，同族推断强但需生成码确认）；② 修法方向（`GcRootScope::Global` 句柄提升到 IIFE 外、或 `write_file` 内部用 promise 根化参数、或协程帧保守槽参与 compact 重写——最后者动 GC 核心红线，需另立 plan）。**本档 §1.1 ④ 的同族清单只盘点了「`const Path&` 形态」，漏了「指针值实参 + IIFE 内句柄析构」这一 GC 变体。**
-
-### 🟡 2. A 方案的完备性前提未写档（§一-1 的 P1/P2）
-
-「A 可单独采用」的结论依赖「用户函数恒按值（mapParamType 无 const&）+ 惰性协程 const& 形参仅 io 5 个」。前者本轮已实证（TypeMap.cpp:477-481），但**档内没写**——这正是「防复发规范」的缺位：建议在 §1.3 补一段「A 的安全前提」，并在 mapParamType 或 ExprClosure 注释处立反向红线（「若引入 const& 参数传递，须先修 A 的覆盖条件」）。
-
-### 🟡 3. `example/used/**` 短路径侥幸面（档内已有预案 ✅）
-
-§1.6 已列「既有含 read_file 的绿判定复核」——方向对。补充建议：复核时加 **`gc_force()` 压测形态**（长路径 read_file + 挂起窗口强制 GC），把 §三-1 的 GC 变体一并压出来——一次压测覆盖两个风险面。
-
-### 🟢 4. bug-103 B 落地后的行为变化面
-
-- `try { sync thread {...} } catch` 从 terminate（不可 catch）变为可 catch——**语义增强**，无既有代码依赖 terminate ✅。
-- thr2/thr4 修复后的 stderr 走哪条路：块尾 `waitAndRethrow` 抛 → main 协程 `unhandled_exception` 值化 → EventLoop 未捕获路径（task.cpp:102 `formatError`）——与 A 的析构路径输出**同款同源**（都是 formatError）⇒ 输出格式统一 ✅（实测已见）。
+⇒ **本档 §4.4 的 C4 结论「四段机制已在位 ⇒ `enumTypes_` 时序不是开放风险」成立** —— GLM 上轮列为「唯一硬前置」的风险，已由**既有 Step 0 gate + 生成期硬失败**双兜底闭环 ✅。这是本档相对 plan 稿最重要的一处实质提升。
 
 ---
 
-## 四、事实核验汇总（辅助）
+## 三、新发现的问题
 
-**✅ 精确命中（抽查全对，引文逐字）**：thread_pool.cpp 群（`waitGroup :76-121`、重抛 **:118** 逐字、erase :105-113、workerLoop :123-201、Error 收集 :163-174、析构 **:233-235 逐字**）；StmtSync.cpp 群（`genSyncThreadStmt :174-197`、节选 :192-196 逐字、`genSyncForStmt` 线程版 :310-316 逐字）；task.cpp:102-103（A 的「同款」声明成立）；waitGroup 的 erase-before-throw（幂等性前提 ④ 实证）；探针/测试文件存在性（`test_codegen_sync_thread.cpp` 确实不存在——档内「若新建则登记」处理正确）。
+### 🔴 E1：(iii) 档缺 `canonicalName` 空守卫 ⇒ 匿名 record 关联值产 `static * _val_A();`（**两条守卫都漏网**）
 
-**⚠️ 行号微偏群（内容逐字正确，仅行号差 1）**：
-- **io.h 群系统性 +1**：`read_file` 实 **:46**（写 :47）、`write_file` 实 **:52**（写 :53）、`mkdir` 实 :61（写 :62）、`remove` 实 :67（写 :68）、`list_dir` 实 :73（写 :74）——B 的 10 处签名行号全部偏 1；
-- **ExprClosure.cpp 群差 1**：`genGcRootedArgs` 实 :37（写 :38）、`deferred[i]` 赋值实 :60（写 :61）、deferred 分支实 **:110-118**（写 :111-119）——A 的修改点行号偏 1；
-- （参考）上轮 bug-97 档 io.cpp 群偏 -1、ModuleManager.cpp 群偏 +1——**三档三方向**，建议定稿统一用物理行号口径（本仓 `Measure-Object -Line` 不计空行的坑也要写进规范）。
+本档 §4.7 的守卫链是：
 
-**⏳ 未逐字核（低风险标注）**：ExprGen.cpp 的 `isHeapSemType`/`isUnboundGenericSemType`/`isDeferredGcRoot`（:65/:75-83）与 path.h:31-34 拷贝构造——前者有 ExprClosure.cpp:35-36 注释背书（「已提升为 CodeGenerator 成员」）、后者有 B 方案 25/25 实测背书，留给实施批顺手复核。
+```cpp
+if (cppTy.empty() || cppTy.rfind("/* unknown_", 0) == 0) { 报错; continue; }
+```
 
-**生成码断言（§2.5 ②）**：`compileSource` + `_stx` 子串断言形态合理；`EXPECT_LT(pos(构造), pos(waitAndRethrow))` 顺序断言 ✅。
+而 `mapSemType(RecordSemType)` 的产物是 **`canonicalName + "*"`**（本档 A2 自述「未过 `safeName`」）。`src/Sema/Checker/DeclChecker.cpp` 的白名单只做 `dynamic_cast<const RecordExpr*>`，**不要求具名**；同一处注释逐字写明该节点「**`e.typeName` 非空即具名字面量**」⇒ **存在 `typeName` 为空的形态**。若该匿名 record 字面量被 Sema 放行为关联值，其 `valueType` 的 `canonicalName` 为空 ⇒ `cppTy == "*"`：
+
+- `"*"` **非空** ✅ 过第一道守卫；
+- `"*"` **不以 `/* unknown_` 开头** ✅ 过第二道守卫；
+
+⇒ 生成 `static * _val_A();` + `* Wrap::_val_A() { … }` ⇒ **坏 C++，且只有 `g++` 能抓**（正是本档反复申明「不可接受」的那一类错）。
+
+**修法（成本一行）**：守卫补 `if (cppTy == "*" || cppTy.front() == '*') { 报错; continue; }`；或在 (iii) 分支前先断言 `RecordSemType::canonicalName` 非空。**并补负例**：匿名 record 关联值 ⇒ 断言**报生成期错**（而非产坏码）。
+
+### 🟡 E2：访问器返回类型**首次打破「只用内建类型名」的隐含前提** ⇒ 同模块**乱序声明**会产坏 C++
+
+形式 A 的返回类型全是内建名（`int32_t` / `double` / `bool` / `aura_rt::GcString*`）⇒ **天然免疫声明顺序**。新增的 (ii)/(iii) 两档首次返回**用户类型**（`Color` / `Point*`）。而壳 struct 与 record 都在 A 遍**按源码顺序**发射 ⇒ 若源码为
+
+```aura
+enum type Slot<Color> = { empty = Color.Red }   // Slot 在前
+enum type Color = { Red, Green }                 // Color 在后
+```
+
+则 header 中 `struct Slot { … static Color _val_empty(); };` 先于 `Color` 的声明出现 ⇒ **`'Color' does not name a type`**（C++ 允许**函数声明**按值返回不完整类型，但**类型名必须先被声明**；指针档 `Point*` 同理需要 `Point` 至少被声明）。
+
+**修法（二选一）**：
+- ① **生成器在壳 struct 前为被引用的关联值类型发射前向声明**（`struct Point;` / `struct Color;`）——一行级、纯生成侧、不改语义；
+- ② 先裁定「Aura 是否允许乱序类型引用」（若 Sema 已强制声明先于使用，本条自动消解）。
+
+**建议**：把「**声明顺序颠倒**」加进 R9 / T-B7 的两模块探针 —— 一次探针同时验「跨模块」与「同模块乱序」，否则这类错要等 `g++` 在很晚的环节才暴露。
+
+### 🟡 E3：判据表列了 4 种 (iii) 形态，而 Sema 白名单**只放行 1 种**（缺交叉自查）
+
+§4.7 判据表把 (iii) 覆盖写作「`RecordSemType`（含元组）/ `ListSemType` / `OptionalSemType`」，但白名单（`DeclChecker.cpp:536-563`）**不含数组字面量、不含 `some(...)`（`CallExpr`）** ⇒ **`ListSemType` / `OptionalSemType` 作为顶层关联值类型疑不可达**（死分支）。
+
+⇒ 这正是本仓「**实现章节与边界章节必须交叉自查**」的教训点。**动作**：在白名单面复核后，把这两档标注为「防御性分支（现行 Sema 不可达）」或补白名单。**并注意**：`NoneLiteral` 的 `valueType` 究竟是 `NoneSemType` 还是 `Optional<…>`（本档 A3 已挂 **T-B6** ✅）—— **若为后者，它会落进 (iii) 而非本档所写的 (ii)**，两种走法的产物差异极大（有无 Global 根）。
+
+### 🟡 E4：`MetaKindTeeth` 的**全产物否定断言**必然假红
+
+§5.2 的 `EXPECT_NOT_CONTAINS(r.unit.metaImpl, "static_cast<uint32_t>(0)")` 是**全产物**断言；而 `typeKindExpr` 与 `symbolFlagsExpr` 的 fallback **同为 `"0"`** ⇒ 任何 **flags/kind 为 0 的其它行**（如符号表的 flags=0）都会渲染出 `static_cast<uint32_t>(0)` ⇒ 用例**因无关原因失败**（本仓已有「断言偏差 D-B3-1/D-B3-7」的前例）。
+
+**修法**：复用同一节**已写好**的 `typeRowOf(meta, "Color")` 把否定断言**收窄到该行** —— 牙齿不减（漏改位表时该行仍渲染 `static_cast<uint32_t>(0)`），假红消除。
+
+### 🟡 E5：§4.7 的默认产物（模板①）与 §5.2 用例源**自相矛盾**
+
+§4.8 的三步判据为「**≥2 次分配 ⇒ 模板②**」，而 §5.2 的 `BoundGlobalRoot` 用例源是 `Point { x = 1, name = "ON" }` —— **含 1 个 string 字段** ⇒ 分配点 = record 本体 + 字符串 intern（**≥2**）⇒ 依其**自身判据**应落**模板②**；但 §4.7 落地代码写的是**模板①**，且本档未点明「本用例预期走②」。
+
+⇒ 若 Step 10 不真跑 T-B2 就照 §4.7 落①，该形态存在「alloc 记录 → alloc 字符串（可触发 GC 移位）→ 再注册**陈旧**指针」的窗口 ⇒ **悬垂**。
+
+**动作**：Step 10 **必须**把**该用例**的分配点数实测落盘，并在文档写明「本用例预期 ①/②」，以免重演「实现章节与测试章节边界语义未交叉自查」（本仓 feature-18 P1 的原型教训）。
+
+> 值得肯定：该用例的断言（`GcRootHandle<Point*> _h{` / `GcRootScope::Global` / `return _h.get();`）**对两版模板都成立** ⇒ 模板切换不破坏用例 ✅。
+
+### 🟡 E6：跨模块 enum 的 **kind** 未进 R9 / T-B7
+
+R9 / T-B7 只验「record 定义可见性」。但 **改动 4 的判据容器 `enumTypes_` 只装填「本单元 AST 的 `TypeDecl`」**（`CodeGen.h` 注释实读明写）⇒ 若 `kTypeTable` 中出现了**导入模块**的 enum 行，`enumTypes_.count(name) == 0` ⇒ **静默回落 `Record`**（L-2 对跨模块 enum 失效且无报错）。
+
+**动作**：在 T-B7 的两模块探针里**同时**断言「导入 enum 的 kind」；若确为 `Record` ⇒ 判据需扩展。**注意**：勿新增第二套判据容器（会与本档 C4「不新增机制」冲突）—— 先探针定事实。
+
+### � E7：`BoundNoRootForEnumValue` 的反向断言**面过宽**
+
+`EXPECT_NOT_CONTAINS(unit.impl, "GcRootHandle")` 断言**整个 impl**。该源含 `fun main(io: Io)`；impl 中若因**其它通路**（io / 闭包捕获 / 驱动代码）合法出现 `GcRootHandle` ⇒ **假红**。
+
+**修法**：切片到 `_val_empty` 的函数体（或断言精确串 `GcRootHandle<Color>`）。
+
+### 🟢 其余（提示级）
+
+- **E8**：(i) 档用 **AST 种类**判、(ii)/(iii) 用 **SemType** 判 ⇒ 判据二元化。本档 §9.4 已警示顺序风险；长期建议统一为 SemType 判据，否则白名单一扩展就会出现「字符串值落进 (iii) 产 `GcRootHandle<GcString*>`」的错位。
+- **E9**：模板②的 `set` 按 `handles.h` 是**不持锁**写 `val_` ⇒ 与并发 compact 的 `memcpy` 存在理论竞争；已被本档「并发面登记为已知（不测）」总括覆盖，建议在 R3 补一句明写，免后来者误判为「已保证线程安全」。
+- **E10**：L-1 产物**当前零消费**（v1 无关联值读取语法，`grep _val_ src/` 零命中）⇒ 性质是**预留接口**，收益**不可由运行期行为证明**；本档 §1 已如实标注 ✅ —— 仅提示勿据此宣称为「用户可见功能」。
+- **E11（未抽验）**：`forceCompactAll()` 是否在测试框架真实存在（§5.4 依赖；编译期即暴露，低风险）；`test_codegen_frames_p4b1.cpp:57-82` 的 helper 模板形态（本档 A6 已挂 ✅）。
 
 ---
 
-## 五、最终清单
+## 四、值得肯定（本档相对 `plan` 稿的实质提升）
 
-### 必改（实施前）
+1. **C1 采纳且判据更硬**：把「是否聚合**含** GC 指针」改成「**映射后 C++ 类型是否以 `*` 结尾**」，并以 D-1 给出偏差理由（纯标量字段的 record 仍是 `GcObject`、仍会被 compact 搬走 ⇒ 裸 static 指针悬垂）——**这个纠偏比 plan 原稿更安全**。
+2. **C2 采纳且写了能力边界**：明确「模板② **不消除**表达式内部窗口」「选择由 T-B2 定，**禁**『②更安全』的表述」⇒ **拒绝了虚假安全感** ✅。
+3. **C4 处理得当**：不新增机制、不重复报错，改为引用**已在位**的四段 —— GLM 实证其中 ③（Step 0 gate）与 ④（生成期硬失败）**逐字在位** ✅。
+4. **自纠机制罕见地强**：§0.4 D1–D6 漂移清单（含把 GLM 的 C5② 驳倒并**留证**）、§9.2 A1–A8 待核实 API 逐条给验证方式、§9.4 主动列出三处最脆弱点、§4.9 删除/替换项逐条 —— 这是本仓少见的**可审查性**。
+5. **探针先行的纪律**：L-3 两项**不写码、只探针**（且明确「禁止在未探针前写码」）✅，并给出「0 命中须先确认产物文件非空」的防假通过条件 ✅。
 
-1. 🔴 **登记 §三-1 的 GC 变体缺陷**（新 bug，交叉 bug-102）：`write_file`/`println` 的 `GcString*` 实参在「IIFE 内句柄析构 + 惰性协程挂起 + compact」下的悬垂窗口——compact.cpp:346 的设计前提被违反的实证链已给全；
-2. 🟡 §1.3 补「A 的安全前提」（P1/P2）+ 在 mapParamType/ExprClosure 注释立反向红线；
-3. 🟡 bug-103 补「提前退出 + 异常」用例（锁死「析构兜底走 exit」的行为边界）；
-4. 🟡 §1.5/§1.6 补「长路径 + gc_force 压测」（一次覆盖 §三-1 与短路径侥幸两个面）；
-5. 🟢 行号微偏群订正（io.h 十处、ExprClosure 三处）。
+---
 
-### 可选建议
+## 五、必改优先级
 
-- §2.4 补一行「既有 `_stx` 断言核查：7 处均为 submit 形态、块尾加行零碰撞」（本轮已替它验证，写进去省得实施批再查）；
-- AGENTS.md 或 io.h 立规范：「惰性协程不得以 `const&` 收非 GC 自带堆类型」（B 修完 io 后防未来新 API 复发）。
+| 优先级 | 项 | 动作 |
+| :-: | :--- | :--- |
+| **1** | **E1** 🔴 | (iii) 守卫补 `"*"` / 前导 `*` 拦截；补匿名 record 负例（断言**报错**而非产坏码） |
+| **2** | **E2** 🟡 | 生成器补被引用类型的前向声明；把「乱序声明」并入 T-B7 探针 |
+| **3** | **E5** 🟡 | Step 10 真跑 T-B2，落盘**该用例**的分配点数；文档写明该用例预期模板 |
+| **4** | **E4 / E7** 🟡 | 两处否定断言**收窄到目标行 / 目标函数体** |
+| **5** | **E3 / E6** 🟡 | 白名单交叉自查（List/Optional 可达性、NoneLiteral 落档）；T-B7 补「导入 enum 的 kind」断言 |
+| 6 | E8–E10 | 提示级，可选加固 |
 
-### 总体评价
+---
 
-这档的「分阶段 + 双方案 + 各自可独立回滚」结构是几档以来最好的工程形态：B(bug-102) 签名级止血面窄、A 通道级根因、B(bug-103) 语义级根治——**分层治本，不是头痛医头**。三处实测矩阵（阈值二分 43↔44、同族 API、A/B 各自 25/25）证据密度高。**最大的洞不在方案里，在方案的盲区外**：`content` 实参的 GC 悬垂面被 bug-102 自己掩盖着，B 修好后它就是下一个爆点——建议本批一并登记，别让它等下一次 ASAN 报告来找。
+## 六、总评
 
-<!-- 本回复由 GLM 生成于 2026-10-04。审查对象：change.md md5 528642dd7cdedc20a78912d1520c7d5b（1037 行）。备份：scripts/_f18_backup/out.md.GLM_b9397审查_轮次前_20261004_110403.bak -->
+本档的**证据层与自纠机制**（D 清单、A 清单、§9.4 脆弱点、C4 裁决、探针先行）已达到可实施标准；四项源码机制经 GLM 抽验**全部在位**（含 GLM 上轮列为唯一硬前置的 `enumTypes_` 时序风险，已被既有 gate + 硬失败双兜底闭环）。
+
+剩余风险集中在 **(iii) 档新增返回类型所引入的两个新面**：
+
+- **E1**：`canonicalName` 空 ⇒ `cppTy == "*"`，两条守卫**都漏网**（坏 C++，只有 `g++` 能抓）；
+- **E2**：首次返回**用户类型名** ⇒ 同模块**乱序声明**时声明早于类型声明（坏 C++，只有 `g++` 能抓）。
+
+这两处**恰好都是「新增形态首次打破既有隐含前提」**——与历轮同源：**既有通路查得很细，新造形态的隐含前提没人验**（既有形式 A 因只用内建名而天然免疫，故该前提从未被记录过）。
+
+<!-- 本回复由 GLM 生成于 2026-10-17。审查对象：change.md md5 dbd6ba64d1c43ec15994d73f681b5dd1（989 行 / 88,396 B）。GLM 本轮撤回自身 C5② 误报（meta.h 行号本档正确），并确立「行号须经 grep/PowerShell 交叉验证」的取数纪律。 -->

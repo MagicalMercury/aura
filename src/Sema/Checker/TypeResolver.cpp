@@ -50,6 +50,25 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
                 materializeCanonicalName(result, *n);
             }
         }
+        // 🔴 批 6（B2）跨模块（导入）enum 的 SemType **传递**（change.md §4.9.4-L18）：
+        //   把 enum 的 `EnumSemType`（**符号表持有的对象**，与 `Symbol::type` 同一身份）
+        //   回填到**类型标注节点**上 —— 与 `TypeDecl::inferredType`（`declareEnumDecl`，
+        //   DeclChecker.cpp:517-529）完全同款的一跳，供 CodeGen 认出「该标注是 enum ⇒ 值类型」。
+        //   为什么必须回填（实读依据）：导入 enum 的 `TypeDecl` **不在**本单元的 AST 里
+        //   （`importExports` 只注入符号：SemAnalyzer.cpp:249-257 `symtab_.defineGlobal`，
+        //    `program.decls` 无依赖模块声明）⇒ CodeGen 第一遍扫 `TypeDecl` **看不到**它；
+        //   本单元里唯一承载「该 enum」身份的 AST 位置就是这些类型标注节点。
+        //   ⚠️ 窄守卫：**只**回填 enum（其它类型零行为变化；已有读取点
+        //      `DeclFun.cpp:154` 读形参标注的 `inferredType`）。
+        //   ⚠️ 只写符号表持有的指针（`sym->type.get()`）：`result` 是 caller 拥有的克隆，
+        //      写它会在 CodeGen 期悬垂（`TypeDecl::inferredType` 的先例同理，写 `existing->type`）。
+        if (dynamic_cast<const EnumSemType*>(result.get())) {
+            auto* esym = symtab_.lookup(fullName);
+            if (esym && esym->type) {
+                if (auto* src = dynamic_cast<const EnumSemType*>(esym->type.get()))
+                    const_cast<NamedType*>(n)->inferredType = src;
+            }
+        }
         return result;
     }
     if (auto* l = dynamic_cast<const ListType*>(&astType)) {
@@ -93,7 +112,21 @@ std::unique_ptr<SemType> SemAnalyzer::resolveType(const TypeExpr& astType) {
                 const auto& other = aIsNone ? u->types[1] : u->types[0];
                 if (other) {
                     auto ot = resolveType(*other);
-                    if (ot && unionVariantGcUnsafe(*ot)) {  // 另一变体为堆类型才折叠
+                    // 🔴 I-1：enum 不得与 None 组成联合 —— 会被折叠成 Optional（语义漂移：
+                    //    形态 1 是整数 tag，Optional 是堆指针装箱），且现状**无任何诊断**。
+                    //    拦截并报错，且不折叠（落到下方通用 UnionSemType 构造路径）。
+                    if (ot && dynamic_cast<const EnumSemType*>(ot.get())) {
+                        // 🔴 feature-20 批 3（C13 / D-B2-3 主 Agent 裁定）：**接同一去重表** ——
+                        //    该类型标注在 Sema 里会被解析两次（占位符号 + 显式标注）⇒ 不接去重时
+                        //    同一错误报两条（批 2 实测 `Compilation failed with 2 error(s)`，
+                        //    两条消息完全相同）。去重机制 = P0 路径既有的 `p0ReportedVariants_`
+                        //    （AST 节点集，见本文件下方 P0 分支）⇒ 保持既有「一错一条」纪律。
+                        if (p0ReportedVariants_.insert(other.get()).second)
+                            error(*other, "enum type '" + ot->toString() +
+                                  "' cannot form a union with 'None' (it would be silently "
+                                  "collapsed to Optional); use an explicit enum variant for "
+                                  "the empty case instead");
+                    } else if (ot && unionVariantGcUnsafe(*ot)) {
                         return OptionalSemType::make(std::move(ot));
                     }
                 }

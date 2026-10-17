@@ -71,6 +71,7 @@ std::string typeKindExpr(uint32_t bits) {
         { 1u << 6, "TypeKindBits::Iterator" },
         { 1u << 7, "TypeKindBits::GenericInst" },
         { 1u << 8, "TypeKindBits::Interface" },
+        { 1u << 9, "TypeKindBits::Enum" },   // 与 runtime/meta.h:33 同位（漏改 ⇒ fallback "0"）
     };
     std::string out;
     for (const Bit& b : kB) {

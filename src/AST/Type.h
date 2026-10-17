@@ -117,4 +117,40 @@ struct GenericTypeRef : TypeExpr {
     }
 };
 
+// enum 的 variant：`Red`（未写值 ⇒ 形态 1 自增）或 `Red = 0xFF0000` / `not_found = "NOT_FOUND"`
+struct EnumVariantDecl {
+    std::string name;
+    std::unique_ptr<ASTNode> value;   // nullptr = 未写 `= 值`
+    int line = 0;                     // 诊断定位（EnumVariantDecl 非 ASTNode，需自持位置）
+    int col  = 0;
+    void print(std::ostream& os, int indent) const;
+    [[nodiscard]] std::unique_ptr<EnumVariantDecl> clone() const {
+        auto n = std::make_unique<EnumVariantDecl>();
+        n->name = name;
+        n->line = line; n->col = col;
+        if (value) n->value.reset(value->clone().release());
+        return n;
+    }
+};
+
+// enum type Name [<绑定类型>] = { Variant, ... }（feature-20 形态 1/2；形态 3 仅留语法占位，Sema 报错）
+struct EnumTypeExpr : TypeExpr {
+    std::vector<EnumVariantDecl> variants;
+    // 绑定类型：0 = 形态 1（int 支撑）；1 = 形态 2（绑定具体类型）；≥2 ⇒ Sema 报错
+    // 注意：`<string>` 与 `<T>` 语法同形（S2 §8-R4），故此处统一存 parseType() 产物，
+    // 「泛型绑定（形态 3）」的判定完全交给 Sema（DeclChecker::declareEnumDecl）
+    std::vector<std::unique_ptr<TypeExpr>> bindingTypes;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<EnumTypeExpr>();
+        for (auto& v : variants) n->variants.push_back(std::move(*v.clone()));
+        for (auto& b : bindingTypes) {
+            if (b) n->bindingTypes.emplace_back(static_cast<TypeExpr*>(b->clone().release()));
+            else   n->bindingTypes.push_back(nullptr);
+        }
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
 } // namespace Aura

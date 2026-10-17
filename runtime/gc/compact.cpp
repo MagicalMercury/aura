@@ -10,6 +10,8 @@
 #include "gc.h"
 #include "../builtin/string.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -60,7 +62,63 @@ bool GcHeap::shouldCompact(CompactScope scope) {
     }
 }
 
+// ============================================================
+// bug-111：compact() 入口不变量自检的实现
+//
+// 真正的不变量（bug-111 归因订正后的表述）：
+//   **所有线程**的 TLAB 都已 flush。判据取 Tlab 的两个字段
+//   （curPage != nullptr || !localYoung.empty()），不是代理指标。
+// 必须遍历 tlabList_：只查本线程 tlab_ 会漏掉其它 mutator 线程
+// （E7 真实情形之一）。GC 自己的 mark worker 不注册 TLAB ⇒ 不会误报；
+// 但**空闲的池 worker 也会持有脏 TLAB**（上次分配后没人替它 flush），
+// 那确实是不安全状态 ⇒ 命中即报错是正确的，不是误报。
+//
+// 并发说明：tlabList_ 的增删在 tlabList_m_ 内（ensureTlab/releaseTlab），故指针
+// 不会因并发注销而悬垂；但 Tlab 的 curPage/localYoung 由**拥有者线程**无锁修改
+// （alloc 快路径 / flushTlab 内持 allocM_）。此处只做「指针是否为空」「begin==end」
+// 这类**比较、不解引用**，最坏是漏报/误报，不会 UB——作为契约自检（诊断）足够。
+// 刻意不去抢 allocM_：flushTlab 持 allocM_，再加 tlabList_m_ 会与
+// ensureTlab 的 tlabList_m_ 形成锁序纠缠。
+// ============================================================
+bool GcHeap::hasDirtyTlabs() {
+    std::lock_guard<std::mutex> lk(tlabList_m_);
+    for (const Tlab* t : tlabList_) {
+        if (!t) continue;
+        // curPage 先查（短路径）：仍在分配中的 TLAB 一定有 curPage，
+        // 此时不必触碰 localYoung（它由拥有者线程无锁 push，见下方说明）。
+        if (t->curPage != nullptr || !t->localYoung.empty()) return true;
+    }
+    return false;
+}
+
+// ============================================================
+// compact() — 紧凑化（小页滑动 + 全局引用重定位）
+//
+// **前置契约（[FIX-BUG111] 改正；原表述「必须在标记/清扫之后调用」是错误的）**：
+//   · 要求：**所有线程**的 TLAB 已 flush（safepoint.cpp:127 的 flushTlab() 即此保证；
+//     forceGc() 首行同样 flush）；
+//   · **不要求**先跑过 mark/sweep —— compact 不依赖 marked 标志，可独立执行；
+//     safepoint.cpp:177-186 的 needCompactOnly 路径就是**合法**的 compact-only 调用。
+//
+// 违反「已 flush」的后果（bug-111 实测链条）：TLAB 快路径对象只进 tlab->localYoung
+// （alloc.cpp:96-97），未 flush ⇒ 不在 youngObjects_ ⇒ 不进 compactEntries_
+// ⇒ setForwardingPtr 从未调用 ⇒ 不被搬运；而 rebuildPageList(All)（:238-262）
+// **无条件**释放整条页链 ⇒ 这些对象所在页被 VirtualFree 解除映射 ⇒ 指向它们的
+// 根槽/字段/oomError_ 立刻悬垂 ⇒ 下一轮 GC 解引用即 AV（帧随堆布局漂移：
+// 实测 mark_sweep.cpp:131 与 :486 两种）。故入口自检、命中即**明确报错终止**。
+//
+// 注：**不**在此自动 flushTlab()（只覆盖调用线程，多线程仍不安全，属于把危险面
+// 缩小而非消除），**不**自动 markPhase()（会引入「mark 了没 sweep」的新中间态）。
+// ============================================================
 void GcHeap::compact(CompactScope scope) {
+    // [FIX-BUG111] 契约自检：所有 TLAB 必须已 flush。命中 ⇒ 立即报错终止，
+    // 而不是让下一轮 GC 在漂移的帧上神秘崩溃。
+    if (hasDirtyTlabs()) {
+        std::fprintf(stderr,
+            "[GC] *** COMPACT CONTRACT VIOLATION ***: "
+            "compact requires all TLABs flushed (call flushTlab() before compact).\n");
+        std::abort();
+    }
     computeForwardingAddresses(scope);
     if (compactEntries_.empty()) return;
 
@@ -353,7 +411,10 @@ void GcHeap::updateAllReferences(CompactScope scope) {
         for (auto* rootPtr : globalRoots_) {
             GcObject* obj;
             std::memcpy(&obj, rootPtr, sizeof(GcObject*));
-            if (obj && obj->forwarded()) {
+            // [FIX-BUG89] 与步骤 1（:341，bug-79 L2）对称加固：globalRoots_ 槽值
+            // 可能因任何悬垂来源成为脏值（0x1 等），此时 obj->forwarded() 读任意
+            // 地址即未定义行为。isGCAddress 只做页区间比较、不解引用 ⇒ 对任意值安全。
+            if (obj && isGCAddress(obj) && obj->forwarded()) {
                 GcObject* newPtr = obj->forwardingPtr();
                 std::memcpy(rootPtr, &newPtr, sizeof(GcObject*));
             }
@@ -830,7 +891,10 @@ void GcHeap::updateMediumPageReferences() {
         for (auto* rootPtr : globalRoots_) {
             GcObject* obj;
             std::memcpy(&obj, rootPtr, sizeof(GcObject*));
-            if (obj && obj->forwarded()) {
+            // [FIX-BUG110] 与 bug-89 在 :359（小页路径·步骤 3）的加固同源同判据：
+            //   中页路径这一份是 bug-89 未覆盖的同族副本，脏/悬垂槽值直接
+            //   obj->forwarded() 即 UB。isGCAddress 只做区间比较、不解引用。
+            if (obj && isGCAddress(obj) && obj->forwarded()) {
                 GcObject* newPtr = obj->forwardingPtr();
                 std::memcpy(rootPtr, &newPtr, sizeof(GcObject*));
             }

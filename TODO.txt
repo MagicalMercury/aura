@@ -706,3 +706,52 @@ GcString 优化（基于 plan/gcstring_optimization.md，2026-07-20 更新）
       - 现状：sync thread v1 采用 FIFO 全局队列（方案 A）
       - 触发条件：worker > 32 吞吐不达标 / 引入递归 spawn / CPU 密集分治为主用例
       - 演进：方案 A → 方案 B（work-stealing），保持 ThreadPool::submit API 不变
+
+================================================================
+[ 十一 ] 枚举类型 enum（issues/features/feature-20-enum-type.md；权威方案 = change.md）
+================================================================
+[x] P1  enum type v1 实施（4 批串行 + 独立验证批）  [2026-10-15 完成，未提交]
+      - 范围：软关键字 `enum` / 形态 1（int 支撑 + 显式值互不相同）/ 形态 2（绑定类型 +
+        形式 A 直调 intern_string）/ variant 值访问 `X.Variant` / 壳上方法（含协程方法）/
+        match 穷尽 + 裸名 / 深只读 / `==` 按 variant 身份 / 空 enum 合法（不可构造）/
+        形态 3（payload）v1 明确报错 / 同名 variant 合法（C++ 侧单例改名）
+      - 落地：src/CodeGen/DeclEnum.cpp（新建）+ Sema/Parser/AST/测试共 30+ 文件
+      - 验证（主 Agent 亲跑）：全量 1559 tests 0 failed；两步铁律（aurac + g++ -fsyntax-only）；
+        `runtime/` 零改动；`example/test.aura` md5 未变
+      - 文档：READMEs/02-lexical.md §2.2 软关键字正文（`as` 从关键字表移出）；change.md 附一…附十一
+[x] P1  **v1.1 必做四项**（2026-10-17 完成，未提交；全量 1606/1606）
+      - **L-1 形态 2 批 B**：三分类（(ii) 零根 / (iii) 形式 B）；模板②（含堆字段 record）/①（纯标量 record）
+        /②防御（tuple/List/Optional）；E1 匿名 record 守卫；两步铁律 3 正例 0/0 + 1 负例不产 C++
+      - **L-2 元数据集成**：`TypeKindBits::Enum = 1u << 9` + `MetaEmit` 位表镜像；`trec.kind` 按 `enumTypes_` 分流
+        （`variants()` 按 T2(a) 未做，另议）
+      - **L-3 深只读两处限制**：探针结案 —— `cap_recv` 对 enum 值接收者**不可达（不成立）**；
+        返回值逃逸无 ReturnStmt 钩子 ⇒ **维持已知限制**
+      - **L-4 别名写报错顺序**：T5 = C2（`ExprInferMisc` enum 成员访问显式报错）⇒ 首条 = 精准错误；C1 未启用
+      - 备注：跨模块导入 enum 的 `enumTypes_` 装填（B2）已补（修复批 6）
+      - 新登记：bug-113（闭包捕获 const 局部 ⇒ 产物对只读成员赋值 ⇒ 编译失败）
+[ ] P1  bug-107 裸名同名变体被误判为「类型模式」⇒ match 恒真吞臂 + 静默无诊断  [2026-10-15 登记；主人裁定：按主 Agent 方案修，**本轮推迟**]
+      - 登记：issues/bugs/bug-107-bare-same-name-variant-pattern-resolved-as-type-pattern.md
+      - 触发：enum type Foo = { Foo, Bar } 下 match 裸名臂 Foo =>（裁定 A 同名 + 裁定 ⑦ 可省限定名
+        的**组合**）⇒ 产物 `if (true)`，后续臂死代码，运行期结果错误且 aurac 诊断 0；限定名可规避
+      - 已批修法：裸名（无绑定名）**先查变体表** ⇒ 变体常量模式；`Color v =>` 带绑定名仍按类型模式；
+        **三处同源同序**（Sema/Checker/StmtFlow.cpp:236–243 覆盖、Sema/Checker/ExprInferMisc.cpp:511–516
+        穷尽性、CodeGen/StmtMatch.cpp 生成）；Parser 无缺陷不动
+      - 简报：scripts/enum_impl_b7_brief.md（下一轮首批执行）；复现：bash scripts/_verify_b5.sh
+        （m4_bare_match.aura ⇒ 产物 :59 if (true)、诊断 0；对照 m3_qualified_match.aura 正确）
+[ ] P1  bug-108 enum 作普通函数形参/返回 ⇒ 物化 thunk 当 `GcObject*`（单文件零 import 即复现，`aurac` 静默）  [2026-10-15 登记；主人裁定本轮**暂停**]
+      - 登记：issues/bugs/bug-108-enum-in-function-signature-materialization-thunk-treats-as-gcobject.md
+      - 现象：`fun take(c: Color) -> int` / `fun give() -> Color` ⇒ aurac_rc=0 但 g++ 报
+        `cannot convert 'GcObject* const' to 'Color::_Tag'` / `invalid static_cast 到 GcObject*`
+      - **根因落点已定位**：CodeGen/ExprClosureArgs.cpp:35/:45/:52（`.v.p` 指针路径）+
+        **:464 vs :467 的「指针/值」分支选择点**（enum 选错）；同族 CodeGen/ExprClosureCallableObj.cpp:35、
+        CodeGen.cpp:614/:661；thunk 名 MetaCollect.cpp:19–26
+      - 复现：scripts/b6_cases/_probe_local_enum_param.aura / _probe_local_enum_ret.aura
+      - 注：与批 3 报红 B3-2（方法物化 thunk 假定指针接收者）**同族**，那次只修了接收者
+[ ] P1  bug-109 `aurac` 输入路径含非 ASCII ⇒ `std::filesystem::filesystem_error` 未捕获崩溃（rc=127）  [2026-10-15 登记；本轮**暂停**]
+      - 登记：issues/bugs/bug-109-aurac-crashes-on-non-ascii-input-path.md
+      - 对照（主 Agent 实测）：仅 **输出**（--cpp）路径含中文 ⇒ 正常 ⇒ 缺口在**读入**侧
+      - 复现：aurac "…/中文目录测试/输入.aura" --cpp … ⇒ terminate: Illegal byte sequence
+[ ] P2  跨模块通用缺口（批 6 遗留①②④，超其红线未修；**record 同病** ⇒ 非 enum 专属）  [2026-10-15 登记，待裁]
+      - ① 跨模块协程识别缺失（控制实验：非 enum 的跨模块协程函数同坏）
+      - ② 跨模块类型出现在**函数签名** ⇒ header 缺 `namespace` 别名（record 同病）
+      - ④ 无别名 `import` 的类型名不限定（record 同病）

@@ -605,6 +605,42 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
 
     clearVarTrackingState();
 
+    // ============================================================
+    // 🔴 R-1（GLM 终审）：生成期**硬失败** —— `enumTypes_` 装填时序的兜底
+    // ============================================================
+    // 判据：`decl.receiverType` 命中【已声明的 enum】（AST 侧真源 = 第一遍收集的
+    //   `declaredEnumNames_`，§4.4-⑨ 改动 2），**却**查不到 `enumTypes_`（Sema 结果真源）。
+    //   ⇒ 这只可能是**装填晚于本轮生成**（§4.8 Step 0 要拦的就是它）。
+    // 为什么必须**硬失败**、不得静默：静默的后果不是「少个 const」而是**走错整条通路**——
+    //   接收者会被当成既有「record 指针接收者」⇒ ①无条件设 `_this`、产
+    //   `aura_rt::GcRootHandle<Color*> _this(this, …)`（把 enum 值当 GC 对象的**错误根**
+    //   + `self` 生成 `_this.get()` 而 `_this` 语义已错）；②值接收者的入口拷贝不注入
+    //   ⇒ 体内 `self == Color.Red` 变**指针与值比较** ⇒ 坏 C++。
+    // 判据来源的正当性：`declaredEnumNames_` 只在**声明级**判「Sema 数据是否已到」，与 E-1
+    //   删掉的 `enumTypeNames_`（表达式级变体访问判定 ⇒ 影子变量误判面）用途正交；
+    //   它不参与任何生成决策，唯一产出是硬报错。
+    // 落笔后**立即 return**：错误已报，本方法不该再产任何 C++。
+    if (declaredEnumNames_.count(decl.receiverType) && enumTypes_.count(decl.receiverType) == 0) {
+        error(decl, "enum receiver '" + decl.receiverType + "' is declared but missing from the enum "
+              "SemType table (enumTypes_); internal ordering bug - the enum SemType map must be "
+              "filled before generating any declaration (see change.md §4.8 Step 0)");
+        return;
+    }
+
+    // 🔴 A-1 撤销（主人裁定 2026-10-14）：接收者是不是 **enum 壳**（值类型）？
+    //   窄守卫 = 只认 enum（`enumTypes_`）。**不得**放宽成 `isValueType(decl.receiverType)`：
+    //   那个 API 对「接口默认方法 receiver（值视图，靠 `_self_root` 句柄）」等也返回 true
+    //   ⇒ 会连带改掉既有语义。
+    //   用途（本批收敛为两处）：①跳过 `_this` GC 句柄；②类外定义追加 ` const`。
+    const bool valueReceiver = enumTypes_.count(decl.receiverType) != 0;
+
+    // 🔴 feature-20 批 3（报红 B3-4）：enum 接收者的 C++ 壳名必须过 `safeName`——壳头由
+    //   `genEnumDecl` 用 `safeName(decl.name)` 生成（`enum type class` ⇒ `struct class_`），
+    //   而类外定义逐字用 `decl.receiverType` ⇒ 产出 `int32_t class::pick_one() const`（坏 C++，
+    //   只有 `g++` 能抓；§4.7.4 的 `CodeGenEnumMatchEnumNameSafeName` 明写「不含 `class::`」）。
+    //   窄守卫（仅 enum 接收者）⇒ record / 接口接收者签名**逐字不变**。
+    if (valueReceiver) recvFullType = safeName(recvFullType);
+
     // 跟踪方法接收者 self 的类型
     if (!decl.receiverTypeArgs.empty() || !registeredTypes_.count(decl.receiverType) || registeredTypes_[decl.receiverType])
         ; // self 通常为指针类型
@@ -697,7 +733,14 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
             }
         }
     }
-    sig += ")";
+    // 🔴 硬约束 (d)（本轮重写 A-1 时发现的**相邻缺口**，不在主人原话的三条内）：
+    //   enum 壳的成员函数必须 ` const`。理由：变体单例声明为 `static const Color Red;`，
+    //   而 Aura 侧 `Color.Red.hex()`（在**变体单例**上调方法）生成的 C++ 是 `Color::Red.hex()`
+    //   ⇒ 非 const 成员函数会报 "passing 'const Color' as 'this' argument discards
+    //   qualifiers" ⇒ 坏 C++（既有形态 2 的 `ErrorCode.not_found.describe()` 同样中招）。
+    //   值接收者无任何可变状态（壳只有 `_tag`；Sema 的深只读也禁止经 enum 值写字段）
+    //   ⇒ 加 const 无语义损失；`self` 是入口按值拷贝出来的 `const Color` 局部副本取字段/比较均合法。
+    sig += valueReceiver ? ") const" : ")";
 
     // 模板方法 / 返回类型推导方法（auto）：体放入头文件（跨模块可见）——
     // 模板参数非空（模板方法）或返回类型为 auto（泛型闭包/函数式别名，返回类型依赖
@@ -707,16 +750,29 @@ void CodeGenerator::genMethodDecl(std::ostream& h, std::ostream& cpp,
         : static_cast<std::ostream&>(cpp);
 
     out << tprefix << sig << " {\n";
-    currentReceiverName_ = decl.receiverName;
-    currentReceiverCppType_ = recvFullType;   // bug-24：协程方法内闭包捕获 this → GcRootHandle<此类型*>
-    // #56：方法体入口 this 保护——this 是隐式 prvalue（无参数位、不能绑 Ref 模式），
-    // 值模式构造。非协程 ThreadLocal（与函数参数同级成本）；协程 Global（帧跨
-    // co_await 挂起、恢复线程可能切换，对齐闭包 _this_root 先例）。体内 self 经
-    // currentMethodThisHandle_ 映射 "_this.get()"（genIdentifier）。
-    currentMethodThisHandle_ = "_this";
-    out << "  aura_rt::GcRootHandle<" << recvFullType << "*> _this(this, aura_rt::GcRootScope::"
-        << (isCoro ? "Global" : "ThreadLocal") << ");\n";
-    // C3.2: 跟踪当前方法返回 Optional<T> 的元素类型（none() 直转 make_none<T> 用）
+    currentReceiverCppType_ = recvFullType;   // bug-24：**两路都保留**——值接收者的嵌套闭包捕获仍走
+                                              //  cap_recv 槽（槽值取 receiverThisSourceExpr()；无句柄
+                                              //  上下文时它返回 "this" = 壳对象地址，语义正确）。
+    if (valueReceiver) {
+        // 🔴 硬约束 (b)（值语义 = **方法体入口按值拷贝**，取代原 (i) `(*this)`）：
+        //   ① 协程安全：副本落**协程帧**内 ⇒ 跨 `co_await` / `spawn` / `sync` 挂起仍有效
+        //      （(i) 的 `(*this)` 指向的可能是临时值，如 `Color.Red.hex()`，挂起期间已析构）。
+        //   ② 无可观察差异：enum 值**深只读** + 壳内**只有** `_tag`（形态 2 的关联值走静态
+        //      访问器、不存进壳）⇒ 拷贝只搬一个 tag，无 GC 指针、无别名面。
+        //   ③ **不设** `currentReceiverName_` / `currentMethodThisHandle_`（沿用硬约束 (a) 的守卫）
+        //      ⇒ `genIdentifier` 对 `self` 落到 `safeName(e.name)` = `self`，正好命中本局部副本；
+        //      `self.m()` / `self.f` 的 `.` 由**既有**值类型登记（上方 valueTypeVarNames_）覆盖。
+        out << "  const " << recvFullType << " " << safeName(decl.receiverName) << " = *this;\n";
+    } else {
+        currentReceiverName_ = decl.receiverName;
+        // #56：方法体入口 this 保护——this 是隐式 prvalue（无参数位、不能绑 Ref 模式），
+        // 值模式构造。非协程 ThreadLocal（与函数参数同级成本）；协程 Global（帧跨
+        // co_await 挂起、恢复线程可能切换，对齐闭包 _this_root 先例）。体内 self 经
+        // currentMethodThisHandle_ 映射 "_this.get()"（genIdentifier）。
+        currentMethodThisHandle_ = "_this";
+        out << "  aura_rt::GcRootHandle<" << recvFullType << "*> _this(this, aura_rt::GcRootScope::"
+            << (isCoro ? "Global" : "ThreadLocal") << ");\n";
+    }
     currentReturnElem_ = optionalElemOf(decl.returnType.get());
     // Bug B 同步修复：方法体入口为堆类型参数生成 GcRootHandle 包装
     // 签名形如 `Tree<T>::map(Tree<U>* node_raw)`，此处生成 `GcRootHandle<decltype(node_raw)> node(node_raw);`

@@ -56,6 +56,7 @@ set(AURA_LIB_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/TypeMap.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/DeclGen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/DeclFun.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/DeclEnum.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/DeclTParams.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtGen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprGen.cpp
@@ -121,6 +122,21 @@ set(AURA_TEST_SOURCES
     # ---- runtime (bug-86 回归：STW 死锁 + concat_multi 并发 GC 越界) ----
     rt/test_gc_bug86.cpp
 
+    # ---- runtime（feature-20 批 3：enum 形态 1/2 的 GC 语义 —— compact(All) 后仍有效）----
+    rt/test_enum_gc.cpp
+
+    # ---- runtime (bug-89 回归：globalRoots_ 更新步骤 3 的 isGCAddress 守卫) ----
+    rt/test_gc_bug89.cpp
+
+    # ---- runtime (bug-110 回归：mark 阶段 3 处 isGCAddress 守卫 —— 全局根 / oomError 四指针 / 中页全局根) ----
+    rt/test_gc_bug110.cpp
+
+    # ---- runtime (bug-111 回归：compact() 入口「所有 TLAB 已 flush」不变量自检 hasDirtyTlabs()) ----
+    rt/test_gc_bug111.cpp
+
+    # ---- runtime (bug-112 回归：intern L1 缓存 key 改内联字节副本 + >32 不进 L1) ----
+    rt/test_intern_cache.cpp
+
     rt/test_error_stack.cpp        # feature-18 P1
     rt/test_logical_stack.cpp      # feature-18 P1
     rt/test_logical_stack_p4a.cpp  # feature-18 P4a 批 4（T1–T3：FrameGuard 配平 / 真递归 300 帧不变量 / setFrameLine 只改栈顶）
@@ -139,6 +155,7 @@ set(AURA_TEST_SOURCES
     parser/test_parser_expr.cpp
     parser/test_parser_stmt.cpp
     parser/test_parser_error.cpp
+    parser/test_parser_enum.cpp
 
     # ---- AST ----
     ast/test_ast.cpp
@@ -163,6 +180,7 @@ set(AURA_TEST_SOURCES
     sema/test_sema_iterator.cpp
     sema/test_sema_functype.cpp
     sema/test_sema_crashguard.cpp
+    sema/test_sema_enum.cpp          # feature-20 批 2/4（enum Sema 面：类型/约束/深只读/==/match）
 
     # ---- 代码生成（test_codegen.cpp 按主题拆分，2026-09-06）----
     codegen/test_codegen_coro.cpp
@@ -181,6 +199,8 @@ set(AURA_TEST_SOURCES
     codegen/test_codegen_path_arg_lifetime.cpp  # bug-102（惰性协程按引用值类型实参：A 物化提升形态断言 + B 长路径按值真运行；collector ON/OFF）
     codegen/test_codegen_sync_thread.cpp        # bug-103（sync thread 块尾 waitAndRethrow：生成码断言 + 提前退出+异常真运行）
     codegen/test_codegen_artifact_key.cpp    # bug-94（依赖 #include 名 + thunk 前缀用身份键：artifactKey 传递链路）
+    codegen/test_codegen_enum.cpp            # feature-20 批 3/4（enum CodeGen 面：壳/成员函数/match/形态 2/保留名负例）
+    codegen/test_codegen_enum_import.cpp     # feature-20 批 6（B2）：跨模块（导入）enum 的装填（多文件 CodeGen 驱动：值语义/限定壳名/本地不变）
 
     # ---- 诊断引擎 ----
     diag/test_diag.cpp

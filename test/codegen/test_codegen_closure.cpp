@@ -791,7 +791,8 @@ TEST(CodeGen, TopFunClosureNoThisCaptureControl) {
         diag);
     EXPECT_FALSE(diag.hasErrors());
     // 捕获 inc → 值捕获槽 cap_inc（feature-06），不得误生成 [this]
-    EXPECT_CONTAINS(unit.impl, "decltype(inc) cap_inc;");
+    // bug-113：值捕获槽类型统一包 `std::remove_const_t<>`（const 源可变性的定量修复）
+    EXPECT_CONTAINS(unit.impl, "std::remove_const_t<decltype(inc)> cap_inc;");
     EXPECT_NOT_CONTAINS(unit.impl, "[this]");
 }
 
@@ -838,7 +839,7 @@ TEST(CodeGen, ClosureCallableObjInvoke) {
     std::string all = unit.header + "\n" + unit.impl;
     // 新路径：gc_alloc_callable 分配 + 捕获槽 + invoke 调用
     EXPECT_CONTAINS(all, "aura_rt::gc_alloc_callable<__closure_");
-    EXPECT_CONTAINS(all, "decltype(base) cap_base;");
+    EXPECT_CONTAINS(all, "std::remove_const_t<decltype(base)> cap_base;");   // bug-113 槽型去 const
     EXPECT_CONTAINS(all, "__c_h.get()->cap_base");
     // 嵌套闭包捕获函数值 f → cap_f 槽；g 的 __invoke 内经捕获槽 invoke 接线
     // （G6 加固：callee 单次物化 `_cb0`，实参经 lambda 实参先求值）
@@ -1278,11 +1279,12 @@ TEST(CodeGen, ClosureNestedCaptureOuterValueSlotScopeExpr) {
         diag);
     EXPECT_FALSE(diag.hasErrors());
     std::string all = unit.header + "\n" + unit.impl;
-    // 外层闭包：base 是当前作用域真变量 → 原生成路径不变（decltype(base) / = base）
-    EXPECT_EQ(f07CountSubstr(all, "decltype(base) cap_base;"), (size_t)1);
+    // 外层闭包：base 是当前作用域真变量 → 原生成路径不变（decltype(base) / = base；
+    // bug-113 起槽型包 remove_const_t，值捕获语义不变）
+    EXPECT_EQ(f07CountSubstr(all, "std::remove_const_t<decltype(base)> cap_base;"), (size_t)1);
     EXPECT_EQ(f07CountSubstr(all, "__o_h.get()->cap_base = base;"), (size_t)1);
     // 内层闭包：base 已是外层槽访问 → 类型/init 同源取 __c_h.get()->cap_base（bug-71 修复点）
-    EXPECT_EQ(f07CountSubstr(all, "decltype(__c_h.get()->cap_base) cap_base;"), (size_t)1);
+    EXPECT_EQ(f07CountSubstr(all, "std::remove_const_t<decltype(__c_h.get()->cap_base)> cap_base;"), (size_t)1);
     EXPECT_EQ(f07CountSubstr(all, "__o_h.get()->cap_base = __c_h.get()->cap_base;"), (size_t)1);
 }
 
@@ -1304,7 +1306,7 @@ TEST(CodeGen, ClosureNestedCaptureRecursiveSelfSlotScopeExpr) {
     EXPECT_CONTAINS(all,
         "__o_h.get()->cap_f = static_cast<aura_rt::CallableObj<int32_t, int32_t>*>(__o_h.get());");
     // 内层闭包捕获 f（外层 cap_self 槽）→ 槽类型/init 走 __c_h.get()->cap_f（bug-71 修复点）
-    EXPECT_EQ(f07CountSubstr(all, "decltype(__c_h.get()->cap_f) cap_f;"), (size_t)1);
+    EXPECT_EQ(f07CountSubstr(all, "std::remove_const_t<decltype(__c_h.get()->cap_f)> cap_f;"), (size_t)1);
     EXPECT_EQ(f07CountSubstr(all, "__o_h.get()->cap_f = __c_h.get()->cap_f;"), (size_t)1);
     EXPECT_NOT_CONTAINS(all, "decltype(f) cap_f;");
 }

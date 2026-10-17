@@ -293,12 +293,15 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
     if (erasedCallee) {
         (void)erasedCalleeTy;
         std::string calleeExpr = genExpr(*e.callee, isCoroutine);
-        std::vector<std::pair<std::string, std::string>> a;
+        // feature-20 批 8（bug-108）：载荷携带实参 SemType（`ErasedCallArg::sem`）——
+        // genErasedInvoke 的装/拆箱判据（isEnumValueSemType）由它驱动，不看 C++ 名。
+        std::vector<CodeGenerator::ErasedCallArg> a;
         for (auto& arg : e.args) {
             std::string cppTy = (arg && arg->inferredType)
                 ? mapSemType(*arg->inferredType) : "";
             if (cppTy == "auto" || cppTy == "/* unknown_semtype */") cppTy = "";
-            a.emplace_back(arg ? genExpr(*arg, isCoroutine) : "???", cppTy);
+            a.push_back(ErasedCallArg{ arg ? genExpr(*arg, isCoroutine) : "???",
+                                       cppTy, arg ? arg->inferredType : nullptr });
         }
         return genErasedInvoke(calleeExpr, a, e.inferredType);
     }
