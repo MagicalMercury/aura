@@ -54,6 +54,7 @@ std::string tokTypeName(TokType type) {
         {TokType::Greater,    ">"},
         {TokType::GreaterEq,  ">="},
         {TokType::EqEq,       "=="},
+        {TokType::StrictEq,   "==="},
         {TokType::NotEq,      "!="},
         {TokType::And,        "and"},
         {TokType::Or,         "or"},

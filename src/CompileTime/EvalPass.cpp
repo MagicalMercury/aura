@@ -330,7 +330,7 @@ void EvalPass::walkExpr(std::unique_ptr<ASTNode>& slot,
     if (auto* e = dynamic_cast<EvalExpr*>(slot.get())) {
         Env env;
         evaluator_->setRuntimeNames(runtimeNames);
-        Value v = evaluator_->evalExpr(*e->expr, env);
+        Value v = evaluator_->evalExpr(*e->expr, env).wait();
         slot = valueToAst(v, atLine, atCol);
         ++replaced_;
         return;
@@ -338,7 +338,7 @@ void EvalPass::walkExpr(std::unique_ptr<ASTNode>& slot,
     if (auto* b = dynamic_cast<EvalBlockExpr*>(slot.get())) {
         Env env;
         evaluator_->setRuntimeNames(runtimeNames);
-        EvalResult r = evaluator_->evalBlock(*b->block, env);
+        EvalResult r = evaluator_->evalBlock(*b->block, env).wait();
         if (r.flow == Flow::Break || r.flow == Flow::Continue) {
             diag_.error(b->line, b->col, "break/continue outside loop in compile-time block");
             ok_ = false;
@@ -358,7 +358,7 @@ void EvalPass::walkExpr(std::unique_ptr<ASTNode>& slot,
         for (auto& a : m->args) walkExpr(a, runtimeNames);
         Env env;
         evaluator_->setRuntimeNames(runtimeNames);
-        slot = valueToAst(evaluator_->evalMetaCall(*m, env), atLine, atCol);
+        slot = valueToAst(evaluator_->evalMetaCall(*m, env).wait(), atLine, atCol);
         ++replaced_;
         return;
     }
@@ -366,7 +366,7 @@ void EvalPass::walkExpr(std::unique_ptr<ASTNode>& slot,
         walkExpr(mm->base, runtimeNames);
         Env env;
         evaluator_->setRuntimeNames(runtimeNames);
-        slot = valueToAst(evaluator_->evalExpr(*mm, env), atLine, atCol);
+        slot = valueToAst(evaluator_->evalExpr(*mm, env).wait(), atLine, atCol);
         ++replaced_;
         return;
     }

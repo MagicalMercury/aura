@@ -3,7 +3,7 @@ type: bug_report
 module: compile-time
 sub_module: Evaluator
 status:
-  - pending_fix
+  - fixed
 severity: medium
 discover_date: 2026-11-14
 related_issues:
@@ -15,7 +15,7 @@ tags:
 ---
 
 # 【标题】`#f(...)` 返回值的直接链式方法调用被拒（`only '#fun' calls are supported in Phase 3`）
-[ ] **`#{ return #squares(3).len() }` 报错，而 `let xs = #squares(3); return xs.len()` 可用**
+[x] **`#{ return #squares(3).len() }` 报错，而 `let xs = #squares(3); return xs.len()` 可用**
 
 > **一句话摘要**：在编译期块里对 `#fun` 调用的**返回值**直接做方法调用（`#f(...).len()`）会命中 `only '#fun' calls are supported in Phase 3`；先绑定到局部变量再调用则正常。plan §4.3 的节点矩阵声称支持 `MethodCallExpr`，二者的差异需要收敛。
 
@@ -70,4 +70,14 @@ fun main(io: Io) throws {
 - 主 Agent 复现：`_probe_main\m1_chain.aura`
 
 ---
-**当前状态**：`2026-11-14` 调研完成（待修复）
+## 8. 修复记录（2026-11-14）
+
+- **实现**：
+  - 抽 `Evaluator::callMethodOn(obj, name, args, env, at)`（`Evaluator.cpp:655`）：内建白名单 → record 用户方法 → 明确失败，实参只求值一次。
+  - `callBuiltinMethod` 签名解耦（`Evaluator.h:92-99`）：第 3 参由 `const MethodCallExpr&` 改为「`args` + `at`」。
+  - `evalMetaCall`（`Evaluator.cpp:539`）新增 `MetaMemberExpr` callee 分支：先求值 `base`，再 `callMethodOn`。
+- **为什么不改 Parser**：`#f(...).len()` 的真实 AST 是 `MetaCallExpr(callee=MetaMemberExpr(...))`；改 Parser 会破坏 `#Command{...}.describe()` 的既有契约与 `HashMethodCall` 单测。
+- **验收（主 Agent 独立复跑）**：`#{ return #squares(3).len() }` → **3**；record 字段链式 `l.name.len()` → 3；新增 2 例（`ChainMethodOnHashFun` / `ChainMethodOnRecordFun`）；全量 **1741/1741**。
+
+---
+**当前状态**：`2026-11-14` **已修复（fixed）**

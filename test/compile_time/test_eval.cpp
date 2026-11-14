@@ -86,6 +86,12 @@ const IntLiteral* letInt(const Program& p, const std::string& name) {
     return as<IntLiteral>(ld->initializer.get());
 }
 
+const BoolLiteral* letBool(const Program& p, const std::string& name) {
+    const auto* ld = topLet(p, name);
+    if (!ld) return nullptr;
+    return as<BoolLiteral>(ld->initializer.get());
+}
+
 } // namespace
 
 // ============================================================
@@ -615,4 +621,183 @@ TEST(CompileTimeEvalPassV, UndefinedVsRuntimeName) {
         "a.aura", diag, &r);
     EXPECT_FALSE(r.ok);
     EXPECT_DIAG_CONTAINS(diag, "undefined name 'hpp'");
+}
+
+// bug-122：`#f(...).m(...)` 直接链式调用（AST 是 MetaCallExpr(MetaMemberExpr)）
+TEST(CompileTimeEvalPassV, ChainMethodOnHashFun) {
+    DiagnosticEngine diag;
+    Aura::ct::EvalPassResult r;
+    auto prog = runEvalPass(
+        "#fun squares(n: int) -> [int] { return [1, 2, 3] }\n"
+        "let b = #{ return #squares(3).len() }\n",
+        "a.aura", diag, &r);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(r.ok);
+    if (!r.ok) aura_test::fail(__FILE__, __LINE__, "diag: " + allErrorsOf(diag));
+
+    const auto* bv = letInt(*prog, "b");
+    ASSERT_TRUE(bv != nullptr);
+    EXPECT_EQ(bv->value, (int64_t)3);
+}
+
+// bug-122：record 路径——`#fun` 返回 record 后链式取成员再调方法
+TEST(CompileTimeEvalPassV, ChainMethodOnRecordFun) {
+    DiagnosticEngine diag;
+    Aura::ct::EvalPassResult r;
+    auto prog = runEvalPass(
+        "type L = { name: string }\n"
+        "#fun mk() -> L { return L { name = \"abc\" } }\n"
+        "let n = #{ let l = #mk(); return l.name.len() }\n",
+        "a.aura", diag, &r);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(r.ok);
+    if (!r.ok) aura_test::fail(__FILE__, __LINE__, "diag: " + allErrorsOf(diag));
+
+    const auto* nv = letInt(*prog, "n");
+    ASSERT_TRUE(nv != nullptr);
+    EXPECT_EQ(nv->value, (int64_t)3);
+}
+
+// ============================================================
+// bug-121：编译期 `===`（结构相等）+ `==` 身份语义
+//
+// 口径：`==` 用例一律写在 `#{}` 内（顶层 `#(a == b)` 引用模块级 let 会先撞
+//       A19 `cannot access runtime variable`）；`===` 无自由变量，可顶层。
+// ============================================================
+
+// `==`：两个独立构造的 list 身份不同 ⇒ false
+TEST(CompileTimeEvalPassV, EqListIdentity) {
+    DiagnosticEngine diag;
+    Aura::ct::EvalPassResult r;
+    auto prog = runEvalPass(
+        "let b = #{ let a = [1, 2]; let c = [1, 2]; return a == c }\n",
+        "a.aura", diag, &r);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(r.ok);
+    if (!r.ok) aura_test::fail(__FILE__, __LINE__, "diag: " + allErrorsOf(diag));
+    const auto* bv = letBool(*prog, "b");
+    ASSERT_TRUE(bv != nullptr);
+    EXPECT_FALSE(bv->value);
+}
+
+// `==`：同一绑定自比 ⇒ true
+TEST(CompileTimeEvalPassV, EqListSameBinding) {
+    DiagnosticEngine diag;
+    Aura::ct::EvalPassResult r;
+    auto prog = runEvalPass(
+        "let b = #{ let a = [1, 2]; return a == a }\n",
+        "a.aura", diag, &r);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(r.ok);
+    if (!r.ok) aura_test::fail(__FILE__, __LINE__, "diag: " + allErrorsOf(diag));
+    const auto* bv = letBool(*prog, "b");
+    ASSERT_TRUE(bv != nullptr);
+    EXPECT_TRUE(bv->value);
+}
+
+// `==`：别名（let c = a）继承同一身份 ⇒ true
+TEST(CompileTimeEvalPassV, EqListAlias) {
+    DiagnosticEngine diag;
+    Aura::ct::EvalPassResult r;
+    auto prog = runEvalPass(
+        "let b = #{ let a = [1, 2]; let c = a; return a == c }\n",
+        "a.aura", diag, &r);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(r.ok);
+    if (!r.ok) aura_test::fail(__FILE__, __LINE__, "diag: " + allErrorsOf(diag));
+    const auto* bv = letBool(*prog, "b");
+    ASSERT_TRUE(bv != nullptr);
+    EXPECT_TRUE(bv->value);
+}
+
+// `!=` 是 `==` 的逻辑取反：两个独立构造的 list ⇒ true
+TEST(CompileTimeEvalPassV, NeListIdentity) {
+    DiagnosticEngine diag;
+    Aura::ct::EvalPassResult r;
+    auto prog = runEvalPass(
+        "let b = #{ let a = [1, 2]; let c = [1, 2]; return a != c }\n",
+        "a.aura", diag, &r);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(r.ok);
+    if (!r.ok) aura_test::fail(__FILE__, __LINE__, "diag: " + allErrorsOf(diag));
+    const auto* bv = letBool(*prog, "b");
+    ASSERT_TRUE(bv != nullptr);
+    EXPECT_TRUE(bv->value);
+}
+
+// `===`：list 结构相等（两个独立构造也相等）⇒ true
+TEST(CompileTimeEvalPassV, StrictEqListStructural) {
+    DiagnosticEngine diag;
+    Aura::ct::EvalPassResult r;
+    auto prog = runEvalPass(
+        "let b = #([1, 2] === [1, 2])\n",
+        "a.aura", diag, &r);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(r.ok);
+    if (!r.ok) aura_test::fail(__FILE__, __LINE__, "diag: " + allErrorsOf(diag));
+    const auto* bv = letBool(*prog, "b");
+    ASSERT_TRUE(bv != nullptr);
+    EXPECT_TRUE(bv->value);
+}
+
+// `===`：Optional 结构相等（两个 none()）⇒ true
+TEST(CompileTimeEvalPassV, StrictEqOptional) {
+    DiagnosticEngine diag;
+    Aura::ct::EvalPassResult r;
+    auto prog = runEvalPass(
+        "let b = #(none() === none())\n",
+        "a.aura", diag, &r);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(r.ok);
+    if (!r.ok) aura_test::fail(__FILE__, __LINE__, "diag: " + allErrorsOf(diag));
+    const auto* bv = letBool(*prog, "b");
+    ASSERT_TRUE(bv != nullptr);
+    EXPECT_TRUE(bv->value);
+}
+
+// `===`：kind 不同 ⇒ false
+TEST(CompileTimeEvalPassV, StrictEqMismatchKind) {
+    DiagnosticEngine diag;
+    Aura::ct::EvalPassResult r;
+    auto prog = runEvalPass(
+        "let b = #(1 === \"a\")\n",
+        "a.aura", diag, &r);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(r.ok);
+    if (!r.ok) aura_test::fail(__FILE__, __LINE__, "diag: " + allErrorsOf(diag));
+    const auto* bv = letBool(*prog, "b");
+    ASSERT_TRUE(bv != nullptr);
+    EXPECT_FALSE(bv->value);
+}
+
+// `==`：record 保持**内容**比较（主人裁定）⇒ 两个独立构造但字段相同 ⇒ true
+TEST(CompileTimeEvalPassV, EqRecordContent) {
+    DiagnosticEngine diag;
+    Aura::ct::EvalPassResult r;
+    auto prog = runEvalPass(
+        "type P = { x: int }\n"
+        "let b = #{ let a = P { x = 1 }; let c = P { x = 1 }; return a == c }\n",
+        "a.aura", diag, &r);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_TRUE(r.ok);
+    if (!r.ok) aura_test::fail(__FILE__, __LINE__, "diag: " + allErrorsOf(diag));
+    const auto* bv = letBool(*prog, "b");
+    ASSERT_TRUE(bv != nullptr);
+    EXPECT_TRUE(bv->value);
+}
+
+// Sema 闸门：运行期 `===` ⇒ "'===' is compile-time only"。
+// 落点说明：本批文件白名单只含 test/compile_time/test_eval.cpp（未含 test/sema/*.cpp），
+// 故用 analyzeSource（parse → Sema，**不经 EvalPass** 的纯 Sema 路径）在此断言。
+TEST(CompileTimeEvalPassV, StrictEqRuntimeRejected) {
+    DiagnosticEngine diag;
+    analyzeSource(
+        "fun main(io: Io) throws {\n"
+        "    let a = 1\n"
+        "    let b = 1\n"
+        "    let c = a === b\n"
+        "}\n",
+        diag);
+    EXPECT_TRUE(diag.hasErrors());
+    EXPECT_DIAG_CONTAINS(diag, "'===' is compile-time only");
 }

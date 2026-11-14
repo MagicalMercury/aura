@@ -353,6 +353,28 @@ TEST(Lexer, GreedyOperatorMatching) {
     EXPECT_EQ(ts[10], TokType::Pipe);
 }
 
+// bug-121：`===` 编译期身份运算符（三级贪心；`!==` 不引入）
+TEST(Lexer, StrictEquality) {
+    // `a===b` ⇒ StrictEq（不是 EqEq + Assign）
+    auto strict = tokenize("a===b");
+    auto sts = typesOf(strict);
+    EXPECT_EQ(sts.size(), (size_t)3);
+    EXPECT_EQ(sts[1], TokType::StrictEq);
+    EXPECT_EQ(tokTypeName(TokType::StrictEq), "===");
+
+    // `a==b` 仍是 EqEq
+    EXPECT_EQ(typesOf(tokenize("a==b"))[1], TokType::EqEq);
+
+    // `a=b` 仍是 Assign
+    EXPECT_EQ(typesOf(tokenize("a=b"))[1], TokType::Assign);
+
+    // `!==` 不引入：切成 `!=` + `=`（由文档说明 `not (a === b)` 是官方写法）
+    auto notStrict = typesOf(tokenize("a!==b"));
+    ASSERT_EQ(notStrict.size(), (size_t)4);
+    EXPECT_EQ(notStrict[1], TokType::NotEq);
+    EXPECT_EQ(notStrict[2], TokType::Assign);
+}
+
 // ============================================================
 // 注释
 // ============================================================

@@ -29,6 +29,7 @@ enum class TokType {
     Greater,       // >
     GreaterEq,     // >=
     EqEq,          // ==
+    StrictEq,      // ===（bug-121：编译期专用身份/结构相等运算符）
     NotEq,         // !=
     And,           // and
     Or,            // or

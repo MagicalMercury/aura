@@ -3,7 +3,7 @@ type: bug_report
 module: compile-time
 sub_module: Evaluator
 status:
-  - pending_fix
+  - fixed
 severity: high
 discover_date: 2026-11-14
 related_issues:
@@ -16,7 +16,7 @@ tags:
 ---
 
 # 【标题】编译期递归在 `maxCallDepth` 检查生效前就栈溢出崩溃
-[ ] **feature-21 Phase 3：`#fun` 递归约 245 层即 `0xC00000FD`（STATUS_STACK_OVERFLOW），无任何诊断**
+[x] **feature-21 Phase 3：`#fun` 递归约 245 层即 `0xC00000FD`（STATUS_STACK_OVERFLOW），无任何诊断**
 
 > **一句话摘要**：`Evaluator` 用 C++ 递归解释 Aura 递归，每层 Aura 调用消耗多层 C++ 栈帧；默认 1 MiB 栈在约 245 层耗尽，而深度检查阈值是 256 —— 检查点永远到不了，编译器直接崩溃、零诊断。
 
@@ -106,4 +106,15 @@ fun main(io: Io) throws {
 
 ---
 
-**当前状态**：`2026-11-14` 调研完成（待修复；V 批补充第二形态）
+## 9. 修复记录（2026-11-14，方案 B）
+
+- **实现**：
+  - 新建 `src/CompileTime/task.h`（110 行）：`Task<T>` 协程（续体 + `std::exception_ptr` + lazy `initial_suspend` + `wait()` 显式 trampoline）；错误载体保持 `EvalFailure`，不引入 runtime 的 GC/Error 依赖（主人裁定选型 A）。
+  - `Evaluator.h/.cpp`：**19 个求值函数**全部协程化（`Task<Value>` / `Task<EvalResult>` / `Task<std::optional<Value>>`），递归点 `co_await`。
+  - `EvalPass.cpp:333/341/361/369`：4 个调用点 `.wait()`。
+  - `Env::lookup` / `lookupType` / `lookupMutable`：沿 parent 链的**递归改迭代**（第二根因，gdb 实证 ~420 层爆栈）。
+- **技术发现（重要）**：GCC 的「对称转移」（`await_suspend` 返回 handle）**不做 tail-resume** —— 第一版照 `runtime/task.h:285-308` 的对称转移写法，编译与单测全绿但 `heavy_210` 仍 `0xC00000FD`；改为「`await_suspend` 返回 void + `wait()` 显式 trampoline + lazy 启动」后 210 层通过。
+- **验收（主 Agent 独立复跑）**：重栈帧 210 → 424 ✅；250 → 504（251 层 ≤ 256，符合既有 `depth_ > 256` 判据）；256 / 300 → `compile-time call depth exceeded` 且不崩溃 ✅；异常穿透 `division by zero` + `at boom @ 1:2` + `文件:行:列`，无 exe 产物 ✅；全量 **1741/1741/0 failed**；`example/test.aura` md5 未变。
+
+---
+**当前状态**：`2026-11-14` **已修复（fixed，方案 B 协程化）**

@@ -16,8 +16,11 @@
 #pragma once
 #include "DeclIndex.h"
 #include "Value.h"
+// bug-120 方案 B：求值协程帧上堆，消除 C++ 递归栈深。
+#include "task.h"
 #include "../Diag/DiagnosticEngine.h"
 #include <climits>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -67,32 +70,39 @@ class Evaluator {
 public:
     Evaluator(DiagnosticEngine& diag, const DeclIndex& index,
               std::string modulePath, EvalLimits limits);
-    Value evalExpr(const ASTNode& expr, Env& env);
-    EvalResult evalBlock(const BlockStmt& block, Env& env);
-    Value evalMetaCall(const MetaCallExpr& call, Env& env);
+    Task<Value> evalExpr(const ASTNode& expr, Env& env);
+    Task<EvalResult> evalBlock(const BlockStmt& block, Env& env);
+    Task<Value> evalMetaCall(const MetaCallExpr& call, Env& env);
     void setRuntimeNames(std::set<std::string> names);
 
 private:
-    Value evalCall(const CallExpr& call, Env& env, bool comptime);
-    Value evalMethod(const MethodCallExpr& call, Env& env);
-    Value evalBinary(const BinaryExpr& e, Env& env);
-    Value evalUnary(const UnaryExpr& e, Env& env);
-    Value evalIndex(const IndexExpr& e, Env& env);
-    Value evalAssign(const AssignExpr& e, Env& env);
-    Value evalMember(const MemberAccessExpr& e, Env& env);
-    Value evalMetaMember(const MetaMemberExpr& e, Env& env);
-    Value evalRecord(const RecordExpr& e, Env& env);
-    Value evalList(const ListExpr& e, Env& env);
-    Value callFun(const FunDecl& f, const std::vector<std::string>& typeParams,
-                  std::vector<Value> args,
-                  const std::vector<std::string>& explicitTypes, Env& callerEnv);
-    Value callMethod(const MethodDecl& m, const std::vector<std::string>& typeParams,
-                     Value self, std::vector<Value> args,
-                     const std::vector<std::string>& explicitTypes, Env& callerEnv);
-    Value callBuiltin(const std::string& name, const CallExpr& call, Env& env);
-    std::optional<Value> callBuiltinMethod(const std::string& name, const Value& obj,
-                                           const MethodCallExpr& call, Env& env);
-    Value evalCompileError(const MetaCallExpr& call, Env& env);
+    Task<Value> evalCall(const CallExpr& call, Env& env, bool comptime);
+    Task<Value> evalMethod(const MethodCallExpr& call, Env& env);
+    Task<Value> evalBinary(const BinaryExpr& e, Env& env);
+    Task<Value> evalUnary(const UnaryExpr& e, Env& env);
+    Task<Value> evalIndex(const IndexExpr& e, Env& env);
+    Task<Value> evalAssign(const AssignExpr& e, Env& env);
+    Task<Value> evalMember(const MemberAccessExpr& e, Env& env);
+    Task<Value> evalMetaMember(const MetaMemberExpr& e, Env& env);
+    Task<Value> evalRecord(const RecordExpr& e, Env& env);
+    Task<Value> evalList(const ListExpr& e, Env& env);
+    Task<Value> callFun(const FunDecl& f, const std::vector<std::string>& typeParams,
+                        std::vector<Value> args,
+                        const std::vector<std::string>& explicitTypes, Env& callerEnv);
+    Task<Value> callMethod(const MethodDecl& m, const std::vector<std::string>& typeParams,
+                           Value self, std::vector<Value> args,
+                           const std::vector<std::string>& explicitTypes, Env& callerEnv);
+    // bug-122：方法分派（内建白名单 → record 用户方法 → 明确失败）从 `evalMethod`
+    // 抽出，供 `evalMetaCall` 处理 `#f(...).m(...)` 的 `MetaMemberExpr` callee 复用。
+    Task<Value> callMethodOn(Value obj, const std::string& name,
+                             const std::vector<std::unique_ptr<ASTNode>>& args,
+                             Env& env, const ASTNode& at);
+    Task<Value> callBuiltin(const std::string& name, const CallExpr& call, Env& env);
+    Task<std::optional<Value>> callBuiltinMethod(
+        const std::string& name, const Value& obj,
+        const std::vector<std::unique_ptr<ASTNode>>& args,
+        Env& env, const ASTNode& at);
+    Task<Value> evalCompileError(const MetaCallExpr& call, Env& env);
 
     void unify(const TypeExpr& pattern, const std::shared_ptr<TypeInfo>& actual,
                std::map<std::string, std::shared_ptr<TypeInfo>>& typeEnv,
@@ -136,6 +146,13 @@ private:
     std::size_t valueBytes(const Value& v) const;
     bool isBuiltinMethod(const std::string& name) const;
     bool isUnresolvedType(const std::shared_ptr<TypeInfo>& t) const;
+
+    // ==== bug-121：编译期容器身份 ====
+    // 每次**新建** list / Optional 值分配一个单调递增的非 0 身份；`==` / `!=` 对
+    // 这两类值走身份比较（同一绑定/别名相等，两个独立构造不相等）。
+    // record / Enum 不赋身份（走内容/变体比较，主人裁定）。
+    std::uint64_t newIdentity() { return nextIdentity_++; }
+    std::uint64_t nextIdentity_ = 1;
 
     DiagnosticEngine& diag_;
     const DeclIndex& index_;

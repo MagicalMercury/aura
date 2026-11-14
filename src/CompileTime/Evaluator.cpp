@@ -125,48 +125,48 @@ std::shared_ptr<TypeInfo> Evaluator::typeOf(const Value& v) {
 // 表达式分派（§4.6）
 // ============================================================
 
-Value Evaluator::evalExpr(const ASTNode& node, Env& env) {
+Task<Value> Evaluator::evalExpr(const ASTNode& node, Env& env) {
     step(node);
-    if (auto* e = dynamic_cast<const IntLiteral*>(&node))    return Value::makeInt(e->value);
-    if (auto* e = dynamic_cast<const FloatLiteral*>(&node))  return Value::makeFloat(e->value);
-    if (auto* e = dynamic_cast<const BoolLiteral*>(&node))   return Value::makeBool(e->value);
-    if (auto* e = dynamic_cast<const StringLiteral*>(&node)) return Value::makeString(e->value);
-    if (dynamic_cast<const NoneLiteral*>(&node))             return Value::makeNone();
+    if (auto* e = dynamic_cast<const IntLiteral*>(&node))    co_return Value::makeInt(e->value);
+    if (auto* e = dynamic_cast<const FloatLiteral*>(&node))  co_return Value::makeFloat(e->value);
+    if (auto* e = dynamic_cast<const BoolLiteral*>(&node))   co_return Value::makeBool(e->value);
+    if (auto* e = dynamic_cast<const StringLiteral*>(&node)) co_return Value::makeString(e->value);
+    if (dynamic_cast<const NoneLiteral*>(&node))             co_return Value::makeNone();
 
     if (auto* e = dynamic_cast<const Identifier*>(&node)) {
         Value v;
-        if (env.lookup(e->name, v)) return v;
+        if (env.lookup(e->name, v)) co_return v;
         if (runtimeNames_.count(e->name))
             fail(node, "cannot access runtime variable '" + e->name + "' in compile-time block");
         fail(node, "undefined name '" + e->name + "'");
     }
-    if (auto* e = dynamic_cast<const BinaryExpr*>(&node))       return evalBinary(*e, env);
-    if (auto* e = dynamic_cast<const UnaryExpr*>(&node))        return evalUnary(*e, env);
+    if (auto* e = dynamic_cast<const BinaryExpr*>(&node))       co_return co_await evalBinary(*e, env);
+    if (auto* e = dynamic_cast<const UnaryExpr*>(&node))        co_return co_await evalUnary(*e, env);
     if (auto* e = dynamic_cast<const ConditionalExpr*>(&node)) {
-        Value c = evalExpr(*e->cond, env);
+        Value c = co_await evalExpr(*e->cond, env);
         if (c.kind != Value::Kind::Bool) fail(node, "condition must be bool");
-        return evalExpr(*(c.b ? e->thenBranch : e->elseBranch), env);
+        co_return co_await evalExpr(*(c.b ? e->thenBranch : e->elseBranch), env);
     }
-    if (auto* e = dynamic_cast<const ListExpr*>(&node))         return evalList(*e, env);
-    if (auto* e = dynamic_cast<const RecordExpr*>(&node))       return evalRecord(*e, env);
-    if (auto* e = dynamic_cast<const MemberAccessExpr*>(&node)) return evalMember(*e, env);
-    if (auto* e = dynamic_cast<const MetaMemberExpr*>(&node))   return evalMetaMember(*e, env);
-    if (auto* e = dynamic_cast<const IndexExpr*>(&node))        return evalIndex(*e, env);
+    if (auto* e = dynamic_cast<const ListExpr*>(&node))         co_return co_await evalList(*e, env);
+    if (auto* e = dynamic_cast<const RecordExpr*>(&node))       co_return co_await evalRecord(*e, env);
+    if (auto* e = dynamic_cast<const MemberAccessExpr*>(&node)) co_return co_await evalMember(*e, env);
+    if (auto* e = dynamic_cast<const MetaMemberExpr*>(&node))   co_return co_await evalMetaMember(*e, env);
+    if (auto* e = dynamic_cast<const IndexExpr*>(&node))        co_return co_await evalIndex(*e, env);
     // S5（S4 报红 §5-1）：`change.md` §4.6 的分派链缺 AssignExpr，
     // 编译期块因此无法做 `x = x + 1` 累加。此处补分派。
-    if (auto* e = dynamic_cast<const AssignExpr*>(&node))       return evalAssign(*e, env);
-    if (auto* e = dynamic_cast<const CallExpr*>(&node))         return evalCall(*e, env, false);
-    if (auto* e = dynamic_cast<const MethodCallExpr*>(&node))   return evalMethod(*e, env);
-    if (auto* e = dynamic_cast<const MetaCallExpr*>(&node))     return evalMetaCall(*e, env);
+    if (auto* e = dynamic_cast<const AssignExpr*>(&node))       co_return co_await evalAssign(*e, env);
+    if (auto* e = dynamic_cast<const CallExpr*>(&node))         co_return co_await evalCall(*e, env, false);
+    if (auto* e = dynamic_cast<const MethodCallExpr*>(&node))   co_return co_await evalMethod(*e, env);
+    if (auto* e = dynamic_cast<const MetaCallExpr*>(&node))     co_return co_await evalMetaCall(*e, env);
 
-    if (auto* e = dynamic_cast<const EvalExpr*>(&node))         return evalExpr(*e->expr, env);
+    if (auto* e = dynamic_cast<const EvalExpr*>(&node))         co_return co_await evalExpr(*e->expr, env);
     if (auto* e = dynamic_cast<const EvalBlockExpr*>(&node)) {
-        EvalResult r = evalBlock(*e->block, env);
+        EvalResult r = co_await evalBlock(*e->block, env);
         if (r.flow == Flow::Break || r.flow == Flow::Continue)
             fail(node, "break/continue outside loop in compile-time block");
         if (r.flow != Flow::Return)
             fail(node, "compile-time block must return a value");
-        return r.value;
+        co_return r.value;
     }
     if (dynamic_cast<const QuoteExpr*>(&node) ||
         dynamic_cast<const MetaConstructExpr*>(&node) ||
@@ -180,16 +180,17 @@ Value Evaluator::evalExpr(const ASTNode& node, Env& env) {
 // 7 个表达式实现（§4.6）
 // ============================================================
 
-Value Evaluator::evalList(const ListExpr& e, Env& env) {
+Task<Value> Evaluator::evalList(const ListExpr& e, Env& env) {
     Value v;
     v.kind = Value::Kind::List;
-    for (const auto& el : e.elements) v.elems.push_back(evalExpr(*el, env));
+    v.ident = newIdentity();   // bug-121：每个新 list 值一个身份
+    for (const auto& el : e.elements) v.elems.push_back(co_await evalExpr(*el, env));
     v.type = typeOf(v);
     chargeMemory(valueBytes(v), e);
-    return v;
+    co_return v;
 }
 
-Value Evaluator::evalRecord(const RecordExpr& e, Env& env) {
+Task<Value> Evaluator::evalRecord(const RecordExpr& e, Env& env) {
     Value v;
     v.kind = Value::Kind::Record;
     v.s = e.typeName;
@@ -197,7 +198,7 @@ Value Evaluator::evalRecord(const RecordExpr& e, Env& env) {
     for (const auto& f : e.fields) {
         if (!f.value) continue;
         v.names.push_back(f.name);
-        v.elems.push_back(evalExpr(*f.value, env));
+        v.elems.push_back(co_await evalExpr(*f.value, env));
     }
     v.type = typeOf(v);
     chargeMemory(valueBytes(v), e);
@@ -207,10 +208,10 @@ Value Evaluator::evalRecord(const RecordExpr& e, Env& env) {
         if (const auto* ti = env.lookupType(arg)) arg = typeNameOfInfo(**ti);
         v.type->typeArgs.push_back(arg);
     }
-    return v;
+    co_return v;
 }
 
-Value Evaluator::evalMember(const MemberAccessExpr& e, Env& env) {
+Task<Value> Evaluator::evalMember(const MemberAccessExpr& e, Env& env) {
     // enum 变体：`Color.Red`（对象不是 env 里的值）
     if (auto* id = dynamic_cast<const Identifier*>(e.object.get())) {
         Value dummy;
@@ -225,44 +226,44 @@ Value Evaluator::evalMember(const MemberAccessExpr& e, Env& env) {
             v.s = id->name;
             v.variant = e.member;
             v.type = typeOf(v);
-            return v;
+            co_return v;
         }
     }
-    Value obj = evalExpr(*e.object, env);
+    Value obj = co_await evalExpr(*e.object, env);
     if (obj.kind != Value::Kind::Record)
         fail(e, "field access requires a record value");
     for (size_t k = 0; k < obj.names.size(); ++k)
-        if (obj.names[k] == e.member) return obj.elems[k];
+        if (obj.names[k] == e.member) co_return obj.elems[k];
     fail(e, "record '" + obj.s + "' has no field '" + e.member + "'");
 }
 
-Value Evaluator::evalMetaMember(const MetaMemberExpr& e, Env& env) {
+Task<Value> Evaluator::evalMetaMember(const MetaMemberExpr& e, Env& env) {
     if (auto* id = dynamic_cast<const Identifier*>(e.base.get()))
         if (id->name == "reflect")
             fail(e, "'#reflect' is not supported in Phase 3 (Phase 5)");
-    Value obj = evalExpr(*e.base, env);
+    Value obj = co_await evalExpr(*e.base, env);
     if (obj.kind != Value::Kind::Record)
         fail(e, "'#' member access requires a compile-time record");
     for (size_t k = 0; k < obj.names.size(); ++k)
-        if (obj.names[k] == e.member) return obj.elems[k];
+        if (obj.names[k] == e.member) co_return obj.elems[k];
     fail(e, "record '" + obj.s + "' has no field '" + e.member + "'");
 }
 
-Value Evaluator::evalIndex(const IndexExpr& e, Env& env) {
-    Value obj = evalExpr(*e.object, env);
-    Value idx = evalExpr(*e.index, env);
+Task<Value> Evaluator::evalIndex(const IndexExpr& e, Env& env) {
+    Value obj = co_await evalExpr(*e.object, env);
+    Value idx = co_await evalExpr(*e.index, env);
     if (idx.kind != Value::Kind::Int) fail(e, "index must be int");
     if (idx.i < 0) fail(e, "index must be non-negative");
     size_t i = static_cast<size_t>(idx.i);
     if (obj.kind == Value::Kind::List) {
         if (i >= obj.elems.size()) fail(e, "list index out of range");
-        return obj.elems[i];
+        co_return obj.elems[i];
     }
     if (obj.kind == Value::Kind::String) {
         if (i >= obj.s.size()) fail(e, "string index out of range");
         Value out = Value::makeString(obj.s.substr(i, 1));
         chargeMemory(valueBytes(out), e);
-        return out;
+        co_return out;
     }
     fail(e, "indexing requires a list or string");
 }
@@ -273,10 +274,10 @@ Value Evaluator::evalIndex(const IndexExpr& e, Env& env) {
 //   - IndexExpr 目标（仅 `标识符[下标]`，List）；
 //   - MemberAccessExpr 目标（仅 `标识符.字段`，Record）。
 // 赋值表达式的值 = 右值（与运行期语义一致），可作语句直接丢弃。
-Value Evaluator::evalAssign(const AssignExpr& e, Env& env) {
+Task<Value> Evaluator::evalAssign(const AssignExpr& e, Env& env) {
     if (!e.target || !e.value)
         fail(e, "malformed assignment in compile-time block");
-    Value rhs = evalExpr(*e.value, env);
+    Value rhs = co_await evalExpr(*e.value, env);
 
     auto bindOf = [&](const std::string& name) -> Value* {
         if (Value* slot = env.lookupMutable(name)) return slot;
@@ -287,7 +288,7 @@ Value Evaluator::evalAssign(const AssignExpr& e, Env& env) {
 
     if (auto* id = dynamic_cast<Identifier*>(e.target.get())) {
         *bindOf(id->name) = rhs;
-        return rhs;
+        co_return rhs;
     }
     if (auto* ix = dynamic_cast<IndexExpr*>(e.target.get())) {
         auto* base = dynamic_cast<Identifier*>(ix->object.get());
@@ -295,14 +296,14 @@ Value Evaluator::evalAssign(const AssignExpr& e, Env& env) {
         Value* slot = bindOf(base->name);
         if (slot->kind != Value::Kind::List)
             fail(e, "indexed assignment requires a compile-time list");
-        Value idx = evalExpr(*ix->index, env);
+        Value idx = co_await evalExpr(*ix->index, env);
         if (idx.kind != Value::Kind::Int) fail(e, "index must be int");
         if (idx.i < 0) fail(e, "index must be non-negative");
         std::size_t i = static_cast<std::size_t>(idx.i);
         if (i >= slot->elems.size()) fail(e, "list index out of range");
         slot->elems[i] = std::move(rhs);
         slot->type = typeOf(*slot);
-        return slot->elems[i];
+        co_return slot->elems[i];
     }
     if (auto* ma = dynamic_cast<MemberAccessExpr*>(e.target.get())) {
         auto* base = dynamic_cast<Identifier*>(ma->object.get());
@@ -314,80 +315,90 @@ Value Evaluator::evalAssign(const AssignExpr& e, Env& env) {
             if (slot->names[k] != ma->member) continue;
             slot->elems[k] = std::move(rhs);
             slot->type = typeOf(*slot);
-            return slot->elems[k];
+            co_return slot->elems[k];
         }
         fail(e, "record '" + slot->s + "' has no field '" + ma->member + "'");
     }
     fail(e, "unsupported assignment target in compile-time block");
 }
 
-Value Evaluator::evalUnary(const UnaryExpr& e, Env& env) {
-    Value v = evalExpr(*e.operand, env);
+Task<Value> Evaluator::evalUnary(const UnaryExpr& e, Env& env) {
+    Value v = co_await evalExpr(*e.operand, env);
     if (e.op == "-") {
-        if (v.kind == Value::Kind::Int) return Value::makeInt(-v.i);
-        if (v.kind == Value::Kind::Float) return Value::makeFloat(-v.f);
+        if (v.kind == Value::Kind::Int) co_return Value::makeInt(-v.i);
+        if (v.kind == Value::Kind::Float) co_return Value::makeFloat(-v.f);
         fail(e, "unary '-' expects a number");
     }
     if (e.op == "not") {
         if (v.kind != Value::Kind::Bool) fail(e, "'not' expects bool");
-        return Value::makeBool(!v.b);
+        co_return Value::makeBool(!v.b);
     }
     fail(e, "unsupported unary operator '" + e.op + "'");
 }
 
-Value Evaluator::evalBinary(const BinaryExpr& e, Env& env) {
-    Value l = evalExpr(*e.left, env);
+Task<Value> Evaluator::evalBinary(const BinaryExpr& e, Env& env) {
+    Value l = co_await evalExpr(*e.left, env);
     if (e.op == "and") {
         if (l.kind != Value::Kind::Bool) fail(e, "'and' expects bool");
-        if (!l.b) return Value::makeBool(false);
-        Value r = evalExpr(*e.right, env);
+        if (!l.b) co_return Value::makeBool(false);
+        Value r = co_await evalExpr(*e.right, env);
         if (r.kind != Value::Kind::Bool) fail(e, "'and' expects bool");
-        return r;
+        co_return r;
     }
     if (e.op == "or") {
         if (l.kind != Value::Kind::Bool) fail(e, "'or' expects bool");
-        if (l.b) return Value::makeBool(true);
-        Value r = evalExpr(*e.right, env);
+        if (l.b) co_return Value::makeBool(true);
+        Value r = co_await evalExpr(*e.right, env);
         if (r.kind != Value::Kind::Bool) fail(e, "'or' expects bool");
-        return r;
+        co_return r;
     }
-    Value r = evalExpr(*e.right, env);
+    Value r = co_await evalExpr(*e.right, env);
 
     if (e.op == "+" && (l.kind == Value::Kind::String || r.kind == Value::Kind::String)) {
         Value out = Value::makeString(l.toString() + r.toString());
         chargeMemory(valueBytes(out), e);
-        return out;
+        co_return out;
     }
 
     if (l.kind == Value::Kind::Int && r.kind == Value::Kind::Int) {
         int64_t a = l.i, b = r.i, out = 0;
-        if (e.op == "+") { if (__builtin_add_overflow(a, b, &out)) fail(e, "integer overflow"); return Value::makeInt(out); }
-        if (e.op == "-") { if (__builtin_sub_overflow(a, b, &out)) fail(e, "integer overflow"); return Value::makeInt(out); }
-        if (e.op == "*") { if (__builtin_mul_overflow(a, b, &out)) fail(e, "integer overflow"); return Value::makeInt(out); }
-        if (e.op == "/") { if (b == 0) fail(e, "division by zero"); if (a == INT64_MIN && b == -1) fail(e, "integer overflow"); return Value::makeInt(a / b); }
-        if (e.op == "%") { if (b == 0) fail(e, "division by zero"); if (a == INT64_MIN && b == -1) fail(e, "integer overflow"); return Value::makeInt(a % b); }
-        if (e.op == "<")  return Value::makeBool(a < b);
-        if (e.op == "<=") return Value::makeBool(a <= b);
-        if (e.op == ">")  return Value::makeBool(a > b);
-        if (e.op == ">=") return Value::makeBool(a >= b);
-        if (e.op == "==") return Value::makeBool(a == b);
-        if (e.op == "!=") return Value::makeBool(a != b);
+        if (e.op == "+") { if (__builtin_add_overflow(a, b, &out)) fail(e, "integer overflow"); co_return Value::makeInt(out); }
+        if (e.op == "-") { if (__builtin_sub_overflow(a, b, &out)) fail(e, "integer overflow"); co_return Value::makeInt(out); }
+        if (e.op == "*") { if (__builtin_mul_overflow(a, b, &out)) fail(e, "integer overflow"); co_return Value::makeInt(out); }
+        if (e.op == "/") { if (b == 0) fail(e, "division by zero"); if (a == INT64_MIN && b == -1) fail(e, "integer overflow"); co_return Value::makeInt(a / b); }
+        if (e.op == "%") { if (b == 0) fail(e, "division by zero"); if (a == INT64_MIN && b == -1) fail(e, "integer overflow"); co_return Value::makeInt(a % b); }
+        if (e.op == "<")  co_return Value::makeBool(a < b);
+        if (e.op == "<=") co_return Value::makeBool(a <= b);
+        if (e.op == ">")  co_return Value::makeBool(a > b);
+        if (e.op == ">=") co_return Value::makeBool(a >= b);
+        if (e.op == "==") co_return Value::makeBool(a == b);
+        if (e.op == "!=") co_return Value::makeBool(a != b);
     }
     if (l.kind == Value::Kind::Float && r.kind == Value::Kind::Float) {
         double a = l.f, b = r.f;
-        if (e.op == "+") return Value::makeFloat(a + b);
-        if (e.op == "-") return Value::makeFloat(a - b);
-        if (e.op == "*") return Value::makeFloat(a * b);
-        if (e.op == "/") { if (b == 0.0) fail(e, "division by zero"); return Value::makeFloat(a / b); }
-        if (e.op == "<")  return Value::makeBool(a < b);
-        if (e.op == "<=") return Value::makeBool(a <= b);
-        if (e.op == ">")  return Value::makeBool(a > b);
-        if (e.op == ">=") return Value::makeBool(a >= b);
-        if (e.op == "==") return Value::makeBool(a == b);
-        if (e.op == "!=") return Value::makeBool(a != b);
+        if (e.op == "+") co_return Value::makeFloat(a + b);
+        if (e.op == "-") co_return Value::makeFloat(a - b);
+        if (e.op == "*") co_return Value::makeFloat(a * b);
+        if (e.op == "/") { if (b == 0.0) fail(e, "division by zero"); co_return Value::makeFloat(a / b); }
+        if (e.op == "<")  co_return Value::makeBool(a < b);
+        if (e.op == "<=") co_return Value::makeBool(a <= b);
+        if (e.op == ">")  co_return Value::makeBool(a > b);
+        if (e.op == ">=") co_return Value::makeBool(a >= b);
+        if (e.op == "==") co_return Value::makeBool(a == b);
+        if (e.op == "!=") co_return Value::makeBool(a != b);
     }
-    if (e.op == "==") return Value::makeBool(l.equals(r));
-    if (e.op == "!=") return Value::makeBool(!l.equals(r));
+    // ==== bug-121：编译期 `==` / `!=` / `===` 语义 ====
+    //   · `==` / `!=`：list / Optional 走**身份**（ident）比较；record 走内容比较
+    //     （主人裁定保持现状）；标量/枚举走值/变体比较（`equals` 与既有直比等价）。
+    //   · `===`：恒为**结构相等**（`equals`）；无对应 `!==`（官方写法 `not (a === b)`）。
+    //   · kind 不同 ⇒ false（与既有 `equals` 行为一致）。
+    if (e.op == "==" || e.op == "!=") {
+        bool isContainer = (l.kind == Value::Kind::List || l.kind == Value::Kind::Optional)
+                        && r.kind == l.kind;
+        bool same = isContainer ? (l.ident != 0 && l.ident == r.ident) : l.equals(r);
+        co_return Value::makeBool(e.op == "==" ? same : !same);
+    }
+    if (e.op == "===") co_return Value::makeBool(l.equals(r));
     fail(e, "unsupported binary operator '" + e.op + "' for compile-time values");
 }
 
@@ -395,79 +406,79 @@ Value Evaluator::evalBinary(const BinaryExpr& e, Env& env) {
 // 语句层（§4.6「语句与流程」，change.md :1045-1150）
 // ============================================================
 
-EvalResult Evaluator::evalBlock(const BlockStmt& block, Env& env) {
+Task<EvalResult> Evaluator::evalBlock(const BlockStmt& block, Env& env) {
     Env local;
     local.parent = &env;
     for (const auto& s : block.stmts) {
         if (!s) continue;
         step(*s);
         if (auto* e = dynamic_cast<const ExprStmt*>(s.get())) {
-            evalExpr(*e->expr, local);
+            co_await evalExpr(*e->expr, local);
             continue;
         }
         if (auto* b = dynamic_cast<const BlockStmt*>(s.get())) {
-            EvalResult r = evalBlock(*b, local);
-            if (r.flow != Flow::Normal) return r;
+            EvalResult r = co_await evalBlock(*b, local);
+            if (r.flow != Flow::Normal) co_return r;
             continue;
         }
         if (auto* d = dynamic_cast<const LetDecl*>(s.get())) {
             if (!d->initializer) fail(*s, "let declaration requires an initializer at compile time");
             if (d->names.size() > 1) fail(*s, "destructuring let is not supported at compile time");
-            local.define(d->name, evalExpr(*d->initializer, local));
+            local.define(d->name, co_await evalExpr(*d->initializer, local));
             continue;
         }
         if (auto* d = dynamic_cast<const ConstDecl*>(s.get())) {
             if (!d->initializer) fail(*s, "const declaration requires an initializer at compile time");
             if (d->names.size() > 1) fail(*s, "destructuring const is not supported at compile time");
-            local.define(d->name, evalExpr(*d->initializer, local));
+            local.define(d->name, co_await evalExpr(*d->initializer, local));
             continue;
         }
         if (auto* i = dynamic_cast<const IfStmt*>(s.get())) {
-            Value c = evalExpr(*i->condition, local);
+            Value c = co_await evalExpr(*i->condition, local);
             if (c.kind != Value::Kind::Bool) fail(*s, "condition must be bool");
             EvalResult r;
             if (c.b) {
-                if (i->thenBranch) r = evalBlock(*i->thenBranch, local);
+                if (i->thenBranch) r = co_await evalBlock(*i->thenBranch, local);
             } else {
                 bool taken = false;
                 for (const auto& ei : i->elseIfs) {
                     if (!ei.condition) continue;
-                    Value ec = evalExpr(*ei.condition, local);
+                    Value ec = co_await evalExpr(*ei.condition, local);
                     if (ec.kind != Value::Kind::Bool) fail(*s, "condition must be bool");
                     if (ec.b) {
-                        if (ei.body) r = evalBlock(*ei.body, local);
+                        if (ei.body) r = co_await evalBlock(*ei.body, local);
                         taken = true;
                         break;
                     }
                 }
-                if (!taken && i->elseBranch) r = evalBlock(*i->elseBranch, local);
+                if (!taken && i->elseBranch) r = co_await evalBlock(*i->elseBranch, local);
             }
-            if (r.flow != Flow::Normal) return r;
+            if (r.flow != Flow::Normal) co_return r;
             continue;
         }
         if (auto* w = dynamic_cast<const WhileStmt*>(s.get())) {
             while (true) {
-                Value c = evalExpr(*w->condition, local);
+                Value c = co_await evalExpr(*w->condition, local);
                 if (c.kind != Value::Kind::Bool) fail(*s, "condition must be bool");
                 if (!c.b) break;
                 if (!w->body) break;
-                EvalResult r = evalBlock(*w->body, local);
-                if (r.flow == Flow::Return) return r;
+                EvalResult r = co_await evalBlock(*w->body, local);
+                if (r.flow == Flow::Return) co_return r;
                 if (r.flow == Flow::Break) break;
                 if (r.flow == Flow::Continue) continue;
             }
             continue;
         }
         if (auto* f = dynamic_cast<const ForStmt*>(s.get())) {
-            Value seq = evalExpr(*f->iterable, local);
+            Value seq = co_await evalExpr(*f->iterable, local);
             if (seq.kind != Value::Kind::List) fail(*s, "for expects a list");
             for (const auto& item : seq.elems) {
                 Env iter;
                 iter.parent = &local;
                 iter.define(f->itemName, item);
                 if (!f->body) break;
-                EvalResult r = evalBlock(*f->body, iter);
-                if (r.flow == Flow::Return) return r;
+                EvalResult r = co_await evalBlock(*f->body, iter);
+                if (r.flow == Flow::Return) co_return r;
                 if (r.flow == Flow::Break) break;
                 if (r.flow == Flow::Continue) continue;
             }
@@ -476,14 +487,14 @@ EvalResult Evaluator::evalBlock(const BlockStmt& block, Env& env) {
         if (auto* r = dynamic_cast<const ReturnStmt*>(s.get())) {
             EvalResult out;
             out.flow = Flow::Return;
-            if (r->expr) out.value = evalExpr(*r->expr, local);
-            return out;
+            if (r->expr) out.value = co_await evalExpr(*r->expr, local);
+            co_return out;
         }
         if (dynamic_cast<const BreakStmt*>(s.get())) {
-            EvalResult out; out.flow = Flow::Break; return out;
+            EvalResult out; out.flow = Flow::Break; co_return out;
         }
         if (dynamic_cast<const ContinueStmt*>(s.get())) {
-            EvalResult out; out.flow = Flow::Continue; return out;
+            EvalResult out; out.flow = Flow::Continue; co_return out;
         }
         if (dynamic_cast<const ThrowStmt*>(s.get()) ||
             dynamic_cast<const TryCatchStmt*>(s.get()))
@@ -497,14 +508,14 @@ EvalResult Evaluator::evalBlock(const BlockStmt& block, Env& env) {
             fail(*s, "local functions are not supported at compile time");
         fail(*s, "unsupported compile-time statement");
     }
-    return {};
+    co_return {};
 }
 
 // ============================================================
 // 调用、泛型推断、方法（§4.6）
 // ============================================================
 
-Value Evaluator::evalCall(const CallExpr& call, Env& env, bool comptime) {
+Task<Value> Evaluator::evalCall(const CallExpr& call, Env& env, bool comptime) {
     auto* id = dynamic_cast<const Identifier*>(call.callee.get());
     if (!id) fail(call, "indirect calls are not supported at compile time");
     if (isForbiddenRoot(id->name))
@@ -517,33 +528,39 @@ Value Evaluator::evalCall(const CallExpr& call, Env& env, bool comptime) {
         if (!comptime && fi->isComptime)
             fail(call, "'#fun' must be called with '#'");
         std::vector<Value> args;
-        for (const auto& a : call.args) args.push_back(evalExpr(*a, env));
+        for (const auto& a : call.args) args.push_back(co_await evalExpr(*a, env));
         std::vector<std::string> explicitTypes;
         for (const auto& t : call.typeArgs) explicitTypes.push_back(typeNameOf(*t));
-        return callFun(*fi->decl, fi->typeParams, std::move(args), explicitTypes, env);
+        co_return co_await callFun(*fi->decl, fi->typeParams, std::move(args), explicitTypes, env);
     }
-    return callBuiltin(id->name, call, env);
+    co_return co_await callBuiltin(id->name, call, env);
 }
 
-Value Evaluator::evalMetaCall(const MetaCallExpr& call, Env& env) {
+Task<Value> Evaluator::evalMetaCall(const MetaCallExpr& call, Env& env) {
+    // bug-122：`#f(...).m(...)` 的真实 AST 是 MetaCallExpr(callee = MetaMemberExpr)，
+    // 不是 MethodCallExpr。这里先对 base 求值，再走与 `evalMethod` 共用的方法分派。
+    if (auto* mm = dynamic_cast<const MetaMemberExpr*>(call.callee.get())) {
+        Value obj = co_await evalExpr(*mm->base, env);
+        co_return co_await callMethodOn(std::move(obj), mm->member, call.args, env, call);
+    }
     auto* r = dynamic_cast<const MetaValueRefExpr*>(call.callee.get());
     if (!r) fail(call, "only '#fun' calls are supported in Phase 3");
-    if (r->name == "compile_error") return evalCompileError(call, env);
+    if (r->name == "compile_error") co_return co_await evalCompileError(call, env);
     bool ambiguous = false;
     const FunInfo* fi = index_.fun(r->name, modulePath_, &ambiguous);
     if (ambiguous) fail(call, "ambiguous public '#fun' '" + r->name + "'");
     if (!fi) fail(call, "undefined compile-time function '#" + r->name + "'");
     std::vector<Value> args;
-    for (const auto& a : call.args) args.push_back(evalExpr(*a, env));
+    for (const auto& a : call.args) args.push_back(co_await evalExpr(*a, env));
     std::vector<std::string> explicitTypes;
     for (const auto& t : call.typeArgs) explicitTypes.push_back(typeNameOf(*t));
-    return callFun(*fi->decl, fi->typeParams, std::move(args), explicitTypes, env);
+    co_return co_await callFun(*fi->decl, fi->typeParams, std::move(args), explicitTypes, env);
 }
 
-Value Evaluator::callFun(const FunDecl& f, const std::vector<std::string>& typeParams,
-                         std::vector<Value> args,
-                         const std::vector<std::string>& explicitTypes,
-                         Env& callerEnv) {
+Task<Value> Evaluator::callFun(const FunDecl& f, const std::vector<std::string>& typeParams,
+                               std::vector<Value> args,
+                               const std::vector<std::string>& explicitTypes,
+                               Env& callerEnv) {
     if (!f.body) fail(f, "compile-time function '" + f.name + "' has no body");
     if (explicitTypes.size() > typeParams.size())
         fail(f, "too many explicit type arguments for '" + f.name + "'");
@@ -560,7 +577,7 @@ Value Evaluator::callFun(const FunDecl& f, const std::vector<std::string>& typeP
         if (k < args.size()) {
             v = std::move(args[k]);
         } else if (p.defaultExpr) {
-            v = evalExpr(*p.defaultExpr, local);
+            v = co_await evalExpr(*p.defaultExpr, local);
         } else {
             fail(f, "missing argument '" + p.name + "' in compile-time call");
         }
@@ -574,18 +591,18 @@ Value Evaluator::callFun(const FunDecl& f, const std::vector<std::string>& typeP
 
     CallGuard guard(*this, f.name, f.line, f.col);
     if (depth_ > limits_.maxCallDepth) fail(f, "compile-time call depth exceeded");
-    EvalResult r = evalBlock(*f.body, local);
-    if (r.flow == Flow::Return) return r.value;
+    EvalResult r = co_await evalBlock(*f.body, local);
+    if (r.flow == Flow::Return) co_return r.value;
     if (r.flow == Flow::Break || r.flow == Flow::Continue)
         fail(f, "break/continue outside loop in compile-time function");
     fail(f, "compile-time function '" + f.name + "' must return a value");
 }
 
-Value Evaluator::callMethod(const MethodDecl& m,
-                            const std::vector<std::string>& typeParams,
-                            Value self, std::vector<Value> args,
-                            const std::vector<std::string>& explicitTypes,
-                            Env& callerEnv) {
+Task<Value> Evaluator::callMethod(const MethodDecl& m,
+                                  const std::vector<std::string>& typeParams,
+                                  Value self, std::vector<Value> args,
+                                  const std::vector<std::string>& explicitTypes,
+                                  Env& callerEnv) {
     if (!m.body) fail(m, "user method '" + m.name + "' has no body");
     if (explicitTypes.size() > typeParams.size())
         fail(m, "too many explicit type arguments for method '" + m.name + "'");
@@ -603,7 +620,7 @@ Value Evaluator::callMethod(const MethodDecl& m,
         if (k < args.size()) {
             v = std::move(args[k]);
         } else if (p.defaultExpr) {
-            v = evalExpr(*p.defaultExpr, local);
+            v = co_await evalExpr(*p.defaultExpr, local);
         } else {
             fail(m, "missing argument '" + p.name + "' in method call");
         }
@@ -617,37 +634,45 @@ Value Evaluator::callMethod(const MethodDecl& m,
 
     CallGuard guard(*this, m.name, m.line, m.col);
     if (depth_ > limits_.maxCallDepth) fail(m, "compile-time call depth exceeded");
-    EvalResult r = evalBlock(*m.body, local);
-    if (r.flow == Flow::Return) return r.value;
+    EvalResult r = co_await evalBlock(*m.body, local);
+    if (r.flow == Flow::Return) co_return r.value;
     if (r.flow == Flow::Break || r.flow == Flow::Continue)
         fail(m, "break/continue outside loop in method");
     fail(m, "method '" + m.name + "' must return a value");
 }
 
-Value Evaluator::evalMethod(const MethodCallExpr& call, Env& env) {
+Task<Value> Evaluator::evalMethod(const MethodCallExpr& call, Env& env) {
     if (auto* id = dynamic_cast<const Identifier*>(call.object.get()))
         if (isForbiddenRoot(id->name))
             fail(call, "'" + id->name + "' is forbidden in compile-time evaluation");
 
-    Value obj = evalExpr(*call.object, env);
+    Value obj = co_await evalExpr(*call.object, env);
+    co_return co_await callMethodOn(std::move(obj), call.method, call.args, env, call);
+}
+
+// bug-122：方法分派公共体——实参**只求值一次**（内建白名单只在内建分支内求值，
+// record 用户方法的实参留给下面的循环）。
+Task<Value> Evaluator::callMethodOn(Value obj, const std::string& name,
+                                    const std::vector<std::unique_ptr<ASTNode>>& args,
+                                    Env& env, const ASTNode& at) {
     // S4（S3 四-2-3）：内建白名单先判名字；只有命中才会进 `callBuiltinMethod`，
     // 实参因此只求值一次（用户方法的实参留给下面的循环）。
-    if (isBuiltinMethod(call.method))
-        if (auto v = callBuiltinMethod(call.method, obj, call, env)) return *v;
+    if (isBuiltinMethod(name))
+        if (auto v = co_await callBuiltinMethod(name, obj, args, env, at)) co_return *v;
 
     if (obj.kind != Value::Kind::Record)
-        fail(call, "method '" + call.method + "' is not available on this compile-time value");
+        fail(at, "method '" + name + "' is not available on this compile-time value");
     bool ambiguous = false;
-    const MethodInfo* mi = index_.method(obj.s, call.method, modulePath_, &ambiguous);
-    if (ambiguous) fail(call, "ambiguous public method '" + call.method + "' on '" + obj.s + "'");
-    if (!mi) fail(call, "undefined method '" + call.method + "' on '" + obj.s + "'");
+    const MethodInfo* mi = index_.method(obj.s, name, modulePath_, &ambiguous);
+    if (ambiguous) fail(at, "ambiguous public method '" + name + "' on '" + obj.s + "'");
+    if (!mi) fail(at, "undefined method '" + name + "' on '" + obj.s + "'");
 
-    std::vector<Value> args;
-    for (const auto& a : call.args) args.push_back(evalExpr(*a, env));
+    std::vector<Value> vals;
+    for (const auto& a : args) vals.push_back(co_await evalExpr(*a, env));
     std::vector<std::string> recvTypeArgs;
     if (obj.type) recvTypeArgs = obj.type->typeArgs;
-    return callMethod(*mi->decl, mi->typeParams, std::move(obj),
-                      std::move(args), recvTypeArgs, env);
+    co_return co_await callMethod(*mi->decl, mi->typeParams, std::move(obj),
+                                  std::move(vals), recvTypeArgs, env);
 }
 
 void Evaluator::unify(const TypeExpr& pattern, const std::shared_ptr<TypeInfo>& actual,
@@ -700,10 +725,10 @@ void Evaluator::unify(const TypeExpr& pattern, const std::shared_ptr<TypeInfo>& 
 // #compile_error（§4.6）
 // ============================================================
 
-Value Evaluator::evalCompileError(const MetaCallExpr& call, Env& env) {
+Task<Value> Evaluator::evalCompileError(const MetaCallExpr& call, Env& env) {
     if (call.args.size() != 1)
         fail(call, "'#compile_error' expects exactly 1 string argument");
-    Value v = evalExpr(*call.args[0], env);
+    Value v = co_await evalExpr(*call.args[0], env);
     if (v.kind != Value::Kind::String)
         fail(call, "'#compile_error' argument must be a string");
     fail(call, v.s);
@@ -714,15 +739,20 @@ Value Evaluator::evalCompileError(const MetaCallExpr& call, Env& env) {
 // ============================================================
 
 bool Env::lookup(const std::string& name, Value& out) const {
-    auto it = locals.find(name);
-    if (it != locals.end()) { out = it->second; return true; }
-    return parent ? parent->lookup(name, out) : false;
+    // bug-120：改迭代遍历 parent 链（原递归在深递归 #fun 下会吃 C++ 栈）。
+    for (const Env* e = this; e; e = e->parent) {
+        auto it = e->locals.find(name);
+        if (it != e->locals.end()) { out = it->second; return true; }
+    }
+    return false;
 }
 
 const std::shared_ptr<TypeInfo>* Env::lookupType(const std::string& name) const {
-    auto it = typeEnv.find(name);
-    if (it != typeEnv.end()) return &it->second;
-    return parent ? parent->lookupType(name) : nullptr;
+    for (const Env* e = this; e; e = e->parent) {
+        auto it = e->typeEnv.find(name);
+        if (it != e->typeEnv.end()) return &it->second;
+    }
+    return nullptr;
 }
 
 void Env::define(const std::string& name, Value v) {
@@ -731,9 +761,11 @@ void Env::define(const std::string& name, Value v) {
 
 // S5：赋值目标解析。沿 parent 链找到最近的可写绑定；找不到返回 nullptr。
 Value* Env::lookupMutable(const std::string& name) {
-    auto it = locals.find(name);
-    if (it != locals.end()) return &it->second;
-    return parent ? parent->lookupMutable(name) : nullptr;
+    for (Env* e = this; e; e = e->parent) {
+        auto it = e->locals.find(name);
+        if (it != e->locals.end()) return &it->second;
+    }
+    return nullptr;
 }
 
 std::string Evaluator::typeNameOf(const TypeExpr& t) {
@@ -844,87 +876,94 @@ bool Evaluator::isForbiddenRoot(const std::string& name) const {
            name == "channel";
 }
 
-Value Evaluator::callBuiltin(const std::string& name, const CallExpr& call, Env& env) {
+Task<Value> Evaluator::callBuiltin(const std::string& name, const CallExpr& call, Env& env) {
     std::vector<Value> args;
-    for (const auto& a : call.args) args.push_back(evalExpr(*a, env));
+    for (const auto& a : call.args) args.push_back(co_await evalExpr(*a, env));
     if (name == "str") {
         if (args.size() != 1) fail(call, "'str' expects 1 argument");
         Value out = Value::makeString(args[0].toString());
         chargeMemory(valueBytes(out), call);
-        return out;
+        co_return out;
     }
     if (name == "some") {
         if (args.size() != 1) fail(call, "'some' expects 1 argument");
         Value out; out.kind = Value::Kind::Optional; out.hasValue = true;
+        out.ident = newIdentity();   // bug-121：新 Optional 值
         out.elems.push_back(args[0]);
         out.type = typeOf(out);
         chargeMemory(valueBytes(out), call);
-        return out;
+        co_return out;
     }
     if (name == "none") {
         if (!args.empty()) fail(call, "'none' expects 0 arguments");
         Value out; out.kind = Value::Kind::Optional; out.hasValue = false;
+        out.ident = newIdentity();   // bug-121：新 Optional 值
         out.type = typeOf(out);
         chargeMemory(valueBytes(out), call);
-        return out;
+        co_return out;
     }
     fail(call, "builtin '" + name + "' is not supported in compile-time evaluation");
 }
 
-std::optional<Value> Evaluator::callBuiltinMethod(
+Task<std::optional<Value>> Evaluator::callBuiltinMethod(
         const std::string& name, const Value& obj,
-        const MethodCallExpr& call, Env& env) {
-    std::vector<Value> args;
-    for (const auto& a : call.args) args.push_back(evalExpr(*a, env));
+        const std::vector<std::unique_ptr<ASTNode>>& args, Env& env,
+        const ASTNode& at) {
+    std::vector<Value> vals;
+    for (const auto& a : args) vals.push_back(co_await evalExpr(*a, env));
     if (name == "len") {
-        if (!args.empty()) fail(call, "'len' expects 0 arguments");
+        if (!vals.empty()) fail(at, "'len' expects 0 arguments");
         if (obj.kind == Value::Kind::String)
-            return Value::makeInt(static_cast<int64_t>(obj.s.size()));
+            co_return Value::makeInt(static_cast<int64_t>(obj.s.size()));
         if (obj.kind == Value::Kind::List)
-            return Value::makeInt(static_cast<int64_t>(obj.elems.size()));
-        fail(call, "'len' is not available on this value");
+            co_return Value::makeInt(static_cast<int64_t>(obj.elems.size()));
+        fail(at, "'len' is not available on this value");
     }
     if (name == "slice") {
-        if (args.size() != 2) fail(call, "'slice' expects 2 arguments");
-        if (args[0].kind != Value::Kind::Int || args[1].kind != Value::Kind::Int)
-            fail(call, "'slice' arguments must be int");
-        int64_t start = args[0].i, len = args[1].i;
-        if (start < 0 || len < 0) fail(call, "'slice' arguments must be non-negative");
+        if (vals.size() != 2) fail(at, "'slice' expects 2 arguments");
+        if (vals[0].kind != Value::Kind::Int || vals[1].kind != Value::Kind::Int)
+            fail(at, "'slice' arguments must be int");
+        int64_t start = vals[0].i, len = vals[1].i;
+        if (start < 0 || len < 0) fail(at, "'slice' arguments must be non-negative");
         if (obj.kind == Value::Kind::String) {
             if (start + len > static_cast<int64_t>(obj.s.size()))
-                fail(call, "'slice' out of range");
+                fail(at, "'slice' out of range");
             Value out = Value::makeString(obj.s.substr(static_cast<size_t>(start), static_cast<size_t>(len)));
-            chargeMemory(valueBytes(out), call);
-            return out;
+            chargeMemory(valueBytes(out), at);
+            co_return out;
         }
         if (obj.kind == Value::Kind::List) {
             if (start + len > static_cast<int64_t>(obj.elems.size()))
-                fail(call, "'slice' out of range");
+                fail(at, "'slice' out of range");
             Value out; out.kind = Value::Kind::List;
+            out.ident = newIdentity();   // bug-121：slice 产生新 list 值（新身份）
             out.elems.assign(obj.elems.begin() + start, obj.elems.begin() + start + len);
             out.type = typeOf(out);
-            chargeMemory(valueBytes(out), call);
-            return out;
+            chargeMemory(valueBytes(out), at);
+            co_return out;
         }
-        fail(call, "'slice' is not available on this value");
+        fail(at, "'slice' is not available on this value");
     }
     if (name == "append") {
-        if (args.size() != 1) fail(call, "'append' expects 1 argument");
+        if (vals.size() != 1) fail(at, "'append' expects 1 argument");
         if (obj.kind == Value::Kind::String) {
-            Value out = Value::makeString(obj.s + args[0].toString());
-            chargeMemory(valueBytes(out), call);
-            return out;
+            Value out = Value::makeString(obj.s + vals[0].toString());
+            chargeMemory(valueBytes(out), at);
+            co_return out;
         }
         if (obj.kind == Value::Kind::List) {
             Value out = obj;
-            out.elems.push_back(args[0]);
+            // bug-121：`append` 通过拷贝 `out = obj` 起手，必须**重新赋身份**——
+            // 否则 `a.append(x)` 会与 `a` 同身份（别名），`==` 语义错误。
+            out.ident = newIdentity();
+            out.elems.push_back(vals[0]);
             out.type = typeOf(out);
-            chargeMemory(valueBytes(out), call);
-            return out;
+            chargeMemory(valueBytes(out), at);
+            co_return out;
         }
-        fail(call, "'append' is not available on this value");
+        fail(at, "'append' is not available on this value");
     }
-    return std::nullopt;
+    co_return std::nullopt;
 }
 
 } // namespace Aura::ct

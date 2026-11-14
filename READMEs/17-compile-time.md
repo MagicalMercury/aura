@@ -193,12 +193,34 @@ fun main(io: Io) throws {
 | record | `Point { x = 3, y = 4 }` | 可读字段、调方法 |
 | Optional | `let a: Optional<int> = #(some(3))` | 需**显式类型标注** |
 
-> ⚠️ **三个已知限制**（2026-11-14 实测，均已登记缺陷）：
-> 1. **`==` 语义差异**：编译期对 list / record / Optional 做**结构比较**，而运行期同一表达式是**引用比较** —— `#([1,2,3] == [1,2,3])` 编译期得 `true`、运行期得 `false`（bug-121）。**不要在编译期依赖容器 `==` 的结论**。
-> 2. **链式调用**：`#f(...)` 的返回值不能直接链式调方法（`#squares(3).len()` 报 `only '#fun' calls are supported in Phase 3`）；先 `let xs = #squares(3)`，再 `xs.len()`（bug-122）。
-> 3. **Optional 无标注**：`let a = #(none())` 会报 list 专用提示；请显式写 `let a: Optional<int> = #(none())`（bug-123）。
->
-> union 值目前只支持「标注 + payload 回写」，编译期不构造联合标签（bug-124，待裁定）。
+#### `==` 与 `===`
+
+编译期 `==` 与运行期语义一致；需要**结构相等**时用 `===`（仅编译期）：
+
+| 类型 | `==`（编译期） | `===`（仅编译期） |
+| :--- | :--- | :--- |
+| int / float / bool / string / None | 值比较 | 值比较 |
+| list / Optional | **身份**（同一次构造 / 同一绑定） | **结构** |
+| record | 内容比较（与 `Comparable.equal` 一致） | **结构** |
+| enum | 变体比较 | 变体比较 |
+
+```aura
+fun main(io: Io) throws {
+    let same = #{ let a = [1, 2]; return a == a }                    // true（同一绑定）
+    let diff = #{ let a = [1, 2]; let b = [1, 2]; return a == b }     // false（不同对象）
+    let st   = #([1, 2] === [1, 2])                                   // true（结构相等）
+    io.println(str(same))
+    io.println(str(diff))
+    io.println(str(st))
+}
+```
+
+- `===` **只能出现在编译期**；写在运行期代码里会报 `'===' is compile-time only`。
+- 没有 `!==`，请写 `not (a === b)`。
+
+> ⚠️ **已知限制（2026-11-14）**：
+> - **Optional 无标注**：`let a = #(none())` 会报 list 专用提示；请显式写 `let a: Optional<int> = #(none())`（bug-123）。
+> - **union 值**：编译期只支持「标注 + payload 回写」，不构造联合标签、不承诺 `==` / `===`（bug-124，已收窄）。
 
 record 与方法在编译期的用法（`Point.sum()` 直接被算出来）：
 
@@ -245,7 +267,7 @@ fun main(io: Io) throws {
 
 当前默认上限：**100 万步**、**64 MiB** 编译期内存、**256 层**编译期调用深度。
 
-> ⚠️ **实测提醒**：编译期递归在约 240 层以内正常；接近 256 层时当前实现会栈溢出崩溃（已登记 bug-120，检测点来不及触发）。写编译期递归时请把深度控制在 200 层以内。
+> ✅ **实测（2026-11-14，bug-120 修复后）**：任意形态（含每层 record + list + 字符串的重栈帧形态）在 210 层可正常执行；到 256 层报 `compile-time call depth exceeded`，**不再栈溢出崩溃**。写编译期递归时按 256 层的上限设计即可。
 超过步数上限的典型形态是编译期死循环：
 
 ```aura
@@ -490,6 +512,7 @@ fun main(io: Io) throws {
 | `integer overflow` | 编译期整数运算溢出 |
 | `compile-time step limit exceeded` | 编译期执行步数超限 |
 | `compile-time call depth exceeded` | 编译期递归/调用层数超过 256 |
+| `'===' is compile-time only` | `===` 只允许出现在编译期（`#(...)` / `#{...}` / `#fun` 体） |
 | `'#compile_error' expects exactly 1 string argument` | `#compile_error` 实参个数不对 |
 | `quote cannot be used in expression position` | 引述绑定被当表达式值用了 |
 | `'#const' is not allowed inside 'Aura{...}'` | 引述体内出现 `#const` |

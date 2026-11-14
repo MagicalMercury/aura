@@ -43,6 +43,9 @@ struct Value {
     std::vector<std::string> names;      // Record 字段名
     std::shared_ptr<TypeInfo> type;      // 递归类型信息（3A）
     bool hasValue = false;               // Optional: present?
+    // bug-121：容器身份（list / Optional）。>0 = 该容器值有独立身份；0 = 标量/无身份。
+    // 只被编译期 `==` / `!=` 的身份比较消费；**不参与** `equals()`（结构比较）与 `toString()`。
+    std::uint64_t ident = 0;
 
     static Value makeInt(int64_t v);
     static Value makeFloat(double v);

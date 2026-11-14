@@ -3,7 +3,7 @@ type: bug_report
 module: compile-time
 sub_module: Evaluator/Value
 status:
-  - pending_fix
+  - fixed
 severity: high
 discover_date: 2026-11-14
 related_issues:
@@ -16,7 +16,7 @@ tags:
 ---
 
 # 【标题】编译期 `==` 对 list/record/Optional 用结构相等，与运行期引用相等不一致（静默错值）
-[ ] **`#([1,2,3] == [1,2,3])` 编译期得 `true`，同一表达式运行期得 `false`；编译期把 `true` 硬编码进程序**
+[x] **`#([1,2,3] == [1,2,3])` 编译期得 `true`，同一表达式运行期得 `false`；编译期把 `true` 硬编码进程序**
 
 > **一句话摘要**：`Value::equals`（`src/CompileTime/Value.h`）对 List / Record / Optional 做**逐元素结构比较**，而运行期 `==` 对堆对象是**引用比较**；于是同一个表达式在编译期和运行期语义不同，且编译结果完全合法——属**静默错误值**。
 
@@ -84,4 +84,16 @@ fun main(io: Io) throws {
 - 复现目录：`_v_batch\`
 
 ---
-**当前状态**：`2026-11-14` 调研完成（待修复）
+## 8. 修复记录（2026-11-14）
+
+- **实现**：
+  - `===`：`TokType::StrictEq` + `TokType.cpp` 名称表 + `Lexer.cpp:75-82` 三级贪心 + `ExprParser.cpp:133-136` 的 `parseEquality` ops 2→3。
+  - `Value::ident`（`Value.h:46-48`）：**5 个 list/Optional 构造点**赋身份（`Evaluator.cpp:186/884/893/932/951`）；record / Enum 不赋。
+  - `evalBinary`（`Evaluator.cpp:389-402`）：`==`/`!=` 对 list/Optional 走**身份**、record 走**内容**、标量走值；`===` 走 `equals`（**结构**）。
+  - Sema（`ExprInfer.cpp:509-516`）：`===` → `'===' is compile-time only`；CodeGen（`ExprBinary.cpp:60-66`）同义**双保险**。
+  - `!==` **不引入**（官方写法 `not (a === b)`）。
+- **语义判定（实测）**：`#{ let a=[1,2]; return a==a }` → true；`#{ let a=[1,2]; let b=[1,2]; return a==b }` → false；`#([1,2] === [1,2])` → true；record 内容相同 → `==` true；运行期 `a === b` → 报错。
+- **验收**：新增 11 例（`EqListIdentity` / `EqListAlias` / `NeListIdentity` / `StrictEqListStructural` / `StrictEqOptional` / `StrictEqMismatchKind` / `EqRecordContent` / `StrictEqRuntimeRejected` 等）；全量 **1741/1741**；`used/1–6` 全过；手册 §17.3.2 已补「`==` 与 `===`」语义表与示例（验证脚本 33/33）。
+
+---
+**当前状态**：`2026-11-14` **已修复（fixed）**

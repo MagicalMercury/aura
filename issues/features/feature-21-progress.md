@@ -60,17 +60,30 @@ related_issues:
 
 | 编号 | 缺陷 | 严重度 | 状态 |
 | :--- | :--- | :-: | :--- |
-| [[bug-120-comptime-recursion-stack-overflow-before-depth-check]] | 编译期递归在 `maxCallDepth=256` 检查前栈溢出（简单形态 ~245、重栈帧 ~205） | high | pending_fix |
-| [[bug-121-comptime-eq-structural-vs-runtime-reference]] | 编译期 `==` 对 list/record/Optional 用结构相等，运行期用引用相等（静默错值） | high | pending_fix |
-| [[bug-122-comptime-hashfun-result-chain-call-rejected]] | `#f(...)` 返回值直接链式调用被拒（`only '#fun' calls are supported`） | medium | pending_fix |
+| [[bug-120-comptime-recursion-stack-overflow-before-depth-check]] | 编译期递归在 `maxCallDepth=256` 检查前栈溢出（简单形态 ~245、重栈帧 ~205） | high | ✅ **fixed**（方案 B：`task.h` trampoline + 19 函数协程化 + Env 迭代） |
+| [[bug-121-comptime-eq-structural-vs-runtime-reference]] | 编译期 `==` 对 list/record/Optional 用结构相等，运行期用引用相等（静默错值） | high | ✅ **fixed**（`===` 新符号 + `Value.ident` 身份语义） |
+| [[bug-122-comptime-hashfun-result-chain-call-rejected]] | `#f(...)` 返回值直接链式调用被拒（`only '#fun' calls are supported`） | medium | ✅ **fixed**（`callMethodOn` + `evalMetaCall` 分流） |
 | [[bug-123-optional-unannotated-gets-list-hint]] | Optional 无标注时给 list 专用文案 | low | pending_fix |
-| [[bug-124-comptime-union-value-unreachable]] | `Value::Kind::Union` 无构造点，union 活动变体不可达 | medium | needs_review（待裁定 A/B） |
+| [[bug-124-comptime-union-value-unreachable]] | `Value::Kind::Union` 无构造点，union 活动变体不可达 | medium | **narrowed**（主人 2026-11-14 裁定收窄，见 §1.2） |
+
+> **修复汇总（2026-11-14）**：全量 **1741/1741/0 failed**；`used/1–6` 全过；`example/test.aura` md5 未变；手册新增「`==` 与 `===`」示例（验证脚本 33/33）。实施记录见 `plan/编译期缺陷修复-bug120-124.md` §12。
 
 > V 批其余观察（不单独立项）：F5 —— `spawn`/`sync` 报 `unsupported compile-time statement`、局部 `fun` 报 parser 顶层文案、`#reflect` 报 Phase 2 的 `'#const' reference`（三者**均报错不静默**，仅文案非专用）；F7 —— `plan/feature-21-phase3.md` §8.2 D3BlockConst 示例写 `#{ #const n=2; return n*4 }`，与「引用必须写 `#`」冲突（实测 `#n*4` = 8），属 plan 示例笔误，待同步。
 >
 > V 批结论：**未发现「求值失败后回退运行期」**（47 个负例全部 `exit=1` 且无 cpp 产物）。
 
 **Phase 2 收官记录**：全量 **1701/1701**、`ConstExpand 26` / `MacroImport 10` / `ParserMeta 57`；`example/used/1–6` 6/6；`change.md` 1191 行 / `b14f148e`。**Phase 1 收官记录**：1658/1658、V 批 10 正例 aurac/g++ 双绿、悬挂 0.59s 返回。
+
+### 1.2 ⚠️ 已收窄：union 值在编译期不可构造（bug-124，2026-11-14 主人裁定）
+
+> **断点续传必读**：union 的编译期值语义是**主动收窄**，不是"还没实现"——后续会话不要把它当 TODO 随手补半套。
+
+- **现象**：`Value::Kind::Union` 在 `src/CompileTime` 里只有消费点（`Value.h:73/111`、`Evaluator.cpp:52/115/678/770`、`EvalPass.cpp:535`），**没有任何构造点**（无 `makeUnion` / `kind = Kind::Union`）。
+- **当前能力**：`let v: int | string = #(1)` 只支持「标注 + payload 回写」——回写成普通 `1`，联合身份丢弃（`EvalPass.cpp:535-542`）。
+- **明确不承诺**：编译期 union 值的 `==` / `===`、活动变体分支、`#reflect` 对 union 的消费。
+- **裁定**：2026-11-14 主人选择「暂时收窄」；缺陷笔记 [[bug-124-comptime-union-value-unreachable]] 状态置 `narrowed`。
+- **重新评估触发条件**：Phase 5（`#reflect`）需要用 union 承载元数据值时，重新立项。
+- **规范落点**：`feature-21 §9.2` 第 6 条值域表 union 行已改「已收窄」；`plan/feature-21-phase3.md` 的 Union 相关行已标注。
 
 ## 2. Phase 0 出口条件：§13 待裁定（7 项）
 
@@ -221,6 +234,7 @@ related_issues:
 | 2026-11-09 | Phase 3 S2–S6 完成（Value/TypeInfo + DeclIndex、Evaluator 表达式/语句层、EvalPass/valueToAst/main、12 新用例）→ **1713/1713**；R7 探针条件通过（payload 回写通过；“`Value::Union` 标签保留”登记为后续增强）；`change.md` 增 §13 → 2364 行 / `ae9ee0cf` |
 | 2026-11-10 | 会话迁入新框架并复核：`cmake --build build` = `no work to do`、全量 1713/1713/0 failed、`example/test.aura` md5 未变、`change.md` 2364 行 / `ae9ee0cf` 一致；**修正本文件过期的状态总览与「当前断点」**（原仍写 Phase 2/3「未开工」、断点在 Phase 0-a），并把“Phase 3 缺 V 批 + v0.4.2 文档”写成硬门禁 |
 | 2026-11-14 | **Phase 3 出口两项闭合**：① 独立验证批 V 完成（fresh eyes，29 正例 / 47 负例全 PASS，F1–F7 台账，主 Agent 独立复跑 F1/F2/F3/P23）；② v0.4.2 规范修订落 **§9**（11 条生效文本 + 阶段表 + 已知缺口，`question.txt` 原稿未动）；③ 文档：新增 `READMEs/17-compile-time.md`、`02-lexical` 交叉链接、`change.md` §10 落点；④ 缺陷登记 bug-119 / bug-120（含 V 批第二形态）/ bug-121 / bug-122 / bug-123 / bug-124；全量 1713/1713 |
+| 2026-11-14（晚） | **4 项编译期缺陷修复闭环**：bug-122（`callMethodOn` 链式调用）、bug-121（`===` + `Value.ident` 身份语义 + Sema/CodeGen 双保险）、bug-120（方案 B：`task.h` trampoline + 19 函数协程化 + Env 迭代）、bug-124（收窄登记）；全量 **1741/1741**、`used/1–6` 全过、`example/test.aura` md5 未变；手册 §17.3.2 新增「`==` 与 `===`」（验证脚本 33/33）；执行记录见 `plan/编译期缺陷修复-bug120-124.md` §12 |
 
 
 ---

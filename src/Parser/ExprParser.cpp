@@ -131,8 +131,9 @@ std::unique_ptr<ASTNode> Parser::parseAnd() {
 }
 
 std::unique_ptr<ASTNode> Parser::parseEquality() {
-    static const TokType ops[] = {TokType::EqEq, TokType::NotEq};
-    return parseBinaryLevel(&Parser::parseComparison, ops, 2);
+    // bug-121：`===` 与 `==` / `!=` 同级（op 串由 token lexeme 给出，即 "==="）
+    static const TokType ops[] = {TokType::EqEq, TokType::StrictEq, TokType::NotEq};
+    return parseBinaryLevel(&Parser::parseComparison, ops, 3);
 }
 
 std::unique_ptr<ASTNode> Parser::parseComparison() {

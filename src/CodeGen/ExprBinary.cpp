@@ -57,6 +57,14 @@ bool CodeGenerator::isStringExprInChain(const std::string& s) const {
 // ============================================================
 
 std::string CodeGenerator::genBinaryExpr(const BinaryExpr& e, bool isCoroutine) {
+    // bug-121 双保险：`===` 是编译期专用运算符（主闸门在 Sema::inferBinaryExpr）。
+    // 若 Sema 报错后调用方仍继续生成，这里报同义诊断并返回安全占位，
+    // **绝不生成 `a === b`**（C++ 无该运算符）。
+    if (e.op == "===") {
+        error(e, "'===' is compile-time only");
+        return "false";
+    }
+
     // bug-64：比较（==/!=）一侧为裸 none()，另一侧为 Optional<T>（元素可为模板期
     // 未绑定泛型名）时，把对端元素 C++ 名临时注入 currentReturnElem_，使 genCallExpr
     // none() 分支生成 make_none<elem>()（elem 为模板参数名时由 g++ 实例化推导）。

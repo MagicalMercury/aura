@@ -506,6 +506,15 @@ std::unique_ptr<SemType> SemAnalyzer::inferBinaryExpr(const BinaryExpr& e) {
     auto rt = inferExpr(*e.right);
     const std::string& op = e.op;
 
+    // bug-121：`===` 是**编译期专用**运算符（`#{}` / `#(...)` 内由 EvalPass 求值回写，
+    // 不会到达 Sema）。运行期代码出现 `===` 一律干净报错，返回 bool 防止级联误报。
+    // 位置：在下方 `==` / `!=` 判等块（以及 enum/record 判等分支）之前，保证任何
+    // 操作数类型（int / list / record / enum…）都只报这一条文案。
+    if (op == "===") {
+        error(e, "'===' is compile-time only");
+        return boolType();
+    }
+
     // 字符串拼接：string + 任意类型 → string（runtime 端有 operator+ 重载 / concat）
     auto* ltPrim = dynamic_cast<PrimSemType*>(lt.get());
     auto* rtPrim = dynamic_cast<PrimSemType*>(rt.get());

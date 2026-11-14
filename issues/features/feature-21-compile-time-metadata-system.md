@@ -252,7 +252,7 @@ supersedes:
 | 3 | 阶段表（编译期方法 / 元数据值 / 类型位 / 注解字段 / `where`） | 【阶段切分】 | A7/A8/A10–A12 | §3 两阶段流程后新增小节 |
 | 4 | 整数溢出 = 编译错误 | 【新增】 | A18 | §8.1 求值语义 |
 | 5 | `#compile_error` 恰好 1 个 string 实参 | 【新增】约束 | A20 | §8.x（`#compile_error`） |
-| 6 | Optional / union / slice 纳入值域；`slice` 白名单 | 【规范】补细则 | A13 / A16 | §8「值域」 |
+| 6 | Optional / union / slice 纳入值域；`slice` 白名单 | 【规范】补细则 | A13 / A16 | §8「值域」；其中 **union 已收窄**（见 §9.2 第 6 条 / bug-124） |
 | 7 | 2A(a)：运行期名字集合 + 专用诊断 | 【新增】诊断 | A19 | §9.2 编译期语境 |
 | 8 | 4A：纯用户方法可编译期调用 | 【规范】§7.1 同逻辑 | A22 | §7.1 / §7.3 |
 | 9 | L1：泛型 `<...>` 声明/调用可写可不写 | 【新语言特性】 | A23 | §5.6 + 新增「声明位/调用位」 |
@@ -300,7 +300,7 @@ supersedes:
 | list | ✅ | 元素类型递归推断；空 list 需上下文 |
 | record | ✅ | 保留 `typeName` / `typeArgs`；可读字段、调纯方法 |
 | Optional | ✅ | `some(v)` / `none()`；`let` 初值需**显式类型标注**（推断不出元素类型时报错） |
-| union | ✅（回写 payload） | 活动变体 payload 回写；**标签保留**为后续增强（R7） |
+| union | ⚠️ **已收窄（2026-11-14，bug-124）** | Phase 3 **不构造** union 值：只支持「标注 + payload 回写」；`Value::Kind::Union` 无构造点，`==` / `===` 均不承诺。重新评估触发条件：Phase 5 `#reflect` 需要消费 union 值时 |
 | slice | ✅ | `slice(start, len)` 在白名单内；实测 `#([1,2,3,4].slice(1,2).len())` = 2 |
 | 内建白名单 | — | `str` / `len` / `slice` / `append` 等；白名单外的方法报未支持 |
 

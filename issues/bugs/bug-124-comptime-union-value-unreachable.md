@@ -3,7 +3,7 @@ type: bug_report
 module: compile-time
 sub_module: Value/Evaluator
 status:
-  - needs_review
+  - narrowed
 severity: medium
 discover_date: 2026-11-14
 related_issues:
@@ -59,5 +59,15 @@ tags:
 - V 批报告 F6
 - 相关：`change.md` §13 R7 结果
 
+## 8. 裁定记录（2026-11-14，主人）
+
+- **裁定**：选择**暂时收窄**——Phase 3 不构造 union 值，只支持「标注 + payload 回写」；**不承诺** `==`/`===` 与活动变体分支。
+- **落地落点**：
+  - `issues/features/feature-21-compile-time-metadata-system.md` §9.2 值域表 union 行改为「已收窄」；
+  - `plan/feature-21-phase3.md` 的 TypeInfo 推断表 / 值回写表 / 边界表 Union 行标注「Phase 3 不可达」；
+  - `issues/features/feature-21-progress.md` 新增 **§1.2 ⚠️ 已收窄** 醒目章节（断点续传必读）；
+  - 本笔记 `status: narrowed`；标题保持 `[ ]`（收窄决策 ≠ 代码修复）。
+- **重新评估触发条件**：Phase 5 `#reflect` 需要用 union 承载元数据值时重新立项。
+
 ---
-**当前状态**：`2026-11-14` 调研完成（待主人裁定 A/B 后再修）
+**当前状态**：`2026-11-14` 已裁定收窄（narrowed），不修代码

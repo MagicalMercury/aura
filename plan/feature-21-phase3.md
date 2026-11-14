@@ -146,7 +146,7 @@ struct Value {
 | Record | `Record{typeName, typeArgs}` |
 | Enum | `Enum{typeName}` |
 | Optional | `Optional< payload 类型 >`；`none()` ⇒ `Optional<Unknown>` |
-| Union | `Union{typeName, 活动分支类型}` |
+| Union | `Union{typeName, 活动分支类型}` —— ⚠️ **Phase 3 不可达**：`Value::Kind::Union` 无构造点（bug-124 收窄，只支持标注 + payload 回写） |
 
 **显式实参优先**：`#g<int>(...)` / `id<int>(...)` 时直接用给定类型建 `TypeEnv`；数量不符、未知类型 ⇒ 编译错误；不再推断该参数。
 
@@ -223,7 +223,7 @@ if (auto* r = dynamic_cast<MetaValueRefExpr*>(call->callee.get());
 | Record | `RecordExpr{typeName, fields, typeArgs}` |
 | Enum | `MemberAccessExpr{Identifier(type), variant}`；Sema 置 `enumVariantAccess` |
 | Optional | `CallExpr(Identifier("some"/"none"), …)` |
-| Union | 活动变体 payload 表达式（标签仅保留在 `Value`，见 R7） |
+| Union | 活动变体 payload 表达式（标签仅保留在 `Value`，见 R7） —— ⚠️ **Phase 3 收窄**：union 值不构造，只回写 payload（bug-124） |
 
 ### 4.7 类型位（Q6 类型位，阶段切分）
 
@@ -343,7 +343,7 @@ fun (self Point) sum() -> int { return self.x + self.y }
 | 空 list/string | 合法；空 list 推断需上下文/显式实参 | `EmptyValues`、`EmptyListInfer` |
 | `None` 误用 | 类型错误 | `NoneMisuse` |
 | Optional `none` 解包 | 报错 | `NoneUnwrap` |
-| union 活动变体 | 按 payload 求值 | `UnionValue` |
+| union 活动变体 | 按 payload 求值；⚠️ **Phase 3 不可达**（bug-124 收窄：无构造点） | `UnionValue`（暂不适用） |
 | 递归/死循环 | 步数 + 深度 | `InfiniteRecursion`、`StepLimit` |
 | 内存 | 字节上限 | `MemoryLimit` |
 | 未支持节点 | 明确报「Phase 3 未支持」 | `UnsupportedNode` |

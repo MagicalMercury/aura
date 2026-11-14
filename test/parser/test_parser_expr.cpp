@@ -171,6 +171,19 @@ TEST(ParserExpr, ComparisonAndLogical) {
     EXPECT_EQ(eq->op, "==");
 }
 
+// bug-121：`===` 与 `==` 同级（equality 层），AST op 串为 "==="
+TEST(ParserExpr, StrictEquality) {
+    DiagnosticEngine diag;
+    auto prog = parseSource("fun f() { let x = a === b }", diag);
+    ASSERT_TRUE(prog != nullptr);
+    EXPECT_FALSE(diag.hasErrors());
+    auto* bin = as<BinaryExpr>(letInitOf(*prog));
+    ASSERT_TRUE(bin != nullptr);
+    EXPECT_EQ(bin->op, "===");
+    EXPECT_TRUE(as<Identifier>(bin->left.get()) != nullptr);
+    EXPECT_TRUE(as<Identifier>(bin->right.get()) != nullptr);
+}
+
 TEST(ParserExpr, OrLowerThanAnd) {
     // a or b and c → a or (b and c)
     DiagnosticEngine diag;

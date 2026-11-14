@@ -73,7 +73,12 @@ Token Lexer::scanOperatorOrDelimiter(char c) {
     case '#': return makeToken(TokType::Hash, "#");
 
     case '=':
-        if (peek() == '=') { advance(); return makeToken(TokType::EqEq,     "=="); }
+        // bug-121：三级贪心——`===` > `==` > `=>` > `=`
+        if (peek() == '=') {
+            advance();
+            if (peek() == '=') { advance(); return makeToken(TokType::StrictEq, "==="); }
+            return makeToken(TokType::EqEq, "==");
+        }
         if (peek() == '>') { advance(); return makeToken(TokType::FatArrow, "=>"); }
         return makeToken(TokType::Assign, "=");
 
