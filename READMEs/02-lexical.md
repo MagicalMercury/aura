@@ -17,7 +17,7 @@
 
 关键字：`fun, let, const, throws, throw, try, catch, match, if, else, for, while, loop, break, continue, spawn, sync, return, import, type, interface, true, false, None, impl`
 
-软关键字（上下文关键字）：`module, as, lock, thread, enum`。它们**不是**关键字——词法上仍是普通标识符，
+软关键字（上下文关键字）：`module, as, lock, thread, enum, where`。它们**不是**关键字——词法上仍是普通标识符，
 仅在特定位置由 Parser 按上下文识别（`module <name>` 只能在文件首；`enum` 只有在后随硬关键字 `type`
 时才构成 `enum type Name = { Variant, ... }` 声明；由于 Aura **换行不参与语法**（无 `Newline` token），
 该组合**分处两行**亦同样成立）。因此它们**可以**继续用作变量名、参数名、字段名与方法名：
@@ -36,6 +36,22 @@ let snake_case_123 = 3.14
 // --- 关键字不能用作标识符 ---
 // let fun = 1      // 错误：fun 是关键字
 // let let = 2      // 错误：let 是关键字
+```
+
+### 编译期元数据前缀 `#`
+
+- `#type` / `#fun` / `#const`：声明编译期类型、编译期函数与编译期常量。
+- `#X{...}`：元数据构造，紧跟一条声明即挂载到该声明上（出现在表达式或 `#const` 初值处则为独立值）。
+- `#(表达式)` / `#{ ... }`：编译期求值——`#(...)` 等价于 `#{ return 表达式 }`；`#{...}` 是多语句块，**必须显式 `return`**（唯一例外是 `#(...)` 这个语法糖）。
+- `Aura { ... }`：引述，记录块内代码的 **AST**（可含多行语句与声明）供注解器使用；**不执行、不触发 import 解析**，引述内的 `import` 只是 AST 数据。
+
+旧的 `#ns.key = value` 指令已移除；原 `#io.sync = true` 的迁移写法是 `#io{ sync = true }`（运行期接线在后续 Phase）。
+权威规范：`issues/features/feature-21-compile-time-metadata-system.md`（附录 A 为 v0.4.1 手稿）；
+使用手册见 [17. 编译期与元数据](17-compile-time.md)。
+
+```aura
+#type Point = { x: int, y: int }
+let n = #(1 + 2)              // 编译期求值 → 3
 ```
 
 ## 2.3 字面量

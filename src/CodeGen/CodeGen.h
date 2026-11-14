@@ -4,7 +4,7 @@
 #include "../AST/Expr.h"
 #include "../AST/Stmt.h"
 #include "../AST/Type.h"
-#include "../ASTWalker.h"
+#include "../AST/AstWalk.h"
 #include "../Diag/DiagnosticEngine.h"
 #include <cstdint>   // feature-18 P3：throwSiteLocalSeq_ / kSlotsPerModule / throwSiteModuleIdx_
 #include <map>

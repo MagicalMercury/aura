@@ -2,7 +2,9 @@
 type: todo_feature
 kind: new_feature
 module: Parser/Sema/CodeGen/Runtime
-status: designing
+status: deprecated
+deprecated_date: 2026-10-17
+superseded_by: "[[feature-21-compile-time-metadata-system]]"
 priority: P3
 estimated_effort: XL
 blocked_by: []
@@ -16,7 +18,9 @@ tags:
   - syntax
 ---
 
-# 【"#" 配置器 + 反射机制】[ ] **主标题：统一配置器语法族（注解）+ 编译期元数据注册表 + 反射查询**
+# 【"#" 配置器 + 反射机制】[已弃用] **主标题：统一配置器语法族（注解）+ 编译期元数据注册表 + 反射查询**
+
+> ⚠️ **已弃用（2026-10-17）**：本 feature 的方案已被 [[feature-21-compile-time-metadata-system]]（`#` 元数据与编译期体系 v0.4.1，规范正文见 `question.txt` / 该笔记附录 A）整体取代，**不再作为实施依据**。保留本笔记仅为历史存档与差异追溯（v0.3 口径见 `plan/hash-metadata-requirements.md`、`plan/hash-v0.3-feature-deltas.md`）。
 
 > **一句话摘要**：引入 `#` 前缀配置器语法族的**注解侧**——`#type` 声明元数据 schema、`#X{...}` 注解在声明上（挂载），元数据进**编译期生成的静态注册表**，标准库提供反射查询 API（`reflect.collect`），支撑 EventFuncCollector 等框架模式（「声明即注册」）。
 >

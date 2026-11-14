@@ -1,8 +1,17 @@
 ﻿# ============================================================
 # test/CMakeLists.txt — Aura 编译器单元测试
 #
-# 构建一个独立可执行文件 aura_tests，包含全部编译器源码
-# （不含 main.cpp）与所有 TEST() 用例，注册到 CTest。
+# 构建策略（2026-11-08）：
+#   · aura_tests            兼容总入口：链接全部测试 OBJECT，仍可直接运行；
+#   · aura_tests_<category> 按类别拆分：rt/lexer/parser/ast/sema/codegen/diag/module/integration；
+#   · 编译器/运行时核心为 OBJECT 库 aura_test_core，所有 exe 共用，只编一次；
+#   · 测试源也是 OBJECT 库，总入口与分类 exe 共用，不重复编译。
+#
+# 常用命令：
+#   cmake --build test/build                    # 构建全部
+#   cmake --build test/build --target aura_tests_sema
+#   ./test/build/aura_tests_sema.exe            # 只跑 sema
+#   ctest --test-dir test/build -j4             # 并行跑 9 个类别
 #
 # 目录组织（按编译器管道阶段）：
 #   framework/    测试基础设施（框架 / 入口 / 辅助工具）
@@ -77,7 +86,12 @@ ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/ExprClosureOldPath.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtSync.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtSpawn.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/CodeGen/StmtMatch.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Module/ExpandConst.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/Module/CompilationDriver.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Module/ModuleManager.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CompileTime/DeclIndex.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CompileTime/Evaluator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/CompileTime/EvalPass.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/Diag/DiagnosticEngine.cpp
 )
 
@@ -156,6 +170,7 @@ set(AURA_TEST_SOURCES
     parser/test_parser_stmt.cpp
     parser/test_parser_error.cpp
     parser/test_parser_enum.cpp
+    parser/test_parser_hash.cpp
 
     # ---- AST ----
     ast/test_ast.cpp
@@ -208,31 +223,84 @@ set(AURA_TEST_SOURCES
     # ---- 模块管理 ----
     module/test_module.cpp
     module/test_module_scan.cpp
+    module/test_const_expand.cpp     # feature-21 Phase 2（§4.1：#const 展开 / 单文件驱动）
+    module/test_macro_import.cpp     # feature-21 Phase 2（§4.2：宏生成 import / epoch 收敛）
+
+    # ---- 编译期求值（feature-21 Phase 3：Value / DeclIndex / EvalPass）----
+    compile_time/test_eval.cpp
 
     # ---- 端到端集成测试 ----
     integration/test_examples.cpp
 )
 
-add_executable(aura_tests ${AURA_TEST_SOURCES} ${AURA_LIB_SOURCES} ${AURA_RT_SOURCES})
+find_package(Threads REQUIRED)
 
-target_include_directories(aura_tests PRIVATE
+# ccache：测试构建同样吃缓存（2026-11-08）
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    message(STATUS ">>> ccache: ${CCACHE_PROGRAM}")
+endif()
+
+# ============================================================
+# 编译器 / 运行时核心：OBJECT 库只编一次，供所有测试 exe 复用
+# ============================================================
+add_library(aura_test_core OBJECT ${AURA_LIB_SOURCES} ${AURA_RT_SOURCES})
+target_include_directories(aura_test_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-
-# 运行期切换到项目根目录，使 ModuleManager 能找到 builtins/*.aurai
-target_compile_definitions(aura_tests PRIVATE
+target_compile_definitions(aura_test_core PRIVATE
     AURA_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
-# 线程库（协程/并发测试）
-find_package(Threads REQUIRED)
-target_link_libraries(aura_tests PRIVATE Threads::Threads)
+# ============================================================
+# 测试按类别拆分；测试源用 OBJECT 库只编一次。
+#   aura_tests_<cat>  : 单类别 exe（只编/链接该类）
+#   aura_tests        : 兼容总入口（链接全部 OBJECT，不重复编译测试源）
+# ============================================================
+set(AURA_TEST_CATEGORIES rt lexer parser ast sema codegen diag module compile_time integration)
+set(AURA_TEST_OBJECTS "")
 
-# 启用 CTest 注册
+function(aura_add_test_exe name)
+    add_executable(${name} framework/test_main.cpp
+        $<TARGET_OBJECTS:aura_test_core> ${ARGN})
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(${name} PRIVATE
+        AURA_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
+    )
+    target_link_libraries(${name} PRIVATE Threads::Threads)
+endfunction()
+
 enable_testing()
 
-# 注册到 CTest
-add_test(NAME aura_tests COMMAND aura_tests)
+foreach(cat IN LISTS AURA_TEST_CATEGORIES)
+    set(cat_sources ${AURA_TEST_SOURCES})
+    list(FILTER cat_sources INCLUDE REGEX "^${cat}/")
+    if(NOT cat_sources)
+        continue()
+    endif()
+    add_library(aura_tests_${cat}_obj OBJECT ${cat_sources})
+    target_include_directories(aura_tests_${cat}_obj PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(aura_tests_${cat}_obj PRIVATE
+        AURA_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
+    )
+    aura_add_test_exe(aura_tests_${cat} $<TARGET_OBJECTS:aura_tests_${cat}_obj>)
+    add_test(NAME aura_tests_${cat} COMMAND aura_tests_${cat})
+    list(APPEND AURA_TEST_OBJECTS $<TARGET_OBJECTS:aura_tests_${cat}_obj>)
+endforeach()
+
+# 兼容既有命令：.	estuildura_tests.exe
+aura_add_test_exe(aura_tests ${AURA_TEST_OBJECTS})

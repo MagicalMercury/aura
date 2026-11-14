@@ -211,6 +211,7 @@ private:
     void doLoadAurai(const Program& ast) {
         for (auto& d : ast.decls) {
             if (!d) continue;
+            if (isComptimeDecl(*d)) continue;   // feature-21：编译期声明不进内置注册表
             if (auto* td = dynamic_cast<const TypeDecl*>(d.get())) {
                 // .aurai 中的 type Name 是前向声明 — 不覆盖已有类型
                 if (types_.count(td->name)) continue;

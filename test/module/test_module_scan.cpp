@@ -659,3 +659,67 @@ TEST(ModuleScan, Bug94NonCollidingKeepsRawStem) {
     EXPECT_EQ(keys[(fs::absolute(fs::path(dir) / "lib.aura")).string()], "lib");  // 逐字节向后兼容
     fs::remove_all(dir);
 }
+
+// ============================================================
+// feature-21 Phase 1（N-1）：编译期声明不进跨模块函数骨架
+//
+// 声明级扫描（Parser::parseDeclarationsOnly → ModuleManager::scanDeclarations）
+// 必须与完整解析对 `#fun` / `#` 接收者方法给出「同一骨架口径」：两者都不是
+// 运行期函数（isComptimeDecl ⇒ 扫描侧跳过；CodeGen 侧亦过滤），故
+//   - unit.funcs 不含 `main`（#fun main）与 `m`（fun (self #Command) m）
+//   - unit.hasMain == false（#fun main 不是入口）
+//   - 普通 `fun f()` 仍在骨架里
+// ============================================================
+TEST(ModuleScan, ScanExcludesComptimeDecls) {
+    auto dir = c2TempDir();
+    const std::string src =
+        "#fun main() { }\n"
+        "fun (self #Command) m() { }\n"
+        "fun f() { }\n";
+    std::string path = c2Write(dir, "meta.aura", src);
+
+    // (a) 解析器层：三种声明都建出来（扫描只跳 body，不丢声明）
+    {
+        DiagnosticEngine diag;
+        diag.setSourceView(src);
+        Lexer lexer(src);
+        Parser parser(lexer.scanAll(), diag);
+        auto prog = parser.parseDeclarationsOnly();
+        ASSERT_TRUE(prog != nullptr);
+        EXPECT_FALSE(diag.hasErrors());
+        ASSERT_EQ(prog->decls.size(), (size_t)3);
+        auto* fnMain = as<FunDecl>(declAt(*prog, 0));
+        ASSERT_TRUE(fnMain != nullptr);
+        EXPECT_EQ(fnMain->name, "main");
+        EXPECT_TRUE(fnMain->isComptime);
+        auto* mth = as<MethodDecl>(declAt(*prog, 1));
+        ASSERT_TRUE(mth != nullptr);
+        EXPECT_EQ(mth->name, "m");
+        EXPECT_EQ(mth->receiverType, "#Command");
+        auto* fnF = as<FunDecl>(declAt(*prog, 2));
+        ASSERT_TRUE(fnF != nullptr);
+        EXPECT_EQ(fnF->name, "f");
+        EXPECT_FALSE(fnF->isComptime);
+    }
+
+    // (b) 模块层：骨架里只剩运行期函数 f
+    {
+        DiagnosticEngine diag;
+        ModuleManager mgr(diag);
+        DeclUnit unit = mgr.scanDeclarations(path);
+        EXPECT_FALSE(diag.hasErrors());
+        bool sawF = false, sawMain = false, sawM = false;
+        for (auto& fn : unit.funcs) {
+            if (fn.name == "f") sawF = true;
+            if (fn.name == "main") sawMain = true;
+            if (fn.name == "m") sawM = true;
+        }
+        EXPECT_TRUE(sawF);
+        EXPECT_FALSE(sawMain);      // #fun main 不是运行期入口
+        EXPECT_FALSE(sawM);         // `#` 接收者方法不是运行期方法
+        EXPECT_EQ(unit.funcs.size(), (size_t)1);
+        EXPECT_FALSE(unit.hasMain);
+    }
+
+    fs::remove_all(dir);
+}

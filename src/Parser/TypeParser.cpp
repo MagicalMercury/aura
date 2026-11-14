@@ -28,6 +28,17 @@ std::unique_ptr<TypeExpr> Parser::parseUnionType() {
 }
 
 std::unique_ptr<TypeExpr> Parser::parsePrimaryType() {
+    // feature-21：编译期类型引用 #Name / #ns.Name
+    if (check(TokType::Hash)) return parseMetaTypeName();
+    // feature-21：`type` 作为类型表达式（#T: type）
+    if (check(TokType::Type)) {
+        auto tok = advance();
+        auto n = std::make_unique<NamedType>();
+        setNodePos(n.get(), tok);
+        n->name = "type";
+        return n;
+    }
+
     // 泛型类型引用 <T>
     if (check(TokType::Less)) {
         advance(); // <
@@ -92,6 +103,18 @@ std::unique_ptr<TypeExpr> Parser::parsePrimaryType() {
         }
 
         return ft;
+    }
+
+    // feature-21 Phase 3（L1）：显式泛型声明 `fun f<T>(x: T)` —— 类型标注中命中当前
+    // 声明的泛型名的裸标识符直接解析为 GenericTypeRef（与旧式 `<T>` 同一个 AST 表示，
+    // Sema 无需第二套机制）。activeTypeParams_ 为空时（含旧式 `fun f(x: <T>)`）本分支
+    // 恒不命中 ⇒ 既有解析路径逐字不变。
+    if (check(TokType::Identifier) && isActiveTypeParam(peek().lexeme)) {
+        auto tok = advance();
+        auto n = std::make_unique<GenericTypeRef>();
+        setNodePos(n.get(), tok);
+        n->name = tok.lexeme;
+        return n;
     }
 
     // 命名类型，可能是泛型实例化: Name<T> 或 Name<A, B>
@@ -168,6 +191,24 @@ std::unique_ptr<TypeExpr> Parser::parsePrimaryType() {
 
     error("expected type");
     return nullptr;
+}
+
+// feature-21 Phase 1（S4）：`#Name` / `#ns.Name`（进入时 current = `#`）。
+// 名字以 `#` 前缀形式存进 NamedType::name（Sema 侧靠前缀识别编译期类型引用）。
+std::unique_ptr<TypeExpr> Parser::parseMetaTypeName() {
+    auto tok = advance(); // '#'
+    if (!(check(TokType::Identifier) || isKeywordIdent(peek().type))) {
+        error("expected type name after '#'");
+        return nullptr;
+    }
+    auto n = std::make_unique<NamedType>();
+    setNodePos(n.get(), tok);
+    n->name = "#" + advance().lexeme;
+    while (match(TokType::Dot)) {
+        n->namespacePrefix.push_back(n->name);
+        n->name = consume(TokType::Identifier, "expected type name after '.'").lexeme;
+    }
+    return n;
 }
 
 // ============================================================
@@ -250,8 +291,12 @@ std::unique_ptr<Pattern> Parser::parseSinglePattern() {
 
 Param Parser::parseParam() {
     Param p;
-    auto& nameTok = consume(TokType::Identifier, "expected parameter name");
-    p.name = nameTok.lexeme;
+    // feature-21 Phase 1（S4）：`#T` 形参（编译期类型/值参数），名字保留 `#` 前缀。
+    bool hashParam = match(TokType::Hash);
+    auto& nameTok = consume(TokType::Identifier,
+                            hashParam ? "expected type parameter name after '#'"
+                                      : "expected parameter name");
+    p.name = (hashParam ? "#" : "") + nameTok.lexeme;
 
     if (match(TokType::Colon)) {
         p.type = parseType();

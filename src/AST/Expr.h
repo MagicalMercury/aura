@@ -116,6 +116,79 @@ struct RecordExpr : ASTNode {
     }
 };
 
+// ============================================================
+// feature-21：编译期元数据表达式（Phase 1 只解析）
+// ============================================================
+struct MetaConstructExpr : ASTNode {
+    std::string typeName;
+    std::vector<RecordField> fields;   // 复用 { name, value }
+
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<MetaConstructExpr>();
+        n->typeName = typeName;
+        for (auto& f : fields) {
+            RecordField c;
+            c.name = f.name;
+            c.value = f.value ? f.value->clone() : nullptr;
+            n->fields.push_back(std::move(c));
+        }
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
+struct EvalExpr : ASTNode {                 // #(expr)
+    std::unique_ptr<ASTNode> expr;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<EvalExpr>();
+        if (expr) n->expr = expr->clone();
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
+struct MetaValueRefExpr : ASTNode {         // #c
+    std::string name;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<MetaValueRefExpr>();
+        n->name = name; n->line = line; n->col = col;
+        return n;
+    }
+};
+
+struct MetaCallExpr : ASTNode {             // #f(...) / #X{...}.m(...)
+    std::unique_ptr<ASTNode> callee;
+    // feature-21 Phase 3（L1）：`#f<int>(...)` 的显式类型实参（可省略）。
+    // 旧式 `#f(...)` 恒为空 ⇒ 既有行为逐字不变。
+    std::vector<std::unique_ptr<TypeExpr>> typeArgs;
+    std::vector<std::unique_ptr<ASTNode>> args;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<MetaCallExpr>();
+        if (callee) n->callee = callee->clone();
+        for (auto& t : typeArgs)
+            n->typeArgs.emplace_back(t ? std::unique_ptr<TypeExpr>(static_cast<TypeExpr*>(t->clone().release())) : nullptr);
+        for (auto& a : args) n->args.push_back(a ? a->clone() : nullptr);
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
+struct MetaMemberExpr : ASTNode {           // #CFG.priority / #reflect.target
+    std::unique_ptr<ASTNode> base;
+    std::string member;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<MetaMemberExpr>();
+        if (base) n->base = base->clone();
+        n->member = member; n->line = line; n->col = col;
+        return n;
+    }
+};
+
 struct BinaryExpr : ASTNode {
     std::string op;
     std::unique_ptr<ASTNode> left;

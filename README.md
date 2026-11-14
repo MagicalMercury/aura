@@ -23,6 +23,7 @@
 - [14. `path` 内置模块](READMEs/14-path-module.md)
 - [15. 完整示例](READMEs/15-example.md)
 - [16. `math` 内置模块](READMEs/16-math-module.md)
+- [17. 编译期与元数据（`#` 语法）](READMEs/17-compile-time.md)
 - [附录 A：`fun` 关键字的三种用法](READMEs/appendix-a-fun-usage.md)
 - [附录 B：速查表](READMEs/appendix-b-cheatsheet.md)
 - [附录 C：待开发特性](README.md#L31)

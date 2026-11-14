@@ -14,6 +14,9 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
         return nullptr;
     }
 
+    // feature-21 Phase 1（S6）：语句位 `#` —— `#const` 声明优先，其余走表达式
+    if (check(TokType::Hash)) return parseHashStmt();
+
     if (check(TokType::If))       return parseIfStmt();
     if (check(TokType::While))    return parseWhileStmt();
     if (check(TokType::Loop))     return parseLoopStmt();
@@ -455,6 +458,50 @@ std::unique_ptr<Stmt> Parser::parseExprStmt() {
     stmt->col  = expr->col;
     stmt->expr = std::move(expr);
     match(TokType::Semicolon);
+    return stmt;
+}
+
+std::unique_ptr<Stmt> Parser::parseHashStmt() {
+    if (peekAt(1).type == TokType::Const) {
+        // feature-21 Phase 2（N-31）：`Aura{...}` 引述体内禁止 `#const`（D5 不限层级）。
+        // §0.3：错误路径先消费 '#' 再返回 nullptr，让上层 parseBlock/parseQuoteBody 同步。
+        if (quoteDepth_ > 0) {
+            errorAt(peek(), "'#const' is not allowed inside 'Aura{...}'");
+            advance();                              // 消费 '#'
+            return nullptr;
+        }
+        advance(); // '#'
+        return parseHashConstDecl();
+    }
+
+    // feature-21 Phase 2（S3，D2）：语句位裸 `#name` ⇒ UnquoteItem（展开期按绑定值分类）。
+    // 判据：名字后不是 . / ( / { 后缀，且名字不是声明型关键字
+    //   —— `#type`/`#fun`/`#const` 仍由 parseHashExpr 的 H-4 拒绝，不得被本分支吃掉；
+    //   `#where` 的 peekAt(2) 是 '{'，不进本支，仍由 H-5 拒绝。
+    {
+        TokType t1 = peekAt(1).type;
+        if ((t1 == TokType::Identifier || isKeywordIdent(t1))
+            && t1 != TokType::Type && t1 != TokType::Fun && t1 != TokType::Const
+            && peekAt(2).type != TokType::Dot && peekAt(2).type != TokType::LParen
+            && peekAt(2).type != TokType::LBrace) {
+            auto hashTok = peek();
+            advance();                       // '#'
+            auto& nameTok = advance();       // 名字
+            auto u = std::make_unique<UnquoteItem>();
+            setNodePos(u.get(), hashTok);
+            u->name = nameTok.lexeme;
+            return u;
+        }
+    }
+
+    auto hashTok = peek();
+    auto hx = parseHashExpr();
+    // H-1/H-2：失败必须返回 nullptr —— parseBlock 只在 nullptr 时调 synchronize()；
+    // 恒返回非空会让循环原地打转，且 null expr 会下传导致下游崩溃。
+    if (!hx) return nullptr;
+    auto stmt = std::make_unique<ExprStmt>();
+    setNodePos(stmt.get(), hashTok);
+    stmt->expr = std::move(hx);
     return stmt;
 }
 

@@ -1,28 +1,185 @@
 #pragma once
+
 // ============================================================
-// ASTWalker — 基于模板的统一 AST 递归遍历框架
+// AstWalk — AST 遍历唯一入口
 //
-// 消除 CodeGen 中 5 处重复的 dynamic_cast 分发链：
-//   collectIdRefs / collectIdRefsExpr / collectDeclared
-//   scanStmtForCoroutine / scanExprForCoroutine
+// 本文件合并了原先分离的两层能力（2026-11-08）：
+//   1. 槽级遍历：forEachExprChild —— 对表达式节点的直接子槽回调，
+//      只负责“遍历”，不含任何展开/改写语义（feature-21 Phase 2）。
+//   2. 模板级遍历：StmtWalker / ExprWalker + 闭包分析 Visitor
+//      （原 src/ASTWalker.h；CodeGen / Sema / CallGraph 使用）。
 //
-// 用法: 定义一个 Visitor 类，为感兴趣的 AST 节点类型提供
-// visit() 方法（返回 bool: true=提前终止遍历），然后将 Visitor
-// 传给 walkStmt/walkExpr。
-//
-// 每个 Visitor 必须实现:
-//   bool visit(const <NodeType>& node, V& self)
-// 其中 self 是 Visitor 自身的引用，用于递归调用 walkStmt/walkExpr。
+// 槽类型约定：
+//   ExprSlot = std::unique_ptr<ASTNode>&
+//   TypeExpr / Block 槽以 release → ASTNode 代理 → restore 包装后透传；
+//   回调若改写槽，必须保证产物仍是原槽的静态类型。
 // ============================================================
 
-#include "AST/Expr.h"
-#include "AST/Stmt.h"
+#include "Expr.h"
+#include "Stmt.h"
 
+#include <cassert>
+#include <functional>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
 namespace Aura {
+
+namespace astwalk_detail {
+
+// Expr 槽：字段本身就是 unique_ptr<ASTNode>，直接交引用。
+inline void visitExprSlot(std::unique_ptr<ASTNode>& slot,
+                          const std::function<void(std::unique_ptr<ASTNode>&)>& fn) {
+    if (slot) fn(slot);
+}
+
+// TypeExpr 槽：unique_ptr<TypeExpr> 与 ExprSlot 类型不兼容，借代理透传。
+inline void visitTypeSlot(std::unique_ptr<TypeExpr>& slot,
+                          const std::function<void(std::unique_ptr<ASTNode>&)>& fn) {
+    if (!slot) return;
+    std::unique_ptr<ASTNode> proxy(slot.release());
+    fn(proxy);
+    slot.reset(static_cast<TypeExpr*>(proxy.release()));
+}
+
+// Block 槽：同上（§8.3 明确禁止把 Block 槽传给 unique_ptr<Stmt>&）。
+inline void visitBlockSlot(std::unique_ptr<BlockStmt>& slot,
+                           const std::function<void(std::unique_ptr<ASTNode>&)>& fn) {
+    if (!slot) return;
+    std::unique_ptr<ASTNode> proxy(slot.release());
+    fn(proxy);
+    slot.reset(static_cast<BlockStmt*>(proxy.release()));
+}
+
+} // namespace astwalk_detail
+
+// 对表达式节点的每一个**直接子槽**回调一次 fn（顺序 = 源码字段顺序）。
+// 嵌套载体（§8.4）虽不是 ASTNode 字段，但其内含表达式同样逐个回调：
+//   RecordExpr::fields[].value、MetaConstructExpr::fields[].value、
+//   FunExpr::params[].defaultExpr。
+// 叶节点（§8.5）无子槽，直接返回。
+inline void forEachExprChild(ASTNode& node,
+                             const std::function<void(std::unique_ptr<ASTNode>&)>& fn) {
+    using astwalk_detail::visitExprSlot;
+    using astwalk_detail::visitTypeSlot;
+    using astwalk_detail::visitBlockSlot;
+
+    // ---- 叶节点（§8.5：无子槽，无需实现） ----
+    if (dynamic_cast<IntLiteral*>(&node))       return;
+    if (dynamic_cast<FloatLiteral*>(&node))     return;
+    if (dynamic_cast<StringLiteral*>(&node))    return;
+    if (dynamic_cast<BoolLiteral*>(&node))      return;
+    if (dynamic_cast<NoneLiteral*>(&node))      return;
+    if (dynamic_cast<Identifier*>(&node))       return;   // §8.5 的 IdentExpr
+    if (dynamic_cast<MetaValueRefExpr*>(&node)) return;
+
+    // ---- TypeExpr 族（§8.5：类型节点在本 pass 视为叶；类型槽的改写由
+    //      rewriteTypeSlot 在槽层处理，不下钻到类型内部） ----
+    if (dynamic_cast<TypeExpr*>(&node)) return;
+
+    // ---- §8.1 Expr 槽 ----
+    if (auto* e = dynamic_cast<ListExpr*>(&node)) {                 // elements
+        for (auto& it : e->elements) visitExprSlot(it, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<RecordExpr*>(&node)) {               // fields[].value, typeArgs
+        for (auto& f : e->fields) visitExprSlot(f.value, fn);
+        for (auto& t : e->typeArgs) visitTypeSlot(t, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<MetaConstructExpr*>(&node)) {        // fields[].value（§8.4）
+        for (auto& f : e->fields) visitExprSlot(f.value, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<EvalExpr*>(&node)) {                 // expr
+        visitExprSlot(e->expr, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<MetaCallExpr*>(&node)) {             // callee, typeArgs, args
+        visitExprSlot(e->callee, fn);
+        for (auto& t : e->typeArgs) visitTypeSlot(t, fn);   // feature-21 Phase 3（L1）
+        for (auto& a : e->args) visitExprSlot(a, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<MetaMemberExpr*>(&node)) {           // base
+        visitExprSlot(e->base, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<BinaryExpr*>(&node)) {               // left, right
+        visitExprSlot(e->left, fn);
+        visitExprSlot(e->right, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<ConditionalExpr*>(&node)) {          // cond, then, else
+        visitExprSlot(e->cond, fn);
+        visitExprSlot(e->thenBranch, fn);
+        visitExprSlot(e->elseBranch, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<UnaryExpr*>(&node)) {                // operand
+        visitExprSlot(e->operand, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<CallExpr*>(&node)) {                 // callee, args, typeArgs
+        visitExprSlot(e->callee, fn);
+        for (auto& a : e->args) visitExprSlot(a, fn);
+        for (auto& t : e->typeArgs) visitTypeSlot(t, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<MethodCallExpr*>(&node)) {           // object, args
+        visitExprSlot(e->object, fn);
+        for (auto& a : e->args) visitExprSlot(a, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<MemberAccessExpr*>(&node)) {         // object
+        visitExprSlot(e->object, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<IndexExpr*>(&node)) {                // object, index
+        visitExprSlot(e->object, fn);
+        visitExprSlot(e->index, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<AssignExpr*>(&node)) {               // target, value
+        visitExprSlot(e->target, fn);
+        visitExprSlot(e->value, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<ErrorPropagationExpr*>(&node)) {     // expr
+        visitExprSlot(e->expr, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<PipeExpr*>(&node)) {                 // left, right
+        visitExprSlot(e->left, fn);
+        visitExprSlot(e->right, fn);
+        return;
+    }
+
+    // ---- 表达式位的块节点（§8.2 末行：block 走 rewriteBlock，此处只透传 Block 槽） ----
+    if (auto* e = dynamic_cast<EvalBlockExpr*>(&node)) {
+        visitBlockSlot(e->block, fn);
+        return;
+    }
+    if (auto* e = dynamic_cast<QuoteExpr*>(&node)) {
+        visitBlockSlot(e->block, fn);
+        return;
+    }
+
+    // ---- FunExpr：params[].defaultExpr（§8.4）+ returnType + body ----
+    if (auto* e = dynamic_cast<FunExpr*>(&node)) {
+        for (auto& p : e->params) visitExprSlot(p.defaultExpr, fn);
+        visitTypeSlot(e->returnType, fn);
+        visitBlockSlot(e->body, fn);
+        return;
+    }
+
+    // ---- 未列出的节点：AURA_DEBUG 下必须暴露，Release 静默跳过（红线 5） ----
+#if defined(AURA_DEBUG)
+    assert(false && "forEachExprChild: unhandled AST node (append to change.md 附录 A)");
+#endif
+}
 
 // ============================================================
 // StmtWalker — 遍历所有 Stmt/Decl 子类型

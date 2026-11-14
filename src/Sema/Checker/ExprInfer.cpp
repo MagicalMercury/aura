@@ -31,6 +31,16 @@ std::unique_ptr<SemType> SemAnalyzer::inferExpr(const ASTNode& expr,
     else if (auto* e = dynamic_cast<const PipeExpr*>(&expr))            result = inferPipe(*e);
     else if (auto* e = dynamic_cast<const ConditionalExpr*>(&expr))     result = inferConditional(*e, expected);
     else if (auto* e = dynamic_cast<const FunExpr*>(&expr))             result = inferFunExpr(*e, expected);
+    else if (dynamic_cast<const MetaConstructExpr*>(&expr)
+          || dynamic_cast<const EvalExpr*>(&expr)
+          || dynamic_cast<const EvalBlockExpr*>(&expr)
+          || dynamic_cast<const MetaValueRefExpr*>(&expr)
+          || dynamic_cast<const MetaCallExpr*>(&expr)
+          || dynamic_cast<const MetaMemberExpr*>(&expr)
+          || dynamic_cast<const QuoteExpr*>(&expr)) {
+        error(expr, "compile-time expressions are not supported yet (feature-21 Phase 3)");
+        return ErrorSemType::make();
+    }
     else {
         error(expr, "internal error: unknown expression node in type inference");
         return ErrorSemType::make();

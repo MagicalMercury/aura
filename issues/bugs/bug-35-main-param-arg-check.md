@@ -72,3 +72,14 @@ tags:
 
 ---
 **当前状态**：`2026-08-30` 修复 bug-28 时登记（待修复，独立缺陷）
+
+---
+
+## 8. 2026-11-01 复核补证（feature-21 Phase 2 S7）
+
+- **无 `#const` 对照件**：`fun main() { }` ⇒ `aurac -S` rc=0，但产物自相矛盾：
+  ```cpp
+  void aura_main() { ::aura_main(io); }   // 定义无参、调用带 io
+  ```
+- `g++ -std=gnu++20 -fsyntax-only` ⇒ `error: too many arguments to function 'void aura_main()'`。
+- 结论：本缺陷仍可复现，优先级维持 high；Phase 2 无关联。

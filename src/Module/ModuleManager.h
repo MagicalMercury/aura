@@ -209,6 +209,31 @@ public:
     // modules_ 填充顺序与调度序无关（runSemaModule 按拓扑层消费）。
     bool loadAllScanned();
 
+    // ============================================================
+    // feature-21 Phase 2 §3.6：`#const` 驱动的接线面（由 CompilationDriver 消费）
+    // ============================================================
+
+    // 按绝对路径加载单个源文件（宏生成 import 的按需加载）：parseModule → modules_
+    // 与 scanUnits_（deps/imports/hasMain 取自 AST 顶层）。已加载 ⇒ 直接返回 true。
+    bool ensureModuleLoaded(const std::string& absPath);
+
+    // R-11 / N-7：用**展开后的 AST** 重建每个模块的 imports / deps / hasMain。
+    // deps 与 imports.path 同一契约：一律绝对路径（相对 import 在此解析）。
+    void refreshDeclUnitsFromAst();
+
+    // 宏生成 import 的解析入口（§3.4.5 R-6/D7）：与 ModuleManager::resolveImportPath 同语义，
+    // 供 ExpandConst 的 unquote 阶段按「定义处目录」解析（D-4）。
+    std::string resolveImportPathFrom(const std::string& importPath,
+                                      const std::string& baseDir) const
+    { return resolveImportPath(importPath, baseDir); }
+
+    // 同 checkModuleConflicts()，但把诊断写到调用者给的引擎（驱动器每轮加载新模块后复查）。
+    bool checkModuleConflicts(DiagnosticEngine& diag) const;
+
+    // §3.6.1：Parser 不知道文件路径 ⇒ 解析成功后由本函数递归写入 HashConstDecl::originFile
+    // （含块内 / 函数体 / 引述体）。必须在建表与展开**之前**调用。
+    static void stampOriginFile(Program& program, const std::string& filePath);
+
     // 加载 builtins/ 下的 .aurai 文件（始终加载：io.aurai）
     void loadBuiltinAurai();
 
@@ -244,6 +269,10 @@ private:
     // 解析 import 语句的路径为绝对路径
     std::string resolveImportPath(const std::string& importPath,
                                    const std::string& importerDir) const;
+
+    // feature-21 Phase 2 §3.6：用 AST 顶层重建单个 DeclUnit（ensureModuleLoaded /
+    // refreshDeclUnitsFromAst 共用）。只改 imports / deps / hasMain（骨架字段不动）。
+    void rebuildDeclUnit(const std::string& absPath, Program& ast, DeclUnit& u);
 
     // 内置模块白名单
     bool isKnownBuiltin(const std::string& name) const;

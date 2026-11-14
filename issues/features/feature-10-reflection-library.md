@@ -7,7 +7,7 @@ priority: P2
 estimated_effort: L
 blocked_by: []
 discover_date: 2026-09-12
-revised_date: 2026-10-05
+revised_date: 2026-10-17
 tags:
   - reflection
   - reflect
@@ -17,17 +17,18 @@ tags:
   - stdlib
 related_issues:
   - "[[feature-18-coroutine-error-semantics-and-diagnostics]]"
+  - "[[feature-21-compile-time-metadata-system]]"
 ---
 
 # 【反射元数据表 + reflect 运行时】[ ] **主标题：编译期符号元数据表（收集形态）+ 运行时静态数据与 reflect API（运行时形态）——以 CallableObj 为唯一动态调用载体**
 
 > **一句话摘要**：编译器在编译期为全部符号（函数 / 方法 / record 类型）生成一张**符号元数据表**（收集形态）；按使用面裁剪后，落地为产物内的 **C++ 静态数据**（运行时形态），由标准库 `reflect` 模块读取。**动态调用一律经 `CallableObj` / `CallableErased`**（复用 feature-06/07 全部成果），不另起调用机制。**Aura 层 `reflect` 库的规范形态一律以 `plan/hash-metadata-requirements.md`（v0.3）§9 为准。**
 
-> **范围声明（2026-09-12 修订；2026-10-05 对齐 v0.3）**：本文**只设计两个形态**——
+> **范围声明（2026-09-12 修订；2026-10-05 对齐 v0.3；2026-10-17 对齐 v0.4.1）**：本文**只设计两个形态**——
 > **① 收集形态**（表里放什么、怎么组织、怎么裁剪）
 > **② 运行时形态**（表落地成什么 + reflect API 怎么读 + 与 CallableObj 的联动契约）
 >
-> **明确留空（不在本文范围）**：`#` 语法设计（注解怎么写 / 守卫块 / 标记）、**编译期形态**（编译期类型一等值 / comptime 查询）、宏系统。这些在 [[feature-08-configurator-reflection]]（§2.1/§2.2/§2.4/§2.5）/ [[feature-09-annotator]]（§2.1/§2.2/§2.5）/ [[feature-11-compile-time-functions]]（§2.1/§2.2/§2.4/§2.6）中另有规范；**语法规范正文以 `plan/hash-metadata-requirements.md`（v0.3）为准**。
+> **明确留空（不在本文范围）**：`#` 语法设计（注解怎么写 / 守卫块 / 标记）、**编译期形态**（编译期类型一等值 / comptime 查询）、宏系统。这些**统一由 [[feature-21-compile-time-metadata-system]] 规范**（`#` 元数据与编译期体系 v0.4.1；规范正文 = 该笔记附录 A，逐字收录自 `question.txt`）。原 feature-08 / feature-09 / feature-11 已于 2026-10-17 标记弃用，仅作历史存档。
 >
 > **与 v0.3 不一致、已移出正文的内容**：`construct` / `get` / `set` + `reflect.Instance`（**D-12**）、`reflect.Type.type_params()`（**D-13**）、各 `*Entry` 的逐条 `kind` 值域细分（**D-14**）、§3.3/§3.4 的旧命名 / 字段式写法（**D-15**）、`typeof` 内建提议（**D-17**）、§11.6 派生「已定」判定（**D-18**）—— 集中登记于 `plan/hash-v0.3-feature-deltas.md`，本文正文只保留指向它的引用行。
 
@@ -349,9 +350,9 @@ reflect.call("Player", "heal", [Any.of(p), Any.of(10)])   // -> reflect.Any
 
 ## 8. 相关资源与参考
 
-- **权威语法规范**：`plan/hash-metadata-requirements.md`（v0.3）—— 本文 §11.1/§11.5/§11.6 的上游语法引用一律以其为准（五档角色 §1.2 / 精确语义 §1.3 / 骨架 §3.1 / `#type`·元数据 §4 / `#fun`·`Code` §6.4 / 值注入 §7.4 / `#c` 展开 §7.6 / `reflect` 库 §9 / 待裁定 §12）。
+- **权威语法规范**：`question.txt`（v0.4.1，逐字收录于 [[feature-21-compile-time-metadata-system]] 附录 A）—— 本文 §11.1/§11.5/§11.6 的上游语法引用一律以其为准（六种角色 §1.2 / 精确语义 §1.3 / 骨架 §3.1 / `#type`·元数据 §4 / `#fun`·`Code` §7.4 / 值注入 §8.4 / `#c` 展开 §8.6 / `reflect` 库 §10 / 待裁定 §13）。
 - **差异登记**：`plan/hash-v0.3-feature-deltas.md`—— 与 v0.3 有区别 / 需裁定项（**D-12** `construct`/`get`/`set`+`reflect.Instance` / **D-13** `type_params()` / **D-14** `*Entry` 逐条 kind 值域 / **D-15** §3.3 旧命名·字段式 / **D-16** §2.3 kind 补 `fun` / **D-17** `typeof` / **D-18** §11.6 派生「已定」）集中登记于此，本文正文只保留指向它的引用行。
-- **上游**：[[feature-08-configurator-reflection]]（`#` 语法族 v1 骨架；§2.1/§2.2/§2.4/§2.5）、[[feature-09-annotator]]（注解生产端；§2.1/§2.2/§2.5）、[[feature-11-compile-time-functions]]（编译期函数；§2.1/§2.2/§2.4/§2.6）。
+- **上游**：[[feature-21-compile-time-metadata-system]]（`#` 元数据与编译期体系 v0.4.1 的统一规范；取代已弃用的 feature-08 / feature-09 / feature-11）。
 - **依赖**：[[feature-05-unify-variant-replace-std-variant]]（Variant → Any）、[[feature-06-unified-callable-origins]]（CallableObj / CallableErased）、[[feature-07-callableobj-remaining-forms-migration]]（协程闭包 = `CallableObj<task<R>,A...>`，使协程动态调用可行）、bug-79 修复（GcRootHandle Value）。
 - **代码锚点**：
   - `runtime/builtin/callable.h:37/56/76/111` —— `CallableObj` / `CallArg` / `CallableErased` / 适配 lambda
@@ -445,26 +446,28 @@ feature-13 两遍扫描 → 全局符号表（编译期唯一真相源）
 
 ## 11. 补充记录：Aura 层元数据类型族与 API（2026-10-04，收录主人草案修订版）
 
+> ⚠️ **本节为历史存档（2026-10-05 v0.3 口径；2026-10-17 冻结）**：下文出现的 `v0.3 §N` 是**当时的章节号**，v0.4.1 已重排（例如 reflect 库 v0.3 §9 → v0.4.1 §10、待裁定 v0.3 §12 → v0.4.1 §13）。与 v0.4.1 的对应关系与差异处置见 **§12.1**；规范正文本体见 [[feature-21-compile-time-metadata-system]] 附录 A。除 §12.1 已列出的处置外，本节不再随规范更新（`kind` 值域待 #26 enum 替换）。
+
 > 📌 **时间序增补之③**。本轮主题：把主人 `newIssue.txt` 第 3 项草案的 **reflect 侧**修订后收入。**结构**：11.1 上游引用 / 11.2 类型族 / 11.3 命名映射 / 11.4 API / 11.5 消费链路 / 11.6 待裁定 / 11.7 修订对照。
 >
 > 📌 **2026-10-05 按 v0.3 复核并全量重写**：本节（§11.1–§11.7）逐项对齐 `plan/hash-metadata-requirements.md`（v0.3）§9 —— §11.1 上游引用引 v0.3 且「`#` 四角色」改**五档角色**（§1.2）；§11.2 类型族与 §9.1 逐项对齐，**本文两处增量（`reflect.Type` 视图方法 `type_params()` 与 `*Entry` 逐条 kind 值域细分）已移出（**D-13** / **D-14**，见 `plan/hash-v0.3-feature-deltas.md`）**；§11.3 旧命名行（D-15）移出；§11.4 内置函数与 §9.2 对齐，**`construct`/`get`/`set`（D-12）与 `typeof` 提议（D-17）移出**；§11.5 消费链路引 `Code` 三位置（§6.4）与 `#c` 挂载（§7.6.5）；§11.6 待裁定加「v0.3 §12 状态」列，**派生「已定」判定逐条标 D-18**。**§11.7 修订对照保留。**
 
 > **来源**：主人 2026-10-04 `newIssue.txt` 第 3 项草案（「`#` 配置器 + 反射机制」）。
-> **收录范围**：草案的 **reflect 侧**（Aura 层可见类型族 / API / `Any` 约束）。草案的 **`#` 语法侧**（`#type` / `#interface` / `#fun` 的定位与统一模型）**不入本文正文** —— 本文范围声明已明确留空「`#` 语法设计 + 编译期形态」，故 §11.1 只列引用行，规范正文归 feature-08 / 09 / 11。
+> **收录范围**：草案的 **reflect 侧**（Aura 层可见类型族 / API / `Any` 约束）。草案的 **`#` 语法侧**（`#type` / `#interface` / `#fun` 的定位与统一模型）**不入本文正文** —— 本文范围声明已明确留空「`#` 语法设计 + 编译期形态」，故 §11.1 只列引用行，规范正文归 [[feature-21-compile-time-metadata-system]]（v0.4.1）。
 > **修订原则**：① 与 §2 / §3 / §4 既有形态**只做映射、不改结构**；② 与 D1–D9、C1–C5、§10 契约**逐条对齐**；③ 草案与既有决策冲突处**以既有决策为准**，改法逐条记于 §11.7。
 
 ### 11.1 上游 `#` 语法族契约（引用，不含规范正文）
 
-> **本节只列引用行与落位**：`#` 语法的**规范正文以 v0.3 为准**（`plan/hash-metadata-requirements.md`）—— 五档角色（**§1.2**）/ 精确语义（**§1.3**）/ 形态骨架（**§3.1**）/ 编译期类型与元数据（**§4**）/ `#fun` 与 `Code`（**§6.4**）/ 值注入（**§7.4**）/ `#c` 展开（**§7.6**）/ `reflect` 库（**§9**）。本文不重复定义。
+> **本节只列引用行与落位**：`#` 语法的**规范正文以 v0.4.1 为准**（`question.txt`，逐字收录于 [[feature-21-compile-time-metadata-system]] 附录 A）—— 六种角色（**§1.2**）/ 精确语义（**§1.3**）/ 形态骨架（**§3.1**）/ 编译期类型与元数据（**§4**）/ `#fun` 与 `Code`（**§7.4**）/ 值注入（**§8.4**）/ `#c` 展开（**§8.6**）/ `reflect` 库（**§10**）。本文不重复定义。
 
 | 上游项 | 归属 | 与本文的关系 |
 | :--- | :--- | :--- |
-| `#` 统一语义 = **「编译期」直觉 + 五档角色**（**v0.3 §1.2**：**定义标记** / **类型引用** / **调用标记** / **值引用·注入** / **求值标记**；精确语义见 v0.3 §1.3「默认不在编译期发生的事」） | v0.3 §1.1–§1.3（规范正文）+ [[feature-08-configurator-reflection]]（语法族骨架）+ [[feature-11-compile-time-functions]] §2.1（五档角色引用） | 本文**只消费其产物**：注解挂载 → 收集形态 → 裁剪 → 运行时形态 |
-| `#type X = {...}`（schema 定义）/ `#X{...}`（声明挂载） | v0.3 §4.1–§4.3 + feature-08 §2.1 / [[feature-09-annotator]] §2.1 | 生产端；`reflect.collect(name)` 的输入 |
-| `#interface`（元数据面 **or** 接口默认方法，**定位待裁定**） | feature-09 §2.2 详解示例 5 + 待裁定（v0.3 §12-6） | 若裁定含元数据面 ⇒ 产生 `reflect.InterfaceEntry`（§11.2） |
-| `#fun`（注解器）/ `#(...)`、`#reflect.*`（编译期求值·消费） | v0.3 §6.1 / §6.4 + feature-09 §2.2 / feature-11 §2.2 / §2.4 | 编译期消费端；**本文不定义**，只记其读表链路（§11.5） |
-| 既有 `#ns.key = value` **编译器指令**（现状 `ConfigDecl`；唯一在用键 `#io.sync`） | 现状实现：`src/AST/Stmt.h:492`、`src/Parser/DeclParser.cpp:19/:310`、`src/Sema/SemAnalyzer.cpp:102` | **v0.3 §1.5 / §3.1：`#` + 标识符 + `.` 仍是指令，暂不处理，不属元数据族**（非五档之一）；本文不涉及其语义，仅作为上游消解文法的约束依据 |
-| `reflect.Type` 的**编译期镜像**（`#reflect.typeof` 等） | feature-11 §2.3（编译期求值）+ v0.3 §9.3（双态） | 本文只要求**双态同名同义**（内部决策 D15） |
+| `#` 统一语义 = **「编译期」直觉 + 六种角色**（**v0.4.1 §1.2**：**定义标记** / **类型引用** / **调用标记** / **值引用·注入** / **求值标记** / **编译期成员访问**；精确语义见 v0.4.1 §1.3「默认不在编译期发生的事」） | v0.4.1 §1.1–§1.3 + [[feature-21-compile-time-metadata-system]] §2.1 | 本文**只消费其产物**：注解挂载 → 收集形态 → 裁剪 → 运行时形态 |
+| `#type X = {...}`（schema 定义）/ `#X{...}`（声明挂载） | v0.4.1 §4.1–§4.3 + [[feature-21-compile-time-metadata-system]] §2.2 | 生产端；`reflect.collect(name)` 的输入 |
+| `#interface`（元数据面 **or** 接口默认方法，**定位待裁定**） | 待裁定（v0.4.1 §13-6） | 若裁定含元数据面 ⇒ 产生 `reflect.InterfaceEntry`（§11.2） |
+| `#fun`（注解器）/ `#(...)`、`#reflect.*`（编译期求值·消费） | v0.4.1 §7.1 / §7.4 / §8 / §10 | 编译期消费端；**本文不定义**，只记其读表链路（§11.5） |
+| 既有 `#ns.key = value` **编译器指令**（现状 `ConfigDecl`；唯一在用键 `#io.sync`） | 现状实现：`src/AST/Stmt.h:492`、`src/Parser/DeclParser.cpp:19/:310`、`src/Sema/SemAnalyzer.cpp:102` | **v0.4.1 §1.5 / §3.1：`#` + 标识符 + `.` 仍是指令，暂不处理，不属元数据族**（非六种角色之一）；本文不涉及其语义，仅作为上游消解文法的约束依据 |
+| `reflect.Type` 的**编译期镜像**（`#reflect.typeof` 等） | v0.4.1 §10.4（双态） | 本文只要求**双态同名同义**（内部决策 D15） |
 
 ### 11.2 Aura 层类型族
 
@@ -668,3 +671,31 @@ CodeGen 收集 → 收集形态（全量符号表）                        （�
 `2026-10-04` **同轮裁定**：**D16**（`CallableEntry = FunEntry | MethodEntry`）、**D17**（条目内类型字段用 `reflect.Type` 视图）—— 均已扩散到 §11.2 / §11.4 / §11.6 / §11.7 / 附录。
 
 `2026-10-04` **结构整理**：新增**顶部导航台**（主题索引 + 三层命名速查）+ 8 处**交叉引用注**（§2.3 / §3.1 / §3.3 / §4 / §7 / §9 / §10 / §11）；**小节编号一律未动**（外部文档与 `runtime/meta.h` 注释引用它们）。
+
+## 12. 与 feature-21（`#` 元数据体系 v0.4.1）的对接（2026-10-17）
+
+> **分工**：元数据的**语法与编译期语义**以 [[feature-21-compile-time-metadata-system]] 为准（规范正文 = `question.txt` v0.4.1，逐字收录于该笔记附录 A）；本笔记只负责 **reflect 库**这一侧的落地——类型族、静态表、裁剪规则、运行期 API。
+
+### 12.1 本笔记中已被 v0.4.1 收敛 / 改写的口径
+
+| 本笔记（2026-10-04 草案） | v0.4.1 定稿 | 处置 |
+| :--- | :--- | :--- |
+| `#code` / `#code()` 作为隐式名字 | **删除**；改由 `target.func`（已绑定实参的闭包）显式访问（§7.4 决策 1） | 本笔记相关段落作废 |
+| 注解器返回值的构造方式未定 | `Aura{...}` 是**引述** + 模型甲（引述时替换注解器作用域的值）（§7.4 决策 2） | 以 v0.4.1 为准 |
+| reflect 对象可写 / 可构造的暗示 | **所有对象都是只读视图**；`reflect.Any` / `reflect.Instance` 例外（它们是运行期值） | 以 v0.4.1 §10.1 为准 |
+| `kind()` / `Entry.kind` 用 `string` 值域 | **待 enum 替换**（§13-26）——前提是确认「enum 成员名能否是关键字」 | 暂按 `string` 版保留，Phase 8 与 enum 同批改 |
+| `reflect.collect` / `invoke` 的字段与调用形态 | **Q12 待裁定**（`e.config` vs `e.metadata[0].config`；`e.invoke` vs `reflect.invoke`） | 保持开放，不先行实现 |
+| 编译期 `#reflect.*` 的建模 | `#reflect` = 预定义 `#type` + 单例 `#const`（建模甲，§10.6）；`target()` 只存在于编译期 | 以 v0.4.1 为准 |
+
+### 12.2 本笔记仍然有效的部分
+
+- §2「一张表 + 按需裁剪」的总体思路与 v0.4.1 §12 一致（编译期生成完整符号元数据表，运行期按需裁剪）。
+- §3 运行时形态、§4 裁剪规则、§10 `materialize` 列的可空契约——属实现细节，不受 v0.4.1 影响。
+- `reflect.Any` 必须能在调用前推断出具体类型、**禁止**承载「未知类型」——v0.4.1 §10.2 原样保留。
+
+### 12.3 实施顺序（与 feature-21 Phase 对齐）
+
+1. feature-21 **Phase 4**（`#type` 登记）完成后，本笔记的静态表才有注解列可写；
+2. feature-21 **Phase 5** 与本笔记的编译期 / 运行期 API **同批落地**（`#reflect.*` + `reflect.*`），禁止单边先合；
+3. **#26 enum 替换**在 feature-21 Phase 8 与本笔记的 `kind` 值域**同批改**；
+4. 零成本判据（无 `import reflect` 且无注解 ⇒ 产物零变化）由两笔记共同验收。

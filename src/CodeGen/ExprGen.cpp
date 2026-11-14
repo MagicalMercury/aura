@@ -266,6 +266,14 @@ std::string CodeGenerator::genExpr(const ASTNode& expr, bool isCoroutine) {
         return genConditionalExpr(*e, isCoroutine);
     if (auto* e = dynamic_cast<const FunExpr*>(&expr))
         return genFunExpr(*e, isCoroutine);
+    if (dynamic_cast<const MetaConstructExpr*>(&expr)
+        || dynamic_cast<const EvalExpr*>(&expr)
+        || dynamic_cast<const EvalBlockExpr*>(&expr)
+        || dynamic_cast<const MetaValueRefExpr*>(&expr)
+        || dynamic_cast<const MetaCallExpr*>(&expr)
+        || dynamic_cast<const MetaMemberExpr*>(&expr)
+        || dynamic_cast<const QuoteExpr*>(&expr))
+        return "/* unsupported compile-time expression */";
     return "/* ??? */";
 }
 

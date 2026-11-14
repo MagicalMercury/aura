@@ -259,7 +259,7 @@ std::unique_ptr<ASTNode> Parser::parseCall() {
             // 循环继续：支持 Box<int>{...}.x / take(Box<int>{...}) 等后缀（与 Point{x=1}.x 同构）
             continue;
         } else if (match(TokType::Dot)) {
-            auto& memberTok = consume(TokType::Identifier, "expected member name after '.'");
+            auto& memberTok = consumeMemberName();
 
             if (check(TokType::LParen)) {
                 auto mc = std::make_unique<MethodCallExpr>();
@@ -328,6 +328,21 @@ std::unique_ptr<ASTNode> Parser::parsePrimary() {
         Token& errTok = advance();
         error("lexical error: " + errTok.lexeme);
         return nullptr;
+    }
+
+    // feature-21：`#(...)` / `#{...}` / `#name...`
+    if (check(TokType::Hash)) return parseHashExpr();
+
+    // feature-21：`Aura { ... }` 引述（**裸标识符 + 紧跟 '{'**；规范 §7.4）
+    if (check(TokType::Identifier) && peek().lexeme == "Aura"
+        && peekNext().type == TokType::LBrace) {
+        auto tok = advance(); // Aura
+        auto n = std::make_unique<QuoteExpr>();
+        setNodePos(n.get(), tok);
+        // feature-21 Phase 2（S3，D5）：引述体允许普通声明（含 import）+ 语句；
+        // 编译期声明由 parseQuoteBody 拒绝。`#{...}`（求值块）仍走 parseBlock。
+        n->block = parseQuoteBody();
+        return n;
     }
 
     // 闭包表达式: fun (params) -> Ret { body }
@@ -440,6 +455,96 @@ std::unique_ptr<ASTNode> Parser::parsePrimary() {
 }
 
 // ============================================================
+// feature-21 Phase 1（S6）：表达式侧 `#` 语法
+// ============================================================
+std::unique_ptr<ASTNode> Parser::parseHashExpr() {
+    auto hashTok = peek();   // '#'
+
+    // H-4：这三种只能作声明。`isKeywordIdent` 覆盖 Fun..None（含 Type/Fun/Const），
+    // 不先拒绝会被静默当成值引用。
+    if (peekAt(1).type == TokType::Type || peekAt(1).type == TokType::Fun
+        || peekAt(1).type == TokType::Const) {
+        error("'#type'/'#fun'/'#const' can only be used as declarations");
+        advance();   // 错误路径必须消费（H-1）
+        return nullptr;
+    }
+
+    // H-5：`#where` 在表达式位不是构造
+    if (peekAt(1).type == TokType::Identifier && peekAt(1).lexeme == "where") {
+        error("'#where' must follow a declaration");
+        advance();   // 错误路径必须消费（H-1）
+        return nullptr;
+    }
+
+    if (peekAt(1).type == TokType::LParen) {
+        advance(); // '#'
+        advance(); // '('
+        auto n = std::make_unique<EvalExpr>();
+        setNodePos(n.get(), hashTok);
+        n->expr = parseExpr();
+        consume(TokType::RParen, "expected ')' after compile-time expression");
+        return n;
+    }
+
+    if (peekAt(1).type == TokType::LBrace) {
+        advance(); // '#'
+        auto n = std::make_unique<EvalBlockExpr>();
+        setNodePos(n.get(), hashTok);
+        n->block = parseBlock();
+        return n;
+    }
+
+    if (peekAt(1).type == TokType::Identifier && peekAt(2).type == TokType::LBrace)
+        return parseMetaSuffix(parseMetaConstructAfterHash(), hashTok);   // #X{...}
+
+    if (peekAt(1).type == TokType::Identifier && peekAt(2).type == TokType::LParen)
+        return parseMetaSuffix(parseHashCallAfterHash(), hashTok);        // #f(...)
+    // feature-21 Phase 3（L1）：`#f<int>(...)` —— 类型实参前瞻不成立时
+    // parseHashCallAfterHash 按裸名返回且不消费 '<'（`#x < 5` 行为不变）
+    if (peekAt(1).type == TokType::Identifier && peekAt(2).type == TokType::Less)
+        return parseMetaSuffix(parseHashCallAfterHash(), hashTok);
+
+    if (peekAt(1).type == TokType::Identifier || isKeywordIdent(peekAt(1).type)) {
+        advance(); // '#'
+        auto ref = std::make_unique<MetaValueRefExpr>();
+        setNodePos(ref.get(), hashTok);
+        ref->name = advance().lexeme;
+        return parseMetaSuffix(std::move(ref), hashTok);                  // #c / #CFG.priority
+    }
+
+    error("expected construct after '#'");
+    advance();   // H-1：错误路径必须消费 ≥1 token，否则 parseBlock 原地死循环
+    return nullptr;
+}
+
+// 统一后缀：.member / .member(args)。`(...)` 的调用点已在各自分支处理。
+std::unique_ptr<ASTNode> Parser::parseMetaSuffix(std::unique_ptr<ASTNode> cur,
+                                                const Token& posTok) {
+    while (match(TokType::Dot)) {
+        auto m = std::make_unique<MetaMemberExpr>();
+        setNodePos(m.get(), posTok);
+        m->member = consumeMemberName().lexeme;
+        m->base = std::move(cur);
+        if (check(TokType::LParen)) {
+            auto call = std::make_unique<MetaCallExpr>();
+            setNodePos(call.get(), posTok);
+            call->callee = std::move(m);
+            advance(); // '('
+            if (!check(TokType::RParen)) {
+                do {
+                    if (auto a = parseExpr()) call->args.push_back(std::move(a));
+                } while (match(TokType::Comma));
+            }
+            consume(TokType::RParen, "expected ')' after compile-time call arguments");
+            cur = std::move(call);
+        } else {
+            cur = std::move(m);
+        }
+    }
+    return cur;
+}
+
+// ============================================================
 // 闭包表达式: fun (params) throws? -> Ret? { body }
 // ============================================================
 std::unique_ptr<ASTNode> Parser::parseFunExpr() {
@@ -529,6 +634,16 @@ bool Parser::lookaheadTypeArgsBeforeRecord() {
         return false;
     }
     return false;
+}
+
+// feature-21 Phase 1：成员名解析（`.type` 放行）。
+// S6 已把成员访问调用点（`parseCall` 的后缀 `.` 分支）统一改成 consumeMemberName()。
+Token& Parser::consumeMemberName() {
+    if (check(TokType::Identifier)) return advance();
+    // feature-21：`type` 是硬关键字，但 `reflect.type` / `#reflect.type` 需要它作成员名
+    if (check(TokType::Type)) return advance();
+    error("expected member name after '.'");
+    return tokens_[currentIdx_];
 }
 
 } // namespace Aura

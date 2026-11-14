@@ -465,6 +465,15 @@ std::string CodeGenerator::genCallExpr(const CallExpr& e, bool isCoroutine) {
             targs += targValues.back();
         }
         targs += ">";
+    } else if (!isCtor && !e.typeArgs.empty()) {
+        // L1（S0.5）：普通函数/方法调用点显式类型实参必须落到 C++ 模板实参；
+        // 返回类型独有的泛型（如 fun emptyList<T>() -> [T]）无法靠形参推导。
+        targs = "<";
+        for (size_t i = 0; i < e.typeArgs.size(); ++i) {
+            if (i > 0) targs += ", ";
+            targs += e.typeArgs[i] ? mapType(*e.typeArgs[i]) : "int32_t";
+        }
+        targs += ">";
     }
 
     bool needAwait = false;

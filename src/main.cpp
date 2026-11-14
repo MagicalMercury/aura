@@ -27,6 +27,8 @@
 #include "CodeGen/MetaCollect.h"   // feature-18 P3：MetaCollector（**完整定义** —— CgResult 需值语义）/ MetaMerger
 #include "CodeGen/MetaEmit.h"      // feature-18 P3：emitMetaHeader / emitMetaImpl
 #include "Module/ModuleManager.h"
+#include "Module/CompilationDriver.h"   // feature-21 Phase 2 S5：`#const` 展开驱动
+#include "CompileTime/EvalPass.h"      // feature-21 Phase 3 S5：`#(...)` / `#{...}` 求值回写
 #include "Diag/DiagnosticEngine.h"
 
 #include <algorithm>  // feature-18 P3：std::sort（flattenLayersDeterministic 的同层字典序）
@@ -146,6 +148,32 @@ int compileSingleFile(const CliOptions& opts, Aura::DiagnosticEngine& diag) {
     if (!program) {
         std::cerr << "Error: failed to parse program.\n";
         return 1;
+    }
+
+    // ---- feature-21 Phase 2 §3.7.1（R-4）：`#const` 展开 ----
+    // 位置语义：解析成功之后、内置 .aurai 扫描 / Sema **之前**（单文件入口第一步会 stamp
+    // originFile，宏生成 import 在单文件模式下报 requires multi-file compilation）。
+    {
+        Aura::CompilationDriver driver(diag);
+        if (!driver.expandSingleFile(*program, opts.inputPath, mgr)) {
+            std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
+            diag.print(std::cerr);
+            return 1;
+        }
+    }
+
+    // ---- feature-21 Phase 3 §4.10：编译期求值（`#(...)` / `#{...}` / `#f(...)`）----
+    // 位置语义：`#const` 展开之后、内置 `.aurai` 扫描与 Sema **之前**；
+    // 只有全部表达式位求值成功才继续，否则按诊断退出。
+    {
+        Aura::ct::DeclIndex ctIndex;
+        ctIndex.addModule(opts.inputPath, *program);
+        Aura::ct::EvalPass eval(diag, ctIndex, opts.inputPath);
+        if (!eval.run(*program).ok) {
+            std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
+            diag.print(std::cerr);
+            return 1;
+        }
     }
 
     // 按需加载 import 声明的内置模块 .aurai（如 import path → 加载 path.aurai）
@@ -300,6 +328,37 @@ int compileMultiFile(const CliOptions& opts, bool keepIntermediate, Aura::Diagno
         diag.print(std::cerr);
         return 1;
     }
+    // ---- feature-21 Phase 2 §3.7.2：`#const` 展开（epoch 不动点）----
+    // 位置语义：`loadAllScanned()` 之后、`topologicalLayersOn()` **之前** —— 拓扑分层要读
+    // 展开后的 deps（宏生成的 import 会把新模块补进扫描表）。
+    {
+        Aura::CompilationDriver driver(diag);
+        if (!driver.run(mgr)) {
+            std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
+            diag.print(std::cerr);
+            return 1;
+        }
+    }
+
+    // ---- feature-21 Phase 3 §4.10：编译期求值（多文件）----
+    // `DeclIndex` 由全部非内置模块统一构建（P3C-8：`pub #fun` 跨模块可调用），
+    // 再逐模块求值回写；仍在 `topologicalLayersOn()` 之前。
+    {
+        Aura::ct::DeclIndex ctIndex;
+        for (auto& [path, mod] : mgr.modulesInternal())
+            if (!mod.isBuiltin && mod.ast) ctIndex.addModule(path, *mod.ast);
+
+        for (auto& [path, mod] : mgr.modulesInternal()) {
+            if (mod.isBuiltin || !mod.ast) continue;
+            Aura::ct::EvalPass eval(diag, ctIndex, path);
+            if (!eval.run(*mod.ast).ok) {
+                std::cerr << "Compilation failed with " << diag.errorCount() << " error(s):\n";
+                diag.print(std::cerr);
+                return 1;
+            }
+        }
+    }
+
     // 拓扑分层（基于扫描表，path 分组）——供 Sema/CodeGen 按层调度
     auto layers = mgr.topologicalLayersOn();
 

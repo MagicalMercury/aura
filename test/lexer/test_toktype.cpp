@@ -78,7 +78,9 @@ TEST(TokType, TypeNameMapping) {
     EXPECT_FALSE(tokTypeName(TokType::Error).empty());
     // 所有枚举值都有名称
     for (int i = 0; i <= (int)TokType::Error; ++i) {
-        EXPECT_FALSE(tokTypeName((TokType)i).empty());
+        std::string n = tokTypeName((TokType)i);
+        EXPECT_FALSE(n.empty());
+        EXPECT_TRUE(n != "???");
     }
 }
 

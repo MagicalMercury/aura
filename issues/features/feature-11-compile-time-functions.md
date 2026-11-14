@@ -2,7 +2,9 @@
 type: todo_feature
 kind: new_feature
 module: Parser/Sema/CodeGen
-status: designing
+status: deprecated
+deprecated_date: 2026-10-17
+superseded_by: "[[feature-21-compile-time-metadata-system]]"
 priority: P2
 estimated_effort: XL
 blocked_by: []
@@ -16,7 +18,9 @@ tags:
   - syntax
 ---
 
-# 【编译期函数】[ ] **主标题：`#` 编译期求值体系（值域解释器 → 类型一等值 → Code 注入）——语法规范与安全边界**
+# 【编译期函数】[已弃用] **主标题：`#` 编译期求值体系（值域解释器 → 类型一等值 → Code 注入）——语法规范与安全边界**
+
+> ⚠️ **已弃用（2026-10-17）**：本 feature 的方案已被 [[feature-21-compile-time-metadata-system]]（`#` 元数据与编译期体系 v0.4.1，规范正文见 `question.txt` / 该笔记附录 A）整体取代，**不再作为实施依据**。保留本笔记仅为历史存档与差异追溯（v0.3 口径见 `plan/hash-metadata-requirements.md`、`plan/hash-v0.3-feature-deltas.md`）。
 
 > **一句话摘要**：Aura 编译期求值体系的**语法对齐 + 安全边界 + 能力分期**。**语法一律以 v0.3 为准**（`plan/hash-metadata-requirements.md`，本文只引用、不重复定义）：`#` 的五档角色与精确语义（§1.1–§1.3）、形态骨架与形态判定（§3.1）、`#fun` 与调用规范（§6.1/§6.2）、`#(expr)`/`#{...}` 求值（§7.1–§7.3）、值注入三×三表（§7.4）、`#c` 展开语义（§7.6）、`Code` 三位置（§6.4）、reflect 双态（§9.3）。本文正文**只保留 v0.3 已定义的形态**；与 v0.3 有差异 / v0.3 未定义的形态已移出，集中登记于 `plan/hash-v0.3-feature-deltas.md`（D-01…D-06）。本文保留**实现层内容**：解释器型求值路线（业界共识）、三期能力分级（值计算 → 类型计算 → AST 注入）、值域边界与「同一函数编译期/运行期语义一致」红线，不含实现方案。
 

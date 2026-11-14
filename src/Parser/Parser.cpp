@@ -1,5 +1,6 @@
 #include "../Parser.h"
 #include <algorithm>
+#include <cassert>
 #include <array>
 #include <sstream>
 
@@ -23,6 +24,15 @@ Token& Parser::peek() {
 Token& Parser::peekNext() {
     if (currentIdx_ + 1 >= tokens_.size()) return tokens_.back();
     return tokens_[currentIdx_ + 1];
+}
+
+// feature-21 Phase 1：任意前瞻（不消费）。越界一律回落到末位（Eof），
+// 与 peekNext 的越界兜底同一假设。
+Token& Parser::peekAt(size_t k) {
+    // 不变量：tokens_ 至少含 Eof（与 peek/peekNext 同一假设；Parser 构造保证）
+    assert(!tokens_.empty() && "Parser invariant: tokens_ must contain Eof");
+    size_t i = currentIdx_ + k;
+    return tokens_[i < tokens_.size() ? i : tokens_.size() - 1];
 }
 
 bool Parser::check(TokType type) {
@@ -50,6 +60,13 @@ bool Parser::atEnd() const {
 
 void Parser::error(const std::string& msg) {
     auto& tok = peek();
+    std::ostringstream oss;
+    oss << msg;
+    if (!tok.lexeme.empty()) oss << " (got \"" << tok.lexeme << "\")";
+    diag_.error(tok.line, tok.col, oss.str());
+}
+
+void Parser::errorAt(const Token& tok, const std::string& msg) {
     std::ostringstream oss;
     oss << msg;
     if (!tok.lexeme.empty()) oss << " (got \"" << tok.lexeme << "\")";

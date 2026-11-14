@@ -83,6 +83,6 @@
 | B2 | `feature-09-annotator.md` | 326 → 358 | ✅ 同上 |
 | B3 | `feature-08-configurator-reflection.md` | 201 → 232 | ✅ 同上 |
 | B4 | `feature-10-reflection-library.md` | 641 → 666 | ✅ 同上 |
-| **阶段 2** | 四份**全量重写**为 v0.3 形态（正文只留 v0.3 已定义形态 + 指向本文件的引用行） | — | 🔄 进行中（详见 `issues/features/hash-v03-feature-rewrite-progress.md`） |
+| **阶段 2** | 四份**全量重写**为 v0.3 形态（正文只留 v0.3 已定义形态 + 指向本文件的引用行） | — | ✅ 完成（2026-10-05）。v0.4.1 已取代本文件口径；原阶段锚点已删除，现行进度见 `issues/features/feature-21-progress.md` |
 
 > 阶段 1 的 4 份批报告在 `scripts/f_v03_rewrite_b{1..4}_report.md`；阶段 2 报告命名 `scripts/f_v03_rewrite2_b{n}_report.md`。

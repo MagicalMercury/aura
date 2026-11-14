@@ -1,5 +1,5 @@
 #include "Sema/SemAnalyzer.h"
-#include "ASTWalker.h"
+#include "../../AST/AstWalk.h"
 
 namespace Aura {
 
@@ -123,7 +123,7 @@ void SemAnalyzer::checkSyncForStmt(const SyncForStmt& stmt) {
 // 为何 Sema 侧要自己写：CodeGen 的 IdRefCollector / DeclaredCollector 是
 // CodeGenerator 的**私有嵌套类**（CodeGen.h:164/217），Sema 侧不可见；
 // 且它们的判定依赖 registeredTypes_ 等 CodeGen 状态（Sema 无此状态）。
-// 因此复用底层的 StmtWalker/ExprWalker 框架（src/ASTWalker.h）
+// 因此复用底层的 StmtWalker/ExprWalker 框架（src/AST/AstWalk.h）
 // 而不重造遍历分发链——同时与 CodeGen 口径对齐。
 //
 // 口径（必须与 CodeGen genSpawnStmt 的 freeVars 一致）：

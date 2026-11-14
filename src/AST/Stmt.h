@@ -107,6 +107,30 @@ struct BlockStmt : Stmt {
     }
 };
 
+// feature-21：`#{ ... }` 编译期求值块（表达式位置）
+struct EvalBlockExpr : ASTNode {
+    std::unique_ptr<BlockStmt> block;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<EvalBlockExpr>();
+        if (block) n->block.reset(static_cast<BlockStmt*>(block->clone().release()));
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
+// feature-21：`Aura { ... }` 引述（注解器用；Phase 1 只解析）
+struct QuoteExpr : ASTNode {
+    std::unique_ptr<BlockStmt> block;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<QuoteExpr>();
+        if (block) n->block.reset(static_cast<BlockStmt*>(block->clone().release()));
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
 struct ReturnStmt : Stmt {
     std::unique_ptr<ASTNode> expr;
     void print(std::ostream& os, int indent) const override;
@@ -331,15 +355,49 @@ struct MatchStmt : Stmt {
 };
 
 // ============================================================
+// feature-21：where / #where 约束（Phase 1 只解析，不校验）
+// ============================================================
+struct Bound {
+    enum class Kind { Impl, By, Throws, Pack };
+    Kind kind = Kind::Impl;
+    std::string name;            // Impl: 接口名；By: #fun 名
+    std::vector<Bound> pack;     // Pack（不嵌套）
+};
+
+struct WhereItem {
+    std::string target;          // T / U / Self / fun / method / type / interface
+    bool hasBound = false;       // `#where { fun, method }` 允许只有目标
+    Bound bound;
+};
+
+struct WhereClause { std::vector<WhereItem> items; };
+// 顶层逗号语义由挂载点决定：`where` = AND（§5.4）、`#where` = OR（§6.4）。
+
+// ============================================================
 // Decl ─ 声明节点
 // ============================================================
 
 struct Decl : Stmt {
     bool isPublic = false;  // Phase B
+    // feature-21：挂载前缀（#X{...} / #X(...)），贴在声明上；Phase 1 不解释
+    std::vector<std::unique_ptr<ASTNode>> metaPrefixes;
+    // feature-21：`where` 子句（外审 F-2）——提升到基类，四类声明共用：
+    // FunDecl / TypeDecl / InterfaceDecl / MethodDecl；`MetaTypeDecl` 亦继承。
+    std::unique_ptr<WhereClause> where;
+
+    void cloneCommonTo(Decl& n) const {
+        for (auto& p : metaPrefixes)
+            n.metaPrefixes.push_back(p ? p->clone() : nullptr);
+        if (where) n.where = std::make_unique<WhereClause>(*where);
+    }
 };
 
 struct FunDecl : Decl {
     std::string name;
+    // feature-21 Phase 3（L1）：`fun f<T, U>` 的显式泛型名（可省略）。
+    // 省略时由签名中的旧式 `<T>` 占位符收集（见 DeclChecker 的 FunDecl 分支）；
+    // 旧式声明恒为空 ⇒ 既有行为逐字不变。
+    std::vector<std::string> typeParams;
     std::vector<Param> params;
     bool throws = false;
     std::unique_ptr<TypeExpr> returnType;
@@ -350,17 +408,101 @@ struct FunDecl : Decl {
     // 但声明骨架仍需知道「源码里到底有没有实体 body」（FuncSkeleton.hasBody）。
     // 故由扫描路径置位；完整解析路径不读不写 → 既有行为逐字不变。
     bool bodySkippedByScan = false;
+    // feature-21：编译期函数（#fun）与挂载约束（#where）
+    bool isComptime = false;
+    std::unique_ptr<WhereClause> mountWhere;   // #where（OR）
+    // `where`（AND）继承自 Decl
     void print(std::ostream& os, int indent) const override;
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<FunDecl>();
         n->name = name;
+        n->typeParams = typeParams;
         for (auto& p : params) n->params.push_back(cloneParam(p));
         n->throws = throws;
         if (returnType) n->returnType.reset(static_cast<TypeExpr*>(returnType->clone().release()));
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
         n->hasCppImpl = hasCppImpl;
         n->bodySkippedByScan = bodySkippedByScan;
+        n->isComptime = isComptime;
+        if (mountWhere) n->mountWhere = std::make_unique<WhereClause>(*mountWhere);
+        cloneCommonTo(*n);
         n->isPublic = isPublic;
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
+// #type Name<T>? where? #where? = { field: T = default, ... }
+struct MetaTypeDecl : Decl {
+    std::string name;
+    std::vector<std::string> typeParams;
+    std::unique_ptr<WhereClause> mountWhere;   // #where（OR）；`where`（AND）继承自 Decl
+    std::vector<Param> fields;       // 复用 Param{name, type, defaultExpr}
+
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<MetaTypeDecl>();
+        n->name = name;
+        n->typeParams = typeParams;
+        if (mountWhere) n->mountWhere = std::make_unique<WhereClause>(*mountWhere);
+        for (auto& f : fields) n->fields.push_back(cloneParam(f));
+        n->isPublic = isPublic;
+        cloneCommonTo(*n);
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
+// #const Name = expr（宏名；无类型）
+struct HashConstDecl : Decl {
+    std::string name;
+    std::unique_ptr<ASTNode> value;
+    std::string originFile;   // feature-21 Phase 2 新增：定义处源文件（绝对路径，D7）
+
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<HashConstDecl>();
+        n->name = name;
+        if (value) n->value = value->clone();
+        n->originFile = originFile;
+        n->isPublic = isPublic;
+        cloneCommonTo(*n);
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
+// ============================================================
+// feature-21 Phase 2：裸 `#name`（D2）
+// 展开期按绑定值的节点类型分类（D3）：QuoteExpr ⇒ 拼接；MetaConstruct ⇒ 挂载；
+// MetaCall ⇒ 织入（Phase 6，本阶段报错）；其它 ⇒ 错误。
+// ============================================================
+
+// 声明位/语句位的单个裸 `#name`。
+struct UnquoteItem : Decl {
+    std::string name;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<UnquoteItem>();
+        n->name = name;
+        n->isPublic = isPublic;
+        cloneCommonTo(*n);
+        n->line = line; n->col = col;
+        return n;
+    }
+};
+
+// 声明位的独立 unquote 组（parseDecl 在「只有裸名前缀、后面没有声明」时返回）。
+// 展开期把它替换成各 QuoteExpr 的声明列表（change.md §3.4.5）。
+struct UnquoteGroup : Decl {
+    std::vector<std::unique_ptr<UnquoteItem>> items;
+    void print(std::ostream& os, int indent) const override;
+    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
+        auto n = std::make_unique<UnquoteGroup>();
+        for (auto& it : items)
+            n->items.emplace_back(static_cast<UnquoteItem*>(it->clone().release()));
+        n->isPublic = isPublic;
+        cloneCommonTo(*n);
         n->line = line; n->col = col;
         return n;
     }
@@ -378,6 +520,7 @@ struct LetDecl : Decl {
         n->names = names;
         if (type) n->type.reset(static_cast<TypeExpr*>(type->clone().release()));
         n->initializer = initializer ? initializer->clone() : nullptr;
+        cloneCommonTo(*n);
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
@@ -396,6 +539,7 @@ struct ConstDecl : Decl {
         n->names = names;
         if (type) n->type.reset(static_cast<TypeExpr*>(type->clone().release()));
         n->initializer = initializer ? initializer->clone() : nullptr;
+        cloneCommonTo(*n);
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
@@ -412,6 +556,7 @@ struct TypeDecl : Decl {
         n->name = name;
         n->typeParams = typeParams;
         if (type) n->type.reset(static_cast<TypeExpr*>(type->clone().release()));
+        cloneCommonTo(*n);
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
@@ -450,6 +595,7 @@ struct InterfaceDecl : Decl {
             if (m.defaultBody) sig.defaultBody.reset(static_cast<BlockStmt*>(m.defaultBody->clone().release()));
             n->methods.push_back(std::move(sig));
         }
+        cloneCommonTo(*n);
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
@@ -466,6 +612,7 @@ struct ImportDecl : Decl {
         n->path = path;
         n->alias = alias;
         n->isBuiltin = isBuiltin;
+        cloneCommonTo(*n);
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
@@ -482,23 +629,7 @@ struct ModuleDecl : Decl {
     [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
         auto n = std::make_unique<ModuleDecl>();
         n->name = name;
-        n->isPublic = isPublic;
-        n->line = line; n->col = col;
-        return n;
-    }
-};
-
-// #config 编译器指令： #namespace.key = value
-struct ConfigDecl : Decl {
-    std::string ns;      // 命名空间（如 "io"）
-    std::string key;     // 键（如 "sync"）
-    std::string value;   // 值（如 "true"）
-    void print(std::ostream& os, int indent) const override;
-    [[nodiscard]] std::unique_ptr<ASTNode> clone() const override {
-        auto n = std::make_unique<ConfigDecl>();
-        n->ns = ns;
-        n->key = key;
-        n->value = value;
+        cloneCommonTo(*n);
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
@@ -537,11 +668,27 @@ struct MethodDecl : Decl {
         if (body) n->body.reset(static_cast<BlockStmt*>(body->clone().release()));
         n->hasCppImpl = hasCppImpl;
         n->bodySkippedByScan = bodySkippedByScan;
+        cloneCommonTo(*n);
         n->isPublic = isPublic;
         n->line = line; n->col = col;
         return n;
     }
 };
+
+// feature-21：编译期方法（接收者类型写 `#X`）——Phase 1 不生成、不注册
+inline bool isComptimeMethod(const MethodDecl& m) {
+    return !m.receiverType.empty() && m.receiverType.front() == '#';
+}
+
+// feature-21：统一谓词——运行期通道（Sema / CodeGen / Module / Registry）的唯一过滤入口。
+// 不得退化为只看 FunDecl::isComptime：`#` 接收者方法是真 MethodDecl，必须同样被过滤。
+inline bool isComptimeDecl(const Decl& d) {
+    if (dynamic_cast<const MetaTypeDecl*>(&d)) return true;
+    if (dynamic_cast<const HashConstDecl*>(&d)) return true;
+    if (auto* f = dynamic_cast<const FunDecl*>(&d)) return f->isComptime;
+    if (auto* m = dynamic_cast<const MethodDecl*>(&d)) return isComptimeMethod(*m);
+    return false;
+}
 
 struct Program : ASTNode {
     std::vector<std::unique_ptr<Decl>> decls;

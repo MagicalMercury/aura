@@ -1,5 +1,6 @@
 #include "Sema/SemAnalyzer.h"
 #include <functional>
+#include <algorithm>
 
 namespace Aura {
 
@@ -186,6 +187,7 @@ std::string SemAnalyzer::recordTypeKey(const std::string& receiverType) const {
 void SemAnalyzer::buildTypeMethods(const Program& program) {
     typeMethods_.clear();
     for (auto& d : program.decls) {
+        if (isComptimeDecl(*d)) continue;   // feature-21：`#` 接收者方法不进接口结构匹配数据
         if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
             if (m->isConstructor || m->receiverType.empty()) continue;
             std::string key = recordTypeKey(m->receiverType);
@@ -235,6 +237,7 @@ void SemAnalyzer::declareTopLevel(const Program& program) {
     // 显式 impl 收集（第 1 遍末尾，record 类型已全部注册，recordTypeKey 安全）
     recordImplIfaces_.clear();
     for (auto& d : program.decls) {
+        if (isComptimeDecl(*d)) continue;   // feature-21：`#` 方法的 impl 不污染 recordImplIfaces_
         if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
             if (m->implInterface.empty() || m->receiverType.empty()) continue;
             std::string key = recordTypeKey(m->receiverType);
@@ -320,11 +323,13 @@ void SemAnalyzer::verifyImplCompleteness(const Program& program) {
 }
 
 void SemAnalyzer::declareDecl(const Decl& decl) {
+    // feature-21：编译期声明不注册运行期符号
+    if (isComptimeDecl(decl)) return;
     // 模块级 pub 策略：pub 仅可修饰声明（type/fun/方法/构造函数）
-    // pub import 为错误（C6-3）；config 语法待定，不参与策略（C6-4）
+    // pub import 为错误（C6-3）；config 指令已在 feature-21 S1 废弃
     if (decl.isPublic && dynamic_cast<const ImportDecl*>(&decl)) {
         error(decl, "pub cannot be applied to import declarations");
-    } else if (decl.isPublic && !dynamic_cast<const ConfigDecl*>(&decl)) {
+    } else if (decl.isPublic) {
         hasAnyPub_ = true;
     }
     if (auto* t = dynamic_cast<const TypeDecl*>(&decl)) {
@@ -416,6 +421,16 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
         // 先注册泛型参数（从参数类型中提取 <T>/<U> 等），
         // 再解析参数类型和返回类型，这样 Tree<U> 中的 U 才能正确解析。
         symtab_.enterScope(ScopeKind::Function);
+        // feature-21 Phase 3（L1）：显式泛型表 `fun f<T, U>` 先注册为 GenericParam，
+        // 再解析参数/返回类型（否则标注里的 T 会被当作未定义类型）。与旧式 `<T>` 的
+        // registerTypeGenerics 用同一 SymKind ⇒ Sema 泛型机制不变；旧式声明
+        // typeParams 为空 ⇒ 本循环不执行（零行为变化）。
+        for (const std::string& tp : f->typeParams) {
+            Symbol g;
+            g.kind = SymKind::GenericParam;
+            g.name = tp;
+            symtab_.define(std::move(g));
+        }
         for (auto& p : f->params) {
             if (p.type) registerTypeGenerics(symtab_, *p.type);
             // bug-07：参数直接写泛型函数类型（`f: fun(U) -> U`）时 U 是裸 NamedType，
@@ -435,6 +450,23 @@ void SemAnalyzer::declareDecl(const Decl& decl) {
             sym.params.push_back(std::move(sp));
         }
         sym.type = f->returnType ? resolveType(*f->returnType) : nullptr;
+        // feature-21 Phase 3（L1）：调用位显式类型实参（`f<int>(...)`）按本表位置绑定
+        //（CallInfer 消费）。显式声明优先；为空时按签名首次出现顺序收集旧式 `<T>`
+        // 泛型名 —— 旧式声明的行为与 L1 前逐字一致（此前 typeParams 恒为空 ⇒
+        // 调用位显式实参只落在构造器分支）。
+        sym.typeParams = f->typeParams;
+        if (sym.typeParams.empty()) {
+            auto addUnique = [&](const TypeExpr* t) {
+                if (!t) return;
+                forEachGenericRef(*t, [&](const std::string& g) {
+                    if (std::find(sym.typeParams.begin(), sym.typeParams.end(), g)
+                        == sym.typeParams.end())
+                        sym.typeParams.push_back(g);
+                });
+            };
+            for (const auto& p : f->params) addUnique(p.type.get());
+            addUnique(f->returnType.get());
+        }
         symtab_.exitScope();
 
         symtab_.defineGlobal(std::move(sym));

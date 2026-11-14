@@ -33,6 +33,8 @@ public:
     // 主入口：分析整个程序，返回是否有错误
     [[nodiscard]] bool analyze(const Program& program);
 
+    // feature-21 Phase 1：`#io.sync = true` 指令已废弃（A-02=c）；
+    // 该开关当前恒为 false，待 `#io{ sync = true }` 元数据（Phase 5+）重新接线。
     // #io.sync 配置
     [[nodiscard]] bool getIoSync() const { return ioSync_; }
 
@@ -318,7 +320,7 @@ private:
     //    仍会漏网；反之「Sema 拦下 CodeGen 本会按需追加的名字」会造成误报。
     //    两边共同的判定骨架：idRefs - declared - params - 类型名 - 内置函数名 - io。
     //
-    // 自由变量收集器重用 src/ASTWalker.h 的 StmtWalker/ExprWalker
+    // 自由变量收集器重用 src/AST/AstWalk.h 的 StmtWalker/ExprWalker
     // 框架（与 CodeGen.h 的 IdRefCollector 同底层），避免自造重复的
     // dynamic_cast 分发链。
 

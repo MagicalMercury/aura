@@ -106,12 +106,17 @@ void SemAnalyzer::checkProgram(const Program& program) {
 }
 
 void SemAnalyzer::checkDecl(const Decl& decl) {
-    if (auto* cfg = dynamic_cast<const ConfigDecl*>(&decl)) {
-        if (cfg->ns == "io" && cfg->key == "sync") {
-            ioSync_ = (cfg->value == "true");
+    // 普通函数里出现 `#T` 参数 ⇒ 报错（否则 CodeGen 会产出非法 C++ 标识符）
+    if (auto* nf = dynamic_cast<const FunDecl*>(&decl); nf && !nf->isComptime) {
+        for (auto& p : nf->params) {
+            if (!p.name.empty() && p.name.front() == '#') {
+                error(decl, "type parameters are only allowed in compile-time functions");
+                return;
+            }
         }
-        return;
     }
+    // feature-21：编译期声明不进运行期 Sema（守卫必须在早退之前）
+    if (isComptimeDecl(decl)) return;
     // 模块级 let/const：解析器允许但 Sema/CodeGen 未实现全局变量，
     // 静默丢弃会让用户代码无声失效 → 报干净错误而不是被忽略
     if (dynamic_cast<const LetDecl*>(&decl)) {

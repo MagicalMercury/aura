@@ -359,36 +359,12 @@ TEST(ParserDecl, ImportWithAlias) {
 // ============================================================
 // #config 指令
 // ============================================================
-TEST(ParserDecl, ConfigBool) {
+TEST(ParserDecl, ConfigDirectiveRemoved) {
     DiagnosticEngine diag;
     auto prog = parseSource("#io.sync = true", diag);
-    ASSERT_TRUE(prog != nullptr);
-    EXPECT_FALSE(diag.hasErrors());
-    auto* cd = as<ConfigDecl>(declAt(*prog, 0));
-    ASSERT_TRUE(cd != nullptr);
-    EXPECT_EQ(cd->ns, "io");
-    EXPECT_EQ(cd->key, "sync");
-    EXPECT_EQ(cd->value, "true");
-}
-
-TEST(ParserDecl, ConfigStringValue) {
-    DiagnosticEngine diag;
-    auto prog = parseSource("#app.name = \"demo\"", diag);
-    ASSERT_TRUE(prog != nullptr);
-    EXPECT_FALSE(diag.hasErrors());
-    auto* cd = as<ConfigDecl>(declAt(*prog, 0));
-    ASSERT_TRUE(cd != nullptr);
-    EXPECT_EQ(cd->ns, "app");
-    EXPECT_EQ(cd->key, "name");
-    EXPECT_EQ(cd->value, "demo");
-}
-
-TEST(ParserDecl, ConfigMissingDot) {
-    DiagnosticEngine diag;
-    auto prog = parseSource("#io sync = true", diag);
-    ASSERT_TRUE(prog != nullptr);
     EXPECT_TRUE(diag.hasErrors());
-    EXPECT_TRUE(hasErrorContaining(diag, "expected '.'"));
+    EXPECT_TRUE(hasErrorContaining(diag, "config directives were removed"));
+    EXPECT_TRUE(hasErrorContaining(diag, "use '#io{"));
 }
 
 // ============================================================

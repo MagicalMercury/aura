@@ -18,7 +18,7 @@
 //      独立约束，本文件不触碰。
 // ============================================================
 #include "../SemAnalyzer.h"
-#include "../../ASTWalker.h"
+#include "../../AST/AstWalk.h"
 
 #include <string>
 #include <vector>
@@ -387,6 +387,7 @@ void SemAnalyzer::buildCallGraph(const Program& program) {
 
     for (auto& d : program.decls) {
         if (!d) continue;
+        if (isComptimeDecl(*d)) continue;   // feature-21：`#fun` 名不进调用图已知函数集
         if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
             if (!f->name.empty() && !f->hasCppImpl && f->body) knownFuncs.insert(f->name);
         } else if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
@@ -455,6 +456,7 @@ void SemAnalyzer::buildCallGraph(const Program& program) {
 
     for (auto& d : program.decls) {
         if (!d) continue;
+        if (isComptimeDecl(*d)) continue;   // feature-21：不把 `#fun` 体当运行期函数体分析
         if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
             if (f->name.empty() || f->hasCppImpl || !f->body) continue;
             collect(f->name, f->body.get(), "", "", "");

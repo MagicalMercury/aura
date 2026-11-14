@@ -3,6 +3,9 @@
 // 保留此文件仅用于历史参考，将在后续版本中移除。
 // ============================================================
 #include "ASTPrinter.h"
+// feature-21 Phase 2（S2）：ASTPrinter.cpp 是本批唯一被 CMake 编译的 .cpp，
+// 用一行 include 让新建的 AST/AstWalk.h（头文件、无独立 TU）真正参与编译验证。
+#include "AST/AstWalk.h"
 #include <iostream>
 
 namespace Aura {
@@ -477,7 +480,17 @@ void MatchStmt::print(std::ostream& os, int indent) const {
 
 void FunDecl::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
-    os << "FunDecl: " << name << (throws ? " throws" : "") << '\n';
+    os << "FunDecl: " << name;
+    // feature-21 Phase 3（L1）：显式泛型名（仅当非空时输出，旧式 dump 不变）
+    if (!typeParams.empty()) {
+        os << '<';
+        for (size_t i = 0; i < typeParams.size(); ++i) {
+            if (i > 0) os << ", ";
+            os << typeParams[i];
+        }
+        os << '>';
+    }
+    os << (throws ? " throws" : "") << '\n';
     if (!params.empty()) {
         printIndent(os, indent + 1);
         os << "params:" << '\n';
@@ -592,11 +605,6 @@ void ModuleDecl::print(std::ostream& os, int indent) const {
     os << "ModuleDecl: " << name << '\n';
 }
 
-void ConfigDecl::print(std::ostream& os, int indent) const {
-    printIndent(os, indent);
-    os << "ConfigDecl: #" << ns << "." << key << " = " << value << '\n';
-}
-
 void MethodDecl::print(std::ostream& os, int indent) const {
     printIndent(os, indent);
     os << (isConstructor ? "Constructor: " : "MethodDecl: ") << name << '\n';
@@ -669,6 +677,80 @@ void FunExpr::print(std::ostream& os, int indent) const {
         printTypeNode(os, indent + 2, returnType.get());
     }
     if (body) body->print(os, indent + 1);
+}
+
+// ============================================================
+// feature-21：编译期元数据节点（Phase 1 只解析）
+// ============================================================
+void MetaTypeDecl::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "MetaTypeDecl: " << name << '\n';
+    for (auto& f : fields) {
+        printIndent(os, indent + 1);
+        os << "field " << f.name << '\n';
+    }
+}
+void HashConstDecl::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "HashConstDecl: " << name << '\n';
+    if (value) value->print(os, indent + 1);
+}
+// feature-21 Phase 2：裸 `#name`
+void UnquoteItem::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "UnquoteItem: #" << name << '\n';
+}
+void UnquoteGroup::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "UnquoteGroup\n";
+    for (auto& it : items) {
+        if (it) it->print(os, indent + 1);
+    }
+}
+void EvalBlockExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "EvalBlockExpr\n";
+    if (block) block->print(os, indent + 1);
+}
+void QuoteExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "QuoteExpr\n";
+    if (block) block->print(os, indent + 1);
+}
+void MetaConstructExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "MetaConstructExpr: " << typeName << '\n';
+    for (auto& f : fields) {
+        printIndent(os, indent + 1);
+        os << "field " << f.name << '\n';
+        if (f.value) f.value->print(os, indent + 2);
+    }
+}
+void EvalExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "EvalExpr\n";
+    if (expr) expr->print(os, indent + 1);
+}
+void MetaValueRefExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "MetaValueRefExpr: #" << name << '\n';
+}
+void MetaCallExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "MetaCallExpr\n";
+    // feature-21 Phase 3（L1）：显式类型实参（仅当非空时输出）
+    if (!typeArgs.empty()) {
+        printIndent(os, indent + 1);
+        os << "typeArgs:\n";
+        for (auto& t : typeArgs) if (t) t->print(os, indent + 2);
+    }
+    if (callee) callee->print(os, indent + 1);
+    for (auto& a : args) if (a) a->print(os, indent + 1);
+}
+void MetaMemberExpr::print(std::ostream& os, int indent) const {
+    printIndent(os, indent);
+    os << "MetaMemberExpr: ." << member << '\n';
+    if (base) base->print(os, indent + 1);
 }
 
 } // namespace Aura

@@ -16,6 +16,13 @@ endif()
 
 project(Aura)
 
+# ccache：重复构建/切分支后命中对象缓存（2026-11-08）
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    message(STATUS ">>> ccache: ${CCACHE_PROGRAM}")
+endif()
+
 # 默认 Debug 编译
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
@@ -102,12 +109,17 @@ set(AURA_SOURCES
     src/CodeGen/StmtMatch.cpp
     src/CodeGen/MetaCollect.cpp
     src/CodeGen/MetaEmit.cpp
+    src/Module/ExpandConst.cpp
+    src/Module/CompilationDriver.cpp
     src/Module/ModuleManager.cpp
+    src/CompileTime/DeclIndex.cpp
+    src/CompileTime/Evaluator.cpp
+    src/CompileTime/EvalPass.cpp
     src/Diag/DiagnosticEngine.cpp
 )
 
 set(AURA_HEADERS
-    src/ASTWalker.h
+    src/AST/AstWalk.h
     src/TokType.h
     src/Token.h
     src/Lexer.h

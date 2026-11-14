@@ -7,8 +7,20 @@
 #include "Diag/DiagnosticEngine.h"
 #include <memory>
 #include <vector>
+#include <algorithm>
+#include <string>
 
 namespace Aura {
+
+// feature-21 Phase 2（N-31）：`Aura{...}` 引述体深度守卫。
+// RAII：parseQuoteBody 入口 ++，离开（含提前 return）--；嵌套引述按层累加。
+struct QuoteDepthGuard {
+    int& depth;
+    explicit QuoteDepthGuard(int& d) : depth(d) { ++depth; }
+    ~QuoteDepthGuard() { --depth; }
+    QuoteDepthGuard(const QuoteDepthGuard&) = delete;
+    QuoteDepthGuard& operator=(const QuoteDepthGuard&) = delete;
+};
 
 class Parser {
 public:
@@ -40,6 +52,9 @@ private:
     // 混用一个标志会让 parseAurai 的既有行为（token 停在 '{'）与扫描行为纠缠，
     // 故独立成员；既有路径（parse/parseAurai）不读本标志 → 行为逐字不变。
     bool scanOnly_ = false;
+    // feature-21 Phase 2（N-31）：引述体嵌套深度（>0 ⇒ 位于 `Aura{...}` 内）。
+    // 由 parseQuoteBody 的 QuoteDepthGuard 维护；parseHashStmt 的 `#const` 分支读取。
+    int quoteDepth_ = 0;
     // feature-13 C0（2026-09-17）：「module」声明的软关键字支持 + 位置约束。
     // module 是【软关键字】（非 TokType::Module）——保持 `let module = 1` 可用
     //（向后兼容红线，探针 1 实测）。识别方式与既有 `as` 同款：Identifier + 文本比对。
@@ -49,11 +64,19 @@ private:
     Token& advance();
     Token& peek();
     Token& peekNext();
+    // feature-21 Phase 1：任意前瞻 token（只读不消费；越界回落到末位 Eof）
+    Token& peekAt(size_t k);
     bool check(TokType type);
     bool match(TokType type);
     Token& consume(TokType type, const std::string& msg);
+    // feature-21 Phase 1：成员名位置放行硬关键字 `type`（`reflect.type` / `#reflect.type`）。
+    // 本批只定义；S6 已把成员访问调用点统一替换为 consumeMemberName()。
+    Token& consumeMemberName();
     bool atEnd() const;
     void error(const std::string& msg);
+    // feature-21 Phase 1（S4）：把诊断定位到指定 token（挂载错误必须报在 `declStart`
+    // 而不是当前 `peek()`，否则 `#A{...}\nlet y = 1` 会被报到下一行声明上）。
+    void errorAt(const Token& tok, const std::string& msg);
     void setNodePos(ASTNode* node, const Token& tok);
     static bool isKeywordIdent(TokType t) { return t >= TokType::Fun && t <= TokType::None; }
     // 软关键字判定：当前 token 是 Identifier 且文本等于 kw
@@ -80,7 +103,62 @@ private:
     std::unique_ptr<ImportDecl> parseImportDecl();
     // feature-13 C0：`module <ident>` 声明（文件首行、import 之前；缺失时回落文件 stem）
     std::unique_ptr<ModuleDecl> parseModuleDecl();
-    std::unique_ptr<Decl> parseConfigDecl();
+
+    // feature-21 Phase 1：`#` 元数据语法骨架（S3 基础设施）
+    // （`#type` / `#fun` / `#const` 的解析属 S4/S5，本批不声明）
+    std::vector<std::unique_ptr<ASTNode>> parseMountPrefixes();
+    std::unique_ptr<ASTNode> parseMetaConstructAfterHash();
+    std::unique_ptr<ASTNode> parseHashCallAfterHash();
+    // feature-21 Phase 2（S3，D2）：裸 `#name` —— 供「裸名前缀」与「语句位裸名」复用。
+    // 进入时 current = `#`；成功消费 '#' + name，失败消费 '#' 后返回 nullptr（§0.3）。
+    std::unique_ptr<ASTNode> parseMetaValueRefAfterHash();
+
+    // feature-21 Phase 1（S4）：`#` 声明与 `where` 子句
+    std::unique_ptr<Decl> parseHashDecl();
+    std::unique_ptr<MetaTypeDecl> parseMetaTypeDecl();
+    // feature-21 Phase 1（S5）：`#fun` / `#const`
+    std::unique_ptr<FunDecl> parseMetaFunDecl();
+    std::unique_ptr<HashConstDecl> parseHashConstDecl();
+    std::unique_ptr<WhereClause> parseWhereClause(bool isMount);
+    Bound parseBound(bool allowThrows = false);
+    std::unique_ptr<TypeExpr> parseMetaTypeName();
+
+    // feature-21 Phase 1（S6）：表达式/语句侧的 `#` 语法
+    std::unique_ptr<ASTNode> parseHashExpr();
+    std::unique_ptr<ASTNode> parseMetaSuffix(std::unique_ptr<ASTNode> base,
+                                             const Token& posTok);
+    std::unique_ptr<Stmt> parseHashStmt();
+    // feature-21 Phase 2（D5）：`Aura{...}` 引述体 —— 允许普通声明（import / type /
+    // enum type / interface / pub 声明 / fun）+ 普通语句；禁止编译期声明
+    // （`#const`/`#type`/`#fun`，含 `pub` 前缀）。入口 consume '{'，用 QuoteDepthGuard 维护 quoteDepth_。
+    std::unique_ptr<BlockStmt> parseQuoteBody();
+
+    // --- feature-21 Phase 3（L1）：显式泛型 `<...>` ---
+    // 当前函数声明正在解析的显式泛型名（仅声明位有效：旧式 `fun f(x: <T>)` 不设置
+    // 本成员 ⇒ 类型标注解析路径逐字不变）。
+    // 用途：`fun f<T>(x: T)` 的类型标注中，命中本表的裸标识符解析为 GenericTypeRef，
+    // 与旧式 `<T>` 共用同一个 AST 表示（Sema 无需第二套机制）。
+    std::vector<std::string> activeTypeParams_;
+    bool isActiveTypeParam(const std::string& name) const {
+        return std::find(activeTypeParams_.begin(), activeTypeParams_.end(), name)
+               != activeTypeParams_.end();
+    }
+    // 活动泛型名的作用域守卫：构造时接管 names、析构时恢复原值（含异常/提前 return）。
+    // 嵌套在 Parser 内以便访问 activeTypeParams_（私有）。
+    struct TypeParamScope {
+        Parser& p;
+        std::vector<std::string> saved;
+        TypeParamScope(Parser& parser, const std::vector<std::string>& names)
+            : p(parser), saved(parser.activeTypeParams_) {
+            p.activeTypeParams_ = names;
+        }
+        ~TypeParamScope() { p.activeTypeParams_ = std::move(saved); }
+        TypeParamScope(const TypeParamScope&) = delete;
+        TypeParamScope& operator=(const TypeParamScope&) = delete;
+    };
+    // `fun f<T, U>` / `#fun g<T>` 名字后的可选泛型形参表；非 '<' 起始时返回 false
+    // 且不消费任何 token（'<' 起始时按声明位语义必然消费到 '>'）。
+    bool parseOptionalTypeParams(std::vector<std::string>& out);
 
     // --- 解析语句 ---
     std::unique_ptr<Stmt> parseStmt();

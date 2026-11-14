@@ -2,7 +2,9 @@
 type: todo_feature
 kind: new_feature
 module: Parser/Sema/CodeGen/Runtime
-status: designing
+status: deprecated
+deprecated_date: 2026-10-17
+superseded_by: "[[feature-21-compile-time-metadata-system]]"
 priority: P2
 estimated_effort: L
 blocked_by:
@@ -18,7 +20,9 @@ tags:
   - syntax
 ---
 
-# 【注解器】[ ] **主标题：两级注解器（L0 元数据注解 + L1 注解器 `#fun`——体替换 decorator 模型）——语法规范与能力边界**
+# 【注解器】[已弃用] **主标题：两级注解器（L0 元数据注解 + L1 注解器 `#fun`——体替换 decorator 模型）——语法规范与能力边界**
+
+> ⚠️ **已弃用（2026-10-17）**：本 feature 的方案已被 [[feature-21-compile-time-metadata-system]]（`#` 元数据与编译期体系 v0.4.1，规范正文见 `question.txt` / 该笔记附录 A）整体取代，**不再作为实施依据**。保留本笔记仅为历史存档与差异追溯（v0.3 口径见 `plan/hash-metadata-requirements.md`、`plan/hash-v0.3-feature-deltas.md`）。
 
 > **一句话摘要**：定义 `#` 配置器语法族的注解侧完整规范——L0 元数据注解（`#type` schema + 静态注册表，反射可查）+ **L1 注解器 `#fun`**（带参编译期函数，返回 `Aura{...}` 代码模板**替换目标函数体**，`#code` 为原函数体在模板内的调用点——C 带参宏的表达力、Python decorator 的形态、Rust macro 的体模板语义）。**语法一律以 v0.3 为准**（`plan/hash-metadata-requirements.md`，本文只引用、不重复定义）：五档角色（§1.2）、精确语义（§1.3）、编译期类型与元数据（§4.1–§4.7）、`where`（§5）、`Code` 与 `#code()` 调用次数（§6.4）、`#c` 展开与三×三表（§7.4 / §7.6）、reflect 双态（§9.3）。本文正文**只保留 v0.3 已定义的形态**；与 v0.3 有差异 / v0.3 未定义的形态（D-09 / D-10 / D-11）已移出，集中登记于 `plan/hash-v0.3-feature-deltas.md`。本文保留**实现层内容**：L0/L1 能力分级、体替换模型、实现分期、验收、依赖、决策速记，不含实现方案。
 

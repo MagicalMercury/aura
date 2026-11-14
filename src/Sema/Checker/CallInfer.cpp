@@ -141,6 +141,22 @@ std::unique_ptr<SemType> SemAnalyzer::inferCall(const CallExpr& e,
         for (auto& p : sym->params) formalTypes.push_back(p.type.get());
         size_t dc = 0;
         for (auto it = sym->params.rbegin(); it != sym->params.rend() && it->hasDefault; ++it) ++dc;
+        // feature-21 Phase 3（L1）：调用位显式类型实参 `f<int>(...)` —— 先于 checkCallArgs
+        // 按 sym->typeParams 位置绑定 genericMap（与构造器分支同款：使形参含 T 时 phase 2
+        // 能用精确期望反推、返回类型能代换）。数量不符直接报错。
+        // 旧式无显式 `<...>` 调用：e.typeArgs 为空 ⇒ 走原有推断，零行为变化。
+        if (!e.typeArgs.empty()) {
+            if (e.typeArgs.size() != sym->typeParams.size()) {
+                error(*e.callee, "generic function '" + callee->name + "' expects "
+                      + std::to_string(sym->typeParams.size()) + " type argument(s), got "
+                      + std::to_string(e.typeArgs.size()));
+            } else {
+                for (size_t k = 0; k < e.typeArgs.size(); ++k) {
+                    if (!e.typeArgs[k]) continue;
+                    genericMap[sym->typeParams[k]] = resolveType(*e.typeArgs[k]);
+                }
+            }
+        }
         checkCallArgs(e, callee->name, "function", formalTypes, e.args, genericMap, dc);
         auto result = sym->type ? sym->type->clone() : ErrorSemType::make();
         auto applied = applyGenericMap(std::move(result), genericMap);

@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "ModuleManager.h"
+#include "../AST/AstWalk.h"   // feature-21：stampOriginFile 借 forEachExprChild 递归表达式子槽
 #include "../Lexer.h"
 #include "../Parser.h"
 #include "../Sema/BuiltinRegistry.h"
@@ -133,6 +134,190 @@ void writeFile(const std::string& path, const std::string& content) {
 std::string stemOf(const std::string& path) {
     namespace fs = std::filesystem;
     return pathString(fsPath(path).stem());   // bug-109：不经 C locale codecvt
+}
+
+// ============================================================
+// feature-21 Phase 2 §3.6.1：originFile 递归写入的遍历骨架
+//
+// Parser 不知道文件路径 ⇒ `HashConstDecl::originFile` 只能由 ModuleManager 在解析
+// 成功后统一递归写入（含块内 / 函数体 / 引述体）。本组函数只做「找 HashConstDecl 并
+// 打戳」，不做任何改写；遍历范围与 ExpandConst.cpp 的 TreeWalker 一致（表达式子槽
+// 借 AstWalk.h 的 forEachExprChild，语句/声明子槽在此手工分派）。
+// ============================================================
+namespace {
+
+void stampStmts(const std::string& file, std::vector<std::unique_ptr<Stmt>>& v);
+
+// 表达式：引述体与块槽都要下钻（引述体内允许声明与 import，见 §3.2.4）
+void stampExpr(const std::string& file, ASTNode& e) {
+    if (auto* q = dynamic_cast<QuoteExpr*>(&e)) {
+        if (q->block) stampStmts(file, q->block->stmts);
+        return;
+    }
+    if (auto* b = dynamic_cast<BlockStmt*>(&e)) {   // AstWalk 的 Block 代理（EvalBlock/FunExpr/Quote）
+        stampStmts(file, b->stmts);
+        return;
+    }
+    forEachExprChild(e, [&](std::unique_ptr<ASTNode>& child) {
+        if (child) stampExpr(file, *child);
+    });
+}
+
+void stampDecl(const std::string& file, Decl& d) {
+    if (auto* hc = dynamic_cast<HashConstDecl*>(&d)) {
+        hc->originFile = file;
+        if (hc->value) stampExpr(file, *hc->value);
+        return;
+    }
+    if (auto* f = dynamic_cast<FunDecl*>(&d)) {
+        for (auto& p : f->params) if (p.defaultExpr) stampExpr(file, *p.defaultExpr);
+        if (f->body) stampStmts(file, f->body->stmts);
+        return;
+    }
+    if (auto* m = dynamic_cast<MethodDecl*>(&d)) {
+        for (auto& p : m->params) if (p.defaultExpr) stampExpr(file, *p.defaultExpr);
+        if (m->body) stampStmts(file, m->body->stmts);
+        return;
+    }
+    if (auto* i = dynamic_cast<InterfaceDecl*>(&d)) {          // N-15：默认体也是块
+        for (auto& sig : i->methods) {
+            for (auto& p : sig.params) if (p.defaultExpr) stampExpr(file, *p.defaultExpr);
+            if (sig.defaultBody) stampStmts(file, sig.defaultBody->stmts);
+        }
+        return;
+    }
+    if (auto* l = dynamic_cast<LetDecl*>(&d)) {
+        if (l->initializer) stampExpr(file, *l->initializer);
+        return;
+    }
+    if (auto* c = dynamic_cast<ConstDecl*>(&d)) {
+        if (c->initializer) stampExpr(file, *c->initializer);
+        return;
+    }
+    if (auto* mt = dynamic_cast<MetaTypeDecl*>(&d)) {
+        for (auto& p : mt->fields) if (p.defaultExpr) stampExpr(file, *p.defaultExpr);
+        return;
+    }
+    // UnquoteItem / UnquoteGroup / ImportDecl / ModuleDecl：无 AST 子槽
+}
+
+void stampStmt(const std::string& file, Stmt& s) {
+    if (auto* b = dynamic_cast<BlockStmt*>(&s)) { stampStmts(file, b->stmts); return; }
+    if (auto* d = dynamic_cast<Decl*>(&s))     { stampDecl(file, *d); return; }   // Decl : Stmt
+    if (auto* e = dynamic_cast<ExprStmt*>(&s))  { if (e->expr) stampExpr(file, *e->expr); return; }
+    if (auto* e = dynamic_cast<ReturnStmt*>(&s)) { if (e->expr) stampExpr(file, *e->expr); return; }
+    if (auto* e = dynamic_cast<ThrowStmt*>(&s))  { if (e->expr) stampExpr(file, *e->expr); return; }
+    if (auto* i = dynamic_cast<IfStmt*>(&s)) {
+        if (i->condition) stampExpr(file, *i->condition);
+        if (i->thenBranch) stampStmts(file, i->thenBranch->stmts);
+        for (auto& ei : i->elseIfs) {
+            if (ei.condition) stampExpr(file, *ei.condition);
+            if (ei.body) stampStmts(file, ei.body->stmts);
+        }
+        if (i->elseBranch) stampStmts(file, i->elseBranch->stmts);
+        return;
+    }
+    if (auto* w = dynamic_cast<WhileStmt*>(&s)) {
+        if (w->condition) stampExpr(file, *w->condition);
+        if (w->body) stampStmts(file, w->body->stmts);
+        return;
+    }
+    if (auto* l = dynamic_cast<LoopStmt*>(&s))     { if (l->body) stampStmts(file, l->body->stmts); return; }
+    if (auto* f = dynamic_cast<ForStmt*>(&s)) {
+        if (f->iterable) stampExpr(file, *f->iterable);
+        if (f->body) stampStmts(file, f->body->stmts);
+        return;
+    }
+    if (auto* t = dynamic_cast<TryCatchStmt*>(&s)) {
+        if (t->tryBody) stampStmts(file, t->tryBody->stmts);
+        if (t->catchBody) stampStmts(file, t->catchBody->stmts);
+        return;
+    }
+    if (auto* y = dynamic_cast<SyncStmt*>(&s)) {
+        if (y->maxExpr) stampExpr(file, *y->maxExpr);
+        if (y->body) stampStmts(file, y->body->stmts);
+        return;
+    }
+    if (auto* k = dynamic_cast<LockStmt*>(&s)) {
+        for (auto& x : k->lockExprs) if (x) stampExpr(file, *x);
+        if (k->body) stampStmts(file, k->body->stmts);
+        return;
+    }
+    if (auto* sp = dynamic_cast<SpawnStmt*>(&s)) {   // §3.4.4 的「spawn 体」同一遍历
+        for (auto& p : sp->params) if (p.defaultExpr) stampExpr(file, *p.defaultExpr);
+        for (auto& a : sp->args) if (a) stampExpr(file, *a);
+        if (sp->callExpr) stampExpr(file, *sp->callExpr);
+        stampStmts(file, sp->body);
+        return;
+    }
+    if (auto* sf = dynamic_cast<SyncForStmt*>(&s)) {
+        if (sf->maxExpr) stampExpr(file, *sf->maxExpr);
+        if (sf->iterable) stampExpr(file, *sf->iterable);
+        if (sf->body) stampStmts(file, sf->body->stmts);
+        return;
+    }
+    if (auto* m = dynamic_cast<MatchStmt*>(&s)) {
+        if (m->expr) stampExpr(file, *m->expr);
+        for (auto& c : m->cases) {
+            if (auto* cp = dynamic_cast<ConstantPattern*>(c.pattern.get()))
+                if (cp->value) stampExpr(file, *cp->value);
+            if (!c.body) continue;
+            if (auto* b = dynamic_cast<BlockStmt*>(c.body.get())) stampStmts(file, b->stmts);
+            else stampExpr(file, *c.body);
+        }
+        return;
+    }
+    // BreakStmt / ContinueStmt：无子节点
+}
+
+void stampStmts(const std::string& file, std::vector<std::unique_ptr<Stmt>>& v) {
+    for (auto& s : v) if (s) stampStmt(file, *s);
+}
+
+} // namespace
+
+void ModuleManager::stampOriginFile(Program& program, const std::string& filePath) {
+    // 与 modules_ / working 的键同一口径：绝对路径（D7 的「定义处目录」基准）
+    const std::string abs = pathString(std::filesystem::absolute(fsPath(filePath)));
+    for (auto& d : program.decls) if (d) stampDecl(abs, *d);
+}
+
+// ============================================================
+// feature-21 Phase 2 §3.6：DeclUnit 的 AST 刷新（imports / deps / hasMain）
+//
+// N-7 + R-11：`u.imports[].path` 与 `u.deps[]` 同一契约 —— 一律绝对路径。
+// 相对 import 在此解析；解析失败记诊断并跳过（与 parseModule 同语义）。
+// ============================================================
+void ModuleManager::rebuildDeclUnit(const std::string& absPath, Program& ast, DeclUnit& u) {
+    u.sourcePath = absPath;
+    u.imports.clear();
+    u.deps.clear();
+    u.hasMain = false;
+
+    for (auto& d : ast.decls) {
+        if (!d) continue;
+        if (isComptimeDecl(*d)) continue;   // feature-21：`#fun main` 不算入口
+
+        if (auto* imp = dynamic_cast<ImportDecl*>(d.get())) {
+            ImportInfo ii;
+            ii.path      = imp->path;
+            ii.alias     = imp->alias;
+            ii.isBuiltin = imp->isBuiltin;
+            if (!ii.isBuiltin && isKnownBuiltin(ii.path)) ii.isBuiltin = true;
+            if (!ii.isBuiltin) {
+                std::string resolved = imp->path;
+                if (!fsPath(resolved).is_absolute())
+                    resolved = resolveImportPath(imp->path,
+                                                 pathString(fsPath(absPath).parent_path()));
+                if (resolved.empty()) continue;   // 解析失败：parseModule 阶段已记诊断
+                ii.path = resolved;
+                u.deps.push_back(resolved);
+            }
+            u.imports.push_back(ii);
+        } else if (auto* fn = dynamic_cast<FunDecl*>(d.get())) {
+            if (!fn->isComptime && fn->name == "main") u.hasMain = true;
+        }
+    }
 }
 
 // ============================================================
@@ -283,6 +468,10 @@ ModuleInfo ModuleManager::parseModule(const std::string& sourcePath) {
         return info;
     }
 
+    // feature-21 Phase 2 §3.6.1：Parser 不知道文件路径 ⇒ 解析成功后立刻递归写 originFile
+    //（必须先于任何建表 / 展开；单文件入口由 CompilationDriver 自行调用）。
+    stampOriginFile(*info.ast, info.sourcePath);
+
     // feature-13 C0（2026-09-17）：解析 `module <ident>` 声明 → 覆盖 moduleName/nsName。
     // 语义（D12）：显式 module 名 = 模块逻辑名（符号前缀 + 产物 namespace 来源），
     // 与文件路径解耦；同 module 多名文件 → **统一 namespace（无哈希）**；
@@ -301,6 +490,7 @@ ModuleInfo ModuleManager::parseModule(const std::string& sourcePath) {
     // 提取 import 依赖 和 has_main
     for (auto& d : info.ast->decls) {
         if (!d) continue;
+        if (isComptimeDecl(*d)) continue;   // feature-21：`#fun main` 不得把模块判成有入口
 
         if (auto* imp = dynamic_cast<ImportDecl*>(d.get())) {
             ImportInfo ii;
@@ -483,6 +673,7 @@ DeclUnit ModuleManager::scanDeclarations(const std::string& sourcePath) {
     // 逐声明收集骨架
     for (auto& d : ast->decls) {
         if (!d) continue;
+        if (isComptimeDecl(*d)) continue;   // feature-21：编译期声明不进跨模块函数骨架
 
         // ---- import：与 parseModule 的 imports/deps 语义逐条对齐 ----
         if (auto* imp = dynamic_cast<ImportDecl*>(d.get())) {
@@ -613,6 +804,12 @@ bool ModuleManager::scanAll(const std::string& entryPath) {
 // 显式同 module（多文件均带 module <name>） → 共享 namespace，合法；
 // 含任一隐式（无 module 声明回落 stem）同 moduleName        → 冲突（无共享意图）。
 bool ModuleManager::checkModuleConflicts() const {
+    return checkModuleConflicts(diag_);
+}
+
+// feature-21 Phase 2 §3.6：驱动器在每轮 ensureModuleLoaded 后用它复查
+// （宏生成模块可能同名/同 ns，只查一次会漏检）。
+bool ModuleManager::checkModuleConflicts(DiagnosticEngine& diag) const {
     // moduleName → [(sourcePath, hasExplicitModule)]
     std::unordered_map<std::string, std::vector<std::pair<std::string, bool>>> byName;
     for (auto& [path, u] : scanUnits_.units)
@@ -629,7 +826,7 @@ bool ModuleManager::checkModuleConflicts() const {
         for (auto& [p, _] : items) msg += "  " + p + "\n";
         msg += "  → 请在上述文件首行添加显式 `module <name>` 声明（显式同名 = 共享命名空间，合法）；"
                "或给模块起不同的名字。";
-        diag_.error(0, 0, msg);
+        diag.error(0, 0, msg);
         return true;
     }
     return false;
@@ -741,6 +938,36 @@ bool ModuleManager::loadAllScanned() {
         modules_[path] = std::move(info);
     }
     return !diag_.hasErrors();
+}
+
+// ============================================================
+// feature-21 Phase 2 §3.6：宏生成 import 的按需加载 + AST 刷新
+// ============================================================
+bool ModuleManager::ensureModuleLoaded(const std::string& absPath) {
+    const std::string abs = pathString(std::filesystem::absolute(fsPath(absPath)));
+    if (modules_.count(abs)) return true;          // 去重：同一目标只加载一次
+
+    ModuleInfo info = parseModule(abs);
+    if (!info.ast) return false;                   // parseModule 已记诊断
+
+    const std::string key = info.sourcePath.empty() ? abs : info.sourcePath;
+    auto& u = scanUnits_.units[key];               // 新模块进入扫描表（骨架留空，deps 真实）
+    u.moduleName        = info.moduleName;
+    u.hasExplicitModule = info.hasExplicitModule;
+    rebuildDeclUnit(key, *info.ast, u);
+
+    modules_[key] = std::move(info);
+    return true;
+}
+
+void ModuleManager::refreshDeclUnitsFromAst() {
+    for (auto& [path, mod] : modules_) {
+        if (!mod.ast) continue;
+        auto& u = scanUnits_.units[path];
+        u.moduleName        = mod.moduleName;
+        u.hasExplicitModule = mod.hasExplicitModule;
+        rebuildDeclUnit(path, *mod.ast, u);
+    }
 }
 
 // ============================================================

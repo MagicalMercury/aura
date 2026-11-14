@@ -236,6 +236,7 @@ CompileUnit CodeGenerator::generate(const Program& program,
     // 第一遍：注册所有类型名和接口名
     for (auto& d : program.decls) {
         if (!d) continue;
+        if (isComptimeDecl(*d)) continue;   // feature-21：`#fun`/`#` 方法不注册运行期名
         if (auto* t = dynamic_cast<const TypeDecl*>(d.get())) {
             // enum 是【值类型】：形态 1/2 都生成同一个「壳 struct」（`enum class _Tag` +
             // `_tag` 身份字段 + 静态变体单例 + operator==/!=；形态 1 无关联值）——§4.4-⑨ 改动 4
@@ -300,6 +301,7 @@ CompileUnit CodeGenerator::generate(const Program& program,
     // ============================================================
     for (auto& d : program.decls) {
         if (!d) continue;
+        if (isComptimeDecl(*d)) continue;   // feature-21：编译期声明不参与导入 enum 标注装填
         if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
             for (auto& p : f->params) registerImportedEnumAnnotations(p.type.get());
             registerImportedEnumAnnotations(f->returnType.get());
@@ -353,6 +355,7 @@ CompileUnit CodeGenerator::generate(const Program& program,
         changed = false;
         for (auto& d : program.decls) {
             if (!d) continue;
+            if (isComptimeDecl(*d)) continue;   // feature-21：`#fun` 不参与协程判定
             if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
                 if (coroutineFunctions_.count(f->name)) continue;
                 if (decideCoro(*f) == CoroDecision::Coroutine) {
@@ -405,6 +408,7 @@ CompileUnit CodeGenerator::generate(const Program& program,
     fnThrows_.clear();
     for (auto& d : program.decls) {
         if (!d) continue;
+        if (isComptimeDecl(*d)) continue;   // feature-21：`#fun` throws 不污染同名运行期函数
         if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
             bool& slot = fnThrows_[f->name];
             slot = slot || f->throws;
@@ -456,6 +460,7 @@ CompileUnit CodeGenerator::generate(const Program& program,
     // 先收集方法信息（供 genRecordStruct 嵌入声明）
     pendingMethods_.clear();
     for (auto& d : program.decls) {
+        if (isComptimeDecl(*d)) continue;   // feature-21：`#` 接收者方法不进 record 生成
         if (auto* m = dynamic_cast<const MethodDecl*>(d.get())) {
             if (!m->isConstructor) {
                 PendingMethod pm;
@@ -598,6 +603,7 @@ CompileUnit CodeGenerator::generate(const Program& program,
             const MethodDecl* md = nullptr;
             for (auto& d : program.decls) {
                 if (!d) continue;
+                if (isComptimeDecl(*d)) continue;   // feature-21：meta 符号反查不命中 `#fun`/`#` 方法
                 if (rec.kind == 0) {
                     if (auto* ff = dynamic_cast<const FunDecl*>(d.get()))
                         if (ff->name == rec.name) { fd = ff; break; }
@@ -721,6 +727,7 @@ CompileUnit CodeGenerator::generate(const Program& program,
 
     // 检测 main 函数并生成入口（必须在命名空间之外）
     for (auto& d : program.decls) {
+        if (isComptimeDecl(*d)) continue;   // feature-21：`#fun main` 不得生成运行期入口
         if (auto* f = dynamic_cast<const FunDecl*>(d.get())) {
             if (f->name == "main") {
                 unit.hasMain = true;
@@ -764,8 +771,11 @@ CompileUnit CodeGenerator::generate(const Program& program,
         //   当成类型写进 `kTypeTable`（实测产物：`{ main, TypeKindBits::Record, ... }`）。
         //   而 §3.5(c)/O8 明确要求「`kTypeTable` 本阶段**只含用户声明类型**」⇒ 必须过滤。
         std::set<std::string> fnNames;
-        for (auto& d : program.decls)
+        for (auto& d : program.decls) {
+            if (!d) continue;
+            if (isComptimeDecl(*d)) continue;   // feature-21：`#fun` 名不得剔除同名用户类型
             if (auto* ff = dynamic_cast<const FunDecl*>(d.get())) fnNames.insert(ff->name);
+        }
         // 🔴 O27：`registeredTypes_` 实为 `std::unordered_map<std::string,bool>`（CodeGen.h:845）⇒
         //   必须结构化绑定遍历（原写 `for (const auto* t : registeredTypes_)` **编不过**）。
         for (const auto& [name, isHeap] : registeredTypes_) {
@@ -813,6 +823,8 @@ CompileUnit CodeGenerator::generate(const Program& program,
 void CodeGenerator::genDecl(std::ostream& h, std::ostream& cpp,
                              const Decl& decl, CompileUnit& /*unit*/,
                              bool declarationsOnly) {
+    // feature-21：编译期声明一律不生成（`#fun` / `#` 接收者方法 / `#type` / `#const`）
+    if (isComptimeDecl(decl)) return;
     if (auto* t = dynamic_cast<const TypeDecl*>(&decl)) {
         // 类型声明在 A 遍生成（B 遍跳过，避免重复）
         if (declarationsOnly)
